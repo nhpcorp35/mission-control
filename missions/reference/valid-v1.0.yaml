@@ -1,0 +1,52 @@
+version: 1.0
+
+mission_id: 2026-07-16-001
+
+title: Repository Verification
+
+repository:
+  name: Legal-AI
+  path: /Users/allenk/Desktop/Legal-AI
+  base_branch: contradiction-engine-v2
+
+execution:
+  agent: cursor
+  mode: plan
+  sandbox: true
+  worktree: true
+
+permissions:
+  read: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+
+instructions: |
+  Read VISION.md completely.
+
+  Read ANCHOR.md completely.
+
+  Verify the current branch, Git status, and latest commit.
+
+  Compare the repository against ANCHOR.md.
+
+  Do not modify files.
+
+deliverables:
+  - current branch
+  - Git status
+  - latest commit
+  - discrepancies
+  - current phase
+  - current mission
+  - known issues
+  - recommended next task
+
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true

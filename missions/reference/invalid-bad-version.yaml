@@ -1,0 +1,37 @@
+version: 9.9
+
+mission_id: 2026-07-16-003
+
+title: Invalid Mission Bad Version
+
+repository:
+  name: Legal-AI
+  path: /Users/allenk/Desktop/Legal-AI
+  base_branch: contradiction-engine-v2
+
+execution:
+  agent: cursor
+  mode: plan
+  sandbox: true
+  worktree: true
+
+permissions:
+  read: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+
+instructions: |
+  Verify repository status.
+
+deliverables:
+  - repository status
+
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true

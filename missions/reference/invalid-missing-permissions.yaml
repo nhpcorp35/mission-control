@@ -1,0 +1,27 @@
+version: 1.0
+
+mission_id: 2026-07-16-002
+
+title: Invalid Mission Missing Permissions
+
+repository:
+  name: Legal-AI
+  path: /Users/allenk/Desktop/Legal-AI
+  base_branch: contradiction-engine-v2
+
+execution:
+  agent: cursor
+  mode: plan
+  sandbox: true
+  worktree: true
+
+instructions: |
+  Verify repository status.
+
+deliverables:
+  - repository status
+
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true
