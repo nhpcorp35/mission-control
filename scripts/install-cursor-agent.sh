@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install Cursor CLI using the official installer during Railway/Nixpacks build.
-curl -fsS https://cursor.com/install | bash
+curl https://cursor.com/install -fsS | bash
 
-export PATH="${HOME}/.local/bin:${PATH}"
+CURSOR_AGENT_SOURCE="$(command -v cursor-agent || true)"
 
-if ! command -v cursor-agent >/dev/null 2>&1; then
-  echo "cursor-agent was not found on PATH after installation" >&2
+if [ -z "$CURSOR_AGENT_SOURCE" ]; then
+  echo "cursor-agent installation failed"
   exit 1
 fi
 
-cursor-agent --version
+mkdir -p /app/.cursor/bin
+cp "$CURSOR_AGENT_SOURCE" /app/.cursor/bin/cursor-agent
+chmod +x /app/.cursor/bin/cursor-agent
+
+/app/.cursor/bin/cursor-agent --version
