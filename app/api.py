@@ -1,12 +1,37 @@
 """Mission Control cloud API."""
 
+from contextlib import asynccontextmanager
+import logging
+import os
+
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+from app.cursor_cli import (
+    augment_path,
+    check_cursor_cli_status,
+    preflight_for_execution,
+)
 from mission_control.executor import run_cursor_agent
 from mission_control.validator import load_mission_yaml, validate_mission_for_run
 
-app = FastAPI(title="Mission Control API", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    os.environ["PATH"] = augment_path()
+    status = check_cursor_cli_status()
+    logger.info(
+        "Cursor CLI startup check: installed=%s authenticated=%s binary=%s",
+        status.installed,
+        status.authenticated,
+        status.binary_path or "not found",
+    )
+    yield
+
+
+app = FastAPI(title="Mission Control API", version="1.0.0", lifespan=lifespan)
 
 
 class MissionYamlRequest(BaseModel):
@@ -18,11 +43,18 @@ class ValidateResponse(BaseModel):
     error: str | None = None
 
 
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+    stage: str
+
+
 class RunResponse(BaseModel):
     ok: bool
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    error_detail: ErrorDetail | None = None
 
 
 @app.get("/health")
@@ -45,6 +77,14 @@ def run_mission_endpoint(request: MissionYamlRequest) -> RunResponse:
     run_result = validate_mission_for_run(mission)
     if not run_result.ok:
         return RunResponse(ok=False, error=run_result.error)
+
+    preflight_error = preflight_for_execution()
+    if preflight_error is not None:
+        return RunResponse(
+            ok=False,
+            error=preflight_error.message,
+            error_detail=ErrorDetail(**preflight_error.to_dict()),
+        )
 
     execution_result = run_cursor_agent(mission)
     if not execution_result.ok:

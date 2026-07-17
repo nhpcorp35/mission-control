@@ -1,0 +1,5 @@
+[phases.setup]
+aptPkgs = ["curl"]
+
+[phases.build]
+cmds = ["bash scripts/install-cursor-agent.sh"]

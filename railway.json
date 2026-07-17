@@ -1,5 +1,5 @@
 {
   "deploy": {
-    "startCommand": "uvicorn app.api:app --host 0.0.0.0 --port $PORT"
+    "startCommand": "bash scripts/railway-start.sh"
   }
 }

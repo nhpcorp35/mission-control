@@ -24,6 +24,89 @@ class TestHealthEndpoint(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "ok"})
 
 
+class TestRunPreflightEndpoint(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def _runnable_mission_yaml(self) -> str:
+        return textwrap.dedent(
+            f"""
+            version: 1.0
+            mission_id: 2026-07-17-999
+            title: Runnable Test
+            repository:
+              name: Mission-Control
+              path: {REPO_ROOT}
+              base_branch: main
+            execution:
+              agent: cursor
+              mode: plan
+              sandbox: true
+              worktree: false
+            permissions:
+              read: true
+              create_files: false
+              modify_files: false
+              delete_files: false
+              run_commands: true
+              stage_changes: false
+              commit: false
+              push: false
+            instructions: |
+              List files.
+            deliverables:
+              - summary
+            approval:
+              execute_without_approval: true
+              commit_requires_approval: true
+              push_requires_approval: true
+            """
+        )
+
+    @patch("app.api.preflight_for_execution")
+    def test_run_cursor_agent_unavailable(self, mock_preflight) -> None:
+        from app.cursor_cli import StructuredError
+
+        mock_preflight.return_value = StructuredError(
+            code="CURSOR_AGENT_UNAVAILABLE",
+            message="cursor-agent is not installed",
+            stage="preflight",
+        )
+
+        response = self.client.post(
+            "/run", json={"mission_yaml": self._runnable_mission_yaml()}
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"], "cursor-agent is not installed")
+        self.assertEqual(
+            body["error_detail"],
+            {
+                "code": "CURSOR_AGENT_UNAVAILABLE",
+                "message": "cursor-agent is not installed",
+                "stage": "preflight",
+            },
+        )
+
+    @patch("app.api.preflight_for_execution")
+    def test_run_cursor_api_key_missing(self, mock_preflight) -> None:
+        from app.cursor_cli import StructuredError
+
+        mock_preflight.return_value = StructuredError(
+            code="CURSOR_API_KEY_MISSING",
+            message="CURSOR_API_KEY environment variable is not set",
+            stage="preflight",
+        )
+
+        response = self.client.post(
+            "/run", json={"mission_yaml": self._runnable_mission_yaml()}
+        )
+        body = response.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error_detail"]["code"], "CURSOR_API_KEY_MISSING")
+
+
 class TestValidateEndpoint(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
@@ -106,8 +189,9 @@ class TestRunEndpoint(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertIn("Worktrees", body["error"])
 
+    @patch("app.api.preflight_for_execution", return_value=None)
     @patch("app.api.run_cursor_agent")
-    def test_run_valid_mission_calls_executor(self, mock_run) -> None:
+    def test_run_valid_mission_calls_executor(self, mock_run, _mock_preflight) -> None:
         mock_run.return_value = ExecutionResult(ok=True, stdout="agent response\n")
 
         response = self.client.post(
@@ -121,12 +205,14 @@ class TestRunEndpoint(unittest.TestCase):
                 "stdout": "agent response\n",
                 "stderr": "",
                 "error": None,
+                "error_detail": None,
             },
         )
         mock_run.assert_called_once()
 
+    @patch("app.api.preflight_for_execution", return_value=None)
     @patch("app.api.run_cursor_agent")
-    def test_run_execution_failure(self, mock_run) -> None:
+    def test_run_execution_failure(self, mock_run, _mock_preflight) -> None:
         mock_run.return_value = ExecutionResult(
             ok=False,
             stderr="agent failed",
