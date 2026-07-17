@@ -72,15 +72,10 @@ def validate_mission(data: object) -> ValidationResult:
     return ValidationResult(ok=True)
 
 
-def load_mission_file(path: str) -> tuple[ValidationResult, dict | None]:
-    """Load a mission file and return structural validation plus parsed data."""
+def load_mission_yaml(yaml_text: str) -> tuple[ValidationResult, dict | None]:
+    """Load mission YAML text and return structural validation plus parsed data."""
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = yaml.safe_load(handle)
-    except FileNotFoundError:
-        return ValidationResult(ok=False, error=f"File not found: {path}"), None
-    except OSError as exc:
-        return ValidationResult(ok=False, error=f"Cannot read file: {path} ({exc})"), None
+        data = yaml.safe_load(yaml_text)
     except yaml.YAMLError as exc:
         return ValidationResult(ok=False, error=f"Invalid YAML: {exc}"), None
 
@@ -88,6 +83,19 @@ def load_mission_file(path: str) -> tuple[ValidationResult, dict | None]:
     if not result.ok:
         return result, None
     return result, data
+
+
+def load_mission_file(path: str) -> tuple[ValidationResult, dict | None]:
+    """Load a mission file and return structural validation plus parsed data."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            yaml_text = handle.read()
+    except FileNotFoundError:
+        return ValidationResult(ok=False, error=f"File not found: {path}"), None
+    except OSError as exc:
+        return ValidationResult(ok=False, error=f"Cannot read file: {path} ({exc})"), None
+
+    return load_mission_yaml(yaml_text)
 
 
 def validate_mission_file(path: str) -> ValidationResult:
