@@ -9,6 +9,7 @@ from mission_control.executor import (
     EXECUTION_TIMEOUT_SECONDS,
     build_cursor_agent_command,
     build_cursor_instruction,
+    execute_cursor_agent,
     run_cursor_agent,
 )
 
@@ -64,6 +65,39 @@ class TestBuildCursorAgentCommand(unittest.TestCase):
             ],
         )
 
+    def test_execute_mode_omits_cursor_mode_flag(self) -> None:
+        command = build_cursor_agent_command(
+            "/Users/allenk/Desktop/Mission-Control",
+            "Create a new file.",
+            mode="execute",
+        )
+
+        self.assertEqual(
+            command,
+            [
+                CURSOR_AGENT,
+                "--print",
+                "--output-format",
+                "text",
+                "--workspace",
+                "/Users/allenk/Desktop/Mission-Control",
+                "--trust",
+                "Create a new file.",
+            ],
+        )
+        self.assertNotIn("--mode", command)
+
+    def test_rejects_unknown_cursor_mode(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Unsupported Cursor Agent mode",
+        ):
+            build_cursor_agent_command(
+                "/tmp/repo",
+                "test",
+                mode="invalid",
+            )
+
     def test_excludes_forbidden_flags(self) -> None:
         command = build_cursor_agent_command("/tmp/repo", "test")
         forbidden = {"--force", "--yolo", "--auto-review", "--worktree", "-w"}
@@ -82,6 +116,26 @@ class TestRunCursorAgent(unittest.TestCase):
         result = run_cursor_agent(_sample_mission())
         self.assertTrue(result.ok)
         self.assertEqual(result.stdout, "PONG\n")
+
+    @patch("mission_control.executor.subprocess.run")
+    def test_execute_uses_write_capable_default_mode(self, mock_run) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="created file\n",
+            stderr="",
+        )
+
+        result = execute_cursor_agent(_sample_mission())
+
+        self.assertTrue(result.ok)
+
+        command = mock_run.call_args.args[0]
+        self.assertIn("--print", command)
+        self.assertIn("--trust", command)
+        self.assertNotIn("--mode", command)
+        self.assertNotIn("--force", command)
+        self.assertNotIn("--yolo", command)
 
     @patch("mission_control.executor.subprocess.run")
     def test_run_failure_returns_stderr(self, mock_run) -> None:

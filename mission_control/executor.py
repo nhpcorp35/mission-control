@@ -72,18 +72,28 @@ def build_cursor_agent_command(
     instruction: str,
     mode: str = "plan",
 ) -> list[str]:
-    return [
+    command = [
         CURSOR_AGENT,
         "--print",
-        "--mode",
-        mode,
-        "--output-format",
-        "text",
-        "--workspace",
-        workspace,
-        "--trust",
-        instruction,
     ]
+
+    if mode in {"plan", "ask"}:
+        command.extend(["--mode", mode])
+    elif mode != "execute":
+        raise ValueError(f"Unsupported Cursor Agent mode: {mode}")
+
+    command.extend(
+        [
+            "--output-format",
+            "text",
+            "--workspace",
+            workspace,
+            "--trust",
+            instruction,
+        ]
+    )
+
+    return command
 
 
 def _run_cursor_agent(
