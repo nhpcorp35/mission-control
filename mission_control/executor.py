@@ -1,4 +1,4 @@
-"""Cursor Agent execution for Phase 2 read-only missions."""
+"""Cursor Agent execution for validated missions."""
 
 from dataclasses import dataclass
 import subprocess
@@ -6,11 +6,21 @@ import subprocess
 CURSOR_AGENT = "cursor-agent"
 EXECUTION_TIMEOUT_SECONDS = 120
 
-SAFETY_CONSTRAINTS = (
+READ_ONLY_CONSTRAINTS = (
     "This is a read-only mission.",
     "Do not modify files.",
     "Do not run Git commands.",
     "Do not create commits.",
+    "Do not use worktrees.",
+)
+
+CREATE_ONLY_CONSTRAINTS = (
+    "This mission may create new files only.",
+    "Do not modify or delete existing files.",
+    "Do not run Git commands.",
+    "Do not stage changes.",
+    "Do not create commits.",
+    "Do not push changes.",
     "Do not use worktrees.",
 )
 
@@ -23,8 +33,10 @@ class ExecutionResult:
     error: str | None = None
 
 
-def build_cursor_instruction(mission: dict) -> str:
-    """Translate a mission into a Cursor Agent instruction."""
+def build_cursor_instruction(
+    mission: dict,
+    constraints: tuple[str, ...] = READ_ONLY_CONSTRAINTS,
+) -> str:
     title = mission.get("title", "")
     instructions = mission.get("instructions", "")
     deliverables = mission.get("deliverables", [])
@@ -34,7 +46,9 @@ def build_cursor_instruction(mission: dict) -> str:
         "",
         "Constraints:",
     ]
-    lines.extend(f"- {constraint}" for constraint in SAFETY_CONSTRAINTS)
+
+    lines.extend(f"- {constraint}" for constraint in constraints)
+
     lines.extend(
         [
             "",
@@ -53,13 +67,16 @@ def build_cursor_instruction(mission: dict) -> str:
     return "\n".join(lines).strip()
 
 
-def build_cursor_agent_command(workspace: str, instruction: str) -> list[str]:
-    """Build the cursor-agent argv for a read-only mission."""
+def build_cursor_agent_command(
+    workspace: str,
+    instruction: str,
+    mode: str = "plan",
+) -> list[str]:
     return [
         CURSOR_AGENT,
         "--print",
         "--mode",
-        "plan",
+        mode,
         "--output-format",
         "text",
         "--workspace",
@@ -69,12 +86,25 @@ def build_cursor_agent_command(workspace: str, instruction: str) -> list[str]:
     ]
 
 
-def run_cursor_agent(mission: dict) -> ExecutionResult:
-    """Launch cursor-agent for a validated, run-eligible mission."""
+def _run_cursor_agent(
+    mission: dict,
+    *,
+    mode: str,
+    constraints: tuple[str, ...],
+) -> ExecutionResult:
     repository = mission["repository"]
     workspace = repository["path"]
-    instruction = build_cursor_instruction(mission)
-    command = build_cursor_agent_command(workspace, instruction)
+
+    instruction = build_cursor_instruction(
+        mission,
+        constraints=constraints,
+    )
+
+    command = build_cursor_agent_command(
+        workspace,
+        instruction,
+        mode=mode,
+    )
 
     try:
         completed = subprocess.run(
@@ -86,7 +116,10 @@ def run_cursor_agent(mission: dict) -> ExecutionResult:
     except subprocess.TimeoutExpired:
         return ExecutionResult(
             ok=False,
-            error=f"cursor-agent timed out after {EXECUTION_TIMEOUT_SECONDS} seconds",
+            error=(
+                "cursor-agent timed out after "
+                f"{EXECUTION_TIMEOUT_SECONDS} seconds"
+            ),
         )
     except FileNotFoundError:
         return ExecutionResult(
@@ -101,8 +134,13 @@ def run_cursor_agent(mission: dict) -> ExecutionResult:
 
     if completed.returncode != 0:
         message = completed.stderr.strip() or completed.stdout.strip()
+
         if not message:
-            message = f"cursor-agent exited with code {completed.returncode}"
+            message = (
+                f"cursor-agent exited with code "
+                f"{completed.returncode}"
+            )
+
         return ExecutionResult(
             ok=False,
             stdout=completed.stdout,
@@ -114,4 +152,20 @@ def run_cursor_agent(mission: dict) -> ExecutionResult:
         ok=True,
         stdout=completed.stdout,
         stderr=completed.stderr,
+    )
+
+
+def run_cursor_agent(mission: dict) -> ExecutionResult:
+    return _run_cursor_agent(
+        mission,
+        mode="plan",
+        constraints=READ_ONLY_CONSTRAINTS,
+    )
+
+
+def execute_cursor_agent(mission: dict) -> ExecutionResult:
+    return _run_cursor_agent(
+        mission,
+        mode="execute",
+        constraints=CREATE_ONLY_CONSTRAINTS,
     )

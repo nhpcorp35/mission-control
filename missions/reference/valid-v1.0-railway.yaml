@@ -1,8 +1,8 @@
 version: 1.0
 
-mission_id: 2026-07-17-002
+mission_id: 2026-07-17-001
 
-title: Mission Control Controlled Write Test
+title: Mission Control Smoke Test
 
 repository:
   name: Mission-Control
@@ -17,7 +17,7 @@ execution:
 
 permissions:
   read: true
-  create_files: true
+  create_files: false
   modify_files: false
   delete_files: false
   run_commands: true
@@ -26,20 +26,13 @@ permissions:
   push: false
 
 instructions: |
-  Create the file tmp/mission-control-smoke-test.txt.
+  List the files in this directory and briefly describe them.
 
-  Write exactly this line into the file:
-
-  Mission Control write test succeeded.
-
-  Read the file back and report its contents.
-
-  Do not modify any other file.
-  Do not run Git commands.
+  Do not modify anything.
 
 deliverables:
-  - tmp/mission-control-smoke-test.txt
-  - confirmation of the file contents
+  - file list
+  - brief descriptions
 
 approval:
   execute_without_approval: true
