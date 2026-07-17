@@ -1,0 +1,27 @@
+mission_id: write-smoke-test-v1.0
+title: Railway controlled write smoke test
+
+permissions:
+  filesystem:
+    read:
+      - /app
+    write:
+      - /app/tmp
+  git:
+    allowed: false
+  network:
+    allowed: false
+
+instructions:
+  - Create the file /app/tmp/mission-control-smoke-test.txt
+  - Write exactly: Mission Control write test succeeded.
+  - Read the file back and report its contents.
+  - Do not modify any other file.
+  - Do not run Git commands.
+
+deliverables:
+  - path: /app/tmp/mission-control-smoke-test.txt
+    description: Disposable smoke-test file
+
+approval:
+  required: false
