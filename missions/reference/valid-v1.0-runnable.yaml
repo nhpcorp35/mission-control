@@ -1,0 +1,40 @@
+version: 1.0
+
+mission_id: 2026-07-17-001
+
+title: Mission Control Smoke Test
+
+repository:
+  name: Mission-Control
+  path: /Users/allenk/Desktop/Mission-Control
+  base_branch: main
+
+execution:
+  agent: cursor
+  mode: plan
+  sandbox: true
+  worktree: false
+
+permissions:
+  read: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+
+instructions: |
+  List the files in this directory and briefly describe them.
+
+  Do not modify anything.
+
+deliverables:
+  - file list
+  - brief descriptions
+
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true

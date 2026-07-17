@@ -1,6 +1,7 @@
 """Validation logic for Mission Specification v1.0 files."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import yaml
 
@@ -16,6 +17,18 @@ REQUIRED_TOP_LEVEL_KEYS = (
     "instructions",
     "deliverables",
     "approval",
+)
+
+RUN_AGENT = "cursor"
+RUN_MODE = "plan"
+
+RUN_FALSE_PERMISSIONS = (
+    "create_files",
+    "modify_files",
+    "delete_files",
+    "stage_changes",
+    "commit",
+    "push",
 )
 
 
@@ -59,16 +72,104 @@ def validate_mission(data: object) -> ValidationResult:
     return ValidationResult(ok=True)
 
 
-def validate_mission_file(path: str) -> ValidationResult:
-    """Load a mission file from disk and validate it."""
+def load_mission_file(path: str) -> tuple[ValidationResult, dict | None]:
+    """Load a mission file and return structural validation plus parsed data."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle)
     except FileNotFoundError:
-        return ValidationResult(ok=False, error=f"File not found: {path}")
+        return ValidationResult(ok=False, error=f"File not found: {path}"), None
     except OSError as exc:
-        return ValidationResult(ok=False, error=f"Cannot read file: {path} ({exc})")
+        return ValidationResult(ok=False, error=f"Cannot read file: {path} ({exc})"), None
     except yaml.YAMLError as exc:
-        return ValidationResult(ok=False, error=f"Invalid YAML: {exc}")
+        return ValidationResult(ok=False, error=f"Invalid YAML: {exc}"), None
 
-    return validate_mission(data)
+    result = validate_mission(data)
+    if not result.ok:
+        return result, None
+    return result, data
+
+
+def validate_mission_file(path: str) -> ValidationResult:
+    """Load a mission file from disk and validate it."""
+    result, _ = load_mission_file(path)
+    return result
+
+
+def _mapping_value(data: dict, section: str) -> dict | None:
+    value = data.get(section)
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def validate_mission_for_run(data: dict) -> ValidationResult:
+    """Validate that a mission is eligible for Phase 2 read-only execution."""
+    execution = _mapping_value(data, "execution")
+    if execution is None:
+        return ValidationResult(
+            ok=False,
+            error="execution must be a mapping",
+        )
+
+    agent = execution.get("agent")
+    if agent != RUN_AGENT:
+        return ValidationResult(
+            ok=False,
+            error=f"Unsupported agent: {agent} (expected {RUN_AGENT})",
+        )
+
+    mode = execution.get("mode")
+    if mode != RUN_MODE:
+        return ValidationResult(
+            ok=False,
+            error=f"Unsupported mode: {mode} (expected {RUN_MODE})",
+        )
+
+    if execution.get("worktree"):
+        return ValidationResult(
+            ok=False,
+            error="Worktrees are not supported in Phase 2",
+        )
+
+    permissions = _mapping_value(data, "permissions")
+    if permissions is None:
+        return ValidationResult(
+            ok=False,
+            error="permissions must be a mapping",
+        )
+
+    for permission in RUN_FALSE_PERMISSIONS:
+        if permissions.get(permission):
+            return ValidationResult(
+                ok=False,
+                error=f"Permission not allowed for run: {permission}",
+            )
+
+    repository = _mapping_value(data, "repository")
+    if repository is None:
+        return ValidationResult(
+            ok=False,
+            error="repository must be a mapping",
+        )
+
+    repo_path = repository.get("path")
+    if not isinstance(repo_path, str) or not repo_path.strip():
+        return ValidationResult(
+            ok=False,
+            error="repository.path must be a non-empty string",
+        )
+
+    path = Path(repo_path)
+    if not path.exists():
+        return ValidationResult(
+            ok=False,
+            error=f"Repository path does not exist: {repo_path}",
+        )
+    if not path.is_dir():
+        return ValidationResult(
+            ok=False,
+            error=f"Repository path is not a directory: {repo_path}",
+        )
+
+    return ValidationResult(ok=True)
