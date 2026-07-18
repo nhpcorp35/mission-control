@@ -33,7 +33,6 @@ RUN_FALSE_PERMISSIONS = (
 )
 
 EXECUTE_FALSE_PERMISSIONS = (
-    "modify_files",
     "delete_files",
     "stage_changes",
     "commit",
@@ -58,7 +57,11 @@ def validate_mission(data: object) -> ValidationResult:
             error="Mission must be a YAML mapping at the top level",
         )
 
-    missing_keys = [key for key in REQUIRED_TOP_LEVEL_KEYS if key not in data]
+    missing_keys = [
+        key
+        for key in REQUIRED_TOP_LEVEL_KEYS
+        if key not in data
+    ]
 
     if missing_keys:
         return ValidationResult(
@@ -80,7 +83,9 @@ def validate_mission(data: object) -> ValidationResult:
     return ValidationResult(ok=True)
 
 
-def load_mission_yaml(yaml_text: str) -> tuple[ValidationResult, dict | None]:
+def load_mission_yaml(
+    yaml_text: str,
+) -> tuple[ValidationResult, dict | None]:
     try:
         data = yaml.safe_load(yaml_text)
     except yaml.YAMLError as exc:
@@ -97,7 +102,9 @@ def load_mission_yaml(yaml_text: str) -> tuple[ValidationResult, dict | None]:
     return result, data
 
 
-def load_mission_file(path: str) -> tuple[ValidationResult, dict | None]:
+def load_mission_file(
+    path: str,
+) -> tuple[ValidationResult, dict | None]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             yaml_text = handle.read()
@@ -120,7 +127,10 @@ def validate_mission_file(path: str) -> ValidationResult:
     return result
 
 
-def _mapping_value(data: dict, section: str) -> dict | None:
+def _mapping_value(
+    data: dict,
+    section: str,
+) -> dict | None:
     value = data.get(section)
 
     if not isinstance(value, dict):
@@ -212,7 +222,9 @@ def validate_mission_for_run(data: dict) -> ValidationResult:
     return _validate_repository_path(data)
 
 
-def validate_mission_for_execute(data: dict) -> ValidationResult:
+def validate_mission_for_execute(
+    data: dict,
+) -> ValidationResult:
     execution = _mapping_value(data, "execution")
 
     if execution is None:
@@ -251,17 +263,26 @@ def validate_mission_for_execute(data: dict) -> ValidationResult:
             error="permissions must be a mapping",
         )
 
-    if not permissions.get("create_files"):
+    create_files = bool(permissions.get("create_files"))
+    modify_files = bool(permissions.get("modify_files"))
+
+    if not create_files and not modify_files:
         return ValidationResult(
             ok=False,
-            error="Execute requires permission: create_files",
+            error=(
+                "Execute requires at least one of: "
+                "create_files or modify_files"
+            ),
         )
 
     for permission in EXECUTE_FALSE_PERMISSIONS:
         if permissions.get(permission):
             return ValidationResult(
                 ok=False,
-                error=f"Permission not allowed for execute: {permission}",
+                error=(
+                    "Permission not allowed for execute: "
+                    f"{permission}"
+                ),
             )
 
     return _validate_repository_path(data)
