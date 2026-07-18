@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager
 import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
 
+from app.auth import require_api_key
 from app.cursor_cli import (
     augment_path,
     check_cursor_cli_status,
@@ -91,6 +92,7 @@ def validate_mission_endpoint(
 @app.post("/run", response_model=RunResponse)
 def run_mission_endpoint(
     request: MissionYamlRequest,
+    _auth: None = Depends(require_api_key),
 ) -> RunResponse:
     structural_result, mission = load_mission_yaml(
         request.mission_yaml
@@ -141,6 +143,7 @@ def run_mission_endpoint(
 @app.post("/execute", response_model=RunResponse)
 def execute_mission_endpoint(
     request: MissionYamlRequest,
+    _auth: None = Depends(require_api_key),
 ) -> RunResponse:
     structural_result, mission = load_mission_yaml(
         request.mission_yaml

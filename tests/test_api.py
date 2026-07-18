@@ -1,5 +1,6 @@
 """Tests for Mission Control cloud API endpoints."""
 
+import os
 import textwrap
 import unittest
 from pathlib import Path
@@ -12,6 +13,13 @@ from mission_control.executor import ExecutionResult
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFERENCE = REPO_ROOT / "missions" / "reference"
+
+TEST_API_KEY = "mc_test_authentication_key"
+AUTH_HEADERS = {
+    "Authorization": f"Bearer {TEST_API_KEY}",
+}
+
+os.environ["MISSION_CONTROL_API_KEY"] = TEST_API_KEY
 
 
 class TestHealthEndpoint(unittest.TestCase):
@@ -26,7 +34,10 @@ class TestHealthEndpoint(unittest.TestCase):
 
 class TestRunPreflightEndpoint(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = TestClient(app)
+        self.client = TestClient(
+            app,
+            headers=AUTH_HEADERS,
+        )
 
     def _runnable_mission_yaml(self) -> str:
         return textwrap.dedent(
@@ -134,7 +145,10 @@ class TestValidateEndpoint(unittest.TestCase):
 
 class TestRunEndpoint(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = TestClient(app)
+        self.client = TestClient(
+            app,
+            headers=AUTH_HEADERS,
+        )
 
     def _runnable_mission_yaml(self) -> str:
         return textwrap.dedent(
@@ -227,6 +241,105 @@ class TestRunEndpoint(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(body["stderr"], "agent failed")
         self.assertEqual(body["error"], "agent failed")
+
+
+class TestAuthentication(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def test_health_remains_public(self) -> None:
+        response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_validate_remains_public(self) -> None:
+        mission_yaml = (
+            REFERENCE / "valid-v1.0.yaml"
+        ).read_text(encoding="utf-8")
+
+        response = self.client.post(
+            "/validate",
+            json={"mission_yaml": mission_yaml},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_run_rejects_missing_token(self) -> None:
+        response = self.client.post(
+            "/run",
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Missing bearer token",
+        )
+        self.assertEqual(
+            response.headers.get("www-authenticate"),
+            "Bearer",
+        )
+
+    def test_execute_rejects_missing_token(self) -> None:
+        response = self.client.post(
+            "/execute",
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_run_rejects_invalid_token(self) -> None:
+        response = self.client.post(
+            "/run",
+            headers={
+                "Authorization": "Bearer wrong-key",
+            },
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid bearer token",
+        )
+
+    def test_correct_token_reaches_run_endpoint(self) -> None:
+        response = self.client.post(
+            "/run",
+            headers=AUTH_HEADERS,
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+
+    def test_correct_token_reaches_execute_endpoint(self) -> None:
+        response = self.client.post(
+            "/execute",
+            headers=AUTH_HEADERS,
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+
+    def test_missing_server_configuration_returns_503(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"MISSION_CONTROL_API_KEY": ""},
+        ):
+            response = self.client.post(
+                "/run",
+                headers=AUTH_HEADERS,
+                json={"mission_yaml": "version: 1.0"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(
+            "MISSION_CONTROL_API_KEY",
+            response.json()["detail"],
+        )
 
 
 if __name__ == "__main__":
