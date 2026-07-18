@@ -10,6 +10,7 @@ import shutil
 CURSOR_AGENT = "cursor-agent"
 CURSOR_API_KEY_ENV = "CURSOR_API_KEY"
 CURSOR_LOCAL_BIN = Path.home() / ".local" / "bin"
+CURSOR_RUNTIME_BIN = Path("/app/.cursor-runtime")
 
 ERROR_CURSOR_AGENT_UNAVAILABLE = "CURSOR_AGENT_UNAVAILABLE"
 ERROR_CURSOR_API_KEY_MISSING = "CURSOR_API_KEY_MISSING"
@@ -53,8 +54,14 @@ def cursor_cli_env() -> dict[str, str]:
 
 
 def find_cursor_agent_binary() -> str | None:
-    """Resolve cursor-agent on PATH, including ~/.local/bin."""
-    return shutil.which(CURSOR_AGENT, path=cursor_cli_env()["PATH"])
+    """Resolve cursor-agent from Railway runtime or the normal CLI PATH."""
+    search_path = cursor_cli_env()["PATH"]
+    runtime_bin = str(CURSOR_RUNTIME_BIN)
+
+    if runtime_bin not in search_path.split(os.pathsep):
+        search_path = os.pathsep.join([runtime_bin, search_path])
+
+    return shutil.which(CURSOR_AGENT, path=search_path)
 
 
 def is_api_key_configured() -> bool:
