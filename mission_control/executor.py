@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import logging
 import subprocess
 
-from app.cursor_cli import cursor_cli_env
+from app.cursor_cli import cursor_cli_env, find_cursor_agent_binary
 
 CURSOR_AGENT = "cursor-agent"
 EXECUTION_TIMEOUT_SECONDS = 120
@@ -76,9 +76,10 @@ def build_cursor_agent_command(
     workspace: str,
     instruction: str,
     mode: str = "plan",
+    binary: str = CURSOR_AGENT,
 ) -> list[str]:
     command = [
-        CURSOR_AGENT,
+        binary,
         "--print",
     ]
 
@@ -115,14 +116,29 @@ def _run_cursor_agent(
         constraints=constraints,
     )
 
+    mission_id = mission.get("mission_id", "unknown")
+    title = mission.get("title", "untitled")
+
+    cursor_binary = find_cursor_agent_binary()
+
+    if cursor_binary is None:
+        logger.error(
+            "Cursor Agent binary not found: mission_id=%s binary=%s",
+            mission_id,
+            CURSOR_AGENT,
+        )
+
+        return ExecutionResult(
+            ok=False,
+            error=f"{CURSOR_AGENT} not found",
+        )
+
     command = build_cursor_agent_command(
         workspace,
         instruction,
         mode=mode,
+        binary=cursor_binary,
     )
-
-    mission_id = mission.get("mission_id", "unknown")
-    title = mission.get("title", "untitled")
 
     logger.info(
         "Starting Cursor mission: mission_id=%s title=%s mode=%s workspace=%s",
@@ -134,7 +150,7 @@ def _run_cursor_agent(
 
     logger.info(
         "Cursor command prepared: binary=%s mode=%s workspace=%s",
-        CURSOR_AGENT,
+        cursor_binary,
         mode,
         workspace,
     )
