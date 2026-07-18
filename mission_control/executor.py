@@ -265,7 +265,7 @@ def _run_cursor_agent(
 def run_cursor_agent(mission: dict) -> ExecutionResult:
     return _run_cursor_agent(
         mission,
-        mode="plan",
+        mode="ask",
         constraints=READ_ONLY_CONSTRAINTS,
     )
 
