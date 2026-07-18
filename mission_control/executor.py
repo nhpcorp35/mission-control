@@ -1,10 +1,15 @@
 """Cursor Agent execution for validated missions."""
 
 from dataclasses import dataclass
+import logging
 import subprocess
+
+from app.cursor_cli import cursor_cli_env
 
 CURSOR_AGENT = "cursor-agent"
 EXECUTION_TIMEOUT_SECONDS = 120
+
+logger = logging.getLogger(__name__)
 
 READ_ONLY_CONSTRAINTS = (
     "This is a read-only mission.",
@@ -116,14 +121,40 @@ def _run_cursor_agent(
         mode=mode,
     )
 
+    mission_id = mission.get("mission_id", "unknown")
+    title = mission.get("title", "untitled")
+
+    logger.info(
+        "Starting Cursor mission: mission_id=%s title=%s mode=%s workspace=%s",
+        mission_id,
+        title,
+        mode,
+        workspace,
+    )
+
+    logger.info(
+        "Cursor command prepared: binary=%s mode=%s workspace=%s",
+        CURSOR_AGENT,
+        mode,
+        workspace,
+    )
+
     try:
         completed = subprocess.run(
             command,
             capture_output=True,
             text=True,
             timeout=EXECUTION_TIMEOUT_SECONDS,
+            cwd=workspace,
+            env=cursor_cli_env(),
         )
     except subprocess.TimeoutExpired:
+        logger.error(
+            "Cursor mission timed out: mission_id=%s timeout_seconds=%s",
+            mission_id,
+            EXECUTION_TIMEOUT_SECONDS,
+        )
+
         return ExecutionResult(
             ok=False,
             error=(
@@ -132,36 +163,86 @@ def _run_cursor_agent(
             ),
         )
     except FileNotFoundError:
+        logger.error(
+            "Cursor Agent binary not found: mission_id=%s binary=%s",
+            mission_id,
+            CURSOR_AGENT,
+        )
+
         return ExecutionResult(
             ok=False,
             error=f"{CURSOR_AGENT} not found",
         )
+    except NotADirectoryError:
+        logger.error(
+            "Cursor workspace is not a directory: mission_id=%s workspace=%s",
+            mission_id,
+            workspace,
+        )
+
+        return ExecutionResult(
+            ok=False,
+            error=f"Repository workspace is not a directory: {workspace}",
+        )
     except OSError as exc:
+        logger.exception(
+            "Failed to launch Cursor Agent: mission_id=%s workspace=%s",
+            mission_id,
+            workspace,
+        )
+
         return ExecutionResult(
             ok=False,
             error=f"Failed to launch {CURSOR_AGENT}: {exc}",
         )
 
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+
+    logger.info(
+        (
+            "Cursor mission completed: mission_id=%s returncode=%s "
+            "stdout_chars=%s stderr_chars=%s"
+        ),
+        mission_id,
+        completed.returncode,
+        len(stdout),
+        len(stderr),
+    )
+
     if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip()
+        message = stderr.strip() or stdout.strip()
 
         if not message:
             message = (
-                f"cursor-agent exited with code "
+                "cursor-agent exited with code "
                 f"{completed.returncode}"
             )
 
+        logger.error(
+            "Cursor mission failed: mission_id=%s returncode=%s error=%s",
+            mission_id,
+            completed.returncode,
+            message[:500],
+        )
+
         return ExecutionResult(
             ok=False,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=stdout,
+            stderr=stderr,
             error=message,
+        )
+
+    if not stdout.strip():
+        logger.warning(
+            "Cursor mission succeeded with empty stdout: mission_id=%s",
+            mission_id,
         )
 
     return ExecutionResult(
         ok=True,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 
