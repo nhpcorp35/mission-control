@@ -29,6 +29,28 @@ CREATE_ONLY_CONSTRAINTS = (
     "Do not use worktrees.",
 )
 
+MODIFY_ONLY_CONSTRAINTS = (
+    "This mission may modify existing files only.",
+    "Modify only the files explicitly identified in the mission instructions.",
+    "Do not create or delete files.",
+    "Do not run Git commands.",
+    "Do not stage changes.",
+    "Do not create commits.",
+    "Do not push changes.",
+    "Do not use worktrees.",
+)
+
+CREATE_AND_MODIFY_CONSTRAINTS = (
+    "This mission may create new files and modify existing files.",
+    "Modify only the files explicitly identified in the mission instructions.",
+    "Do not delete files.",
+    "Do not run Git commands.",
+    "Do not stage changes.",
+    "Do not create commits.",
+    "Do not push changes.",
+    "Do not use worktrees.",
+)
+
 
 @dataclass
 class ExecutionResult:
@@ -262,6 +284,26 @@ def _run_cursor_agent(
     )
 
 
+def _execution_constraints(
+    mission: dict,
+) -> tuple[str, ...]:
+    permissions = mission.get("permissions", {})
+
+    if not isinstance(permissions, dict):
+        return CREATE_ONLY_CONSTRAINTS
+
+    create_files = bool(permissions.get("create_files"))
+    modify_files = bool(permissions.get("modify_files"))
+
+    if create_files and modify_files:
+        return CREATE_AND_MODIFY_CONSTRAINTS
+
+    if modify_files:
+        return MODIFY_ONLY_CONSTRAINTS
+
+    return CREATE_ONLY_CONSTRAINTS
+
+
 def run_cursor_agent(mission: dict) -> ExecutionResult:
     return _run_cursor_agent(
         mission,
@@ -274,5 +316,5 @@ def execute_cursor_agent(mission: dict) -> ExecutionResult:
     return _run_cursor_agent(
         mission,
         mode="execute",
-        constraints=CREATE_ONLY_CONSTRAINTS,
+        constraints=_execution_constraints(mission),
     )
