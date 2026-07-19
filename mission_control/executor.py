@@ -7,7 +7,7 @@ import subprocess
 from app.cursor_cli import cursor_cli_env, find_cursor_agent_binary
 
 CURSOR_AGENT = "cursor-agent"
-EXECUTION_TIMEOUT_SECONDS = 120
+EXECUTION_TIMEOUT_SECONDS = 600
 
 logger = logging.getLogger(__name__)
 
