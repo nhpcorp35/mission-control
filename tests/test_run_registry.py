@@ -146,6 +146,7 @@ class TestResultStorage(unittest.TestCase):
         self.assertEqual(updated.stdout, "out")
         self.assertEqual(updated.stderr, "err")
         self.assertEqual(updated.error, "boom")
+        self.assertIsNone(updated.commit_sha)
         # Status is unchanged; store_result is independent of transitions.
         self.assertEqual(updated.status, RunStatus.QUEUED)
 
@@ -154,6 +155,35 @@ class TestResultStorage(unittest.TestCase):
         self.assertEqual(fetched.stdout, "out")
         self.assertEqual(fetched.stderr, "err")
         self.assertEqual(fetched.error, "boom")
+        self.assertIsNone(fetched.commit_sha)
+
+
+class TestCommitShaStorage(unittest.TestCase):
+    def test_store_result_persists_commit_sha(self) -> None:
+        registry = RunRegistry()
+        record = registry.create_run()
+        updated = registry.store_result(
+            record.run_id,
+            stdout="done",
+            commit_sha="abc123def4567890",
+        )
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.commit_sha, "abc123def4567890")
+
+        fetched = registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.commit_sha, "abc123def4567890")
+
+    def test_store_result_leaves_commit_sha_none_by_default(self) -> None:
+        registry = RunRegistry()
+        record = registry.create_run()
+        registry.store_result(record.run_id, stdout="done")
+
+        fetched = registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertIsNone(fetched.commit_sha)
 
 
 class TestConcurrentAccess(unittest.TestCase):

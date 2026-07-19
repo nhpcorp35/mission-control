@@ -342,5 +342,72 @@ class TestAuthentication(unittest.TestCase):
         )
 
 
+class TestExecuteEndpoint(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(
+            app,
+            headers=AUTH_HEADERS,
+        )
+
+    def _executable_mission_yaml(self) -> str:
+        return textwrap.dedent(
+            f"""
+            version: 1.0
+            mission_id: 2026-07-19-execute
+            title: Execute Test
+            repository:
+              name: Mission-Control
+              path: {REPO_ROOT}
+              base_branch: main
+            execution:
+              agent: cursor
+              mode: execute
+              sandbox: true
+              worktree: false
+            permissions:
+              read: true
+              create_files: true
+              modify_files: false
+              delete_files: false
+              run_commands: true
+              stage_changes: false
+              commit: false
+              push: false
+            instructions: |
+              Create a file.
+            deliverables:
+              - summary
+            approval:
+              execute_without_approval: true
+              commit_requires_approval: true
+              push_requires_approval: true
+            """
+        )
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    @patch("app.api.execute_cursor_agent")
+    @patch("mission_control.workspace.execute_registered_run")
+    def test_execute_does_not_use_async_workspace_flow(
+        self,
+        mock_registered_run,
+        mock_execute,
+        _mock_preflight,
+    ) -> None:
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout="sync result\n",
+        )
+
+        response = self.client.post(
+            "/execute",
+            json={"mission_yaml": self._executable_mission_yaml()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        mock_execute.assert_called_once()
+        mock_registered_run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

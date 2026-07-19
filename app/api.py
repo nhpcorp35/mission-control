@@ -22,6 +22,7 @@ from mission_control.run_registry import (
     RunRegistry,
     RunStatus,
 )
+from mission_control.workspace import execute_registered_run
 from mission_control.validator import (
     load_mission_yaml,
     validate_mission_for_execute,
@@ -73,37 +74,13 @@ class RunStatusResponse(BaseModel):
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
-def _map_execution_status(ok: bool, error: str | None) -> RunStatus:
-    if ok:
-        return RunStatus.COMPLETED
-    if error is not None and "timed out" in error:
-        return RunStatus.TIMED_OUT
-    return RunStatus.FAILED
+    commit_sha: str | None = None
 def _execute_run_worker(
     run_id: str,
     mission: dict,
     registry: RunRegistry,
 ) -> None:
-    registry.update_status(run_id, RunStatus.RUNNING)
-    try:
-        execution_result = execute_cursor_agent(mission)
-    except Exception as exc:  # pragma: no cover - defensive
-        registry.store_result(run_id, error=str(exc))
-        registry.update_status(run_id, RunStatus.FAILED)
-        return
-    registry.store_result(
-        run_id,
-        stdout=execution_result.stdout,
-        stderr=execution_result.stderr,
-        error=execution_result.error,
-    )
-    registry.update_status(
-        run_id,
-        _map_execution_status(
-            execution_result.ok,
-            execution_result.error,
-        ),
-    )
+    execute_registered_run(run_id, mission, registry)
 def _run_status_response(record: RunRecord) -> RunStatusResponse:
     return RunStatusResponse(
         run_id=record.run_id,
@@ -115,6 +92,7 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
         stdout=record.stdout,
         stderr=record.stderr,
         error=record.error,
+        commit_sha=record.commit_sha,
     )
 @app.get("/health")
 def health() -> dict[str, str]:

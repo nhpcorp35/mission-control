@@ -37,6 +37,7 @@ class RunRecord:
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    commit_sha: str | None = None
 
 
 def _utc_now() -> datetime:
@@ -110,6 +111,7 @@ class RunRegistry:
         stdout: str = "",
         stderr: str = "",
         error: str | None = None,
+        commit_sha: str | None = None,
     ) -> RunRecord | None:
         """Store execution output fields on an existing run.
 
@@ -124,4 +126,6 @@ class RunRegistry:
             record.stdout = stdout
             record.stderr = stderr
             record.error = error
+            if commit_sha is not None:
+                record.commit_sha = commit_sha
             return record

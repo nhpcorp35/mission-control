@@ -11,6 +11,7 @@ import app.api as api_module
 from app.api import app
 from mission_control.executor import ExecutionResult
 from mission_control.run_registry import RunRegistry, RunStatus
+from mission_control.workspace import PersistenceResult, WorkspacePrepResult
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFERENCE = REPO_ROOT / "missions" / "reference"
 TEST_API_KEY = "mc_test_authentication_key"
@@ -77,17 +78,28 @@ class TestRunsApi(unittest.TestCase):
         self.fail(
             f"run {run_id} did not reach a terminal status; last={body}"
         )
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
     @patch("app.api.preflight_for_execution", return_value=None)
-    @patch("app.api.execute_cursor_agent")
     def test_post_runs_accepts_and_returns_queued(
         self,
-        mock_execute,
         _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
     ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
         mock_execute.return_value = ExecutionResult(
             ok=True,
             stdout="done\n",
         )
+        mock_persist.return_value = PersistenceResult(ok=True, commit_sha=None)
         response = self.client.post(
             "/runs",
             json={"mission_yaml": _executable_mission_yaml()},
@@ -98,17 +110,28 @@ class TestRunsApi(unittest.TestCase):
         self.assertEqual(body["status"], "queued")
         self._wait_for_terminal(body["run_id"])
         mock_execute.assert_called_once()
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
     @patch("app.api.preflight_for_execution", return_value=None)
-    @patch("app.api.execute_cursor_agent")
     def test_get_run_reports_completed(
         self,
-        mock_execute,
         _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
     ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
         mock_execute.return_value = ExecutionResult(
             ok=True,
             stdout="agent response\n",
         )
+        mock_persist.return_value = PersistenceResult(ok=True, commit_sha=None)
         submit = self.client.post(
             "/runs",
             json={"mission_yaml": _executable_mission_yaml()},
@@ -122,13 +145,24 @@ class TestRunsApi(unittest.TestCase):
         self.assertIsNotNone(body["started_at"])
         self.assertIsNotNone(body["completed_at"])
         self.assertIsNotNone(body["elapsed_seconds"])
+        self.assertIsNone(body["commit_sha"])
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
     @patch("app.api.preflight_for_execution", return_value=None)
-    @patch("app.api.execute_cursor_agent")
     def test_get_run_reports_failed(
         self,
-        mock_execute,
         _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
     ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
         mock_execute.return_value = ExecutionResult(
             ok=False,
             stderr="agent failed",
@@ -142,13 +176,23 @@ class TestRunsApi(unittest.TestCase):
         self.assertEqual(body["status"], "failed")
         self.assertEqual(body["stderr"], "agent failed")
         self.assertEqual(body["error"], "agent failed")
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
     @patch("app.api.preflight_for_execution", return_value=None)
-    @patch("app.api.execute_cursor_agent")
     def test_get_run_reports_timed_out(
         self,
-        mock_execute,
         _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
     ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
         mock_execute.return_value = ExecutionResult(
             ok=False,
             error="cursor-agent timed out after 600 seconds",
