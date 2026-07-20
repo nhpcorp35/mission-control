@@ -97,6 +97,36 @@ def _git_status_porcelain(workspace_path: str) -> subprocess.CompletedProcess[st
     return _run_git(["-C", workspace_path, "status", "--porcelain"])
 
 
+
+def configure_git_identity(workspace_path: str) -> str | None:
+    """Configure the repository-local Git author identity."""
+    name = os.environ.get("MISSION_CONTROL_GIT_NAME", "").strip()
+    email = os.environ.get("MISSION_CONTROL_GIT_EMAIL", "").strip()
+
+    if not name:
+        return "MISSION_CONTROL_GIT_NAME is not configured."
+
+    if not email:
+        return "MISSION_CONTROL_GIT_EMAIL is not configured."
+
+    for key, value in (("user.name", name), ("user.email", email)):
+        result = _run_git(
+            [
+                "-C",
+                workspace_path,
+                "config",
+                key,
+                value,
+            ]
+        )
+        if result.returncode != 0:
+            message = result.stderr.strip() or result.stdout.strip()
+            if not message:
+                message = f"git config {key} failed with code {result.returncode}"
+            return message
+
+    return None
+
 def persist_workspace_changes(
     run_id: str,
     mission: dict,
@@ -119,6 +149,10 @@ def persist_workspace_changes(
         if not message:
             message = f"git add failed with code {add.returncode}"
         return PersistenceResult(ok=False, error=message)
+
+    identity_error = configure_git_identity(workspace_path)
+    if identity_error is not None:
+        return PersistenceResult(ok=False, error=identity_error)
 
     commit = _run_git(
         [
