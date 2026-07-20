@@ -261,6 +261,13 @@ def submit_run_endpoint(
             ).model_dump(),
         )
     record = run_registry.create_run()
+    logger.info(
+    "POST /runs pid=%s registry=%s run_id=%s keys=%s",
+    os.getpid(),
+    id(run_registry),
+    record.run_id,
+    list(run_registry._runs.keys()),
+)
     thread = threading.Thread(
         target=_execute_run_worker,
         args=(record.run_id, mission, run_registry),
@@ -285,7 +292,13 @@ def get_run_endpoint(
     run_id: str,
     _auth: None = Depends(require_api_key),
 ) -> RunStatusResponse:
-    record = run_registry.get_run(run_id)
+    logger.info(
+    "GET /runs pid=%s registry=%s run_id=%s keys=%s",
+    os.getpid(),
+    id(run_registry),
+    run_id,
+    list(run_registry._runs.keys()),
+)record = run_registry.get_run(run_id)
     if record is None:
         raise HTTPException(
             status_code=404,
