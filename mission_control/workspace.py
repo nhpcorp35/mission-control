@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 from dataclasses import dataclass
 import logging
@@ -30,12 +31,17 @@ class PersistenceResult:
     error: str | None = None
 
 
-def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_git(
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
         capture_output=True,
         text=True,
         shell=False,
+        env=env,
     )
 
 
@@ -127,6 +133,27 @@ def configure_git_identity(workspace_path: str) -> str | None:
 
     return None
 
+def _github_push_environment() -> tuple[dict[str, str] | None, str | None]:
+    """Return a Git environment containing GitHub HTTPS authentication."""
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not token:
+        return None, (
+            "GITHUB_TOKEN is not configured. Set a GitHub token with "
+            "read/write access to the repository."
+        )
+
+    credentials = base64.b64encode(
+        f"x-access-token:{token}".encode("utf-8")
+    ).decode("ascii")
+
+    env = os.environ.copy()
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+    env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: basic {credentials}"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env, None
+
+
 def persist_workspace_changes(
     run_id: str,
     mission: dict,
@@ -169,6 +196,10 @@ def persist_workspace_changes(
             message = f"git commit failed with code {commit.returncode}"
         return PersistenceResult(ok=False, error=message)
 
+    push_env, push_auth_error = _github_push_environment()
+    if push_auth_error is not None:
+        return PersistenceResult(ok=False, error=push_auth_error)
+
     base_branch = mission["repository"]["base_branch"]
     push = _run_git(
         [
@@ -177,7 +208,8 @@ def persist_workspace_changes(
             "push",
             "origin",
             f"HEAD:{base_branch}",
-        ]
+        ],
+        env=push_env,
     )
     if push.returncode != 0:
         message = push.stderr.strip() or push.stdout.strip()
