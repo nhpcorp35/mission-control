@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -56,36 +57,37 @@ def configure_workspace_origin(
 
 
 def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
-    """Clone the source repository into a temporary isolated workspace."""
+    """Clone the configured repository into a temporary isolated workspace."""
     repository = mission["repository"]
-    source_path = repository["path"]
+    base_branch = repository["base_branch"]
+    repository_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL", "").strip()
 
-    origin_url = get_origin_url(source_path)
-    if origin_url is None:
+    if not repository_url:
         return WorkspacePrepResult(
             ok=False,
-            error="Repository origin remote is not configured",
+            error=(
+                "MISSION_CONTROL_REPOSITORY_URL is not configured. "
+                "Set it to the Git clone URL for the repository."
+            ),
         )
 
     workspace_path = tempfile.mkdtemp(prefix="mission-control-run-")
 
-    clone = _run_git(["clone", "--local", source_path, workspace_path])
+    clone = _run_git(
+        [
+            "clone",
+            "--branch",
+            base_branch,
+            "--single-branch",
+            repository_url,
+            workspace_path,
+        ]
+    )
     if clone.returncode != 0:
         _safe_cleanup(workspace_path)
         message = clone.stderr.strip() or clone.stdout.strip()
         if not message:
             message = f"git clone failed with code {clone.returncode}"
-        return WorkspacePrepResult(ok=False, error=message)
-
-    configure = configure_workspace_origin(workspace_path, origin_url)
-    if configure.returncode != 0:
-        _safe_cleanup(workspace_path)
-        message = configure.stderr.strip() or configure.stdout.strip()
-        if not message:
-            message = (
-                "Failed to configure workspace origin "
-                f"(exit code {configure.returncode})"
-            )
         return WorkspacePrepResult(ok=False, error=message)
 
     return WorkspacePrepResult(ok=True, workspace_path=workspace_path)
