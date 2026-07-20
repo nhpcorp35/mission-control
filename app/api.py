@@ -147,7 +147,18 @@ def run_mission_endpoint(
         stdout=execution_result.stdout,
         stderr=execution_result.stderr,
     )
-@app.post("/execute", response_model=RunResponse)
+@app.post(
+    "/execute",
+    response_model=RunResponse,
+    operation_id="execute_mission_legacy",
+    summary="Execute mission synchronously (legacy)",
+    description=(
+        "Legacy synchronous endpoint. Validates and executes a mission "
+        "inline against repository.path and returns the result in the same "
+        "request. Prefer POST /runs for asynchronous execution with isolated "
+        "workspace handling and Git persistence."
+    ),
+)
 def execute_mission_endpoint(
     request: MissionYamlRequest,
     _auth: None = Depends(require_api_key),
@@ -188,33 +199,66 @@ def execute_mission_endpoint(
         stdout=execution_result.stdout,
         stderr=execution_result.stderr,
     )
-@app.post("/runs", response_model=None)
+@app.post(
+    "/runs",
+    status_code=202,
+    operation_id="submit_run",
+    summary="Submit asynchronous mission run",
+    description=(
+        "Validate an execute-mode mission and queue it for asynchronous "
+        "execution in an isolated workspace. Poll GET /runs/{run_id} for "
+        "status, output, and commit SHA."
+    ),
+    response_model=RunAcceptedResponse,
+    responses={
+        200: {
+            "model": RunResponse,
+            "description": (
+                "Structural validation, execute eligibility, or Cursor CLI "
+                "preflight failure."
+            ),
+        },
+        202: {
+            "model": RunAcceptedResponse,
+            "description": "Run accepted and queued for background execution.",
+        },
+    },
+)
 def submit_run_endpoint(
     request: MissionYamlRequest,
     _auth: None = Depends(require_api_key),
-):
+) -> RunAcceptedResponse:
     structural_result, mission = load_mission_yaml(
         request.mission_yaml
     )
     if not structural_result.ok:
-        return RunResponse(
-            ok=False,
-            error=structural_result.error,
+        return JSONResponse(
+            status_code=200,
+            content=RunResponse(
+                ok=False,
+                error=structural_result.error,
+            ).model_dump(),
         )
     execute_result = validate_mission_for_execute(mission)
     if not execute_result.ok:
-        return RunResponse(
-            ok=False,
-            error=execute_result.error,
+        return JSONResponse(
+            status_code=200,
+            content=RunResponse(
+                ok=False,
+                error=execute_result.error,
+            ).model_dump(),
         )
     preflight_error = preflight_for_execution()
     if preflight_error is not None:
-        return RunResponse(
-            ok=False,
-            error=preflight_error.message,
-            error_detail=ErrorDetail(
-                **preflight_error.to_dict()
-            ),
+        return JSONResponse(
+            status_code=200,
+            content=RunResponse(
+                ok=False,
+                error=preflight_error.message,
+                error_detail=ErrorDetail(
+                    **preflight_error.to_dict()
+                ),
+            ).model_dump(),
         )
     record = run_registry.create_run()
     thread = threading.Thread(
@@ -223,14 +267,20 @@ def submit_run_endpoint(
         daemon=True,
     )
     thread.start()
-    return JSONResponse(
-        status_code=202,
-        content={
-            "run_id": record.run_id,
-            "status": RunStatus.QUEUED.value,
-        },
+    return RunAcceptedResponse(
+        run_id=record.run_id,
+        status=RunStatus.QUEUED.value,
     )
-@app.get("/runs/{run_id}", response_model=RunStatusResponse)
+@app.get(
+    "/runs/{run_id}",
+    response_model=RunStatusResponse,
+    operation_id="get_run",
+    summary="Get asynchronous run status",
+    description=(
+        "Return the lifecycle status, execution output, error, and commit "
+        "SHA for a run previously submitted via POST /runs."
+    ),
+)
 def get_run_endpoint(
     run_id: str,
     _auth: None = Depends(require_api_key),
