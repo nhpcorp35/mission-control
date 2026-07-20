@@ -301,8 +301,14 @@ def get_run_endpoint(
     )
     record = run_registry.get_run(run_id)
     if record is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Run not found",
-        )
-    return _run_status_response(record)
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "message": "Run not found",
+            "known_run_ids": list(run_registry._runs.keys()),
+            "registry_id": id(run_registry),
+            "pid": os.getpid(),
+        },
+    )
+
+return _run_status_response(record)
