@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -17,6 +18,8 @@ mcp = FastMCP(
     instructions=(
         "Submit Mission Control YAML and retrieve asynchronous run status."
     ),
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", "8001")),
     json_response=True,
 )
 
