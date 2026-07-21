@@ -107,7 +107,9 @@ def build_cursor_agent_command(
 
     if mode in {"plan", "ask"}:
         command.extend(["--mode", mode])
-    elif mode != "execute":
+    elif mode == "execute":
+        command.append("--force")
+    else:
         raise ValueError(f"Unsupported Cursor Agent mode: {mode}")
 
     command.extend(

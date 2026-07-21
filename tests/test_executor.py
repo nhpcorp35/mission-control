@@ -77,6 +77,7 @@ class TestBuildCursorAgentCommand(unittest.TestCase):
             [
                 CURSOR_AGENT,
                 "--print",
+                "--force",
                 "--output-format",
                 "text",
                 "--workspace",
@@ -134,7 +135,7 @@ class TestRunCursorAgent(unittest.TestCase):
         self.assertIn("--print", command)
         self.assertIn("--trust", command)
         self.assertNotIn("--mode", command)
-        self.assertNotIn("--force", command)
+        self.assertIn("--force", command)
         self.assertNotIn("--yolo", command)
 
     @patch("mission_control.executor.subprocess.run")
