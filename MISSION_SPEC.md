@@ -272,6 +272,12 @@ Never push.
 Stage changes, create a local commit, and push to the mission
 `repository.base_branch`.
 
+`persistence.mode: push` is a privileged platform action. It can commit to
+the repository, push to GitHub, and trigger deployment. Mission Control must
+not perform platform push unless the mission provides explicit platform-push
+approval (see Approval). Agent `permissions.push` does not authorize
+platform push.
+
 When the `persistence` block is omitted, Mission Control defaults to
 `persistence.mode: none`.
 
@@ -343,6 +349,10 @@ approval:
   commit_requires_approval: true
 
   push_requires_approval: true
+
+  platform_push_approved: false
+
+  allow_automatic_platform_push: false
 ```
 
 Approval to execute is not approval to commit.
@@ -350,6 +360,31 @@ Approval to execute is not approval to commit.
 Approval to commit is not approval to push.
 
 Each approval is independent.
+
+### Platform push approval
+
+Platform-level `persistence.mode: push` requires its own approval. It is
+not covered by agent `permissions.push`, and it is not covered by
+`approval.push_requires_approval` (agent push policy).
+
+Mission Control may perform platform push only when one of the following
+is true:
+
+- `approval.platform_push_approved: true` — explicit per-mission approval
+- `approval.allow_automatic_platform_push: true` — clearly named policy
+  that authorizes automatic platform pushes
+
+Otherwise Mission Control must reject the queued run (and must refuse
+again at the final persistence boundary) with the machine-readable error
+`PLATFORM_PUSH_APPROVAL_REQUIRED`.
+
+Rules:
+
+- `persistence.mode: none` never requires platform-push approval
+- `persistence.mode: commit` never receives permission to push and never
+  requires platform-push approval
+- Agent `permissions.push: true` does not authorize platform push
+- Passing earlier validation does not waive the persistence-boundary check
 
 ---
 
@@ -423,6 +458,9 @@ Before execution Mission Control verifies:
 - repository clean enough for requested operation
 - permissions valid
 - persistence.mode valid when provided
+- persistence.mode=push authorized when provided
+  (`approval.platform_push_approved` or
+  `approval.allow_automatic_platform_push`)
 - execution mode valid
 
 Invalid missions must never execute.

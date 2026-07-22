@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_PERSISTENCE_MODE = "none"
 SUPPORTED_PERSISTENCE_MODES = frozenset({"none", "commit", "push"})
 
+# Machine-readable gate for privileged platform persistence.mode=push.
+# Distinct from agent permissions.push.
+PLATFORM_PUSH_APPROVAL_REQUIRED = (
+    "PLATFORM_PUSH_APPROVAL_REQUIRED: persistence.mode=push requires "
+    "explicit approval.platform_push_approved=true (or the "
+    "allow_automatic_platform_push=true policy)"
+)
+
 
 @dataclass(frozen=True)
 class WorkspacePrepResult:
@@ -47,6 +55,38 @@ def resolve_persistence_mode(mission: dict) -> str:
     if mode is None:
         return DEFAULT_PERSISTENCE_MODE
     return str(mode)
+
+
+def is_platform_push_authorized(mission: dict) -> bool:
+    """Return whether platform ``persistence.mode=push`` is authorized.
+
+    Authorization is granted only by:
+
+    - ``approval.platform_push_approved: true`` (explicit per-mission approval)
+    - ``approval.allow_automatic_platform_push: true`` (named automatic policy)
+
+    Agent ``permissions.push`` does not authorize platform push.
+    """
+    approval = mission.get("approval")
+    if not isinstance(approval, dict):
+        return False
+    if approval.get("platform_push_approved") is True:
+        return True
+    if approval.get("allow_automatic_platform_push") is True:
+        return True
+    return False
+
+
+def require_platform_push_approval(mission: dict) -> str | None:
+    """Return a machine-readable error when platform push is not approved.
+
+    Modes ``none`` and ``commit`` never require platform-push approval.
+    """
+    if resolve_persistence_mode(mission) != "push":
+        return None
+    if is_platform_push_authorized(mission):
+        return None
+    return PLATFORM_PUSH_APPROVAL_REQUIRED
 
 
 def _run_git(
@@ -202,9 +242,12 @@ def persist_workspace_changes(
     - ``none``: do not stage, commit, or push
     - ``commit``: stage and create a local commit, but do not push
     - ``push``: stage, commit, and push to the mission base branch
+      (requires explicit platform-push approval; see
+      ``require_platform_push_approval``)
 
     Agent ``permissions.commit`` / ``permissions.push`` are separate and do not
-    control this platform persistence path.
+    control this platform persistence path. Approval is enforced again here so
+    a run cannot bypass the gate merely because earlier validation succeeded.
     """
     mode = resolve_persistence_mode(mission)
     if mode not in SUPPORTED_PERSISTENCE_MODES:
@@ -218,6 +261,11 @@ def persist_workspace_changes(
 
     if mode == "none":
         return PersistenceResult(ok=True, commit_sha=None)
+
+    if mode == "push":
+        approval_error = require_platform_push_approval(mission)
+        if approval_error is not None:
+            return PersistenceResult(ok=False, error=approval_error)
 
     status = _git_status_porcelain(workspace_path)
     if status.returncode != 0:

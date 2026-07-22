@@ -12,15 +12,19 @@ import os
 
 from mission_control.executor import ExecutionResult
 from mission_control.run_registry import RunRegistry, RunStatus
+from mission_control.validator import validate_mission_for_execute
 from mission_control.workspace import (
+    PLATFORM_PUSH_APPROVAL_REQUIRED,
     PersistenceResult,
     WorkspacePrepResult,
     cleanup_workspace,
     configure_workspace_origin,
     execute_registered_run,
     get_origin_url,
+    is_platform_push_authorized,
     persist_workspace_changes,
     prepare_isolated_workspace,
+    require_platform_push_approval,
 )
 
 
@@ -82,7 +86,14 @@ class GitRepoFixture:
         os.environ["MISSION_CONTROL_GIT_NAME"] = "Test User"
         os.environ["MISSION_CONTROL_GIT_EMAIL"] = "test@example.com"
 
-    def mission(self, *, persistence_mode: str | None = "push") -> dict:
+    def mission(
+        self,
+        *,
+        persistence_mode: str | None = "push",
+        platform_push_approved: bool | None = None,
+        allow_automatic_platform_push: bool | None = None,
+        permissions_push: bool = False,
+    ) -> dict:
         mission = {
             "mission_id": "2026-07-19-workspace",
             "repository": {
@@ -90,9 +101,21 @@ class GitRepoFixture:
                 "path": str(self.source_repo),
                 "base_branch": self.base_branch,
             },
+            "permissions": {
+                "push": permissions_push,
+            },
         }
         if persistence_mode is not None:
             mission["persistence"] = {"mode": persistence_mode}
+        approval: dict[str, bool] = {}
+        if platform_push_approved is not None:
+            approval["platform_push_approved"] = platform_push_approved
+        if allow_automatic_platform_push is not None:
+            approval["allow_automatic_platform_push"] = (
+                allow_automatic_platform_push
+            )
+        if approval:
+            mission["approval"] = approval
         return mission
 
     def cleanup(self) -> None:
@@ -189,7 +212,10 @@ class TestWorkspacePersistence(unittest.TestCase):
         try:
             result = persist_workspace_changes(
                 "run-no-change",
-                self.fixture.mission(persistence_mode="push"),
+                self.fixture.mission(
+                    persistence_mode="push",
+                    platform_push_approved=True,
+                ),
                 workspace_path,
             )
             self.assertTrue(result.ok, result.error)
@@ -308,7 +334,10 @@ class TestWorkspacePersistence(unittest.TestCase):
             ):
                 result = persist_workspace_changes(
                     "run-with-change",
-                    self.fixture.mission(persistence_mode="push"),
+                    self.fixture.mission(
+                        persistence_mode="push",
+                        platform_push_approved=True,
+                    ),
                     workspace_path,
                 )
             self.assertTrue(result.ok, result.error)
@@ -323,6 +352,152 @@ class TestWorkspacePersistence(unittest.TestCase):
                 ]
             )
             self.assertEqual(remote_head.stdout.strip(), result.commit_sha)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_push_rejected_without_platform_push_approval(self) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-push-unapproved",
+                    self.fixture.mission(persistence_mode="push"),
+                    workspace_path,
+                )
+            self.assertFalse(result.ok)
+            self.assertTrue(
+                (result.error or "").startswith("PLATFORM_PUSH_APPROVAL_REQUIRED"),
+                result.error,
+            )
+            mock_git.assert_not_called()
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_push_succeeds_when_platform_push_approved(self) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "run-push-approved",
+                    self.fixture.mission(
+                        persistence_mode="push",
+                        platform_push_approved=True,
+                    ),
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertIsNotNone(result.commit_sha)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_push_succeeds_with_automatic_platform_push_policy(
+        self,
+    ) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "run-push-auto-policy",
+                    self.fixture.mission(
+                        persistence_mode="push",
+                        allow_automatic_platform_push=True,
+                    ),
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertIsNotNone(result.commit_sha)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_mode_none_does_not_require_platform_push_approval(
+        self,
+    ) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(persistence_mode="none")
+            self.assertIsNone(require_platform_push_approval(mission))
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-none-no-approval",
+                    mission,
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            mock_git.assert_not_called()
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_agent_permissions_push_does_not_authorize_platform_push(
+        self,
+    ) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                permissions_push=True,
+            )
+            self.assertFalse(is_platform_push_authorized(mission))
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-agent-push-not-enough",
+                    mission,
+                    workspace_path,
+                )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
+            mock_git.assert_not_called()
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persistence_layer_enforces_approval_independently(self) -> None:
+        """Boundary check rejects push even if a caller skipped queue validation."""
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(persistence_mode="push")
+            # Simulate a caller that did not run validate_mission_for_execute.
+            self.assertFalse(is_platform_push_authorized(mission))
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-boundary-only",
+                    mission,
+                    workspace_path,
+                )
+            self.assertFalse(result.ok)
+            self.assertTrue(
+                (result.error or "").startswith("PLATFORM_PUSH_APPROVAL_REQUIRED"),
+                result.error,
+            )
+            mock_git.assert_not_called()
         finally:
             cleanup_workspace(workspace_path)
 
@@ -353,7 +528,10 @@ class TestWorkspacePersistence(unittest.TestCase):
             ):
                 result = persist_workspace_changes(
                     "run-commit-fail",
-                    self.fixture.mission(persistence_mode="push"),
+                    self.fixture.mission(
+                        persistence_mode="push",
+                        platform_push_approved=True,
+                    ),
                     workspace_path,
                 )
             self.assertFalse(result.ok)
@@ -394,7 +572,10 @@ class TestWorkspacePersistence(unittest.TestCase):
             ):
                 result = persist_workspace_changes(
                     "run-push-fail",
-                    self.fixture.mission(persistence_mode="push"),
+                    self.fixture.mission(
+                        persistence_mode="push",
+                        platform_push_approved=True,
+                    ),
                     workspace_path,
                 )
             self.assertFalse(result.ok)

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from mission_control.workspace import require_platform_push_approval
+
 SUPPORTED_VERSION = "1.0"
 
 SUPPORTED_PERSISTENCE_MODES = (
@@ -319,4 +321,15 @@ def validate_mission_for_execute(
                 ),
             )
 
-    return _validate_repository_path(data)
+    path_result = _validate_repository_path(data)
+    if not path_result.ok:
+        return path_result
+
+    # Platform persistence.mode=push is privileged and distinct from
+    # agent permissions.push. Reject queued runs that lack explicit
+    # platform-push approval (or the automatic platform-push policy).
+    approval_error = require_platform_push_approval(data)
+    if approval_error is not None:
+        return ValidationResult(ok=False, error=approval_error)
+
+    return ValidationResult(ok=True)

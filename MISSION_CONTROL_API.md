@@ -226,9 +226,30 @@ After a successful agent execution in an isolated workspace, Mission Control app
 | --- | --- |
 | `none` (default when the block is omitted) | Do not stage, commit, or push |
 | `commit` | Stage and create a local commit; never push |
-| `push` | Stage, commit, and push to `repository.base_branch` |
+| `push` | Stage, commit, and push to `repository.base_branch` (privileged; requires platform-push approval) |
 
 Agent `permissions.commit` and `permissions.push` remain agent permissions only. They do not select platform persistence behavior. Unsupported `persistence.mode` values fail mission validation.
+
+#### Platform-push approval
+
+`persistence.mode=push` is a privileged platform action (commit, GitHub push, and possible deployment). It is distinct from agent `permissions.push`.
+
+Before a queued run may perform platform push, Mission Control requires one of:
+
+| Approval field | Meaning |
+| --- | --- |
+| `approval.platform_push_approved: true` | Explicit per-mission approval for platform push |
+| `approval.allow_automatic_platform_push: true` | Named policy authorizing automatic platform pushes |
+
+If neither is set, `POST /runs` rejects the mission during execute eligibility with a machine-readable error whose message begins with `PLATFORM_PUSH_APPROVAL_REQUIRED`. The same check is enforced again inside the persistence layer so a run cannot bypass the gate merely because earlier validation succeeded.
+
+| Mode | Platform-push approval required? |
+| --- | --- |
+| `none` | No |
+| `commit` | No (and commit never pushes) |
+| `push` | Yes |
+
+Already authorized pushes keep the existing commit-and-push behavior once approval (or the automatic policy) is present.
 
 ### Run state persistence
 
