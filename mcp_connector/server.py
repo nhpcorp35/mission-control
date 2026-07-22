@@ -69,14 +69,17 @@ async def get_run(run_id: str) -> dict[str, Any]:
 @mcp.tool()
 async def wait_for_run(
     run_id: str,
-    timeout_seconds: float = 300.0,
-    poll_interval_seconds: float = 1.0,
+    timeout_seconds: float = 900.0,
+    poll_interval_seconds: float = 2.0,
 ) -> dict[str, Any]:
     """Wait until a run reaches a terminal status or the timeout expires.
 
-    Uses bounded server-side polling through GET /runs/{run_id}. Returns
-    immediately when the run is already terminal. Wait timeout does not
-    mutate run state. Response includes reached_terminal and wait_expired.
+    Polls through the same authenticated get_run path until the run is
+    terminal (completed, failed, or timed_out) or timeout_seconds elapses.
+    Returns immediately when already terminal. On success the payload shape
+    matches get_run. On wait timeout returns a structured error with run_id,
+    timeout_seconds, and the latest successful payload when available.
+    Defaults: timeout_seconds=900, poll_interval_seconds=2.
     """
     try:
         if not run_id.strip():

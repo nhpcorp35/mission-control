@@ -224,12 +224,14 @@ Requires authentication.
 
 Bounded server-side wait for an asynchronous run. Polls the existing run lookup path (`GET /runs/{run_id}` / registry `get_run`) until the run reaches a terminal status or `timeout_seconds` elapses. Returns immediately when the run is already terminal. Does **not** mutate run state when the wait expires (a wait timeout is distinct from run status `timed_out`).
 
-This endpoint backs the MCP `wait_for_run` tool.
+HTTP clients may use this endpoint for a server-side wait. The MCP
+`wait_for_run` tool instead polls `GET /runs/{run_id}` on the connector side
+(see **MCP tools** below).
 
 **Intended HAL flow**
 
 1. `submit_run` (`POST /runs`) — queue the mission
-2. `wait_for_run` (`POST /runs/{run_id}/wait`) — block until terminal or wait budget exhausted
+2. `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — block until terminal or wait budget exhausted
 3. Inspect `status`, `stdout` / `stderr` / `error`, and `commit_sha`
 
 **Request body** `application/json` (all fields optional; defaults shown)
@@ -261,13 +263,35 @@ Terminal statuses are defined by a single helper (`is_terminal_status`) covering
 
 ### MCP tools
 
-The Mission Control MCP connector exposes:
+The Mission Control MCP connector exposes exactly these run-operation tools:
 
 | Tool | Purpose |
 | --- | --- |
 | `submit_run` | Submit mission YAML (`POST /runs`) |
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
-| `wait_for_run` | Wait for terminal status (`POST /runs/{run_id}/wait`) with `run_id`, `timeout_seconds`, and `poll_interval_seconds` |
+| `wait_for_run` | Block until the run reaches a terminal status by polling `get_run` |
+
+#### `wait_for_run`
+
+| Argument | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `run_id` | string | yes | — | Run identifier returned by `submit_run` |
+| `timeout_seconds` | number | no | `900` | Maximum time to wait; must be positive |
+| `poll_interval_seconds` | number | no | `2` | Delay between `get_run` polls; must be positive |
+
+**Terminal behavior.** Reuses Mission Control terminal statuses (`completed`,
+`failed`, `timed_out`) via `is_terminal_status`. Returns immediately when the
+run is already terminal. On success, the tool returns `{"ok": true, ...}` with
+the same run fields as `get_run` (no extra wait-only fields).
+
+**Timeout behavior.** Uses a monotonic clock and sleeps between polls (no
+busy-wait). Zero or negative `timeout_seconds` / `poll_interval_seconds` are
+rejected with a validation error. When the wait budget expires while the run is
+still non-terminal, the tool returns a structured error (`ok: false`) whose
+`error.details` include `run_id`, `timeout_seconds`, and `latest` (the most
+recent successful `get_run` payload when available). A single transient polling
+failure does not end the wait while time remains; `404` (unknown `run_id`) is
+fatal immediately.
 
 ### Platform Git persistence
 

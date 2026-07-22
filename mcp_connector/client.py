@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 import httpx
 
 from mcp_connector.config import Settings
 from mcp_connector.errors import MissionControlError
+from mission_control.run_registry import is_terminal_status
 
 
 class MissionControlClient:
@@ -91,20 +94,70 @@ class MissionControlClient:
         self,
         run_id: str,
         *,
-        timeout_seconds: float = 300.0,
-        poll_interval_seconds: float = 1.0,
+        timeout_seconds: float = 900.0,
+        poll_interval_seconds: float = 2.0,
     ) -> dict[str, Any]:
-        # HTTP client timeout must exceed the server-side wait budget.
-        http_timeout = max(
-            self._settings.request_timeout_seconds,
-            float(timeout_seconds) + 30.0,
-        )
-        return await self._request(
-            "POST",
-            f"/runs/{run_id}/wait",
-            json={
-                "timeout_seconds": timeout_seconds,
-                "poll_interval_seconds": poll_interval_seconds,
-            },
-            timeout=http_timeout,
-        )
+        """Poll ``get_run`` until the run is terminal or the timeout expires.
+
+        Uses the same Mission Control URL, API key, and request path as
+        ``get_run``. Sleeps between polls with a monotonic deadline.
+        """
+        if timeout_seconds <= 0:
+            raise ValueError(
+                "timeout_seconds must be a positive number"
+            )
+        if poll_interval_seconds <= 0:
+            raise ValueError(
+                "poll_interval_seconds must be a positive number"
+            )
+
+        deadline = time.monotonic() + float(timeout_seconds)
+        latest: dict[str, Any] | None = None
+        last_error: MissionControlError | None = None
+
+        while True:
+            try:
+                payload = await self.get_run(run_id)
+            except MissionControlError as exc:
+                # Unknown run cannot become available later.
+                if exc.status_code == 404:
+                    raise
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MissionControlError(
+                        (
+                            f"Timed out waiting for run {run_id} after "
+                            f"{timeout_seconds} seconds"
+                        ),
+                        details={
+                            "run_id": run_id,
+                            "timeout_seconds": timeout_seconds,
+                            "latest": latest,
+                            "last_error": last_error.as_dict()["error"],
+                        },
+                    ) from last_error
+                await asyncio.sleep(min(poll_interval_seconds, remaining))
+                continue
+
+            latest = payload
+            last_error = None
+            status = payload.get("status")
+            if status is not None and is_terminal_status(str(status)):
+                return payload
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MissionControlError(
+                    (
+                        f"Timed out waiting for run {run_id} after "
+                        f"{timeout_seconds} seconds"
+                    ),
+                    details={
+                        "run_id": run_id,
+                        "timeout_seconds": timeout_seconds,
+                        "latest": latest,
+                    },
+                )
+
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
