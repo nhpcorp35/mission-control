@@ -213,9 +213,21 @@ Return lifecycle status and retained output for a previously accepted run.
 | `stderr` | string | Agent stderr when available |
 | `error` | string or null | Failure detail when unsuccessful |
 | `return_code` | integer or null | Process exit code when available |
-| `commit_sha` | string or null | Pushed commit SHA after successful persistence |
+| `commit_sha` | string or null | Commit SHA after successful platform persistence (`persistence.mode` of `commit` or `push`); null when mode is `none` or there were no changes |
 
 **Response** `404 Not Found` only when the `run_id` was never accepted by this process. Completed and failed runs are retained and keep returning `200` with their terminal status and failure details.
+
+### Platform Git persistence
+
+After a successful agent execution in an isolated workspace, Mission Control applies the mission's top-level `persistence` block:
+
+| `persistence.mode` | Behavior |
+| --- | --- |
+| `none` (default when the block is omitted) | Do not stage, commit, or push |
+| `commit` | Stage and create a local commit; never push |
+| `push` | Stage, commit, and push to `repository.base_branch` |
+
+Agent `permissions.commit` and `permissions.push` remain agent permissions only. They do not select platform persistence behavior. Unsupported `persistence.mode` values fail mission validation.
 
 ### Run state persistence
 

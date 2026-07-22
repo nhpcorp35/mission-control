@@ -16,6 +16,9 @@ from mission_control.run_registry import RunRegistry, RunStatus
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PERSISTENCE_MODE = "none"
+SUPPORTED_PERSISTENCE_MODES = frozenset({"none", "commit", "push"})
+
 
 @dataclass(frozen=True)
 class WorkspacePrepResult:
@@ -29,6 +32,21 @@ class PersistenceResult:
     ok: bool
     commit_sha: str | None = None
     error: str | None = None
+
+
+def resolve_persistence_mode(mission: dict) -> str:
+    """Return the platform persistence mode for ``mission``.
+
+    When the top-level ``persistence`` block is omitted, or when ``mode`` is
+    omitted inside that block, the mode defaults to ``none``.
+    """
+    persistence = mission.get("persistence")
+    if not isinstance(persistence, dict):
+        return DEFAULT_PERSISTENCE_MODE
+    mode = persistence.get("mode", DEFAULT_PERSISTENCE_MODE)
+    if mode is None:
+        return DEFAULT_PERSISTENCE_MODE
+    return str(mode)
 
 
 def _run_git(
@@ -154,12 +172,53 @@ def _github_push_environment() -> tuple[dict[str, str] | None, str | None]:
     return env, None
 
 
+def _read_head_commit_sha(workspace_path: str) -> PersistenceResult:
+    rev_parse = _run_git(["-C", workspace_path, "rev-parse", "HEAD"])
+    if rev_parse.returncode != 0:
+        message = rev_parse.stderr.strip() or rev_parse.stdout.strip()
+        if not message:
+            message = f"git rev-parse failed with code {rev_parse.returncode}"
+        return PersistenceResult(ok=False, error=message)
+
+    commit_sha = rev_parse.stdout.strip()
+    if not commit_sha:
+        return PersistenceResult(
+            ok=False,
+            error="git rev-parse returned an empty commit SHA",
+        )
+
+    return PersistenceResult(ok=True, commit_sha=commit_sha)
+
+
 def persist_workspace_changes(
     run_id: str,
     mission: dict,
     workspace_path: str,
 ) -> PersistenceResult:
-    """Commit and push workspace changes after a successful agent execution."""
+    """Apply platform Git persistence according to ``persistence.mode``.
+
+    Modes:
+
+    - ``none``: do not stage, commit, or push
+    - ``commit``: stage and create a local commit, but do not push
+    - ``push``: stage, commit, and push to the mission base branch
+
+    Agent ``permissions.commit`` / ``permissions.push`` are separate and do not
+    control this platform persistence path.
+    """
+    mode = resolve_persistence_mode(mission)
+    if mode not in SUPPORTED_PERSISTENCE_MODES:
+        return PersistenceResult(
+            ok=False,
+            error=(
+                f"Unsupported persistence.mode: {mode} "
+                "(expected one of: none, commit, push)"
+            ),
+        )
+
+    if mode == "none":
+        return PersistenceResult(ok=True, commit_sha=None)
+
     status = _git_status_porcelain(workspace_path)
     if status.returncode != 0:
         message = status.stderr.strip() or status.stdout.strip()
@@ -196,6 +255,9 @@ def persist_workspace_changes(
             message = f"git commit failed with code {commit.returncode}"
         return PersistenceResult(ok=False, error=message)
 
+    if mode == "commit":
+        return _read_head_commit_sha(workspace_path)
+
     push_env, push_auth_error = _github_push_environment()
     if push_auth_error is not None:
         return PersistenceResult(ok=False, error=push_auth_error)
@@ -217,21 +279,7 @@ def persist_workspace_changes(
             message = f"git push failed with code {push.returncode}"
         return PersistenceResult(ok=False, error=message)
 
-    rev_parse = _run_git(["-C", workspace_path, "rev-parse", "HEAD"])
-    if rev_parse.returncode != 0:
-        message = rev_parse.stderr.strip() or rev_parse.stdout.strip()
-        if not message:
-            message = f"git rev-parse failed with code {rev_parse.returncode}"
-        return PersistenceResult(ok=False, error=message)
-
-    commit_sha = rev_parse.stdout.strip()
-    if not commit_sha:
-        return PersistenceResult(
-            ok=False,
-            error="git rev-parse returned an empty commit SHA",
-        )
-
-    return PersistenceResult(ok=True, commit_sha=commit_sha)
+    return _read_head_commit_sha(workspace_path)
 
 
 def cleanup_workspace(workspace_path: str) -> None:

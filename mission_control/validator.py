@@ -7,6 +7,12 @@ import yaml
 
 SUPPORTED_VERSION = "1.0"
 
+SUPPORTED_PERSISTENCE_MODES = (
+    "none",
+    "commit",
+    "push",
+)
+
 REQUIRED_TOP_LEVEL_KEYS = (
     "version",
     "mission_id",
@@ -77,6 +83,34 @@ def validate_mission(data: object) -> ValidationResult:
             error=(
                 f"Unsupported version: {data['version']} "
                 f"(expected {SUPPORTED_VERSION})"
+            ),
+        )
+
+    return _validate_persistence(data)
+
+
+def _validate_persistence(data: dict) -> ValidationResult:
+    """Validate optional top-level ``persistence`` (platform Git modes)."""
+    if "persistence" not in data:
+        return ValidationResult(ok=True)
+
+    persistence = data["persistence"]
+    if not isinstance(persistence, dict):
+        return ValidationResult(
+            ok=False,
+            error="persistence must be a mapping",
+        )
+
+    if "mode" not in persistence or persistence.get("mode") is None:
+        return ValidationResult(ok=True)
+
+    mode = persistence.get("mode")
+    if mode not in SUPPORTED_PERSISTENCE_MODES:
+        return ValidationResult(
+            ok=False,
+            error=(
+                f"Unsupported persistence.mode: {mode} "
+                "(expected one of: none, commit, push)"
             ),
         )
 

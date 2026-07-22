@@ -45,6 +45,75 @@ class TestValidateMission(unittest.TestCase):
         result = validate_mission(mission)
         self.assertTrue(result.ok)
 
+    def test_omitted_persistence_defaults_to_valid(self) -> None:
+        mission = {
+            "version": "1.0",
+            "mission_id": "test",
+            "title": "Test",
+            "repository": {},
+            "execution": {},
+            "permissions": {},
+            "instructions": "Do something.",
+            "deliverables": [],
+            "approval": {},
+        }
+        self.assertNotIn("persistence", mission)
+        result = validate_mission(mission)
+        self.assertTrue(result.ok)
+
+    def test_accepts_supported_persistence_modes(self) -> None:
+        for mode in ("none", "commit", "push"):
+            with self.subTest(mode=mode):
+                mission = {
+                    "version": "1.0",
+                    "mission_id": "test",
+                    "title": "Test",
+                    "repository": {},
+                    "execution": {},
+                    "permissions": {},
+                    "persistence": {"mode": mode},
+                    "instructions": "Do something.",
+                    "deliverables": [],
+                    "approval": {},
+                }
+                result = validate_mission(mission)
+                self.assertTrue(result.ok, result.error)
+
+    def test_rejects_unsupported_persistence_mode(self) -> None:
+        mission = {
+            "version": "1.0",
+            "mission_id": "test",
+            "title": "Test",
+            "repository": {},
+            "execution": {},
+            "permissions": {},
+            "persistence": {"mode": "rebase"},
+            "instructions": "Do something.",
+            "deliverables": [],
+            "approval": {},
+        }
+        result = validate_mission(mission)
+        self.assertFalse(result.ok)
+        self.assertIn("Unsupported persistence.mode", result.error or "")
+        self.assertIn("rebase", result.error or "")
+
+    def test_rejects_non_mapping_persistence(self) -> None:
+        mission = {
+            "version": "1.0",
+            "mission_id": "test",
+            "title": "Test",
+            "repository": {},
+            "execution": {},
+            "permissions": {},
+            "persistence": "push",
+            "instructions": "Do something.",
+            "deliverables": [],
+            "approval": {},
+        }
+        result = validate_mission(mission)
+        self.assertFalse(result.ok)
+        self.assertIn("persistence must be a mapping", result.error or "")
+
 
 class TestValidateCli(unittest.TestCase):
     def _run_mc(self, *args: str) -> subprocess.CompletedProcess[str]:

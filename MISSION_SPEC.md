@@ -65,12 +65,16 @@ execution:
 
 permissions:
 
+persistence:
+
 instructions:
 
 deliverables:
 
 approval:
 ```
+
+`persistence` is optional. When omitted, Mission Control defaults to `persistence.mode: none`.
 
 Mission Control must reject missions that do not satisfy the specification.
 
@@ -194,6 +198,9 @@ Repository modifications allowed if permissions permit.
 
 Permissions are deny-by-default.
 
+They describe what the coding agent may do while executing the mission.
+They are not Mission Control's platform Git persistence controls.
+
 Example
 
 ```yaml
@@ -216,7 +223,59 @@ permissions:
   push: false
 ```
 
+`permissions.commit` and `permissions.push` are agent permissions only.
+They authorize whether the coding agent itself may run Git commit or push
+commands. They do not cause Mission Control to stage, commit, or push after
+the agent finishes.
+
 Mission Control enforces permissions regardless of agent behavior.
+
+---
+
+# Persistence
+
+Platform-level Git persistence after a successful agent run is controlled by
+the optional top-level `persistence` block.
+
+This is separate from agent `permissions.commit` and `permissions.push`.
+
+Example
+
+```yaml
+persistence:
+
+  mode: none
+```
+
+Supported modes:
+
+```
+none
+
+commit
+
+push
+```
+
+### none
+
+Do not stage, commit, or push.
+Mission Control must not invoke platform Git persistence for this mode.
+
+### commit
+
+Stage changes and create a local commit.
+Never push.
+
+### push
+
+Stage changes, create a local commit, and push to the mission
+`repository.base_branch`.
+
+When the `persistence` block is omitted, Mission Control defaults to
+`persistence.mode: none`.
+
+Mission Control must reject unsupported `persistence.mode` values.
 
 ---
 
@@ -363,6 +422,7 @@ Before execution Mission Control verifies:
 - repository exists
 - repository clean enough for requested operation
 - permissions valid
+- persistence.mode valid when provided
 - execution mode valid
 
 Invalid missions must never execute.

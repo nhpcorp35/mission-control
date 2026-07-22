@@ -82,8 +82,8 @@ class GitRepoFixture:
         os.environ["MISSION_CONTROL_GIT_NAME"] = "Test User"
         os.environ["MISSION_CONTROL_GIT_EMAIL"] = "test@example.com"
 
-    def mission(self) -> dict:
-        return {
+    def mission(self, *, persistence_mode: str | None = "push") -> dict:
+        mission = {
             "mission_id": "2026-07-19-workspace",
             "repository": {
                 "name": "test-repo",
@@ -91,6 +91,9 @@ class GitRepoFixture:
                 "base_branch": self.base_branch,
             },
         }
+        if persistence_mode is not None:
+            mission["persistence"] = {"mode": persistence_mode}
+        return mission
 
     def cleanup(self) -> None:
         if self._previous_repo_url is None:
@@ -186,11 +189,108 @@ class TestWorkspacePersistence(unittest.TestCase):
         try:
             result = persist_workspace_changes(
                 "run-no-change",
-                self.fixture.mission(),
+                self.fixture.mission(persistence_mode="push"),
                 workspace_path,
             )
             self.assertTrue(result.ok, result.error)
             self.assertIsNone(result.commit_sha)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_mode_none_invokes_no_git_add_commit_or_push(self) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-none",
+                    self.fixture.mission(persistence_mode="none"),
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertIsNone(result.commit_sha)
+            mock_git.assert_not_called()
+            status = _run_git(["-C", workspace_path, "status", "--porcelain"])
+            self.assertIn("created.txt", status.stdout)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_omitted_persistence_defaults_to_none(self) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-default-none",
+                    self.fixture.mission(persistence_mode=None),
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertIsNone(result.commit_sha)
+            mock_git.assert_not_called()
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_mode_commit_never_pushes(self) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            remote_before = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+
+            recorded_args: list[list[str]] = []
+            real_run_git = persist_workspace_changes.__globals__["_run_git"]
+
+            def tracking_run_git(
+                args: list[str],
+                *,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                recorded_args.append(list(args))
+                return real_run_git(args, env=env)
+
+            with patch(
+                "mission_control.workspace._run_git",
+                side_effect=tracking_run_git,
+            ):
+                result = persist_workspace_changes(
+                    "run-commit-only",
+                    self.fixture.mission(persistence_mode="commit"),
+                    workspace_path,
+                )
+
+            self.assertTrue(result.ok, result.error)
+            self.assertIsNotNone(result.commit_sha)
+            self.assertFalse(
+                any("push" in args for args in recorded_args),
+                recorded_args,
+            )
+
+            remote_after = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(remote_before, remote_after)
+            self.assertNotEqual(remote_after, result.commit_sha)
         finally:
             cleanup_workspace(workspace_path)
 
@@ -208,7 +308,7 @@ class TestWorkspacePersistence(unittest.TestCase):
             ):
                 result = persist_workspace_changes(
                     "run-with-change",
-                    self.fixture.mission(),
+                    self.fixture.mission(persistence_mode="push"),
                     workspace_path,
                 )
             self.assertTrue(result.ok, result.error)
@@ -253,7 +353,7 @@ class TestWorkspacePersistence(unittest.TestCase):
             ):
                 result = persist_workspace_changes(
                     "run-commit-fail",
-                    self.fixture.mission(),
+                    self.fixture.mission(persistence_mode="push"),
                     workspace_path,
                 )
             self.assertFalse(result.ok)
@@ -294,11 +394,26 @@ class TestWorkspacePersistence(unittest.TestCase):
             ):
                 result = persist_workspace_changes(
                     "run-push-fail",
-                    self.fixture.mission(),
+                    self.fixture.mission(persistence_mode="push"),
                     workspace_path,
                 )
             self.assertFalse(result.ok)
             self.assertIn("push rejected", result.error or "")
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_persist_unsupported_mode_fails_inside_persist(self) -> None:
+        workspace_path = self._prepare_workspace()
+        try:
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-bad-mode",
+                    self.fixture.mission(persistence_mode="rebase"),
+                    workspace_path,
+                )
+            self.assertFalse(result.ok)
+            self.assertIn("Unsupported persistence.mode", result.error or "")
+            mock_git.assert_not_called()
         finally:
             cleanup_workspace(workspace_path)
 
