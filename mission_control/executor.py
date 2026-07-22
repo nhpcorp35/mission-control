@@ -11,12 +11,17 @@ EXECUTION_TIMEOUT_SECONDS = 600
 
 logger = logging.getLogger(__name__)
 
+_NO_RECURSIVE_MISSIONS = (
+    "Do not submit recursive Mission Control missions.",
+)
+
 READ_ONLY_CONSTRAINTS = (
     "This is a read-only mission.",
     "Do not modify files.",
     "Do not run Git commands.",
     "Do not create commits.",
     "Do not use worktrees.",
+    *_NO_RECURSIVE_MISSIONS,
 )
 
 CREATE_ONLY_CONSTRAINTS = (
@@ -27,6 +32,7 @@ CREATE_ONLY_CONSTRAINTS = (
     "Do not create commits.",
     "Do not push changes.",
     "Do not use worktrees.",
+    *_NO_RECURSIVE_MISSIONS,
 )
 
 MODIFY_ONLY_CONSTRAINTS = (
@@ -38,6 +44,7 @@ MODIFY_ONLY_CONSTRAINTS = (
     "Do not create commits.",
     "Do not push changes.",
     "Do not use worktrees.",
+    *_NO_RECURSIVE_MISSIONS,
 )
 
 CREATE_AND_MODIFY_CONSTRAINTS = (
@@ -49,6 +56,7 @@ CREATE_AND_MODIFY_CONSTRAINTS = (
     "Do not create commits.",
     "Do not push changes.",
     "Do not use worktrees.",
+    *_NO_RECURSIVE_MISSIONS,
 )
 
 
@@ -58,6 +66,7 @@ class ExecutionResult:
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    return_code: int | None = None
 
 
 def build_cursor_instruction(
@@ -271,6 +280,7 @@ def _run_cursor_agent(
             stdout=stdout,
             stderr=stderr,
             error=message,
+            return_code=completed.returncode,
         )
 
     if not stdout.strip():
@@ -283,6 +293,7 @@ def _run_cursor_agent(
         ok=True,
         stdout=stdout,
         stderr=stderr,
+        return_code=completed.returncode,
     )
 
 

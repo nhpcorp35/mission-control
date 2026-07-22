@@ -289,6 +289,7 @@ def execute_registered_run(
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=execution_result.error,
+                return_code=execution_result.return_code,
             )
             registry.update_status(
                 run_id,
@@ -310,6 +311,7 @@ def execute_registered_run(
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=persistence_result.error,
+                return_code=execution_result.return_code,
             )
             registry.update_status(run_id, RunStatus.FAILED)
             return
@@ -318,6 +320,7 @@ def execute_registered_run(
             run_id,
             stdout=execution_result.stdout,
             stderr=execution_result.stderr,
+            return_code=execution_result.return_code,
             commit_sha=persistence_result.commit_sha,
         )
         registry.update_status(run_id, RunStatus.COMPLETED)

@@ -41,6 +41,35 @@ class TestBuildCursorInstruction(unittest.TestCase):
         self.assertIn("Do not run Git commands.", instruction)
         self.assertIn("Do not create commits.", instruction)
         self.assertIn("Do not use worktrees.", instruction)
+        self.assertIn(
+            "Do not submit recursive Mission Control missions.",
+            instruction,
+        )
+
+    def test_execute_constraints_forbid_recursive_missions(self) -> None:
+        mission = _sample_mission()
+        mission["permissions"] = {
+            "create_files": True,
+            "modify_files": True,
+        }
+        with patch(
+            "mission_control.executor.find_cursor_agent_binary",
+            return_value=CURSOR_AGENT,
+        ), patch(
+            "mission_control.executor.subprocess.run",
+        ) as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+            )
+            execute_cursor_agent(mission)
+            instruction = mock_run.call_args.args[0][-1]
+            self.assertIn(
+                "Do not submit recursive Mission Control missions.",
+                instruction,
+            )
 
 
 class TestBuildCursorAgentCommand(unittest.TestCase):
@@ -150,6 +179,19 @@ class TestRunCursorAgent(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.stderr, "agent failed")
         self.assertIn("agent failed", result.error or "")
+        self.assertEqual(result.return_code, 1)
+
+    @patch("mission_control.executor.subprocess.run")
+    def test_run_success_preserves_return_code(self, mock_run) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="PONG\n",
+            stderr="",
+        )
+        result = run_cursor_agent(_sample_mission())
+        self.assertTrue(result.ok)
+        self.assertEqual(result.return_code, 0)
 
     @patch("mission_control.executor.subprocess.run")
     def test_run_timeout(self, mock_run) -> None:

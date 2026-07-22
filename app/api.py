@@ -74,6 +74,7 @@ class RunStatusResponse(BaseModel):
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    return_code: int | None = None
     commit_sha: str | None = None
 def _execute_run_worker(
     run_id: str,
@@ -92,6 +93,7 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
         stdout=record.stdout,
         stderr=record.stderr,
         error=record.error,
+        return_code=record.return_code,
         commit_sha=record.commit_sha,
     )
 @app.get("/health")

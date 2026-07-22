@@ -115,6 +115,176 @@ class TestRunsApi(unittest.TestCase):
     @patch("mission_control.workspace.execute_cursor_agent")
     @patch("mission_control.workspace.prepare_isolated_workspace")
     @patch("app.api.preflight_for_execution", return_value=None)
+    def test_status_polling_after_successful_completion(
+        self,
+        _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout="agent response\n",
+            return_code=0,
+        )
+        mock_persist.return_value = PersistenceResult(ok=True, commit_sha=None)
+        submit = self.client.post(
+            "/runs",
+            json={"mission_yaml": _executable_mission_yaml()},
+        )
+        self.assertEqual(submit.status_code, 202)
+        run_id = submit.json()["run_id"]
+        body = self._wait_for_terminal(run_id)
+        self.assertEqual(body["status"], "completed")
+        self.assertEqual(body["stdout"], "agent response\n")
+        self.assertIsNone(body["error"])
+        self.assertEqual(body["return_code"], 0)
+        self.assertIsNotNone(body["started_at"])
+        self.assertIsNotNone(body["completed_at"])
+        self.assertIn(run_id, api_module.run_registry._runs)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_status_polling_after_subprocess_failure(
+        self,
+        _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=False,
+            stdout="partial out",
+            stderr="cursor agent crashed",
+            error="cursor agent crashed",
+            return_code=1,
+        )
+        submit = self.client.post(
+            "/runs",
+            json={"mission_yaml": _executable_mission_yaml()},
+        )
+        run_id = submit.json()["run_id"]
+        body = self._wait_for_terminal(run_id)
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(body["stdout"], "partial out")
+        self.assertEqual(body["stderr"], "cursor agent crashed")
+        self.assertEqual(body["error"], "cursor agent crashed")
+        self.assertEqual(body["return_code"], 1)
+        self.assertIsNotNone(body["completed_at"])
+        mock_persist.assert_not_called()
+        self.assertIn(run_id, api_module.run_registry._runs)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_retained_error_details_after_failure(
+        self,
+        _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=False,
+            stdout="out-before-fail",
+            stderr="stderr-detail",
+            error="subprocess failed",
+            return_code=42,
+        )
+        submit = self.client.post(
+            "/runs",
+            json={"mission_yaml": _executable_mission_yaml()},
+        )
+        run_id = submit.json()["run_id"]
+        body = self._wait_for_terminal(run_id)
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(body["error"], "subprocess failed")
+        self.assertEqual(body["stderr"], "stderr-detail")
+        self.assertEqual(body["stdout"], "out-before-fail")
+        self.assertEqual(body["return_code"], 42)
+        self.assertIsNotNone(body["created_at"])
+        self.assertIsNotNone(body["started_at"])
+        self.assertIsNotNone(body["completed_at"])
+        self.assertIsNotNone(body["elapsed_seconds"])
+        stored = api_module.run_registry.get_run(run_id)
+        assert stored is not None
+        self.assertEqual(stored.status, RunStatus.FAILED)
+        self.assertEqual(stored.error, "subprocess failed")
+        self.assertEqual(stored.return_code, 42)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_repeated_get_returns_same_terminal_run(
+        self,
+        _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path="/tmp/workspace",
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout="stable\n",
+            return_code=0,
+        )
+        mock_persist.return_value = PersistenceResult(
+            ok=True,
+            commit_sha="abc123",
+        )
+        submit = self.client.post(
+            "/runs",
+            json={"mission_yaml": _executable_mission_yaml()},
+        )
+        run_id = submit.json()["run_id"]
+        first = self._wait_for_terminal(run_id)
+        self.assertEqual(first["status"], "completed")
+
+        for _ in range(5):
+            response = self.client.get(f"/runs/{run_id}")
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(body["run_id"], run_id)
+            self.assertEqual(body["status"], "completed")
+            self.assertEqual(body["stdout"], "stable\n")
+            self.assertEqual(body["return_code"], 0)
+            self.assertEqual(body["commit_sha"], "abc123")
+            self.assertEqual(body["completed_at"], first["completed_at"])
+
+        self.assertEqual(len(api_module.run_registry._runs), 1)
+        self.assertIn(run_id, api_module.run_registry._runs)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    @patch("app.api.preflight_for_execution", return_value=None)
     def test_get_run_reports_completed(
         self,
         _mock_preflight,

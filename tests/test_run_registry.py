@@ -139,6 +139,7 @@ class TestResultStorage(unittest.TestCase):
             stdout="out",
             stderr="err",
             error="boom",
+            return_code=7,
         )
 
         self.assertIsNotNone(updated)
@@ -146,6 +147,7 @@ class TestResultStorage(unittest.TestCase):
         self.assertEqual(updated.stdout, "out")
         self.assertEqual(updated.stderr, "err")
         self.assertEqual(updated.error, "boom")
+        self.assertEqual(updated.return_code, 7)
         self.assertIsNone(updated.commit_sha)
         # Status is unchanged; store_result is independent of transitions.
         self.assertEqual(updated.status, RunStatus.QUEUED)
@@ -155,7 +157,32 @@ class TestResultStorage(unittest.TestCase):
         self.assertEqual(fetched.stdout, "out")
         self.assertEqual(fetched.stderr, "err")
         self.assertEqual(fetched.error, "boom")
+        self.assertEqual(fetched.return_code, 7)
         self.assertIsNone(fetched.commit_sha)
+
+    def test_terminal_failure_retains_existing_record(self) -> None:
+        registry = RunRegistry()
+        record = registry.create_run()
+        run_id = record.run_id
+        registry.update_status(run_id, RunStatus.RUNNING)
+        registry.store_result(
+            run_id,
+            stdout="partial",
+            stderr="boom-stderr",
+            error="boom",
+            return_code=3,
+        )
+        registry.update_status(run_id, RunStatus.FAILED)
+
+        self.assertEqual(len(registry._runs), 1)
+        fetched = registry.get_run(run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.status, RunStatus.FAILED)
+        self.assertEqual(fetched.error, "boom")
+        self.assertEqual(fetched.stderr, "boom-stderr")
+        self.assertEqual(fetched.stdout, "partial")
+        self.assertEqual(fetched.return_code, 3)
+        self.assertIsNotNone(fetched.completed_at)
 
 
 class TestCommitShaStorage(unittest.TestCase):

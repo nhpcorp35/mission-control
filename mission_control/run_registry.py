@@ -26,7 +26,12 @@ class RunStatus(str, Enum):
 
 @dataclass
 class RunRecord:
-    """Snapshot of a single mission run held in process memory."""
+    """Snapshot of a single mission run held in process memory.
+
+    Records are retained for the lifetime of the process. Terminal statuses
+    (completed, failed, timed_out) update the existing entry in place and
+    never remove it from the registry.
+    """
 
     run_id: str
     status: RunStatus
@@ -37,6 +42,7 @@ class RunRecord:
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    return_code: int | None = None
     commit_sha: str | None = None
 
 
@@ -78,6 +84,7 @@ class RunRegistry:
     ) -> RunRecord | None:
         """Update run status and related timestamps.
 
+        Mutates the existing registry entry in place and never removes it.
         Returns ``None`` when ``run_id`` is unknown.
         """
         with self._lock:
@@ -111,12 +118,14 @@ class RunRegistry:
         stdout: str = "",
         stderr: str = "",
         error: str | None = None,
+        return_code: int | None = None,
         commit_sha: str | None = None,
     ) -> RunRecord | None:
         """Store execution output fields on an existing run.
 
-        Returns ``None`` when ``run_id`` is unknown. Does not change status;
-        callers should use :meth:`update_status` for lifecycle transitions.
+        Updates the existing record in place; never removes it. Returns
+        ``None`` when ``run_id`` is unknown. Does not change status; callers
+        should use :meth:`update_status` for lifecycle transitions.
         """
         with self._lock:
             record = self._runs.get(run_id)
@@ -126,6 +135,7 @@ class RunRegistry:
             record.stdout = stdout
             record.stderr = stderr
             record.error = error
+            record.return_code = return_code
             if commit_sha is not None:
                 record.commit_sha = commit_sha
             return record
