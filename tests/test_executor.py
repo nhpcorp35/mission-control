@@ -2,7 +2,7 @@
 
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mission_control.executor import (
     CURSOR_AGENT,
@@ -21,6 +21,20 @@ def _sample_mission() -> dict:
         "deliverables": ["file list", "summary"],
         "repository": {"path": "/Users/allenk/Desktop/Mission-Control"},
     }
+
+
+def _mock_completed_process(
+    *,
+    returncode: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+    pid: int = 4242,
+) -> MagicMock:
+    proc = MagicMock()
+    proc.pid = pid
+    proc.returncode = returncode
+    proc.communicate.return_value = (stdout, stderr)
+    return proc
 
 
 class TestBuildCursorInstruction(unittest.TestCase):
@@ -56,16 +70,11 @@ class TestBuildCursorInstruction(unittest.TestCase):
             "mission_control.executor.find_cursor_agent_binary",
             return_value=CURSOR_AGENT,
         ), patch(
-            "mission_control.executor.subprocess.run",
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout="ok\n",
-                stderr="",
-            )
+            "mission_control.executor.subprocess.Popen",
+        ) as mock_popen:
+            mock_popen.return_value = _mock_completed_process(stdout="ok\n")
             execute_cursor_agent(mission)
-            instruction = mock_run.call_args.args[0][-1]
+            instruction = mock_popen.call_args.args[0][-1]
             self.assertIn(
                 "Do not submit recursive Mission Control missions.",
                 instruction,
@@ -135,44 +144,48 @@ class TestBuildCursorAgentCommand(unittest.TestCase):
 
 
 class TestRunCursorAgent(unittest.TestCase):
-    @patch("mission_control.executor.subprocess.run")
-    def test_run_success_prints_stdout(self, mock_run) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="PONG\n",
-            stderr="",
-        )
+    @patch(
+        "mission_control.executor.find_cursor_agent_binary",
+        return_value=CURSOR_AGENT,
+    )
+    @patch("mission_control.executor.subprocess.Popen")
+    def test_run_success_prints_stdout(self, mock_popen, _mock_binary) -> None:
+        mock_popen.return_value = _mock_completed_process(stdout="PONG\n")
         result = run_cursor_agent(_sample_mission())
         self.assertTrue(result.ok)
         self.assertEqual(result.stdout, "PONG\n")
 
-    @patch("mission_control.executor.subprocess.run")
-    def test_execute_uses_write_capable_default_mode(self, mock_run) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="created file\n",
-            stderr="",
-        )
+    @patch(
+        "mission_control.executor.find_cursor_agent_binary",
+        return_value=CURSOR_AGENT,
+    )
+    @patch("mission_control.executor.subprocess.Popen")
+    def test_execute_uses_write_capable_default_mode(
+        self,
+        mock_popen,
+        _mock_binary,
+    ) -> None:
+        mock_popen.return_value = _mock_completed_process(stdout="created file\n")
 
         result = execute_cursor_agent(_sample_mission())
 
         self.assertTrue(result.ok)
 
-        command = mock_run.call_args.args[0]
+        command = mock_popen.call_args.args[0]
         self.assertIn("--print", command)
         self.assertIn("--trust", command)
         self.assertNotIn("--mode", command)
         self.assertIn("--force", command)
         self.assertNotIn("--yolo", command)
 
-    @patch("mission_control.executor.subprocess.run")
-    def test_run_failure_returns_stderr(self, mock_run) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
+    @patch(
+        "mission_control.executor.find_cursor_agent_binary",
+        return_value=CURSOR_AGENT,
+    )
+    @patch("mission_control.executor.subprocess.Popen")
+    def test_run_failure_returns_stderr(self, mock_popen, _mock_binary) -> None:
+        mock_popen.return_value = _mock_completed_process(
             returncode=1,
-            stdout="",
             stderr="agent failed",
         )
         result = run_cursor_agent(_sample_mission())
@@ -181,27 +194,44 @@ class TestRunCursorAgent(unittest.TestCase):
         self.assertIn("agent failed", result.error or "")
         self.assertEqual(result.return_code, 1)
 
-    @patch("mission_control.executor.subprocess.run")
-    def test_run_success_preserves_return_code(self, mock_run) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
+    @patch(
+        "mission_control.executor.find_cursor_agent_binary",
+        return_value=CURSOR_AGENT,
+    )
+    @patch("mission_control.executor.subprocess.Popen")
+    def test_run_success_preserves_return_code(
+        self,
+        mock_popen,
+        _mock_binary,
+    ) -> None:
+        mock_popen.return_value = _mock_completed_process(
             returncode=0,
             stdout="PONG\n",
-            stderr="",
         )
         result = run_cursor_agent(_sample_mission())
         self.assertTrue(result.ok)
         self.assertEqual(result.return_code, 0)
 
-    @patch("mission_control.executor.subprocess.run")
-    def test_run_timeout(self, mock_run) -> None:
-        mock_run.side_effect = subprocess.TimeoutExpired(
-            cmd=[CURSOR_AGENT],
-            timeout=EXECUTION_TIMEOUT_SECONDS,
-        )
+    @patch(
+        "mission_control.executor.find_cursor_agent_binary",
+        return_value=CURSOR_AGENT,
+    )
+    @patch("mission_control.executor.subprocess.Popen")
+    def test_run_timeout(self, mock_popen, _mock_binary) -> None:
+        proc = MagicMock()
+        proc.pid = 99
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(
+                cmd=[CURSOR_AGENT],
+                timeout=EXECUTION_TIMEOUT_SECONDS,
+            ),
+            ("", ""),
+        ]
+        mock_popen.return_value = proc
         result = run_cursor_agent(_sample_mission())
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error or "")
+        proc.kill.assert_called_once()
 
 
 if __name__ == "__main__":

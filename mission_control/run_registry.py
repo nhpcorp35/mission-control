@@ -10,8 +10,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import logging
+import os
 import threading
 import uuid
+
+logger = logging.getLogger(__name__)
+
+_TERMINAL_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "timed_out",
+    }
+)
 
 
 class RunStatus(str, Enum):
@@ -61,6 +73,12 @@ class RunRegistry:
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.Lock()
 
+    def diagnostic_state(self) -> tuple[int, list[str]]:
+        """Return ``(count, run_ids)`` for lifecycle logs (no secrets)."""
+        with self._lock:
+            keys = list(self._runs.keys())
+        return len(keys), keys
+
     def create_run(self) -> RunRecord:
         """Create a new run in ``queued`` status with a UUID4 ``run_id``."""
         record = RunRecord(
@@ -70,6 +88,20 @@ class RunRegistry:
         )
         with self._lock:
             self._runs[record.run_id] = record
+            count = len(self._runs)
+            keys = list(self._runs.keys())
+        logger.info(
+            (
+                "lifecycle run_id=%s event=run_record_created status=%s "
+                "api_pid=%s registry_id=%s registry_count=%s registry_keys=%s"
+            ),
+            record.run_id,
+            record.status.value,
+            os.getpid(),
+            id(self),
+            count,
+            keys,
+        )
         return record
 
     def get_run(self, run_id: str) -> RunRecord | None:
@@ -109,7 +141,28 @@ class RunRegistry:
                         record.completed_at - record.started_at
                     ).total_seconds()
 
-            return record
+            count = len(self._runs)
+            keys = list(self._runs.keys())
+
+        event = (
+            "final_status_update"
+            if status.value in _TERMINAL_STATUSES
+            else "status_update"
+        )
+        logger.info(
+            (
+                "lifecycle run_id=%s event=%s status=%s "
+                "api_pid=%s registry_id=%s registry_count=%s registry_keys=%s"
+            ),
+            run_id,
+            event,
+            status.value,
+            os.getpid(),
+            id(self),
+            count,
+            keys,
+        )
+        return record
 
     def store_result(
         self,

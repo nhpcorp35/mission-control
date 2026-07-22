@@ -263,6 +263,18 @@ def execute_registered_run(
     registry: RunRegistry,
 ) -> None:
     """Run a registered mission in an isolated workspace and persist changes."""
+    count, keys = registry.diagnostic_state()
+    logger.info(
+        (
+            "lifecycle run_id=%s event=registered_run_entered "
+            "api_pid=%s registry_id=%s registry_count=%s registry_keys=%s"
+        ),
+        run_id,
+        os.getpid(),
+        id(registry),
+        count,
+        keys,
+    )
     registry.update_status(run_id, RunStatus.RUNNING)
     workspace_path: str | None = None
 
@@ -282,7 +294,10 @@ def execute_registered_run(
             "path": workspace_path,
         }
 
-        execution_result = execute_cursor_agent(isolated_mission)
+        execution_result = execute_cursor_agent(
+            isolated_mission,
+            run_id=run_id,
+        )
         if not execution_result.ok:
             registry.store_result(
                 run_id,
@@ -324,7 +339,16 @@ def execute_registered_run(
             commit_sha=persistence_result.commit_sha,
         )
         registry.update_status(run_id, RunStatus.COMPLETED)
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
+        logger.exception(
+            (
+                "lifecycle run_id=%s event=exception "
+                "api_pid=%s registry_id=%s stage=registered_run"
+            ),
+            run_id,
+            os.getpid(),
+            id(registry),
+        )
         registry.store_result(run_id, error=str(exc))
         registry.update_status(run_id, RunStatus.FAILED)
     finally:

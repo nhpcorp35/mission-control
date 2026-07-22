@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 import logging
+import os
 import threading
 from typing import Any
 
@@ -17,6 +18,18 @@ logger = logging.getLogger(__name__)
 
 # execute(run_id, mission, registry)
 ExecuteFn = Callable[[str, dict, Any], None]
+
+
+def _registry_log_fields(registry: Any) -> tuple[int | None, int | None, list[str] | None]:
+    """Best-effort registry identity/count/keys without assuming a concrete type."""
+    if registry is None:
+        return None, None, None
+    registry_id = id(registry)
+    diagnostic = getattr(registry, "diagnostic_state", None)
+    if callable(diagnostic):
+        count, keys = diagnostic()
+        return registry_id, count, keys
+    return registry_id, None, None
 
 
 class RunQueue:
@@ -49,13 +62,37 @@ class RunQueue:
             self._pending.append((run_id, mission, registry))
             depth = len(self._pending)
             active = self._active_run_id
+            registry_id, registry_count, registry_keys = _registry_log_fields(
+                registry
+            )
             logger.info(
-                "lifecycle run_id=%s event=queued queue_depth=%s active_run_id=%s",
+                (
+                    "lifecycle run_id=%s event=queued queue_depth=%s "
+                    "active_run_id=%s api_pid=%s registry_id=%s "
+                    "registry_count=%s registry_keys=%s"
+                ),
                 run_id,
                 depth,
                 active,
+                os.getpid(),
+                registry_id,
+                registry_count,
+                registry_keys,
             )
-            self._ensure_worker_locked()
+            scheduled_new = self._ensure_worker_locked()
+            logger.info(
+                (
+                    "lifecycle run_id=%s event=worker_scheduled "
+                    "new_worker=%s worker_alive=%s api_pid=%s "
+                    "registry_id=%s registry_count=%s"
+                ),
+                run_id,
+                scheduled_new,
+                bool(self._worker is not None and self._worker.is_alive()),
+                os.getpid(),
+                registry_id,
+                registry_count,
+            )
             self._cond.notify()
 
     def reset(self) -> None:
@@ -82,15 +119,16 @@ class RunQueue:
         with self._lock:
             return self._active_run_id is not None
 
-    def _ensure_worker_locked(self) -> None:
+    def _ensure_worker_locked(self) -> bool:
         if self._worker is not None and self._worker.is_alive():
-            return
+            return False
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="mission-control-run-queue",
             daemon=True,
         )
         self._worker.start()
+        return True
 
     def _worker_loop(self) -> None:
         while True:
@@ -105,17 +143,43 @@ class RunQueue:
                 execute_fn = self._execute_fn
 
             assert execute_fn is not None
+            registry_id, registry_count, registry_keys = _registry_log_fields(
+                registry
+            )
             logger.info(
-                "lifecycle run_id=%s event=dequeued queue_depth=%s",
+                (
+                    "lifecycle run_id=%s event=dequeued queue_depth=%s "
+                    "api_pid=%s registry_id=%s registry_count=%s"
+                ),
                 run_id,
                 self.pending_count(),
+                os.getpid(),
+                registry_id,
+                registry_count,
+            )
+            logger.info(
+                (
+                    "lifecycle run_id=%s event=worker_entered "
+                    "api_pid=%s registry_id=%s registry_count=%s "
+                    "registry_keys=%s"
+                ),
+                run_id,
+                os.getpid(),
+                registry_id,
+                registry_count,
+                registry_keys,
             )
             try:
                 execute_fn(run_id, mission, registry)
             except Exception:
                 logger.exception(
-                    "lifecycle run_id=%s event=worker_error",
+                    (
+                        "lifecycle run_id=%s event=worker_error "
+                        "api_pid=%s registry_id=%s"
+                    ),
                     run_id,
+                    os.getpid(),
+                    registry_id,
                 )
             finally:
                 with self._cond:

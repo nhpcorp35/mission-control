@@ -40,20 +40,51 @@ run_queue = RunQueue()
 
 def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> None:
     """Run one queued mission with lifecycle logging (no secrets)."""
-    logger.info("lifecycle run_id=%s event=started", run_id)
+    count, keys = registry.diagnostic_state()
+    logger.info(
+        (
+            "lifecycle run_id=%s event=started api_pid=%s "
+            "registry_id=%s registry_count=%s registry_keys=%s"
+        ),
+        run_id,
+        os.getpid(),
+        id(registry),
+        count,
+        keys,
+    )
     with execution_scope():
         try:
             execute_registered_run(run_id, mission, registry)
+        except Exception:
+            logger.exception(
+                (
+                    "lifecycle run_id=%s event=exception "
+                    "api_pid=%s registry_id=%s stage=queued_run"
+                ),
+                run_id,
+                os.getpid(),
+                id(registry),
+            )
+            raise
         finally:
             record = registry.get_run(run_id)
             status = record.status.value if record is not None else "unknown"
             error = record.error if record is not None else None
+            count, keys = registry.diagnostic_state()
             # Log failure presence without dumping full stderr/YAML secrets.
             logger.info(
-                "lifecycle run_id=%s event=finished status=%s has_error=%s",
+                (
+                    "lifecycle run_id=%s event=finished status=%s has_error=%s "
+                    "api_pid=%s registry_id=%s registry_count=%s "
+                    "registry_keys=%s"
+                ),
                 run_id,
                 status,
                 bool(error),
+                os.getpid(),
+                id(registry),
+                count,
+                keys,
             )
 
 
@@ -307,12 +338,21 @@ def submit_run_endpoint(
             ).model_dump(),
         )
     record = run_registry.create_run()
+    count, keys = run_registry.diagnostic_state()
     logger.info(
-        "lifecycle run_id=%s event=accepted status=%s pending=%s active=%s",
+        (
+            "lifecycle run_id=%s event=accepted status=%s pending=%s "
+            "active=%s api_pid=%s registry_id=%s registry_count=%s "
+            "registry_keys=%s"
+        ),
         record.run_id,
         RunStatus.QUEUED.value,
         run_queue.pending_count(),
         run_queue.active_run_id,
+        os.getpid(),
+        id(run_registry),
+        count,
+        keys,
     )
     run_queue.enqueue(record.run_id, mission, run_registry)
     return RunAcceptedResponse(

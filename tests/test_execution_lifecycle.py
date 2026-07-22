@@ -162,7 +162,7 @@ class TestRunsLifecycleApi(unittest.TestCase):
         call_order: list[str] = []
         lock = threading.Lock()
 
-        def slow_execute(mission: dict) -> ExecutionResult:
+        def slow_execute(mission: dict, **_kwargs) -> ExecutionResult:
             mission_id = str(mission.get("mission_id", ""))
             with lock:
                 call_order.append(mission_id)
@@ -228,7 +228,7 @@ class TestRunsLifecycleApi(unittest.TestCase):
         max_active = 0
         lock = threading.Lock()
 
-        def tracked_execute(_mission: dict) -> ExecutionResult:
+        def tracked_execute(_mission: dict, **_kwargs) -> ExecutionResult:
             nonlocal active, max_active
             with lock:
                 active += 1
