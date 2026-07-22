@@ -102,12 +102,7 @@ def _row_to_record(row: sqlite3.Row) -> RunRecord:
 class RunRegistry:
     """Thread-safe run registry backed by SQLite."""
 
-    def __init__(
-        self,
-        db_path: str | None = None,
-        *,
-        recover: bool = True,
-    ) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
         self._db_path = os.path.abspath(
             os.path.expanduser(db_path or resolve_db_path())
         )
@@ -119,8 +114,6 @@ class RunRegistry:
         )
         self._conn.row_factory = sqlite3.Row
         self._ensure_schema()
-        if recover:
-            self.recover_interrupted_runs()
 
     @property
     def db_path(self) -> str:

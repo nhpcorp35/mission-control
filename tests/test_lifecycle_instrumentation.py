@@ -177,7 +177,7 @@ class TestAsyncRunLifecycleInstrumentation(unittest.TestCase):
     def setUp(self) -> None:
         self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(self._db_fd)
-        api_module.run_registry = RunRegistry(self._db_path, recover=False)
+        api_module.run_registry = RunRegistry(self._db_path)
         api_module.run_queue = RunQueue()
         api_module.run_queue.configure(api_module._execute_queued_run)
         self.client = TestClient(app, headers=AUTH_HEADERS)

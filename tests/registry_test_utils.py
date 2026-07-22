@@ -15,7 +15,7 @@ class SqliteRegistryTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(self._db_fd)
-        self.registry = RunRegistry(self._db_path, recover=False)
+        self.registry = RunRegistry(self._db_path)
 
     def tearDown(self) -> None:
         self.registry.close()

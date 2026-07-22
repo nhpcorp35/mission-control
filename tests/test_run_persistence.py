@@ -30,7 +30,7 @@ class TestRegistryPersistenceAcrossInstances(SqliteRegistryTestCase):
         self.registry.update_status(created.run_id, RunStatus.COMPLETED)
         self.registry.close()
 
-        other = RunRegistry(self._db_path, recover=False)
+        other = RunRegistry(self._db_path)
         try:
             fetched = other.get_run(created.run_id)
             self.assertIsNotNone(fetched)
@@ -50,12 +50,12 @@ class TestRegistryPersistenceAcrossInstances(SqliteRegistryTestCase):
         created = self.registry.create_run()
         self.registry.close()
 
-        other = RunRegistry(self._db_path, recover=False)
+        other = RunRegistry(self._db_path)
         try:
             other.update_status(created.run_id, RunStatus.RUNNING)
             other.close()
 
-            third = RunRegistry(self._db_path, recover=False)
+            third = RunRegistry(self._db_path)
             try:
                 fetched = third.get_run(created.run_id)
                 assert fetched is not None
@@ -74,8 +74,11 @@ class TestInterruptedRunRecovery(SqliteRegistryTestCase):
         self.registry.update_status(running.run_id, RunStatus.RUNNING)
         self.registry.close()
 
-        recovered_registry = RunRegistry(self._db_path, recover=True)
+        recovered_registry = RunRegistry(self._db_path)
         try:
+            recovered = recovered_registry.recover_interrupted_runs()
+            self.assertEqual(recovered, 2)
+
             queued_record = recovered_registry.get_run(queued.run_id)
             running_record = recovered_registry.get_run(running.run_id)
             assert queued_record is not None
@@ -92,6 +95,75 @@ class TestInterruptedRunRecovery(SqliteRegistryTestCase):
             self.assertIsNotNone(running_record.elapsed_seconds)
         finally:
             recovered_registry.close()
+
+    def test_constructing_registry_does_not_recover_active_runs(self) -> None:
+        """Opening a registry must not fail runs still owned by another process."""
+        queued = self.registry.create_run()
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+
+        with patch.object(
+            RunRegistry,
+            "recover_interrupted_runs",
+            autospec=True,
+            return_value=0,
+        ) as recover_mock:
+            other = RunRegistry(self._db_path)
+            try:
+                recover_mock.assert_not_called()
+                queued_record = other.get_run(queued.run_id)
+                running_record = other.get_run(running.run_id)
+                assert queued_record is not None
+                assert running_record is not None
+                self.assertEqual(queued_record.status, RunStatus.QUEUED)
+                self.assertEqual(running_record.status, RunStatus.RUNNING)
+                self.assertIsNone(queued_record.error)
+                self.assertIsNone(running_record.error)
+            finally:
+                other.close()
+
+        # Without mocking, unfinished rows must still be untouched after open.
+        reopened = RunRegistry(self._db_path)
+        try:
+            queued_record = reopened.get_run(queued.run_id)
+            running_record = reopened.get_run(running.run_id)
+            assert queued_record is not None
+            assert running_record is not None
+            self.assertEqual(queued_record.status, RunStatus.QUEUED)
+            self.assertEqual(running_record.status, RunStatus.RUNNING)
+        finally:
+            reopened.close()
+
+    def test_default_registry_construction_skips_recovery(self) -> None:
+        """Tests/subprocesses must not recover the configured production DB."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "production.db")
+            owner = RunRegistry(db_path)
+            try:
+                active = owner.create_run()
+                owner.update_status(active.run_id, RunStatus.RUNNING)
+            finally:
+                owner.close()
+
+            with patch.dict(
+                os.environ,
+                {"MISSION_CONTROL_DB_PATH": db_path},
+                clear=False,
+            ):
+                with patch.object(
+                    RunRegistry,
+                    "recover_interrupted_runs",
+                    autospec=True,
+                    return_value=0,
+                ) as recover_mock:
+                    opened = RunRegistry()
+                    try:
+                        recover_mock.assert_not_called()
+                        record = opened.get_run(active.run_id)
+                        assert record is not None
+                        self.assertEqual(record.status, RunStatus.RUNNING)
+                    finally:
+                        opened.close()
 
 
 class TestRegistryDefaults(unittest.TestCase):
@@ -110,7 +182,7 @@ class TestRegistryDefaults(unittest.TestCase):
     def test_registry_creates_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "nested", "mission-control.db")
-            registry = RunRegistry(db_path, recover=False)
+            registry = RunRegistry(db_path)
             try:
                 self.assertTrue(os.path.isdir(os.path.dirname(db_path)))
                 registry.create_run()

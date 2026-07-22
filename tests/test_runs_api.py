@@ -63,7 +63,7 @@ class TestRunsApi(unittest.TestCase):
     def setUp(self) -> None:
         self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(self._db_fd)
-        api_module.run_registry = RunRegistry(self._db_path, recover=False)
+        api_module.run_registry = RunRegistry(self._db_path)
         from mission_control.run_queue import RunQueue
 
         api_module.run_queue = RunQueue()
@@ -483,5 +483,66 @@ class TestRunsApi(unittest.TestCase):
         self.assertFalse(response.json()["ok"])
         self.assertNotIn(TEST_API_KEY, response.text)
         self.assertEqual(api_module.run_registry.count_runs(), 0)
+
+
+class TestStartupRecovery(unittest.TestCase):
+    """Recovery runs on API lifespan startup, not on registry construction."""
+
+    def setUp(self) -> None:
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        self._previous_registry = api_module.run_registry
+        seed = RunRegistry(self._db_path)
+        try:
+            self._queued = seed.create_run()
+            self._running = seed.create_run()
+            seed.update_status(self._running.run_id, RunStatus.RUNNING)
+        finally:
+            seed.close()
+        api_module.run_registry = RunRegistry(self._db_path)
+
+    def tearDown(self) -> None:
+        api_module.run_registry.close()
+        api_module.run_registry = self._previous_registry
+        os.unlink(self._db_path)
+
+    def test_import_and_construction_leave_active_runs_intact(self) -> None:
+        queued = api_module.run_registry.get_run(self._queued.run_id)
+        running = api_module.run_registry.get_run(self._running.run_id)
+        assert queued is not None
+        assert running is not None
+        self.assertEqual(queued.status, RunStatus.QUEUED)
+        self.assertEqual(running.status, RunStatus.RUNNING)
+
+        # TestClient without context manager must not run lifespan recovery.
+        client = TestClient(app, headers=AUTH_HEADERS)
+        queued = api_module.run_registry.get_run(self._queued.run_id)
+        running = api_module.run_registry.get_run(self._running.run_id)
+        assert queued is not None
+        assert running is not None
+        self.assertEqual(queued.status, RunStatus.QUEUED)
+        self.assertEqual(running.status, RunStatus.RUNNING)
+        client.get("/health")
+
+    def test_lifespan_startup_recovers_interrupted_runs_once(self) -> None:
+        from mission_control.run_registry import INTERRUPTED_RUN_ERROR
+
+        with patch.object(
+            api_module.run_registry,
+            "recover_interrupted_runs",
+            wraps=api_module.run_registry.recover_interrupted_runs,
+        ) as recover_mock:
+            with TestClient(app, headers=AUTH_HEADERS):
+                recover_mock.assert_called_once()
+                queued = api_module.run_registry.get_run(self._queued.run_id)
+                running = api_module.run_registry.get_run(self._running.run_id)
+                assert queued is not None
+                assert running is not None
+                self.assertEqual(queued.status, RunStatus.FAILED)
+                self.assertEqual(running.status, RunStatus.FAILED)
+                self.assertEqual(queued.error, INTERRUPTED_RUN_ERROR)
+                self.assertEqual(running.error, INTERRUPTED_RUN_ERROR)
+
+
 if __name__ == "__main__":
     unittest.main()
