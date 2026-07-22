@@ -29,12 +29,18 @@ class MissionControlClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
+        request_timeout = (
+            self._settings.request_timeout_seconds
+            if timeout is None
+            else timeout
+        )
         try:
             async with httpx.AsyncClient(
                 base_url=self._settings.mission_control_url,
                 headers=self._headers(),
-                timeout=self._settings.request_timeout_seconds,
+                timeout=request_timeout,
             ) as client:
                 response = await client.request(
                     method,
@@ -80,3 +86,25 @@ class MissionControlClient:
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/runs/{run_id}")
+
+    async def wait_for_run(
+        self,
+        run_id: str,
+        *,
+        timeout_seconds: float = 300.0,
+        poll_interval_seconds: float = 1.0,
+    ) -> dict[str, Any]:
+        # HTTP client timeout must exceed the server-side wait budget.
+        http_timeout = max(
+            self._settings.request_timeout_seconds,
+            float(timeout_seconds) + 30.0,
+        )
+        return await self._request(
+            "POST",
+            f"/runs/{run_id}/wait",
+            json={
+                "timeout_seconds": timeout_seconds,
+                "poll_interval_seconds": poll_interval_seconds,
+            },
+            timeout=http_timeout,
+        )

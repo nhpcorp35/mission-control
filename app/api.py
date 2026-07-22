@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import logging
 import os
-from fastapi import Depends, FastAPI, HTTPException, Request
+import time
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from app.auth import require_api_key
@@ -26,6 +27,7 @@ from mission_control.run_registry import (
     RunRecord,
     RunRegistry,
     RunStatus,
+    is_terminal_status,
 )
 from mission_control.workspace import execute_registered_run
 from mission_control.validator import (
@@ -36,6 +38,14 @@ from mission_control.validator import (
 logger = logging.getLogger(__name__)
 run_registry = RunRegistry()
 run_queue = RunQueue()
+
+# Bounds for POST /runs/{run_id}/wait (and the MCP wait_for_run tool).
+WAIT_MIN_TIMEOUT_SECONDS = 0.1
+WAIT_MAX_TIMEOUT_SECONDS = 3600.0
+WAIT_MIN_POLL_INTERVAL_SECONDS = 0.05
+WAIT_MAX_POLL_INTERVAL_SECONDS = 60.0
+WAIT_DEFAULT_TIMEOUT_SECONDS = 300.0
+WAIT_DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 
 
 def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> None:
@@ -143,6 +153,26 @@ class RunStatusResponse(BaseModel):
     error: str | None = None
     return_code: int | None = None
     commit_sha: str | None = None
+
+
+class WaitForRunRequest(BaseModel):
+    timeout_seconds: float = Field(
+        default=WAIT_DEFAULT_TIMEOUT_SECONDS,
+        ge=WAIT_MIN_TIMEOUT_SECONDS,
+        le=WAIT_MAX_TIMEOUT_SECONDS,
+    )
+    poll_interval_seconds: float = Field(
+        default=WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+        ge=WAIT_MIN_POLL_INTERVAL_SECONDS,
+        le=WAIT_MAX_POLL_INTERVAL_SECONDS,
+    )
+
+
+class WaitForRunResponse(RunStatusResponse):
+    reached_terminal: bool
+    wait_expired: bool
+
+
 def _run_status_response(record: RunRecord) -> RunStatusResponse:
     return RunStatusResponse(
         run_id=record.run_id,
@@ -156,6 +186,20 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
         error=record.error,
         return_code=record.return_code,
         commit_sha=record.commit_sha,
+    )
+
+
+def _wait_for_run_response(
+    record: RunRecord,
+    *,
+    reached_terminal: bool,
+    wait_expired: bool,
+) -> WaitForRunResponse:
+    base = _run_status_response(record)
+    return WaitForRunResponse(
+        **base.model_dump(),
+        reached_terminal=reached_terminal,
+        wait_expired=wait_expired,
     )
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -395,3 +439,67 @@ def get_run_endpoint(
         record.status.value,
     )
     return _run_status_response(record)
+
+
+@app.post(
+    "/runs/{run_id}/wait",
+    response_model=WaitForRunResponse,
+    operation_id="wait_for_run",
+    summary="Wait for an asynchronous run to reach a terminal status",
+    description=(
+        "Poll the existing run lookup path until the run reaches a terminal "
+        "status (completed, failed, or timed_out) or timeout_seconds elapses. "
+        "Returns immediately when the run is already terminal. Wait timeout "
+        "does not mutate run state. Intended HAL flow: submit_run, then "
+        "wait_for_run, then inspect status/output/commit_sha."
+    ),
+)
+def wait_for_run_endpoint(
+    run_id: str,
+    request: WaitForRunRequest = Body(default_factory=WaitForRunRequest),
+    _auth: None = Depends(require_api_key),
+) -> WaitForRunResponse:
+    timeout_seconds = request.timeout_seconds
+    poll_interval_seconds = request.poll_interval_seconds
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        # get_run acquires and releases the registry lock per lookup so the
+        # wait loop never holds SQLite locks while sleeping.
+        record = run_registry.get_run(run_id)
+        if record is None:
+            logger.info(
+                "lifecycle run_id=%s event=wait_lookup_miss",
+                run_id,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="Run not found",
+            )
+
+        if is_terminal_status(record.status):
+            logger.info(
+                "lifecycle run_id=%s event=wait_terminal status=%s",
+                run_id,
+                record.status.value,
+            )
+            return _wait_for_run_response(
+                record,
+                reached_terminal=True,
+                wait_expired=False,
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.info(
+                "lifecycle run_id=%s event=wait_expired status=%s",
+                run_id,
+                record.status.value,
+            )
+            return _wait_for_run_response(
+                record,
+                reached_terminal=False,
+                wait_expired=True,
+            )
+
+        time.sleep(min(poll_interval_seconds, remaining))

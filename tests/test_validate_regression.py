@@ -23,6 +23,8 @@ def _executable_mission(
     platform_push_approved: bool | None = None,
     allow_automatic_platform_push: bool | None = None,
     permissions_push: bool = False,
+    create_files: bool = True,
+    modify_files: bool = False,
 ) -> dict:
     mission: dict = {
         "version": "1.0",
@@ -41,8 +43,8 @@ def _executable_mission(
         },
         "permissions": {
             "read": True,
-            "create_files": True,
-            "modify_files": False,
+            "create_files": create_files,
+            "modify_files": modify_files,
             "delete_files": False,
             "run_commands": True,
             "stage_changes": False,
@@ -220,6 +222,83 @@ class TestPlatformPushApprovalForExecute(unittest.TestCase):
         result = validate_mission_for_execute(mission)
         self.assertFalse(result.ok)
         self.assertEqual(result.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
+
+    def test_execute_push_only_accepted_without_create_or_modify_files(
+        self,
+    ) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                create_files=False,
+                modify_files=False,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
+
+    def test_execute_push_only_with_automatic_policy_without_file_perms(
+        self,
+    ) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                allow_automatic_platform_push=True,
+                create_files=False,
+                modify_files=False,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
+
+    def test_execute_push_only_still_requires_platform_push_approval(
+        self,
+    ) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                create_files=False,
+                modify_files=False,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
+
+    def test_execute_without_file_perms_rejected_for_non_push_persistence(
+        self,
+    ) -> None:
+        for mode in ("none", "commit", None):
+            with self.subTest(mode=mode):
+                result = validate_mission_for_execute(
+                    _executable_mission(
+                        persistence_mode=mode,
+                        create_files=False,
+                        modify_files=False,
+                    )
+                )
+                self.assertFalse(result.ok)
+                self.assertIn("create_files or modify_files", result.error or "")
+
+    def test_execute_push_does_not_require_permissions_push(self) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                permissions_push=False,
+                create_files=False,
+                modify_files=False,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
+        # permissions.push=true remains forbidden for execute.
+        blocked = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                permissions_push=True,
+            )
+        )
+        self.assertFalse(blocked.ok)
+        self.assertIn("push", blocked.error or "")
+        self.assertIn("not allowed for execute", blocked.error or "")
 
 
 class TestValidateCli(unittest.TestCase):

@@ -21,7 +21,7 @@ Authorization: Bearer <MISSION_CONTROL_API_KEY>
 | Missing or invalid credentials | `401 Unauthorized` with `WWW-Authenticate: Bearer` |
 | Server key unset / empty | `503 Service Unavailable` |
 
-Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `GET /runs/{run_id}`.
+Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `GET /runs/{run_id}`, `POST /runs/{run_id}/wait`.
 
 Public endpoints (no API key): `GET /health`, `POST /validate`.
 
@@ -218,6 +218,57 @@ Return lifecycle status and retained output for a previously accepted run.
 
 **Response** `404 Not Found` only when the `run_id` was never accepted by this process. Completed and failed runs are retained and keep returning `200` with their terminal status and failure details.
 
+### POST /runs/{run_id}/wait
+
+Requires authentication.
+
+Bounded server-side wait for an asynchronous run. Polls the existing run lookup path (`GET /runs/{run_id}` / registry `get_run`) until the run reaches a terminal status or `timeout_seconds` elapses. Returns immediately when the run is already terminal. Does **not** mutate run state when the wait expires (a wait timeout is distinct from run status `timed_out`).
+
+This endpoint backs the MCP `wait_for_run` tool.
+
+**Intended HAL flow**
+
+1. `submit_run` (`POST /runs`) — queue the mission
+2. `wait_for_run` (`POST /runs/{run_id}/wait`) — block until terminal or wait budget exhausted
+3. Inspect `status`, `stdout` / `stderr` / `error`, and `commit_sha`
+
+**Request body** `application/json` (all fields optional; defaults shown)
+
+| Field | Type | Default | Bounds | Description |
+| --- | --- | --- | --- | --- |
+| `timeout_seconds` | number | `300` | `0.1` … `3600` | Maximum time to wait for a terminal status |
+| `poll_interval_seconds` | number | `1` | `0.05` … `60` | Delay between registry lookups while the run is non-terminal |
+
+Out-of-bounds values return `422 Unprocessable Entity`.
+
+**Response** `200 OK`
+
+Includes the same fields as `GET /runs/{run_id}`, plus:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `reached_terminal` | boolean | `true` when the run status is terminal (`completed`, `failed`, or `timed_out`) |
+| `wait_expired` | boolean | `true` when the wait budget elapsed while the run was still `queued` or `running` |
+
+| Outcome | `reached_terminal` | `wait_expired` | Run state mutated? |
+| --- | --- | --- | --- |
+| Already terminal / becomes terminal during wait | `true` | `false` | No (wait only observes) |
+| Wait budget exhausted while non-terminal | `false` | `true` | No |
+
+Terminal statuses are defined by a single helper (`is_terminal_status`) covering `completed`, `failed`, and `timed_out`.
+
+**Response** `404 Not Found` when the `run_id` is unknown.
+
+### MCP tools
+
+The Mission Control MCP connector exposes:
+
+| Tool | Purpose |
+| --- | --- |
+| `submit_run` | Submit mission YAML (`POST /runs`) |
+| `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
+| `wait_for_run` | Wait for terminal status (`POST /runs/{run_id}/wait`) with `run_id`, `timeout_seconds`, and `poll_interval_seconds` |
+
 ### Platform Git persistence
 
 After a successful agent execution in an isolated workspace, Mission Control applies the mission's top-level `persistence` block:
@@ -229,6 +280,10 @@ After a successful agent execution in an isolated workspace, Mission Control app
 | `push` | Stage, commit, and push to `repository.base_branch` (privileged; requires platform-push approval) |
 
 Agent `permissions.commit` and `permissions.push` remain agent permissions only. They do not select platform persistence behavior. Unsupported `persistence.mode` values fail mission validation.
+
+Push authorization is expressed through `persistence.mode=push` plus `approval.platform_push_approved=true` (or `approval.allow_automatic_platform_push=true`). There is no separate `permissions.push` platform gate; agent `permissions.push` must remain `false` for execute missions.
+
+Execute missions with `persistence.mode=push` and platform-push approval may be **push-only**: they are valid even when `create_files=false` and `modify_files=false`.
 
 #### Platform-push approval
 

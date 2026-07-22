@@ -19,13 +19,16 @@ INTERRUPTED_RUN_ERROR = "Run interrupted by service restart."
 
 _RUNS_TABLE = "runs"
 
-_TERMINAL_STATUSES = frozenset(
+TERMINAL_STATUSES = frozenset(
     {
         "completed",
         "failed",
         "timed_out",
     }
 )
+
+# Backward-compatible private alias for internal call sites.
+_TERMINAL_STATUSES = TERMINAL_STATUSES
 
 
 class RunStatus(str, Enum):
@@ -36,6 +39,13 @@ class RunStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
+
+
+def is_terminal_status(status: RunStatus | str) -> bool:
+    """Return True when ``status`` is a terminal run lifecycle status."""
+    if isinstance(status, RunStatus):
+        return status.value in TERMINAL_STATUSES
+    return str(status) in TERMINAL_STATUSES
 
 
 @dataclass

@@ -16,7 +16,9 @@ client = MissionControlClient(settings)
 mcp = FastMCP(
     "Mission Control",
     instructions=(
-        "Submit Mission Control YAML and retrieve asynchronous run status."
+        "Submit Mission Control YAML, retrieve asynchronous run status, "
+        "and wait for runs to reach a terminal state. Intended HAL flow: "
+        "submit_run, then wait_for_run, then inspect status/output/commit_sha."
     ),
     host="0.0.0.0",
     port=int(os.environ.get("PORT", "8001")),
@@ -59,6 +61,32 @@ async def get_run(run_id: str) -> dict[str, Any]:
             raise ValueError("run_id must not be empty")
 
         result = await client.get_run(run_id)
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def wait_for_run(
+    run_id: str,
+    timeout_seconds: float = 300.0,
+    poll_interval_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Wait until a run reaches a terminal status or the timeout expires.
+
+    Uses bounded server-side polling through GET /runs/{run_id}. Returns
+    immediately when the run is already terminal. Wait timeout does not
+    mutate run state. Response includes reached_terminal and wait_expired.
+    """
+    try:
+        if not run_id.strip():
+            raise ValueError("run_id must not be empty")
+
+        result = await client.wait_for_run(
+            run_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
         return {"ok": True, **result}
     except Exception as exc:
         return _tool_error(exc)

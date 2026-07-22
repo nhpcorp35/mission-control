@@ -5,7 +5,10 @@ from pathlib import Path
 
 import yaml
 
-from mission_control.workspace import require_platform_push_approval
+from mission_control.workspace import (
+    require_platform_push_approval,
+    resolve_persistence_mode,
+)
 
 SUPPORTED_VERSION = "1.0"
 
@@ -302,14 +305,19 @@ def validate_mission_for_execute(
     create_files = bool(permissions.get("create_files"))
     modify_files = bool(permissions.get("modify_files"))
 
+    # Push-only execute missions (persistence.mode=push) may omit both
+    # create_files and modify_files. Platform push authorization is enforced
+    # separately via approval.platform_push_approved (or the automatic
+    # platform-push policy). Agent permissions.push is never required.
     if not create_files and not modify_files:
-        return ValidationResult(
-            ok=False,
-            error=(
-                "Execute requires at least one of: "
-                "create_files or modify_files"
-            ),
-        )
+        if resolve_persistence_mode(data) != "push":
+            return ValidationResult(
+                ok=False,
+                error=(
+                    "Execute requires at least one of: "
+                    "create_files or modify_files"
+                ),
+            )
 
     for permission in EXECUTE_FALSE_PERMISSIONS:
         if permissions.get(permission):
