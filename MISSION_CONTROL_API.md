@@ -147,9 +147,56 @@ Preflight error codes:
 | `CURSOR_AGENT_UNAVAILABLE` | `cursor-agent` is not installed or not on `PATH` |
 | `CURSOR_API_KEY_MISSING` | `CURSOR_API_KEY` is unset or empty |
 
+### POST /runs
+
+Validate an execute-mode mission and accept it for asynchronous execution in an isolated workspace. Only one Cursor execution is active at a time; additional accepted runs wait in FIFO order. Poll `GET /runs/{run_id}` for lifecycle status.
+
+**Request body** `application/json`
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `mission_yaml` | string | yes | Full mission document as YAML text |
+
+**Response** `202 Accepted` when the run is queued
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `run_id` | string | Opaque run identifier |
+| `status` | string | Always `queued` on acceptance |
+
+Validation, eligibility, preflight, and recursive-submission failures return `200 OK` with a `RunResponse` body (`ok: false`) instead of queueing a run.
+
+Recursive local submissions (same-thread re-entrancy during an active execution, or an explicit recursive-submission header) are rejected. Cursor agent subprocesses also do not receive Mission Control API credentials, which prevents nested local `POST /runs` calls from authenticating.
+
+### GET /runs/{run_id}
+
+Return lifecycle status and retained output for a previously accepted run.
+
+**Response** `200 OK`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `run_id` | string | Run identifier |
+| `status` | string | `queued`, `running`, `completed`, `failed`, or `timed_out` |
+| `created_at` | string | ISO timestamp |
+| `started_at` | string or null | Set when execution begins |
+| `completed_at` | string or null | Set when the run reaches a terminal status |
+| `elapsed_seconds` | number or null | Duration from start to completion |
+| `stdout` | string | Agent stdout when available |
+| `stderr` | string | Agent stderr when available |
+| `error` | string or null | Failure detail when unsuccessful |
+| `return_code` | integer or null | Process exit code when available |
+| `commit_sha` | string or null | Pushed commit SHA after successful persistence |
+
+**Response** `404 Not Found` only when the `run_id` was never accepted by this process. Completed and failed runs are retained and keep returning `200` with their terminal status and failure details.
+
+### Run state persistence
+
+Asynchronous run records live in a process-local in-memory registry. They are not written to disk, Redis, or any shared store. Restarting the API process discards queued, running, completed, and failed run state. Clients must treat run history as ephemeral to the current process lifetime.
+
 ## Safety
 
-The API exposes only mission validation and read-only execution. It does not provide shell access, arbitrary filesystem operations, Git commands, or other command endpoints.
+The API exposes only mission validation and read-only / execute-mode mission execution. It does not provide shell access, arbitrary filesystem operations, Git commands, or other command endpoints. Nested Mission Control submissions from an active local execution are rejected.
 
 ## Local development
 

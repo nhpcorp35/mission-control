@@ -12,6 +12,14 @@ CURSOR_API_KEY_ENV = "CURSOR_API_KEY"
 CURSOR_LOCAL_BIN = Path.home() / ".local" / "bin"
 CURSOR_RUNTIME_BIN = Path("/app/.cursor-runtime")
 
+# Mission Control credentials that must not be forwarded into Cursor agents.
+# Stripping them prevents recursive local submissions from the subprocess.
+_MISSION_CONTROL_SUBMISSION_ENV = (
+    "MISSION_CONTROL_API_KEY",
+    "MISSION_CONTROL_URL",
+)
+RECURSIVE_SUBMISSIONS_ENV = "MISSION_CONTROL_RECURSIVE_SUBMISSIONS"
+
 ERROR_CURSOR_AGENT_UNAVAILABLE = "CURSOR_AGENT_UNAVAILABLE"
 ERROR_CURSOR_API_KEY_MISSING = "CURSOR_API_KEY_MISSING"
 
@@ -47,9 +55,16 @@ def augment_path(path: str | None = None) -> str:
 
 
 def cursor_cli_env() -> dict[str, str]:
-    """Return a copy of the process environment with Cursor CLI PATH applied."""
+    """Return a copy of the process environment with Cursor CLI PATH applied.
+
+    Mission Control submission credentials are removed so a Cursor agent cannot
+    authenticate recursive local ``POST /runs`` submissions back to this API.
+    """
     env = os.environ.copy()
     env["PATH"] = augment_path(env.get("PATH"))
+    for key in _MISSION_CONTROL_SUBMISSION_ENV:
+        env.pop(key, None)
+    env[RECURSIVE_SUBMISSIONS_ENV] = "blocked"
     return env
 
 

@@ -61,6 +61,10 @@ def _executable_mission_yaml() -> str:
 class TestRunsApi(unittest.TestCase):
     def setUp(self) -> None:
         api_module.run_registry = RunRegistry()
+        from mission_control.run_queue import RunQueue
+
+        api_module.run_queue = RunQueue()
+        api_module.run_queue.configure(api_module._execute_queued_run)
         self.client = TestClient(
             app,
             headers=AUTH_HEADERS,

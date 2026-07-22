@@ -38,6 +38,21 @@ class TestCursorCliEnv(unittest.TestCase):
             env = cursor_cli_env()
             self.assertTrue(env["PATH"].startswith(str(CURSOR_LOCAL_BIN)))
 
+    def test_env_strips_mission_control_submission_credentials(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin",
+                "MISSION_CONTROL_API_KEY": "secret",
+                "MISSION_CONTROL_URL": "http://127.0.0.1:8000",
+            },
+            clear=False,
+        ):
+            env = cursor_cli_env()
+        self.assertNotIn("MISSION_CONTROL_API_KEY", env)
+        self.assertNotIn("MISSION_CONTROL_URL", env)
+        self.assertEqual(env["MISSION_CONTROL_RECURSIVE_SUBMISSIONS"], "blocked")
+
 
 class TestApiKeyConfigured(unittest.TestCase):
     def test_missing_key(self) -> None:

@@ -3,8 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import logging
 import os
-import threading
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from app.auth import require_api_key
@@ -17,6 +16,12 @@ from mission_control.executor import (
     execute_cursor_agent,
     run_cursor_agent,
 )
+from mission_control.recursion import (
+    RECURSIVE_SUBMISSION_ERROR,
+    execution_scope,
+    is_recursive_submission,
+)
+from mission_control.run_queue import RunQueue
 from mission_control.run_registry import (
     RunRecord,
     RunRegistry,
@@ -30,6 +35,31 @@ from mission_control.validator import (
 )
 logger = logging.getLogger(__name__)
 run_registry = RunRegistry()
+run_queue = RunQueue()
+
+
+def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> None:
+    """Run one queued mission with lifecycle logging (no secrets)."""
+    logger.info("lifecycle run_id=%s event=started", run_id)
+    with execution_scope():
+        try:
+            execute_registered_run(run_id, mission, registry)
+        finally:
+            record = registry.get_run(run_id)
+            status = record.status.value if record is not None else "unknown"
+            error = record.error if record is not None else None
+            # Log failure presence without dumping full stderr/YAML secrets.
+            logger.info(
+                "lifecycle run_id=%s event=finished status=%s has_error=%s",
+                run_id,
+                status,
+                bool(error),
+            )
+
+
+run_queue.configure(_execute_queued_run)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     os.environ["PATH"] = augment_path()
@@ -76,12 +106,6 @@ class RunStatusResponse(BaseModel):
     error: str | None = None
     return_code: int | None = None
     commit_sha: str | None = None
-def _execute_run_worker(
-    run_id: str,
-    mission: dict,
-    registry: RunRegistry,
-) -> None:
-    execute_registered_run(run_id, mission, registry)
 def _run_status_response(record: RunRecord) -> RunStatusResponse:
     return RunStatusResponse(
         run_id=record.run_id,
@@ -208,16 +232,19 @@ def execute_mission_endpoint(
     summary="Submit asynchronous mission run",
     description=(
         "Validate an execute-mode mission and queue it for asynchronous "
-        "execution in an isolated workspace. Poll GET /runs/{run_id} for "
-        "status, output, and commit SHA."
+        "execution in an isolated workspace. Only one Cursor execution is "
+        "active at a time; additional runs wait in FIFO order. Poll "
+        "GET /runs/{run_id} for status, output, and commit SHA. Run records "
+        "are retained in process memory for the lifetime of the server "
+        "process (including completed and failed runs)."
     ),
     response_model=RunAcceptedResponse,
     responses={
         200: {
             "model": RunResponse,
             "description": (
-                "Structural validation, execute eligibility, or Cursor CLI "
-                "preflight failure."
+                "Structural validation, execute eligibility, Cursor CLI "
+                "preflight failure, or recursive submission rejection."
             ),
         },
         202: {
@@ -228,8 +255,25 @@ def execute_mission_endpoint(
 )
 def submit_run_endpoint(
     request: MissionYamlRequest,
+    raw_request: Request,
     _auth: None = Depends(require_api_key),
 ) -> RunAcceptedResponse:
+    if is_recursive_submission(dict(raw_request.headers)):
+        logger.info(
+            "lifecycle event=recursive_submission_rejected"
+        )
+        return JSONResponse(
+            status_code=200,
+            content=RunResponse(
+                ok=False,
+                error=RECURSIVE_SUBMISSION_ERROR,
+                error_detail=ErrorDetail(
+                    code="RECURSIVE_SUBMISSION",
+                    message=RECURSIVE_SUBMISSION_ERROR,
+                    stage="submit",
+                ),
+            ).model_dump(),
+        )
     structural_result, mission = load_mission_yaml(
         request.mission_yaml
     )
@@ -264,18 +308,13 @@ def submit_run_endpoint(
         )
     record = run_registry.create_run()
     logger.info(
-        "POST /runs pid=%s registry=%s run_id=%s keys=%s",
-        os.getpid(),
-        id(run_registry),
+        "lifecycle run_id=%s event=accepted status=%s pending=%s active=%s",
         record.run_id,
-        list(run_registry._runs.keys()),
+        RunStatus.QUEUED.value,
+        run_queue.pending_count(),
+        run_queue.active_run_id,
     )
-    thread = threading.Thread(
-        target=_execute_run_worker,
-        args=(record.run_id, mission, run_registry),
-        daemon=True,
-    )
-    thread.start()
+    run_queue.enqueue(record.run_id, mission, run_registry)
     return RunAcceptedResponse(
         run_id=record.run_id,
         status=RunStatus.QUEUED.value,
@@ -287,24 +326,28 @@ def submit_run_endpoint(
     summary="Get asynchronous run status",
     description=(
         "Return the lifecycle status, execution output, error, and commit "
-        "SHA for a run previously submitted via POST /runs."
+        "SHA for a run previously submitted via POST /runs. Completed and "
+        "failed runs remain available until the process restarts. Run state "
+        "is process-local in-memory only and is not durable."
     ),
 )
 def get_run_endpoint(
     run_id: str,
     _auth: None = Depends(require_api_key),
 ) -> RunStatusResponse:
-    logger.info(
-        "GET /runs pid=%s registry=%s run_id=%s keys=%s",
-        os.getpid(),
-        id(run_registry),
-        run_id,
-        list(run_registry._runs.keys()),
-    )
     record = run_registry.get_run(run_id)
     if record is None:
+        logger.info(
+            "lifecycle run_id=%s event=lookup_miss",
+            run_id,
+        )
         raise HTTPException(
             status_code=404,
             detail="Run not found",
         )
+    logger.info(
+        "lifecycle run_id=%s event=lookup status=%s",
+        run_id,
+        record.status.value,
+    )
     return _run_status_response(record)
