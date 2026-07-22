@@ -169,6 +169,7 @@ Preflight error codes:
 | --- | --- |
 | `CURSOR_AGENT_UNAVAILABLE` | `cursor-agent` is not installed or not on `PATH` |
 | `CURSOR_API_KEY_MISSING` | `CURSOR_API_KEY` is unset or empty |
+| `PYTHON_UNAVAILABLE` | Python 3 interpreter is not installed or not on `PATH` |
 
 ### POST /runs
 
@@ -261,7 +262,17 @@ python -m unittest discover -s tests -v
 
 ## Railway deployment
 
-Mission Control is configured for Railway using Nixpacks. The build installs Cursor CLI with the official installer, and the start script ensures `~/.local/bin` is on `PATH` before Uvicorn starts.
+Mission Control is configured for Railway using Nixpacks. The runner image includes a Python 3 interpreter (via the Nixpacks Python provider and the `python3` apt package) so verification missions can run Python tests. The build also installs Cursor CLI with the official installer, and the start script puts `/app/.venv/bin`, `/app/.cursor-runtime`, and `~/.local/bin` on `PATH` before the service starts.
+
+### Expected runtime
+
+| Component | Location / requirement |
+| --- | --- |
+| Python 3 | `python3` on `PATH` (system package and/or `/app/.venv/bin/python3`) |
+| Cursor CLI | `cursor-agent` on `PATH` (`/app/.cursor-runtime` or `~/.local/bin`) |
+| App dependencies | Installed into `/app/.venv` from `requirements.txt` |
+
+Execution preflight fails with `PYTHON_UNAVAILABLE` when no Python 3 interpreter can be resolved before a mission runs.
 
 ### Required environment variables
 
@@ -277,7 +288,7 @@ Set `MISSION_CONTROL_API_KEY` and `CURSOR_API_KEY` in the Railway service **Vari
 
 Railway reads:
 
-- `nixpacks.toml` — installs `curl`, then runs `scripts/install-cursor-agent.sh`
+- `nixpacks.toml` — enables the Python provider, installs `curl` and `python3`, then runs `scripts/install-cursor-agent.sh`
 - `railway.json` — starts the API with `scripts/railway-start.sh`
 
 The install script runs:
@@ -286,7 +297,7 @@ The install script runs:
 curl -fsS https://cursor.com/install | bash
 ```
 
-The start script exports `PATH="$HOME/.local/bin:$PATH"` and launches Uvicorn.
+The start script exports `PATH="/app/.venv/bin:/app/.cursor-runtime:$HOME/.local/bin:$PATH"` and launches Uvicorn (or the MCP server).
 
 ### Startup logging
 

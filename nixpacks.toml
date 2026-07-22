@@ -1,5 +1,7 @@
+providers = ["python"]
+
 [phases.setup]
-aptPkgs = ["curl"]
+aptPkgs = ["curl", "python3"]
 
 [phases.build]
 cmds = ["bash scripts/install-cursor-agent.sh"]

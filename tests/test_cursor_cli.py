@@ -7,12 +7,14 @@ from unittest.mock import patch
 from app.cursor_cli import (
     ERROR_CURSOR_AGENT_UNAVAILABLE,
     ERROR_CURSOR_API_KEY_MISSING,
+    ERROR_PYTHON_UNAVAILABLE,
     CURSOR_API_KEY_ENV,
     CURSOR_LOCAL_BIN,
     augment_path,
     check_cursor_cli_status,
     cursor_cli_env,
     find_cursor_agent_binary,
+    find_python_interpreter,
     is_api_key_configured,
     preflight_for_execution,
 )
@@ -81,6 +83,27 @@ class TestFindCursorAgentBinary(unittest.TestCase):
         self.assertIsNone(find_cursor_agent_binary())
 
 
+class TestFindPythonInterpreter(unittest.TestCase):
+    @patch("app.cursor_cli.shutil.which")
+    def test_returns_python3_when_found(self, mock_which) -> None:
+        mock_which.side_effect = lambda cmd, path=None: (
+            "/app/.venv/bin/python3" if cmd == "python3" else None
+        )
+        self.assertEqual(find_python_interpreter(), "/app/.venv/bin/python3")
+
+    @patch("app.cursor_cli.shutil.which")
+    def test_falls_back_to_python(self, mock_which) -> None:
+        mock_which.side_effect = lambda cmd, path=None: (
+            "/usr/bin/python" if cmd == "python" else None
+        )
+        self.assertEqual(find_python_interpreter(), "/usr/bin/python")
+
+    @patch("app.cursor_cli.shutil.which")
+    def test_returns_none_when_missing(self, mock_which) -> None:
+        mock_which.return_value = None
+        self.assertIsNone(find_python_interpreter())
+
+
 class TestCheckCursorCliStatus(unittest.TestCase):
     @patch("app.cursor_cli.find_cursor_agent_binary")
     @patch("app.cursor_cli.is_api_key_configured")
@@ -123,11 +146,27 @@ class TestPreflightForExecution(unittest.TestCase):
         self.assertEqual(error.code, ERROR_CURSOR_API_KEY_MISSING)
         self.assertIn(CURSOR_API_KEY_ENV, error.message)
 
+    @patch("app.cursor_cli.find_python_interpreter")
     @patch("app.cursor_cli.is_api_key_configured")
     @patch("app.cursor_cli.find_cursor_agent_binary")
-    def test_passes_when_ready(self, mock_binary, mock_key) -> None:
+    def test_python_unavailable(self, mock_binary, mock_key, mock_python) -> None:
         mock_binary.return_value = "/tmp/cursor-agent"
         mock_key.return_value = True
+        mock_python.return_value = None
+        error = preflight_for_execution()
+        self.assertIsNotNone(error)
+        assert error is not None
+        self.assertEqual(error.code, ERROR_PYTHON_UNAVAILABLE)
+        self.assertEqual(error.stage, "preflight")
+        self.assertIn("Python 3", error.message)
+
+    @patch("app.cursor_cli.find_python_interpreter")
+    @patch("app.cursor_cli.is_api_key_configured")
+    @patch("app.cursor_cli.find_cursor_agent_binary")
+    def test_passes_when_ready(self, mock_binary, mock_key, mock_python) -> None:
+        mock_binary.return_value = "/tmp/cursor-agent"
+        mock_key.return_value = True
+        mock_python.return_value = "/app/.venv/bin/python3"
         self.assertIsNone(preflight_for_execution())
 
 

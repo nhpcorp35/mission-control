@@ -11,6 +11,8 @@ CURSOR_AGENT = "cursor-agent"
 CURSOR_API_KEY_ENV = "CURSOR_API_KEY"
 CURSOR_LOCAL_BIN = Path.home() / ".local" / "bin"
 CURSOR_RUNTIME_BIN = Path("/app/.cursor-runtime")
+VENV_BIN = Path("/app/.venv/bin")
+PYTHON_INTERPRETER = "python3"
 
 # Mission Control credentials that must not be forwarded into Cursor agents.
 # Stripping them prevents recursive local submissions from the subprocess.
@@ -22,6 +24,7 @@ RECURSIVE_SUBMISSIONS_ENV = "MISSION_CONTROL_RECURSIVE_SUBMISSIONS"
 
 ERROR_CURSOR_AGENT_UNAVAILABLE = "CURSOR_AGENT_UNAVAILABLE"
 ERROR_CURSOR_API_KEY_MISSING = "CURSOR_API_KEY_MISSING"
+ERROR_PYTHON_UNAVAILABLE = "PYTHON_UNAVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,20 @@ def find_cursor_agent_binary() -> str | None:
     return shutil.which(CURSOR_AGENT, path=search_path)
 
 
+def find_python_interpreter() -> str | None:
+    """Resolve a Python 3 interpreter from the runner venv or PATH."""
+    search_path = cursor_cli_env()["PATH"]
+    venv_bin = str(VENV_BIN)
+
+    if venv_bin not in search_path.split(os.pathsep):
+        search_path = os.pathsep.join([venv_bin, search_path])
+
+    found = shutil.which(PYTHON_INTERPRETER, path=search_path)
+    if found is not None:
+        return found
+    return shutil.which("python", path=search_path)
+
+
 def is_api_key_configured() -> bool:
     """Return True when CURSOR_API_KEY is set to a non-empty value."""
     return bool(os.environ.get(CURSOR_API_KEY_ENV, "").strip())
@@ -97,7 +114,7 @@ def check_cursor_cli_status() -> CursorCliStatus:
 
 
 def preflight_for_execution() -> StructuredError | None:
-    """Return a structured preflight error when Cursor CLI cannot run."""
+    """Return a structured preflight error when execution cannot proceed."""
     if not find_cursor_agent_binary():
         return StructuredError(
             code=ERROR_CURSOR_AGENT_UNAVAILABLE,
@@ -116,6 +133,17 @@ def preflight_for_execution() -> StructuredError | None:
                 f"{CURSOR_API_KEY_ENV} environment variable is not set. "
                 "Create a key at https://cursor.com/dashboard/api and configure "
                 "it as a Railway service variable."
+            ),
+            stage="preflight",
+        )
+
+    if not find_python_interpreter():
+        return StructuredError(
+            code=ERROR_PYTHON_UNAVAILABLE,
+            message=(
+                "Python 3 interpreter is not installed or not on PATH. "
+                "Ensure the runner image installs python3 (nixpacks.toml "
+                f"aptPkgs) and that {VENV_BIN} is on PATH at runtime."
             ),
             stage="preflight",
         )
