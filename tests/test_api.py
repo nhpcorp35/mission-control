@@ -324,6 +324,63 @@ class TestAuthentication(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["ok"])
 
+    def test_runs_rejects_missing_token(self) -> None:
+        response = self.client.post(
+            "/runs",
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Missing bearer token",
+        )
+
+    def test_runs_rejects_invalid_token(self) -> None:
+        response = self.client.post(
+            "/runs",
+            headers={
+                "Authorization": "Bearer wrong-key",
+            },
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid bearer token",
+        )
+
+    def test_get_run_rejects_missing_token(self) -> None:
+        response = self.client.get("/runs/some-id")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_get_run_rejects_invalid_token(self) -> None:
+        response = self.client.get(
+            "/runs/some-id",
+            headers={
+                "Authorization": "Bearer wrong-key",
+            },
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid bearer token",
+        )
+
+    def test_correct_token_reaches_runs_endpoint(self) -> None:
+        response = self.client.post(
+            "/runs",
+            headers=AUTH_HEADERS,
+            json={"mission_yaml": "version: 1.0"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+        self.assertNotIn(TEST_API_KEY, response.text)
+
     def test_missing_server_configuration_returns_503(self) -> None:
         with patch.dict(
             os.environ,

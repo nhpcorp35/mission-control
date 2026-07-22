@@ -6,11 +6,32 @@ Minimal cloud HTTP wrapper around the Mission Control validator and read-only ex
 
 The service listens on the host and port configured at deploy time. On Railway, the public URL is assigned by the platform.
 
+## Authentication
+
+Protected endpoints require a Mission Control API key as an HTTP Bearer token:
+
+```http
+Authorization: Bearer <MISSION_CONTROL_API_KEY>
+```
+
+| Item | Value |
+| --- | --- |
+| Environment variable | `MISSION_CONTROL_API_KEY` |
+| Header | `Authorization: Bearer <key>` |
+| Missing or invalid credentials | `401 Unauthorized` with `WWW-Authenticate: Bearer` |
+| Server key unset / empty | `503 Service Unavailable` |
+
+Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `GET /runs/{run_id}`.
+
+Public endpoints (no API key): `GET /health`, `POST /validate`.
+
+Do not log, print, or return the API key value. The MCP connector reads the same `MISSION_CONTROL_API_KEY` and sends it on Mission Control API requests.
+
 ## Endpoints
 
 ### GET /health
 
-Liveness check.
+Liveness check. No authentication required (Railway health checks).
 
 **Response** `200 OK`
 
@@ -64,6 +85,8 @@ Validate mission YAML against Mission Specification v1.0. This performs structur
 ```
 
 ### POST /run
+
+Requires authentication.
 
 Validate a mission, confirm it is eligible for Phase 2 read-only execution, then invoke the existing Cursor Agent executor.
 
@@ -149,6 +172,8 @@ Preflight error codes:
 
 ### POST /runs
 
+Requires authentication.
+
 Validate an execute-mode mission and accept it for asynchronous execution in an isolated workspace. Only one Cursor execution is active at a time; additional accepted runs wait in FIFO order. Poll `GET /runs/{run_id}` for lifecycle status.
 
 **Request body** `application/json`
@@ -169,6 +194,8 @@ Validation, eligibility, preflight, and recursive-submission failures return `20
 Recursive local submissions (same-thread re-entrancy during an active execution, or an explicit recursive-submission header) are rejected. Cursor agent subprocesses also do not receive Mission Control API credentials, which prevents nested local `POST /runs` calls from authenticating.
 
 ### GET /runs/{run_id}
+
+Requires authentication.
 
 Return lifecycle status and retained output for a previously accepted run.
 
@@ -209,9 +236,11 @@ pip install -r requirements.txt
 Run the server:
 
 ```bash
+export MISSION_CONTROL_API_KEY="local-dev-key"
 uvicorn app.api:app --reload
 ```
 
+Protected routes require `Authorization: Bearer $MISSION_CONTROL_API_KEY`.
 Run tests:
 
 ```bash
@@ -226,10 +255,11 @@ Mission Control is configured for Railway using Nixpacks. The build installs Cur
 
 | Variable | Required | Description |
 | --- | --- | --- |
+| `MISSION_CONTROL_API_KEY` | yes | Shared secret for Mission Control HTTP API authentication (`Authorization: Bearer …`). Required by the API and by the MCP connector. Do not commit this value. |
 | `CURSOR_API_KEY` | yes | Cursor user API key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api). Used by `cursor-agent` at runtime. Do not commit this value. |
 | `PORT` | yes | Provided automatically by Railway. |
 
-Set `CURSOR_API_KEY` in the Railway service **Variables** tab. Use a secret/reference variable, not a hardcoded value in the repo.
+Set `MISSION_CONTROL_API_KEY` and `CURSOR_API_KEY` in the Railway service **Variables** tab. Use secret/reference variables, not hardcoded values in the repo.
 
 ### Build and start commands
 
@@ -262,6 +292,7 @@ Use the Railway reference mission, which points at the deployed repo root:
 
 ```bash
 curl -sS -X POST "$RAILWAY_PUBLIC_URL/run" \
+  -H "Authorization: Bearer $MISSION_CONTROL_API_KEY" \
   -H "Content-Type: application/json" \
   --data-binary @- <<EOF
 {
@@ -270,7 +301,7 @@ curl -sS -X POST "$RAILWAY_PUBLIC_URL/run" \
 EOF
 ```
 
-Or POST the contents of `missions/reference/valid-v1.0-railway.yaml` from your local machine against the deployed `/run` endpoint.
+Or POST the contents of `missions/reference/valid-v1.0-railway.yaml` from your local machine against the deployed `/run` endpoint, including the same `Authorization: Bearer` header.
 
 ### Local development with Cursor CLI
 

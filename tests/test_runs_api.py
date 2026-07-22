@@ -432,9 +432,56 @@ class TestRunsApi(unittest.TestCase):
             json={"mission_yaml": _executable_mission_yaml()},
         )
         self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Missing bearer token",
+        )
+        self.assertNotIn(TEST_API_KEY, response.text)
+
+    def test_post_runs_rejects_invalid_auth(self) -> None:
+        client = TestClient(app)
+        response = client.post(
+            "/runs",
+            headers={"Authorization": "Bearer wrong-key"},
+            json={"mission_yaml": _executable_mission_yaml()},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid bearer token",
+        )
+        self.assertNotIn(TEST_API_KEY, response.text)
+
     def test_get_run_requires_auth(self) -> None:
         client = TestClient(app)
         response = client.get("/runs/some-id")
         self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Missing bearer token",
+        )
+
+    def test_get_run_rejects_invalid_auth(self) -> None:
+        client = TestClient(app)
+        response = client.get(
+            "/runs/some-id",
+            headers={"Authorization": "Bearer wrong-key"},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid bearer token",
+        )
+
+    def test_post_runs_accepts_valid_auth(self) -> None:
+        # Valid credentials reach the handler (structural failure, not 401).
+        response = self.client.post(
+            "/runs",
+            json={"mission_yaml": "version: 1.0"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+        self.assertNotIn(TEST_API_KEY, response.text)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
 if __name__ == "__main__":
     unittest.main()
