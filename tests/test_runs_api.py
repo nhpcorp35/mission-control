@@ -1,6 +1,7 @@
 """Focused tests for asynchronous POST /runs and GET /runs/{run_id}."""
 from __future__ import annotations
 import os
+import tempfile
 import textwrap
 import time
 import unittest
@@ -60,7 +61,9 @@ def _executable_mission_yaml() -> str:
     )
 class TestRunsApi(unittest.TestCase):
     def setUp(self) -> None:
-        api_module.run_registry = RunRegistry()
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        api_module.run_registry = RunRegistry(self._db_path, recover=False)
         from mission_control.run_queue import RunQueue
 
         api_module.run_queue = RunQueue()
@@ -69,6 +72,10 @@ class TestRunsApi(unittest.TestCase):
             app,
             headers=AUTH_HEADERS,
         )
+
+    def tearDown(self) -> None:
+        api_module.run_registry.close()
+        os.unlink(self._db_path)
     def _wait_for_terminal(self, run_id: str, timeout: float = 2.0) -> dict:
         deadline = time.time() + timeout
         body: dict | None = None
@@ -150,7 +157,7 @@ class TestRunsApi(unittest.TestCase):
         self.assertEqual(body["return_code"], 0)
         self.assertIsNotNone(body["started_at"])
         self.assertIsNotNone(body["completed_at"])
-        self.assertIn(run_id, api_module.run_registry._runs)
+        self.assertIsNotNone(api_module.run_registry.get_run(run_id))
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
@@ -189,7 +196,7 @@ class TestRunsApi(unittest.TestCase):
         self.assertEqual(body["return_code"], 1)
         self.assertIsNotNone(body["completed_at"])
         mock_persist.assert_not_called()
-        self.assertIn(run_id, api_module.run_registry._runs)
+        self.assertIsNotNone(api_module.run_registry.get_run(run_id))
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
@@ -281,8 +288,8 @@ class TestRunsApi(unittest.TestCase):
             self.assertEqual(body["commit_sha"], "abc123")
             self.assertEqual(body["completed_at"], first["completed_at"])
 
-        self.assertEqual(len(api_module.run_registry._runs), 1)
-        self.assertIn(run_id, api_module.run_registry._runs)
+        self.assertEqual(api_module.run_registry.count_runs(), 1)
+        self.assertIsNotNone(api_module.run_registry.get_run(run_id))
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
@@ -390,7 +397,7 @@ class TestRunsApi(unittest.TestCase):
         body = response.json()
         self.assertFalse(body["ok"])
         self.assertIn("Unsupported version", body["error"])
-        self.assertEqual(len(api_module.run_registry._runs), 0)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
     @patch("app.api.preflight_for_execution")
     def test_post_runs_rejects_preflight_failure(
         self,
@@ -413,7 +420,7 @@ class TestRunsApi(unittest.TestCase):
             body["error_detail"]["code"],
             "CURSOR_API_KEY_MISSING",
         )
-        self.assertEqual(len(api_module.run_registry._runs), 0)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
     def test_get_unknown_run_returns_404(self) -> None:
         response = self.client.get("/runs/missing-run-id")
         self.assertEqual(response.status_code, 404)

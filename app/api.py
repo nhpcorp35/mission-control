@@ -101,6 +101,12 @@ async def lifespan(_: FastAPI):
         status.authenticated,
         status.binary_path or "not found",
     )
+    recovered = run_registry.recover_interrupted_runs()
+    if recovered:
+        logger.info(
+            "Marked %s interrupted run(s) failed on startup",
+            recovered,
+        )
     yield
 app = FastAPI(
     title="Mission Control API",
@@ -266,8 +272,7 @@ def execute_mission_endpoint(
         "execution in an isolated workspace. Only one Cursor execution is "
         "active at a time; additional runs wait in FIFO order. Poll "
         "GET /runs/{run_id} for status, output, and commit SHA. Run records "
-        "are retained in process memory for the lifetime of the server "
-        "process (including completed and failed runs)."
+        "are persisted in SQLite and survive process restarts."
     ),
     response_model=RunAcceptedResponse,
     responses={
@@ -367,8 +372,7 @@ def submit_run_endpoint(
     description=(
         "Return the lifecycle status, execution output, error, and commit "
         "SHA for a run previously submitted via POST /runs. Completed and "
-        "failed runs remain available until the process restarts. Run state "
-        "is process-local in-memory only and is not durable."
+        "failed runs remain available in the SQLite-backed run registry."
     ),
 )
 def get_run_endpoint(

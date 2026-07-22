@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import textwrap
 import time
 import unittest
@@ -174,10 +175,16 @@ class TestExecutorSubprocessLifecycleLogs(unittest.TestCase):
 
 class TestAsyncRunLifecycleInstrumentation(unittest.TestCase):
     def setUp(self) -> None:
-        api_module.run_registry = RunRegistry()
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        api_module.run_registry = RunRegistry(self._db_path, recover=False)
         api_module.run_queue = RunQueue()
         api_module.run_queue.configure(api_module._execute_queued_run)
         self.client = TestClient(app, headers=AUTH_HEADERS)
+
+    def tearDown(self) -> None:
+        api_module.run_registry.close()
+        os.unlink(self._db_path)
 
     def _wait_for_terminal(self, run_id: str, timeout: float = 3.0) -> dict:
         deadline = time.time() + timeout

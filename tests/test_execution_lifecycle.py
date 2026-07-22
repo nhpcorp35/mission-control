@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import threading
 import textwrap
 import time
@@ -119,10 +120,16 @@ class TestRunQueueUnit(unittest.TestCase):
 
 class TestRunsLifecycleApi(unittest.TestCase):
     def setUp(self) -> None:
-        api_module.run_registry = RunRegistry()
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        api_module.run_registry = RunRegistry(self._db_path, recover=False)
         api_module.run_queue = RunQueue()
         api_module.run_queue.configure(api_module._execute_queued_run)
         self.client = TestClient(app, headers=AUTH_HEADERS)
+
+    def tearDown(self) -> None:
+        api_module.run_registry.close()
+        os.unlink(self._db_path)
 
     def _wait_for_terminal(self, run_id: str, timeout: float = 3.0) -> dict:
         deadline = time.time() + timeout
@@ -320,8 +327,8 @@ class TestRunsLifecycleApi(unittest.TestCase):
             self.assertEqual(fail_response.json()["error"], "boom")
             self.assertEqual(fail_response.json()["return_code"], 9)
 
-        self.assertIn(completed, api_module.run_registry._runs)
-        self.assertIn(failed, api_module.run_registry._runs)
+        self.assertIsNotNone(api_module.run_registry.get_run(completed))
+        self.assertIsNotNone(api_module.run_registry.get_run(failed))
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
@@ -412,7 +419,7 @@ class TestRunsLifecycleApi(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"], RECURSIVE_SUBMISSION_ERROR)
         self.assertEqual(payload["error_detail"]["code"], "RECURSIVE_SUBMISSION")
-        self.assertEqual(len(api_module.run_registry._runs), 0)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
 
     def test_recursion_guard_blocks_explicit_header(self) -> None:
         response = self.client.post(
@@ -424,7 +431,7 @@ class TestRunsLifecycleApi(unittest.TestCase):
         body = response.json()
         self.assertFalse(body["ok"])
         self.assertIn("Recursive", body["error"])
-        self.assertEqual(len(api_module.run_registry._runs), 0)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
 
     def test_cursor_env_strips_mission_control_credentials(self) -> None:
         with patch.dict(

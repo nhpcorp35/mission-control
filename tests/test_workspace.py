@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import os
+
 from mission_control.executor import ExecutionResult
 from mission_control.run_registry import RunRegistry, RunStatus
 from mission_control.workspace import (
@@ -73,6 +75,13 @@ class GitRepoFixture:
         )
         _run_git(["-C", str(self.source_repo), "push", "-u", "origin", self.base_branch])
 
+        self._previous_repo_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL")
+        self._previous_git_name = os.environ.get("MISSION_CONTROL_GIT_NAME")
+        self._previous_git_email = os.environ.get("MISSION_CONTROL_GIT_EMAIL")
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = str(self.bare_remote)
+        os.environ["MISSION_CONTROL_GIT_NAME"] = "Test User"
+        os.environ["MISSION_CONTROL_GIT_EMAIL"] = "test@example.com"
+
     def mission(self) -> dict:
         return {
             "mission_id": "2026-07-19-workspace",
@@ -84,6 +93,21 @@ class GitRepoFixture:
         }
 
     def cleanup(self) -> None:
+        if self._previous_repo_url is None:
+            os.environ.pop("MISSION_CONTROL_REPOSITORY_URL", None)
+        else:
+            os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._previous_repo_url
+
+        if self._previous_git_name is None:
+            os.environ.pop("MISSION_CONTROL_GIT_NAME", None)
+        else:
+            os.environ["MISSION_CONTROL_GIT_NAME"] = self._previous_git_name
+
+        if self._previous_git_email is None:
+            os.environ.pop("MISSION_CONTROL_GIT_EMAIL", None)
+        else:
+            os.environ["MISSION_CONTROL_GIT_EMAIL"] = self._previous_git_email
+
         self.temp.cleanup()
 
 
@@ -135,19 +159,13 @@ class TestWorkspacePreparation(unittest.TestCase):
             cleanup_workspace(prep.workspace_path)
 
     def test_prepare_isolated_workspace_fails_when_origin_missing(self) -> None:
-        repo = Path(self.fixture.temp.name) / "missing-origin"
-        repo.mkdir()
-        _run_git(["init", str(repo)])
-        mission = {
-            "repository": {
-                "path": str(repo),
-                "base_branch": "main",
-            }
-        }
-
-        prep = prepare_isolated_workspace(mission)
+        with patch.dict(os.environ, {"MISSION_CONTROL_REPOSITORY_URL": ""}, clear=False):
+            prep = prepare_isolated_workspace(self.fixture.mission())
         self.assertFalse(prep.ok)
-        self.assertIn("origin", (prep.error or "").lower())
+        self.assertIn(
+            "mission_control_repository_url",
+            (prep.error or "").lower(),
+        )
 
 
 class TestWorkspacePersistence(unittest.TestCase):
@@ -179,34 +197,20 @@ class TestWorkspacePersistence(unittest.TestCase):
     def test_persist_workspace_changes_commits_and_pushes(self) -> None:
         workspace_path = self._prepare_workspace()
         try:
-            _run_git(
-                [
-                    "-C",
-                    workspace_path,
-                    "config",
-                    "user.email",
-                    "test@example.com",
-                ]
-            )
-            _run_git(
-                [
-                    "-C",
-                    workspace_path,
-                    "config",
-                    "user.name",
-                    "Test User",
-                ]
-            )
             (Path(workspace_path) / "created.txt").write_text(
                 "mission output\n",
                 encoding="utf-8",
             )
 
-            result = persist_workspace_changes(
-                "run-with-change",
-                self.fixture.mission(),
-                workspace_path,
-            )
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "run-with-change",
+                    self.fixture.mission(),
+                    workspace_path,
+                )
             self.assertTrue(result.ok, result.error)
             self.assertIsNotNone(result.commit_sha)
 
@@ -302,10 +306,14 @@ class TestWorkspacePersistence(unittest.TestCase):
 class TestExecuteRegisteredRun(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = GitRepoFixture()
-        self.registry = RunRegistry()
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        self.registry = RunRegistry(self._db_path, recover=False)
 
     def tearDown(self) -> None:
         self.fixture.cleanup()
+        self.registry.close()
+        os.unlink(self._db_path)
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
@@ -404,7 +412,7 @@ class TestExecuteRegisteredRun(unittest.TestCase):
     ) -> None:
         mock_prepare.return_value = WorkspacePrepResult(
             ok=False,
-            error="Repository origin remote is not configured",
+            error="MISSION_CONTROL_REPOSITORY_URL is not configured.",
         )
 
         record = self.registry.create_run()
@@ -413,7 +421,7 @@ class TestExecuteRegisteredRun(unittest.TestCase):
         updated = self.registry.get_run(record.run_id)
         assert updated is not None
         self.assertEqual(updated.status, RunStatus.FAILED)
-        self.assertIn("origin", (updated.error or "").lower())
+        self.assertIn("repository_url", (updated.error or "").lower())
         mock_cleanup.assert_not_called()
 
     @patch("mission_control.workspace._safe_cleanup")
@@ -423,19 +431,13 @@ class TestExecuteRegisteredRun(unittest.TestCase):
         mock_run_git,
         mock_safe_cleanup,
     ) -> None:
-        origin = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=str(self.fixture.bare_remote),
-            stderr="",
-        )
         clone = subprocess.CompletedProcess(
             args=[],
             returncode=1,
             stdout="",
             stderr="clone failed",
         )
-        mock_run_git.side_effect = [origin, clone]
+        mock_run_git.return_value = clone
 
         prep = prepare_isolated_workspace(self.fixture.mission())
         self.assertFalse(prep.ok)
