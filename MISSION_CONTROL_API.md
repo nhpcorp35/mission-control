@@ -231,7 +231,7 @@ HTTP clients may use this endpoint for a server-side wait. The MCP
 **Intended HAL flow**
 
 1. `submit_run` (`POST /runs`) — queue the mission
-2. `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — block until terminal or wait budget exhausted
+2. `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — poll until terminal or wait budget exhausted; for MCP, repeat short waits when `wait_expired` is true
 3. Inspect `status`, `stdout` / `stderr` / `error`, and `commit_sha`
 
 **Request body** `application/json` (all fields optional; defaults shown)
@@ -269,7 +269,7 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | --- | --- |
 | `submit_run` | Submit mission YAML (`POST /runs`) |
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
-| `wait_for_run` | Block until the run reaches a terminal status by polling `get_run` |
+| `wait_for_run` | Short ChatGPT-safe poll of `get_run` until terminal or wait window expires; call repeatedly until terminal |
 
 #### ChatGPT custom MCP app
 
@@ -296,25 +296,43 @@ bash scripts/railway-start.sh
 
 #### `wait_for_run`
 
+ChatGPT's MCP tool-call runtime cannot safely hold a single tool call for
+long durations (a live wait that spanned ~35s failed at the transport layer
+with no usable payload). The MCP tool therefore uses a **short default wait
+window** and expects HAL to **call `wait_for_run` repeatedly without user
+prompting** until the run is terminal.
+
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `run_id` | string | yes | — | Run identifier returned by `submit_run` |
-| `timeout_seconds` | number | no | `900` | Maximum time to wait; must be positive |
-| `poll_interval_seconds` | number | no | `2` | Delay between `get_run` polls; must be positive |
+| `timeout_seconds` | number | no | `20` | Maximum time to wait for this call; must be `>= 0.1`. Values above `25` are capped to `25` (ChatGPT-safe). Zero/negative values are rejected. |
+| `poll_interval_seconds` | number | no | `2` | Delay between `get_run` polls; must be `>= 0.05`. Values above `10` are capped to `10`. Zero/negative values are rejected. |
+
+**Intended HAL loop.** `submit_run` → repeat `wait_for_run` until
+`wait_expired` is `false` and `status` is terminal → inspect
+`stdout` / `stderr` / `error` / `commit_sha`.
 
 **Terminal behavior.** Reuses Mission Control terminal statuses (`completed`,
 `failed`, `timed_out`) via `is_terminal_status`. Returns immediately when the
-run is already terminal. On success, the tool returns `{"ok": true, ...}` with
-the same run fields as `get_run` (no extra wait-only fields).
+run is already terminal. Payload shape: `{"ok": true, ...}` with the same run
+fields as `get_run`, plus `wait_expired: false`, `reached_terminal: true`, and
+`timeout_seconds` (effective value after any cap).
 
-**Timeout behavior.** Uses a monotonic clock and sleeps between polls (no
-busy-wait). Zero or negative `timeout_seconds` / `poll_interval_seconds` are
-rejected with a validation error. When the wait budget expires while the run is
-still non-terminal, the tool returns a structured error (`ok: false`) whose
-`error.details` include `run_id`, `timeout_seconds`, and `latest` (the most
-recent successful `get_run` payload when available). A single transient polling
-failure does not end the wait while time remains; `404` (unknown `run_id`) is
-fatal immediately.
+**Wait-window expiry.** Uses a monotonic clock and sleeps between polls (no
+busy-wait). When the wait window expires while the run is still non-terminal,
+the tool returns a **normal usable payload** (not a transport/tool error):
+
+| Field | Value |
+| --- | --- |
+| `ok` | `true` |
+| `run_id` / `status` / other run fields | Latest successful `get_run` payload |
+| `wait_expired` | `true` |
+| `reached_terminal` | `false` |
+| `timeout_seconds` | Effective wait window used for this call |
+
+HAL should treat `wait_expired: true` as “call `wait_for_run` again,” not as
+failure. A single transient polling failure does not end the wait while time
+remains; `404` (unknown `run_id`) is fatal immediately.
 
 ### Platform Git persistence
 
