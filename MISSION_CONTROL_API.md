@@ -271,6 +271,29 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
 | `wait_for_run` | Block until the run reaches a terminal status by polling `get_run` |
 
+#### ChatGPT custom MCP app
+
+Use the Streamable HTTP endpoint (not `/sse`):
+
+| Item | Value |
+| --- | --- |
+| ChatGPT MCP server URL | `https://mission-control-mcp-production.up.railway.app/mcp` |
+| Transport | Streamable HTTP (`SERVICE_MODE=mcp` on Railway) |
+| Authentication in ChatGPT | **No authentication** |
+| Backend API auth | Connector uses server-side `MISSION_CONTROL_API_KEY` as `Authorization: Bearer …` when calling Mission Control; that key is not sent by ChatGPT |
+
+Legacy SSE is also mounted at `https://mission-control-mcp-production.up.railway.app/sse` (with `/messages`) so older `/sse` app URLs keep discovering the same three tools. Prefer `/mcp` for new ChatGPT custom apps.
+
+Local MCP HTTP (same routes as Railway):
+
+```bash
+export SERVICE_MODE=mcp
+export PORT=8001
+export MISSION_CONTROL_URL="https://mission-control-production-76ff.up.railway.app"
+export MISSION_CONTROL_API_KEY="<key>"
+bash scripts/railway-start.sh
+```
+
 #### `wait_for_run`
 
 | Argument | Type | Required | Default | Description |

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
 
 from mcp_connector.client import MissionControlClient
 from mcp_connector.config import Settings
 from mcp_connector.errors import MissionControlError
 
+
+EXPECTED_TOOL_NAMES = ("submit_run", "get_run", "wait_for_run")
 
 settings = Settings.from_env()
 client = MissionControlClient(settings)
@@ -95,5 +100,47 @@ async def wait_for_run(
         return _tool_error(exc)
 
 
+def create_http_app() -> Starlette:
+    """Build the Railway/public MCP HTTP app.
+
+    ChatGPT custom apps should use Streamable HTTP at ``/mcp``. Legacy SSE at
+    ``/sse`` (plus ``/messages``) is also mounted so existing ``/sse`` URLs keep
+    discovering the same tools.
+    """
+    streamable_app = mcp.streamable_http_app()
+    sse_app = mcp.sse_app()
+
+    routes = list(streamable_app.routes)
+    seen_paths = {getattr(route, "path", None) for route in routes}
+    for route in sse_app.routes:
+        path = getattr(route, "path", None)
+        if path in seen_paths:
+            continue
+        routes.append(route)
+        seen_paths.add(path)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette):
+        async with mcp.session_manager.run():
+            yield
+
+    return Starlette(
+        debug=mcp.settings.debug,
+        routes=routes,
+        lifespan=lifespan,  # type: ignore[arg-type]
+    )
+
+
+def main() -> None:
+    """Start the MCP HTTP server (Railway ``SERVICE_MODE=mcp`` entrypoint)."""
+    app = create_http_app()
+    uvicorn.run(
+        app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    main()
