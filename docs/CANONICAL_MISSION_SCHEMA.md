@@ -236,6 +236,13 @@ authorize platform push.
 - The executor includes deliverable strings in the Cursor instruction prompt
   (or `- (none specified)` when the list is empty/absent at prompt-build time).
 
+### Operator log deliverable (operational practice)
+
+Repository-changing missions should declare `docs/HAL_OPERATOR_LOG.md` as a
+file deliverable so the HAL operator log is updated and verified before
+completion. This is an operating convention (`docs/HAL_OPERATOR.md`), not a
+structural validation requirement.
+
 ### Completed-run file verification guarantee (current implementation)
 
 For asynchronous **`POST /runs`** (and the same
@@ -408,8 +415,10 @@ persistence:
   mode: none
 instructions: |
   Create docs/example-none.txt with one line of text.
+  Update docs/HAL_OPERATOR_LOG.md with verified results.
 deliverables:
   - docs/example-none.txt
+  - docs/HAL_OPERATOR_LOG.md
 approval:
   execute_without_approval: true
   commit_requires_approval: true
@@ -444,8 +453,10 @@ persistence:
   mode: commit
 instructions: |
   Create docs/example-commit.txt with one line of text.
+  Update docs/HAL_OPERATOR_LOG.md with verified results.
 deliverables:
   - docs/example-commit.txt
+  - docs/HAL_OPERATOR_LOG.md
 approval:
   execute_without_approval: true
   commit_requires_approval: true
@@ -480,8 +491,10 @@ persistence:
   mode: push
 instructions: |
   Create docs/example-push.txt with one line of text.
+  Update docs/HAL_OPERATOR_LOG.md with verified results.
 deliverables:
   - docs/example-push.txt
+  - docs/HAL_OPERATOR_LOG.md
 approval:
   execute_without_approval: true
   commit_requires_approval: true

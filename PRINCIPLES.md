@@ -121,3 +121,12 @@ Trust is built through:
 - review before irreversible actions
 - reliable execution
 - clear responsibility
+
+---
+
+## 11. HAL Operator Log
+
+HAL operates Mission Control under `docs/HAL_OPERATOR.md`.
+
+`docs/HAL_OPERATOR_LOG.md` must be updated as the final verified step of every
+significant Mission Control objective before that objective is declared complete.
