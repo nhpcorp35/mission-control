@@ -38,7 +38,7 @@ Outcome: **123 tests OK** (including new structured-result regressions).
 
 ### Resulting commit
 
-Pending commit SHA on `main` after this log entry is included in the commit.
+`d472be59c5d56e7b4652f5d904098fa8846e9353` on `main`.
 
 ### Limitations
 
