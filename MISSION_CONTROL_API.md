@@ -210,11 +210,89 @@ Return lifecycle status and retained output for a previously accepted run.
 | `started_at` | string or null | Set when execution begins |
 | `completed_at` | string or null | Set when the run reaches a terminal status |
 | `elapsed_seconds` | number or null | Duration from start to completion |
-| `stdout` | string | Agent stdout when available |
-| `stderr` | string | Agent stderr when available |
+| `stdout` | string | Agent stdout when available (diagnostic; not verified evidence) |
+| `stderr` | string | Agent stderr when available (diagnostic; not verified evidence) |
 | `error` | string or null | Failure detail when unsuccessful |
 | `return_code` | integer or null | Process exit code when available |
 | `commit_sha` | string or null | Commit SHA after successful platform persistence (`persistence.mode` of `commit` or `push`); null when mode is `none` or there were no changes |
+| `result` | object or null | Structured objective evidence collected by Mission Control (see below). Null for non-terminal runs that have not stored evidence yet; present on terminal runs when Mission Control recorded evidence |
+
+#### Trust boundary: `result` vs `stdout` / `stderr`
+
+- **`result`** is objective evidence Mission Control collected from its own execution records and repository state (Git status, process exit codes, declared file-deliverable checks, platform persistence). HAL and automation should prefer `result` for verification.
+- **`stdout` / `stderr`** are agent-authored diagnostic text. Do **not** treat natural-language claims in stdout as verified structured evidence.
+
+#### `result` object
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `files_changed` | string[] | Repository-relative paths changed in the isolated workspace (from Git status). Empty when none or unavailable |
+| `commands` | object[] | Commands Mission Control executed (for example the Cursor agent subprocess), each with `argv`, `exit_code`, `passed`, and `kind` |
+| `test_counts` | object or null | Aggregate pass/fail/skip counts when reliably available without fragile parsing; otherwise `null` |
+| `deliverables` | object or null | Declared file-deliverable verification: `verified`, `passed`, `checked_paths`, `missing` |
+| `persistence` | object or null | Platform persistence outcome: `mode`, `attempted`, `ok`, `commit_sha` |
+| `warnings` | string[] | Limitations explaining unavailable evidence (never fabricated values) |
+
+Failed and timed-out runs retain any partial evidence Mission Control actually collected.
+
+**Example completed response**
+
+```json
+{
+  "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "completed",
+  "created_at": "2026-07-23T17:00:00+00:00",
+  "started_at": "2026-07-23T17:00:01+00:00",
+  "completed_at": "2026-07-23T17:01:30+00:00",
+  "elapsed_seconds": 89.0,
+  "stdout": "Agent prose summary (diagnostic only)\n",
+  "stderr": "",
+  "error": null,
+  "return_code": 0,
+  "commit_sha": "abc123def456",
+  "result": {
+    "files_changed": [
+      "docs/HAL_OPERATOR_LOG.md",
+      "mission_control/run_result.py"
+    ],
+    "commands": [
+      {
+        "argv": [
+          "cursor-agent",
+          "--print",
+          "--force",
+          "--output-format",
+          "text",
+          "--workspace",
+          "/tmp/mission-control-run-xyz",
+          "--trust",
+          "<instruction>"
+        ],
+        "exit_code": 0,
+        "passed": true,
+        "kind": "cursor_agent"
+      }
+    ],
+    "test_counts": null,
+    "deliverables": {
+      "verified": true,
+      "passed": true,
+      "checked_paths": ["docs/HAL_OPERATOR_LOG.md"],
+      "missing": []
+    },
+    "persistence": {
+      "mode": "commit",
+      "attempted": true,
+      "ok": true,
+      "commit_sha": "abc123def456"
+    },
+    "warnings": [
+      "Aggregate test counts are unavailable; Mission Control does not parse agent stdout for test results.",
+      "No separate Mission Control verification shell commands were executed; only the Cursor agent subprocess and platform checks are recorded."
+    ]
+  }
+}
+```
 
 **Response** `404 Not Found` only when the `run_id` was never accepted by this process. Completed and failed runs are retained and keep returning `200` with their terminal status and failure details.
 

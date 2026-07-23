@@ -12,6 +12,12 @@ import sqlite3
 import threading
 import uuid
 
+from mission_control.run_result import (
+    StructuredRunResult,
+    deserialize_structured_result,
+    serialize_structured_result,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "./data/mission-control.db"
@@ -63,6 +69,7 @@ class RunRecord:
     error: str | None = None
     return_code: int | None = None
     commit_sha: str | None = None
+    result: StructuredRunResult | None = None
 
 
 def resolve_db_path() -> str:
@@ -106,6 +113,9 @@ def _row_to_record(row: sqlite3.Row) -> RunRecord:
         error=row["error"],
         return_code=row["return_code"],
         commit_sha=row["commit_sha"],
+        result=deserialize_structured_result(
+            row["result_json"] if "result_json" in row.keys() else None
+        ),
     )
 
 
@@ -144,7 +154,8 @@ class RunRegistry:
                     stderr TEXT NOT NULL DEFAULT '',
                     error TEXT,
                     return_code INTEGER,
-                    commit_sha TEXT
+                    commit_sha TEXT,
+                    result_json TEXT
                 )
                 """
             )
@@ -157,6 +168,10 @@ class RunRegistry:
             if "return_code" not in columns:
                 self._conn.execute(
                     f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN return_code INTEGER"
+                )
+            if "result_json" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN result_json TEXT"
                 )
             self._conn.commit()
 
@@ -249,8 +264,9 @@ class RunRegistry:
                 stderr,
                 error,
                 return_code,
-                commit_sha
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                commit_sha,
+                result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 status = excluded.status,
                 created_at = excluded.created_at,
@@ -261,7 +277,8 @@ class RunRegistry:
                 stderr = excluded.stderr,
                 error = excluded.error,
                 return_code = excluded.return_code,
-                commit_sha = excluded.commit_sha
+                commit_sha = excluded.commit_sha,
+                result_json = excluded.result_json
             """,
             (
                 record.run_id,
@@ -275,6 +292,7 @@ class RunRegistry:
                 record.error,
                 record.return_code,
                 record.commit_sha,
+                serialize_structured_result(record.result),
             ),
         )
         self._conn.commit()
@@ -374,6 +392,7 @@ class RunRegistry:
         error: str | None = None,
         return_code: int | None = None,
         commit_sha: str | None = None,
+        result: StructuredRunResult | None = None,
     ) -> RunRecord | None:
         """Store execution output fields on an existing run."""
         with self._lock:
@@ -388,6 +407,8 @@ class RunRegistry:
             record.return_code = return_code
             if commit_sha is not None:
                 record.commit_sha = commit_sha
+            if result is not None:
+                record.result = result
             self._persist_record(record)
             return record
 

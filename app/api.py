@@ -29,6 +29,7 @@ from mission_control.run_registry import (
     RunStatus,
     is_terminal_status,
 )
+from mission_control.run_result import StructuredRunResult
 from mission_control.workspace import execute_registered_run
 from mission_control.validator import (
     load_mission_yaml,
@@ -141,6 +142,40 @@ class RunResponse(BaseModel):
 class RunAcceptedResponse(BaseModel):
     run_id: str
     status: str
+
+
+class CommandEvidenceModel(BaseModel):
+    argv: list[str]
+    exit_code: int | None = None
+    passed: bool | None = None
+    kind: str
+
+
+class DeliverableEvidenceModel(BaseModel):
+    verified: bool
+    passed: bool | None = None
+    checked_paths: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+
+
+class PersistenceEvidenceModel(BaseModel):
+    mode: str | None = None
+    attempted: bool
+    ok: bool | None = None
+    commit_sha: str | None = None
+
+
+class StructuredRunResultModel(BaseModel):
+    """Objective Mission Control evidence (not agent-authored stdout)."""
+
+    files_changed: list[str] = Field(default_factory=list)
+    commands: list[CommandEvidenceModel] = Field(default_factory=list)
+    test_counts: dict[str, int] | None = None
+    deliverables: DeliverableEvidenceModel | None = None
+    persistence: PersistenceEvidenceModel | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class RunStatusResponse(BaseModel):
     run_id: str
     status: str
@@ -153,6 +188,7 @@ class RunStatusResponse(BaseModel):
     error: str | None = None
     return_code: int | None = None
     commit_sha: str | None = None
+    result: StructuredRunResultModel | None = None
 
 
 class WaitForRunRequest(BaseModel):
@@ -173,6 +209,14 @@ class WaitForRunResponse(RunStatusResponse):
     wait_expired: bool
 
 
+def _structured_result_model(
+    result: StructuredRunResult | None,
+) -> StructuredRunResultModel | None:
+    if result is None:
+        return None
+    return StructuredRunResultModel.model_validate(result.to_dict())
+
+
 def _run_status_response(record: RunRecord) -> RunStatusResponse:
     return RunStatusResponse(
         run_id=record.run_id,
@@ -186,6 +230,7 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
         error=record.error,
         return_code=record.return_code,
         commit_sha=record.commit_sha,
+        result=_structured_result_model(record.result),
     )
 
 
@@ -414,10 +459,97 @@ def submit_run_endpoint(
     operation_id="get_run",
     summary="Get asynchronous run status",
     description=(
-        "Return the lifecycle status, execution output, error, and commit "
-        "SHA for a run previously submitted via POST /runs. Completed and "
-        "failed runs remain available in the SQLite-backed run registry."
+        "Return the lifecycle status, execution output, error, commit SHA, "
+        "and structured result evidence for a run previously submitted via "
+        "POST /runs. The `result` object is objective evidence collected by "
+        "Mission Control (changed files, commands Mission Control executed, "
+        "deliverable verification, persistence outcome). Agent-authored "
+        "`stdout` / `stderr` remain available for diagnostics but are not "
+        "verified structured evidence. Completed and failed runs remain "
+        "available in the SQLite-backed run registry."
     ),
+    responses={
+        200: {
+            "description": "Run record found.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "completed": {
+                            "summary": "Completed run with structured result",
+                            "value": {
+                                "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                                "status": "completed",
+                                "created_at": "2026-07-23T17:00:00+00:00",
+                                "started_at": "2026-07-23T17:00:01+00:00",
+                                "completed_at": "2026-07-23T17:01:30+00:00",
+                                "elapsed_seconds": 89.0,
+                                "stdout": "Agent prose summary (diagnostic only)\n",
+                                "stderr": "",
+                                "error": None,
+                                "return_code": 0,
+                                "commit_sha": "abc123def456",
+                                "result": {
+                                    "files_changed": [
+                                        "docs/HAL_OPERATOR_LOG.md",
+                                        "mission_control/run_result.py",
+                                    ],
+                                    "commands": [
+                                        {
+                                            "argv": [
+                                                "cursor-agent",
+                                                "--print",
+                                                "--force",
+                                                "--output-format",
+                                                "text",
+                                                "--workspace",
+                                                "/tmp/mission-control-run-xyz",
+                                                "--trust",
+                                                "<instruction>",
+                                            ],
+                                            "exit_code": 0,
+                                            "passed": True,
+                                            "kind": "cursor_agent",
+                                        }
+                                    ],
+                                    "test_counts": None,
+                                    "deliverables": {
+                                        "verified": True,
+                                        "passed": True,
+                                        "checked_paths": [
+                                            "docs/HAL_OPERATOR_LOG.md"
+                                        ],
+                                        "missing": [],
+                                    },
+                                    "persistence": {
+                                        "mode": "commit",
+                                        "attempted": True,
+                                        "ok": True,
+                                        "commit_sha": "abc123def456",
+                                    },
+                                    "warnings": [
+                                        (
+                                            "Aggregate test counts are "
+                                            "unavailable; Mission Control "
+                                            "does not parse agent stdout for "
+                                            "test results."
+                                        ),
+                                        (
+                                            "No separate Mission Control "
+                                            "verification shell commands "
+                                            "were executed; only the Cursor "
+                                            "agent subprocess and platform "
+                                            "checks are recorded."
+                                        ),
+                                    ],
+                                },
+                            },
+                        }
+                    }
+                }
+            },
+        },
+        404: {"description": "Unknown run_id."},
+    },
 )
 def get_run_endpoint(
     run_id: str,

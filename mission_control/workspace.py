@@ -15,6 +15,18 @@ import tempfile
 
 from mission_control.executor import execute_cursor_agent
 from mission_control.run_registry import RunRegistry, RunStatus
+from mission_control.run_result import (
+    DeliverableEvidence,
+    PersistenceEvidence,
+    WARNING_DELIVERABLES_NOT_CHECKED,
+    WARNING_FILES_CHANGED_UNAVAILABLE,
+    WARNING_PERSISTENCE_NOT_ATTEMPTED,
+    WARNING_PREP_FAILED,
+    append_warning,
+    command_evidence_from_execution,
+    empty_structured_result,
+    parse_git_status_porcelain_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -455,10 +467,28 @@ def verify_declared_file_deliverables(
     and unsafe/escaping paths do not fail this gate; unsafe paths are skipped
     rather than inspected outside the workspace.
     """
+    evidence = collect_deliverable_evidence(mission, workspace_path)
+    if evidence.missing:
+        return f"Missing declared file deliverable: {evidence.missing[0]}"
+    return None
+
+
+def collect_deliverable_evidence(
+    mission: dict,
+    workspace_path: str,
+) -> DeliverableEvidence:
+    """Collect structured declared file-deliverable verification evidence."""
     deliverables = mission.get("deliverables", [])
     if not isinstance(deliverables, list) or not deliverables:
-        return None
+        return DeliverableEvidence(
+            verified=True,
+            passed=True,
+            checked_paths=[],
+            missing=[],
+        )
 
+    checked_paths: list[str] = []
+    missing: list[str] = []
     for item in deliverables:
         if not isinstance(item, str):
             continue
@@ -467,9 +497,45 @@ def verify_declared_file_deliverables(
         target = resolve_safe_workspace_deliverable(workspace_path, item)
         if target is None:
             continue
+        checked_paths.append(item)
         if not target.is_file():
-            return f"Missing declared file deliverable: {item}"
-    return None
+            missing.append(item)
+
+    return DeliverableEvidence(
+        verified=True,
+        passed=len(missing) == 0,
+        checked_paths=checked_paths,
+        missing=missing,
+    )
+
+
+def collect_changed_files(
+    workspace_path: str,
+) -> tuple[list[str], str | None]:
+    """Return changed/untracked repo-relative paths from Git status.
+
+    Returns ``(paths, warning)``. ``warning`` is set when status cannot be read.
+    """
+    status = _git_status_porcelain(workspace_path)
+    if status.returncode != 0:
+        return [], WARNING_FILES_CHANGED_UNAVAILABLE
+    return parse_git_status_porcelain_paths(status.stdout), None
+
+
+def build_persistence_evidence(
+    mission: dict,
+    *,
+    attempted: bool,
+    ok: bool | None = None,
+    commit_sha: str | None = None,
+) -> PersistenceEvidence:
+    """Record platform persistence outcome for the structured result."""
+    return PersistenceEvidence(
+        mode=resolve_persistence_mode(mission),
+        attempted=attempted,
+        ok=ok,
+        commit_sha=commit_sha,
+    )
 
 
 def execute_registered_run(
@@ -492,11 +558,27 @@ def execute_registered_run(
     )
     registry.update_status(run_id, RunStatus.RUNNING)
     workspace_path: str | None = None
+    structured = empty_structured_result()
 
     try:
         prep = prepare_isolated_workspace(mission)
         if not prep.ok:
-            registry.store_result(run_id, error=prep.error)
+            append_warning(structured, WARNING_PREP_FAILED)
+            append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
+            structured.deliverables = DeliverableEvidence(
+                verified=False,
+                passed=None,
+            )
+            registry.store_result(
+                run_id,
+                error=prep.error,
+                result=structured,
+            )
             registry.update_status(run_id, RunStatus.FAILED)
             return
 
@@ -513,13 +595,33 @@ def execute_registered_run(
             isolated_mission,
             run_id=run_id,
         )
+        structured.commands = [
+            command_evidence_from_execution(execution_result),
+        ]
+        changed_files, files_warning = collect_changed_files(workspace_path)
+        structured.files_changed = changed_files
+        if files_warning is not None:
+            append_warning(structured, files_warning)
+
         if not execution_result.ok:
+            append_warning(structured, WARNING_DELIVERABLES_NOT_CHECKED)
+            append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+            structured.deliverables = DeliverableEvidence(
+                verified=False,
+                passed=None,
+            )
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
             registry.store_result(
                 run_id,
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=execution_result.error,
                 return_code=execution_result.return_code,
+                result=structured,
             )
             registry.update_status(
                 run_id,
@@ -530,17 +632,28 @@ def execute_registered_run(
             )
             return
 
-        deliverable_error = verify_declared_file_deliverables(
+        deliverable_evidence = collect_deliverable_evidence(
             mission,
             workspace_path,
         )
-        if deliverable_error is not None:
+        structured.deliverables = deliverable_evidence
+        if deliverable_evidence.missing:
+            append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
             registry.store_result(
                 run_id,
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
-                error=deliverable_error,
+                error=(
+                    "Missing declared file deliverable: "
+                    f"{deliverable_evidence.missing[0]}"
+                ),
                 return_code=execution_result.return_code,
+                result=structured,
             )
             registry.update_status(run_id, RunStatus.FAILED)
             return
@@ -550,6 +663,21 @@ def execute_registered_run(
             mission,
             workspace_path,
         )
+        structured.persistence = build_persistence_evidence(
+            mission,
+            attempted=True,
+            ok=persistence_result.ok,
+            commit_sha=persistence_result.commit_sha,
+        )
+        # Re-read changed files after persistence so commit-only cleanliness
+        # does not erase the pre-persist change list already captured.
+        if not structured.files_changed:
+            changed_files, files_warning = collect_changed_files(workspace_path)
+            if changed_files:
+                structured.files_changed = changed_files
+            if files_warning is not None:
+                append_warning(structured, files_warning)
+
         if not persistence_result.ok:
             registry.store_result(
                 run_id,
@@ -557,6 +685,7 @@ def execute_registered_run(
                 stderr=execution_result.stderr,
                 error=persistence_result.error,
                 return_code=execution_result.return_code,
+                result=structured,
             )
             registry.update_status(run_id, RunStatus.FAILED)
             return
@@ -567,6 +696,7 @@ def execute_registered_run(
             stderr=execution_result.stderr,
             return_code=execution_result.return_code,
             commit_sha=persistence_result.commit_sha,
+            result=structured,
         )
         registry.update_status(run_id, RunStatus.COMPLETED)
     except Exception as exc:
@@ -579,7 +709,18 @@ def execute_registered_run(
             os.getpid(),
             id(registry),
         )
-        registry.store_result(run_id, error=str(exc))
+        append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+        if structured.persistence is None:
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
+        registry.store_result(
+            run_id,
+            error=str(exc),
+            result=structured,
+        )
         registry.update_status(run_id, RunStatus.FAILED)
     finally:
         if workspace_path is not None:

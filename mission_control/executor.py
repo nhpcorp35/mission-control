@@ -79,6 +79,8 @@ class ExecutionResult:
     stderr: str = ""
     error: str | None = None
     return_code: int | None = None
+    # Redacted argv Mission Control actually launched (instruction omitted).
+    command: list[str] | None = None
 
 
 def build_cursor_instruction(
@@ -178,6 +180,7 @@ def _run_cursor_agent(
         return ExecutionResult(
             ok=False,
             error=f"{CURSOR_AGENT} not found",
+            command=[CURSOR_AGENT],
         )
 
     command = build_cursor_agent_command(
@@ -186,6 +189,8 @@ def _run_cursor_agent(
         mode=mode,
         binary=cursor_binary,
     )
+    # Persist redacted argv for structured evidence (omit mission instruction).
+    command_evidence = list(command[:-1]) + ["<instruction>"]
 
     logger.info(
         "Starting Cursor mission: mission_id=%s title=%s mode=%s workspace=%s",
@@ -234,6 +239,7 @@ def _run_cursor_agent(
         return ExecutionResult(
             ok=False,
             error=f"{CURSOR_AGENT} not found",
+            command=command_evidence,
         )
     except NotADirectoryError:
         logger.error(
@@ -245,6 +251,7 @@ def _run_cursor_agent(
         return ExecutionResult(
             ok=False,
             error=f"Repository workspace is not a directory: {workspace}",
+            command=command_evidence,
         )
     except OSError as exc:
         logger.exception(
@@ -261,6 +268,7 @@ def _run_cursor_agent(
         return ExecutionResult(
             ok=False,
             error=f"Failed to launch {CURSOR_AGENT}: {exc}",
+            command=command_evidence,
         )
 
     child_pid = proc.pid
@@ -316,6 +324,7 @@ def _run_cursor_agent(
                 "cursor-agent timed out after "
                 f"{EXECUTION_TIMEOUT_SECONDS} seconds"
             ),
+            command=command_evidence,
         )
     except Exception:
         logger.exception(
@@ -381,6 +390,7 @@ def _run_cursor_agent(
             stderr=stderr,
             error=message,
             return_code=returncode,
+            command=command_evidence,
         )
 
     if not stdout.strip():
@@ -394,6 +404,7 @@ def _run_cursor_agent(
         stdout=stdout,
         stderr=stderr,
         return_code=returncode,
+        command=command_evidence,
     )
 
 
