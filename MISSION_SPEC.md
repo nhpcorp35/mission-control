@@ -335,6 +335,22 @@ deliverables:
 
 Mission Control marks the mission incomplete if required deliverables are missing.
 
+For asynchronous `POST /runs` execute missions, after the agent succeeds and
+before platform persistence, Mission Control verifies each declared deliverable
+that clearly represents a **relative file path** exists as a regular file in
+the isolated run workspace. Missing path deliverables fail the run with:
+
+`Missing declared file deliverable: <path>`
+
+Path detection is conservative: a deliverable is path-like when it contains a
+`/` separator or a short alphanumeric file extension (for example
+`MISSION_SPEC.md`, `src/app.py`). Descriptive items such as `summary`,
+`report`, `confirmation`, or other non-path text are not checked on disk.
+Absolute paths and paths that escape the workspace are rejected from
+filesystem checking (they are not read outside the workspace) and do not
+themselves fail this gate. Empty `deliverables: []` keeps prior behavior.
+File content is not validated—only presence of regular files.
+
 ---
 
 # Approval

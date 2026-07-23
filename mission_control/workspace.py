@@ -7,6 +7,8 @@ import copy
 from dataclasses import dataclass
 import logging
 import os
+from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PERSISTENCE_MODE = "none"
 SUPPORTED_PERSISTENCE_MODES = frozenset({"none", "commit", "push"})
+
+# Basename with a short alphanumeric extension (e.g. README.md, app.py).
+_FILE_EXTENSION_RE = re.compile(r"\.[A-Za-z0-9]{1,16}$")
 
 # Machine-readable gate for privileged platform persistence.mode=push.
 # Distinct from agent permissions.push.
@@ -353,6 +358,120 @@ def _execution_run_status(ok: bool, error: str | None) -> RunStatus:
     return RunStatus.FAILED
 
 
+def looks_like_file_path_deliverable(deliverable: str) -> bool:
+    """Return whether ``deliverable`` clearly resembles a filesystem path.
+
+    Conservative detection rule (documented contract):
+
+    - Non-empty string without NUL bytes.
+    - Treated as path-like when it contains a ``/`` separator **or** the
+      final path segment has a short alphanumeric file extension
+      (``.[A-Za-z0-9]{1,16}``), e.g. ``MISSION_SPEC.md``, ``src/app.py``.
+    - Absolute forms (``/…``, ``~/…``, Windows drive paths) are also
+      classified as path-like so they can be rejected from workspace checks
+      rather than mistaken for descriptive text.
+    - Descriptive phrases without separators or extensions — including
+      ``summary``, ``report``, ``confirmation``, and multi-word text such as
+      ``repository status`` — are **not** path-like and are not verified on
+      disk.
+    """
+    if not isinstance(deliverable, str) or not deliverable:
+        return False
+    if "\x00" in deliverable:
+        return False
+
+    if deliverable.startswith(("/", "~")):
+        return True
+    if (
+        len(deliverable) >= 3
+        and deliverable[1] == ":"
+        and deliverable[0].isalpha()
+        and deliverable[2] in "/\\"
+    ):
+        return True
+    if Path(deliverable).is_absolute():
+        return True
+
+    if "/" in deliverable:
+        return True
+
+    basename = deliverable.rsplit("/", 1)[-1]
+    if basename in ("", ".", ".."):
+        return False
+    return bool(_FILE_EXTENSION_RE.search(basename))
+
+
+def resolve_safe_workspace_deliverable(
+    workspace_path: str,
+    deliverable: str,
+) -> Path | None:
+    """Resolve ``deliverable`` to a path under ``workspace_path``, or None.
+
+    Returns ``None`` when the deliverable is not a safe relative path inside
+    the workspace (absolute paths, home paths, NUL, or ``..`` escapes). Callers
+    must treat ``None`` as “do not perform a filesystem check” so Mission
+    Control never reads outside the isolated run workspace.
+    """
+    if not looks_like_file_path_deliverable(deliverable):
+        return None
+    if "\x00" in deliverable:
+        return None
+    if deliverable.startswith(("/", "~")):
+        return None
+    if (
+        len(deliverable) >= 3
+        and deliverable[1] == ":"
+        and deliverable[0].isalpha()
+        and deliverable[2] in "/\\"
+    ):
+        return None
+
+    candidate = Path(deliverable)
+    if candidate.is_absolute():
+        return None
+
+    workspace = Path(workspace_path).resolve()
+    resolved = (workspace / candidate).resolve()
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        return None
+    return resolved
+
+
+def verify_declared_file_deliverables(
+    mission: dict,
+    workspace_path: str,
+) -> str | None:
+    """Verify path-like declared deliverables exist as regular files.
+
+    Runs after successful agent execution and before platform persistence.
+    Only deliverables that pass :func:`looks_like_file_path_deliverable` and
+    resolve safely inside the workspace are checked. Missing files produce:
+
+    ``Missing declared file deliverable: <path>``
+
+    Empty deliverable lists, non-list values, descriptive (non-path) items,
+    and unsafe/escaping paths do not fail this gate; unsafe paths are skipped
+    rather than inspected outside the workspace.
+    """
+    deliverables = mission.get("deliverables", [])
+    if not isinstance(deliverables, list) or not deliverables:
+        return None
+
+    for item in deliverables:
+        if not isinstance(item, str):
+            continue
+        if not looks_like_file_path_deliverable(item):
+            continue
+        target = resolve_safe_workspace_deliverable(workspace_path, item)
+        if target is None:
+            continue
+        if not target.is_file():
+            return f"Missing declared file deliverable: {item}"
+    return None
+
+
 def execute_registered_run(
     run_id: str,
     mission: dict,
@@ -409,6 +528,21 @@ def execute_registered_run(
                     execution_result.error,
                 ),
             )
+            return
+
+        deliverable_error = verify_declared_file_deliverables(
+            mission,
+            workspace_path,
+        )
+        if deliverable_error is not None:
+            registry.store_result(
+                run_id,
+                stdout=execution_result.stdout,
+                stderr=execution_result.stderr,
+                error=deliverable_error,
+                return_code=execution_result.return_code,
+            )
+            registry.update_status(run_id, RunStatus.FAILED)
             return
 
         persistence_result = persist_workspace_changes(

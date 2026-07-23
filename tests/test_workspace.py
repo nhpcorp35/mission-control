@@ -22,9 +22,12 @@ from mission_control.workspace import (
     execute_registered_run,
     get_origin_url,
     is_platform_push_authorized,
+    looks_like_file_path_deliverable,
     persist_workspace_changes,
     prepare_isolated_workspace,
     require_platform_push_approval,
+    resolve_safe_workspace_deliverable,
+    verify_declared_file_deliverables,
 )
 
 
@@ -599,6 +602,123 @@ class TestWorkspacePersistence(unittest.TestCase):
             cleanup_workspace(workspace_path)
 
 
+class TestDeclaredFileDeliverables(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp.name) / "workspace"
+        self.workspace.mkdir()
+        (self.workspace / "README.md").write_text("ok\n", encoding="utf-8")
+        (self.workspace / "docs").mkdir()
+        (self.workspace / "docs" / "out.txt").write_text("out\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_looks_like_file_path_deliverable_detection(self) -> None:
+        self.assertTrue(looks_like_file_path_deliverable("MISSION_SPEC.md"))
+        self.assertTrue(looks_like_file_path_deliverable("docs/out.txt"))
+        self.assertTrue(looks_like_file_path_deliverable("src/app.py"))
+        self.assertTrue(looks_like_file_path_deliverable("/etc/passwd"))
+        self.assertTrue(looks_like_file_path_deliverable("../outside.txt"))
+
+        self.assertFalse(looks_like_file_path_deliverable("summary"))
+        self.assertFalse(looks_like_file_path_deliverable("report"))
+        self.assertFalse(looks_like_file_path_deliverable("confirmation"))
+        self.assertFalse(looks_like_file_path_deliverable("repository status"))
+        self.assertFalse(looks_like_file_path_deliverable(""))
+
+    def test_existing_declared_file_deliverable_passes(self) -> None:
+        mission = {"deliverables": ["README.md", "docs/out.txt"]}
+        self.assertIsNone(
+            verify_declared_file_deliverables(mission, str(self.workspace))
+        )
+
+    def test_missing_declared_file_deliverable_fails(self) -> None:
+        mission = {"deliverables": ["missing-output.txt"]}
+        error = verify_declared_file_deliverables(mission, str(self.workspace))
+        self.assertEqual(
+            error,
+            "Missing declared file deliverable: missing-output.txt",
+        )
+
+    def test_multiple_file_deliverables_identify_missing_item(self) -> None:
+        mission = {
+            "deliverables": [
+                "README.md",
+                "docs/out.txt",
+                "docs/missing.txt",
+            ]
+        }
+        error = verify_declared_file_deliverables(mission, str(self.workspace))
+        self.assertEqual(
+            error,
+            "Missing declared file deliverable: docs/missing.txt",
+        )
+
+    def test_descriptive_only_deliverables_preserve_current_behavior(self) -> None:
+        mission = {
+            "deliverables": [
+                "summary",
+                "report",
+                "confirmation",
+                "repository status",
+            ]
+        }
+        self.assertIsNone(
+            verify_declared_file_deliverables(mission, str(self.workspace))
+        )
+
+    def test_empty_deliverables_preserve_current_behavior(self) -> None:
+        self.assertIsNone(
+            verify_declared_file_deliverables(
+                {"deliverables": []},
+                str(self.workspace),
+            )
+        )
+        self.assertIsNone(
+            verify_declared_file_deliverables({}, str(self.workspace))
+        )
+
+    def test_unsafe_escaping_paths_are_not_read_outside_workspace(self) -> None:
+        outside = Path(self.temp.name) / "outside_secret.txt"
+        outside.write_text("secret\n", encoding="utf-8")
+        workspace = self.workspace.resolve()
+        real_is_file = Path.is_file
+
+        def guarded_is_file(self: Path) -> bool:
+            resolved = self if self.is_absolute() else (Path.cwd() / self)
+            resolved = resolved.resolve()
+            try:
+                resolved.relative_to(workspace)
+            except ValueError as exc:
+                raise AssertionError(
+                    f"attempted filesystem check outside workspace: {resolved}"
+                ) from exc
+            return real_is_file(self)
+
+        mission = {
+            "deliverables": [
+                str(outside),
+                f"../{outside.name}",
+                "/etc/passwd",
+                "~/secret.txt",
+            ]
+        }
+        with patch.object(Path, "is_file", guarded_is_file):
+            self.assertIsNone(
+                verify_declared_file_deliverables(mission, str(self.workspace))
+            )
+            self.assertIsNone(
+                resolve_safe_workspace_deliverable(
+                    str(self.workspace),
+                    f"../{outside.name}",
+                )
+            )
+            self.assertIsNone(
+                resolve_safe_workspace_deliverable(str(self.workspace), str(outside))
+            )
+
+
 class TestExecuteRegisteredRun(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = GitRepoFixture()
@@ -738,6 +858,166 @@ class TestExecuteRegisteredRun(unittest.TestCase):
         prep = prepare_isolated_workspace(self.fixture.mission())
         self.assertFalse(prep.ok)
         mock_safe_cleanup.assert_called_once()
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    def test_existing_file_deliverable_allows_persistence(
+        self,
+        mock_execute,
+        mock_persist,
+        mock_cleanup,
+    ) -> None:
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            (Path(prep.workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            mock_execute.return_value = ExecutionResult(ok=True, stdout="done\n")
+            mock_persist.return_value = PersistenceResult(ok=True, commit_sha=None)
+
+            mission = self.fixture.mission(persistence_mode="none")
+            mission["deliverables"] = ["created.txt"]
+            with patch(
+                "mission_control.workspace.prepare_isolated_workspace",
+                return_value=prep,
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
+
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.COMPLETED)
+            mock_persist.assert_called_once()
+            mock_cleanup.assert_called_once_with(prep.workspace_path)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    def test_missing_file_deliverable_fails_before_persistence(
+        self,
+        mock_execute,
+        mock_persist,
+        mock_cleanup,
+    ) -> None:
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            mock_execute.return_value = ExecutionResult(ok=True, stdout="done\n")
+
+            mission = self.fixture.mission(persistence_mode="none")
+            mission["deliverables"] = ["missing-output.txt"]
+            with patch(
+                "mission_control.workspace.prepare_isolated_workspace",
+                return_value=prep,
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
+
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.FAILED)
+            self.assertEqual(
+                updated.error,
+                "Missing declared file deliverable: missing-output.txt",
+            )
+            mock_persist.assert_not_called()
+            mock_cleanup.assert_called_once_with(prep.workspace_path)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    def test_descriptive_and_empty_deliverables_still_persist(
+        self,
+        mock_execute,
+        mock_persist,
+        mock_cleanup,
+    ) -> None:
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            mock_execute.return_value = ExecutionResult(ok=True, stdout="done\n")
+            mock_persist.return_value = PersistenceResult(ok=True, commit_sha=None)
+
+            for deliverables in (
+                ["summary", "report", "confirmation"],
+                [],
+            ):
+                mock_persist.reset_mock()
+                mock_cleanup.reset_mock()
+                mission = self.fixture.mission(persistence_mode="none")
+                mission["deliverables"] = list(deliverables)
+                with patch(
+                    "mission_control.workspace.prepare_isolated_workspace",
+                    return_value=WorkspacePrepResult(
+                        ok=True,
+                        workspace_path=prep.workspace_path,
+                    ),
+                ):
+                    record = self.registry.create_run()
+                    execute_registered_run(record.run_id, mission, self.registry)
+
+                updated = self.registry.get_run(record.run_id)
+                assert updated is not None
+                self.assertEqual(updated.status, RunStatus.COMPLETED)
+                mock_persist.assert_called_once()
+
+            mock_cleanup.assert_called_with(prep.workspace_path)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+    def test_persistence_modes_none_commit_push_unchanged_with_file_gate(
+        self,
+    ) -> None:
+        """Deliverable verification must not alter none/commit/push semantics."""
+        for mode, expect_sha in (
+            ("none", False),
+            ("commit", True),
+            ("push", True),
+        ):
+            workspace_path = prepare_isolated_workspace(
+                self.fixture.mission()
+            )
+            self.assertTrue(workspace_path.ok, workspace_path.error)
+            assert workspace_path.workspace_path is not None
+            path = workspace_path.workspace_path
+            try:
+                (Path(path) / "created.txt").write_text(
+                    "mission output\n",
+                    encoding="utf-8",
+                )
+                mission = self.fixture.mission(
+                    persistence_mode=mode,
+                    platform_push_approved=(mode == "push"),
+                )
+                mission["deliverables"] = ["created.txt"]
+                self.assertIsNone(
+                    verify_declared_file_deliverables(mission, path)
+                )
+                with patch(
+                    "mission_control.workspace._github_push_environment",
+                    return_value=(os.environ.copy(), None),
+                ):
+                    result = persist_workspace_changes(
+                        f"run-mode-{mode}",
+                        mission,
+                        path,
+                    )
+                self.assertTrue(result.ok, result.error)
+                if expect_sha:
+                    self.assertIsNotNone(result.commit_sha)
+                else:
+                    self.assertIsNone(result.commit_sha)
+            finally:
+                cleanup_workspace(path)
 
 
 if __name__ == "__main__":

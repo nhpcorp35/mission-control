@@ -336,7 +336,9 @@ remains; `404` (unknown `run_id`) is fatal immediately.
 
 ### Platform Git persistence
 
-After a successful agent execution in an isolated workspace, Mission Control applies the mission's top-level `persistence` block:
+After a successful agent execution in an isolated workspace, Mission Control
+verifies declared **file-path** deliverables (see below), then applies the
+mission's top-level `persistence` block:
 
 | `persistence.mode` | Behavior |
 | --- | --- |
@@ -345,6 +347,24 @@ After a successful agent execution in an isolated workspace, Mission Control app
 | `push` | Stage, commit, and push to `repository.base_branch` (privileged; requires platform-push approval) |
 
 Agent `permissions.commit` and `permissions.push` remain agent permissions only. They do not select platform persistence behavior. Unsupported `persistence.mode` values fail mission validation.
+
+#### Completed-run file deliverable verification
+
+Before platform persistence and before a run is marked `completed`, Mission
+Control checks each `deliverables` entry that clearly names a relative file
+path. Each such path must exist as a regular file inside the isolated run
+workspace. A missing file fails the run (`status: failed`) with an error of
+the form `Missing declared file deliverable: <path>`. Persistence is not
+attempted for that run, so a missing deliverable is never recorded as a
+successful completed run.
+
+Conservative path detection: entries with a `/` separator or a short
+alphanumeric file extension (for example `docs/out.txt`, `MISSION_SPEC.md`)
+are treated as file paths. Descriptive deliverables (`summary`, `report`,
+`confirmation`, multi-word phrases, and other non-path text) are unchanged and
+are not checked on disk. Empty `deliverables: []` is unchanged. Absolute paths
+and paths that would escape the workspace are not inspected outside the
+workspace (skipped, not followed). File *content* is not validated.
 
 Push authorization is expressed through `persistence.mode=push` plus `approval.platform_push_approved=true` (or `approval.allow_automatic_platform_push=true`). There is no separate `permissions.push` platform gate; agent `permissions.push` must remain `false` for execute missions.
 

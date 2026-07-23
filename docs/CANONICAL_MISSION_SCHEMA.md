@@ -238,21 +238,51 @@ authorize platform push.
 
 ### Completed-run file verification guarantee (current implementation)
 
-Mission Control **does not** currently verify that deliverable file paths exist
-on disk before marking an asynchronous run `completed`.
-
-A `POST /runs` run is marked `completed` when:
+For asynchronous **`POST /runs`** (and the same
+`execute_registered_run` lifecycle used by that path), Mission Control
+verifies declared **file-path** deliverables after successful agent execution
+and **before** platform persistence / `completed` status:
 
 1. isolated workspace preparation succeeds,
 2. `execute_cursor_agent` returns `ok`,
-3. `persist_workspace_changes` returns `ok`,
+3. each path-like deliverable exists as a regular file under the workspace
+   (or the gate is skipped for non-path / unsafe entries — see below),
+4. `persist_workspace_changes` returns `ok`,
 
 then the temporary workspace is deleted.
 
-`MISSION_SPEC.md` states that missing deliverables should mark a mission
-incomplete; that filesystem/content check is **not implemented** in the
-validator, executor, or run lifecycle today. Treat deliverables as
-contractual instructions to the agent, not as a platform-enforced file gate.
+If a required path-like deliverable is missing, the run is stored as
+`failed` with error `Missing declared file deliverable: <path>`, persistence
+is not invoked, and the run is not marked `completed`.
+
+#### Conservative path-detection rule
+
+A deliverable string is treated as a file-path candidate when it is a
+non-empty string without NUL and either:
+
+- contains a `/` path separator, or
+- has a basename with a short alphanumeric extension matching
+  `.[A-Za-z0-9]{1,16}` (for example `MISSION_SPEC.md`, `app.py`),
+
+including absolute forms (`/…`, `~/…`, Windows drive paths) so they can be
+classified as path-like and rejected from workspace checks.
+
+Descriptive deliverables without separators or extensions — including
+`summary`, `report`, `confirmation`, and phrases such as `repository status`
+— are **not** verified on disk (prior behavior preserved).
+
+Unsafe paths (absolute paths, home paths, or resolved paths that escape the
+isolated workspace) are **not** read outside the workspace: they are skipped
+by the filesystem check and do not fail this gate by themselves.
+
+Limitations:
+
+- Sync **`POST /run`** and legacy **`POST /execute`** do not use this isolated
+  lifecycle gate.
+- File *content* is not validated—only that a regular file exists at the
+  relative path.
+- Extension-less filenames without `/` (for example a bare `SUMMARY`) are not
+  treated as path deliverables under the conservative rule.
 
 ---
 
@@ -264,8 +294,10 @@ For **`POST /runs`** (async execute):
    temporary directory (`mission-control-run-*`).
 2. Rewrite `repository.path` for that run to the temp workspace.
 3. Execute the agent there.
-4. Apply platform persistence for that workspace.
-5. Always attempt `cleanup_workspace` (delete the temp directory) in `finally`.
+4. Verify path-like declared file deliverables exist as regular files in that
+   workspace (fail the run before persistence if any are missing).
+5. Apply platform persistence for that workspace.
+6. Always attempt `cleanup_workspace` (delete the temp directory) in `finally`.
 
 Consequences:
 
