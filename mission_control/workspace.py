@@ -371,21 +371,28 @@ def _execution_run_status(ok: bool, error: str | None) -> RunStatus:
 
 
 def looks_like_file_path_deliverable(deliverable: str) -> bool:
-    """Return whether ``deliverable`` clearly resembles a filesystem path.
+    """Return whether a bare-string deliverable clearly resembles a path.
 
-    Conservative detection rule (documented contract):
+    Compatibility rule for untyped string deliverables (documented contract):
 
     - Non-empty string without NUL bytes.
-    - Treated as path-like when it contains a ``/`` separator **or** the
-      final path segment has a short alphanumeric file extension
-      (``.[A-Za-z0-9]{1,16}``), e.g. ``MISSION_SPEC.md``, ``src/app.py``.
-    - Absolute forms (``/…``, ``~/…``, Windows drive paths) are also
-      classified as path-like so they can be rejected from workspace checks
-      rather than mistaken for descriptive text.
-    - Descriptive phrases without separators or extensions — including
-      ``summary``, ``report``, ``confirmation``, and multi-word text such as
-      ``repository status`` — are **not** path-like and are not verified on
-      disk.
+    - Absolute forms (``/…``, ``~/…``, Windows drive paths) are classified as
+      path-like so they can be rejected from workspace checks rather than
+      mistaken for descriptive text.
+    - Otherwise treated as path-like when either:
+
+      - the final path segment has a short alphanumeric file extension
+        (``.[A-Za-z0-9]{1,16}``), e.g. ``MISSION_SPEC.md``, ``docs/out.txt``,
+        or
+      - it contains a ``/`` separator **and** contains no whitespace.
+
+    Descriptive phrases — including ``summary``, ``report``,
+    ``repository status``, and slash-containing prose such as
+    ``API/OpenAPI documentation updates`` — are **not** path-like and are not
+    verified on disk. A lone ``/`` inside free text is not enough.
+
+    Prefer explicit typed entries (``file:`` / ``description:``) for new
+    missions; see :func:`file_path_from_deliverable`.
     """
     if not isinstance(deliverable, str) or not deliverable:
         return False
@@ -404,41 +411,86 @@ def looks_like_file_path_deliverable(deliverable: str) -> bool:
     if Path(deliverable).is_absolute():
         return True
 
-    if "/" in deliverable:
-        return True
-
     basename = deliverable.rsplit("/", 1)[-1]
     if basename in ("", ".", ".."):
         return False
-    return bool(_FILE_EXTENSION_RE.search(basename))
+    if _FILE_EXTENSION_RE.search(basename):
+        return True
+
+    if "/" in deliverable and not any(ch.isspace() for ch in deliverable):
+        return True
+    return False
 
 
-def resolve_safe_workspace_deliverable(
-    workspace_path: str,
-    deliverable: str,
-) -> Path | None:
-    """Resolve ``deliverable`` to a path under ``workspace_path``, or None.
+def file_path_from_deliverable(item: object) -> str | None:
+    """Return the filesystem path to verify for ``item``, or ``None``.
 
-    Returns ``None`` when the deliverable is not a safe relative path inside
-    the workspace (absolute paths, home paths, NUL, or ``..`` escapes). Callers
-    must treat ``None`` as “do not perform a filesystem check” so Mission
-    Control never reads outside the isolated run workspace.
+    Supported shapes:
+
+    - **Typed file** mapping: ``{file: <path>}`` or
+      ``{kind: file, path: <path>}`` — always treated as a file deliverable
+      (subject to workspace safety resolution).
+    - **Typed descriptive** mapping: ``{description: <text>}`` or
+      ``{kind: descriptive|description, ...}`` — never checked on disk.
+    - **Bare string** — checked only when
+      :func:`looks_like_file_path_deliverable` is true.
+
+    Unknown shapes are skipped (not treated as paths).
     """
-    if not looks_like_file_path_deliverable(deliverable):
+    if isinstance(item, str):
+        if looks_like_file_path_deliverable(item):
+            return item
         return None
-    if "\x00" in deliverable:
+
+    if not isinstance(item, dict):
         return None
-    if deliverable.startswith(("/", "~")):
+
+    kind_raw = item.get("kind")
+    kind = str(kind_raw).strip().lower() if kind_raw is not None else ""
+
+    if kind in {"descriptive", "description"}:
+        return None
+    if "description" in item and kind != "file" and "file" not in item:
+        return None
+
+    if kind == "file":
+        path = item.get("path", item.get("file"))
+        if isinstance(path, str) and path and "\x00" not in path:
+            return path
+        return None
+
+    file_value = item.get("file")
+    if isinstance(file_value, str) and file_value and "\x00" not in file_value:
+        return file_value
+
+    return None
+
+
+def resolve_safe_workspace_path(
+    workspace_path: str,
+    relative_path: str,
+) -> Path | None:
+    """Resolve ``relative_path`` under ``workspace_path``, or ``None``.
+
+    Returns ``None`` for absolute paths, home paths, NUL, or ``..`` escapes.
+    Does not apply the bare-string path heuristic; callers decide whether a
+    deliverable is a file path first.
+    """
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+    if "\x00" in relative_path:
+        return None
+    if relative_path.startswith(("/", "~")):
         return None
     if (
-        len(deliverable) >= 3
-        and deliverable[1] == ":"
-        and deliverable[0].isalpha()
-        and deliverable[2] in "/\\"
+        len(relative_path) >= 3
+        and relative_path[1] == ":"
+        and relative_path[0].isalpha()
+        and relative_path[2] in "/\\"
     ):
         return None
 
-    candidate = Path(deliverable)
+    candidate = Path(relative_path)
     if candidate.is_absolute():
         return None
 
@@ -451,19 +503,36 @@ def resolve_safe_workspace_deliverable(
     return resolved
 
 
+def resolve_safe_workspace_deliverable(
+    workspace_path: str,
+    deliverable: str,
+) -> Path | None:
+    """Resolve a bare-string deliverable under ``workspace_path``, or None.
+
+    Returns ``None`` when the deliverable is not path-like or is not a safe
+    relative path inside the workspace. Callers must treat ``None`` as “do not
+    perform a filesystem check” so Mission Control never reads outside the
+    isolated run workspace.
+    """
+    if not looks_like_file_path_deliverable(deliverable):
+        return None
+    return resolve_safe_workspace_path(workspace_path, deliverable)
+
+
 def verify_declared_file_deliverables(
     mission: dict,
     workspace_path: str,
 ) -> str | None:
-    """Verify path-like declared deliverables exist as regular files.
+    """Verify declared file deliverables exist as regular files.
 
     Runs after successful agent execution and before platform persistence.
-    Only deliverables that pass :func:`looks_like_file_path_deliverable` and
+    Only file deliverables (explicit ``file:`` / ``kind: file`` entries, or
+    bare strings that pass :func:`looks_like_file_path_deliverable`) that
     resolve safely inside the workspace are checked. Missing files produce:
 
     ``Missing declared file deliverable: <path>``
 
-    Empty deliverable lists, non-list values, descriptive (non-path) items,
+    Empty deliverable lists, non-list values, descriptive (non-file) items,
     and unsafe/escaping paths do not fail this gate; unsafe paths are skipped
     rather than inspected outside the workspace.
     """
@@ -490,16 +559,15 @@ def collect_deliverable_evidence(
     checked_paths: list[str] = []
     missing: list[str] = []
     for item in deliverables:
-        if not isinstance(item, str):
+        path = file_path_from_deliverable(item)
+        if path is None:
             continue
-        if not looks_like_file_path_deliverable(item):
-            continue
-        target = resolve_safe_workspace_deliverable(workspace_path, item)
+        target = resolve_safe_workspace_path(workspace_path, path)
         if target is None:
             continue
-        checked_paths.append(item)
+        checked_paths.append(path)
         if not target.is_file():
-            missing.append(item)
+            missing.append(path)
 
     return DeliverableEvidence(
         verified=True,

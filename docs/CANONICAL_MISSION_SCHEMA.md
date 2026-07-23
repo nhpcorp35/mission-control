@@ -233,50 +233,92 @@ authorize platform push.
 - Structural validation only checks presence.
 - An empty list `[]` is structurally valid.
 - Non-list / missing items are not type-checked structurally.
-- The executor includes deliverable strings in the Cursor instruction prompt
+- The executor includes deliverable entries in the Cursor instruction prompt
   (or `- (none specified)` when the list is empty/absent at prompt-build time).
+  Prefer bare strings or simple typed mappings for readable prompts.
+
+### Entry shapes (file vs descriptive)
+
+Each `deliverables` list item may be:
+
+| Shape | Example | Filesystem check? |
+| --- | --- | --- |
+| Typed **file** | `file: docs/out.txt` or `kind: file` + `path:` | Yes (if safe relative path) |
+| Typed **descriptive** | `description: …` or `kind: descriptive` | No |
+| Bare string (compat) | `MISSION_SPEC.md`, `docs/out.txt`, `summary` | Only when path-like (below) |
+
+**Recommended syntax for new missions** — declare intent explicitly:
+
+```yaml
+deliverables:
+  - file: docs/HAL_OPERATOR_LOG.md
+  - file: mission_control/workspace.py
+  - description: API/OpenAPI documentation updates
+```
+
+Equivalent `kind` form:
+
+```yaml
+deliverables:
+  - kind: file
+    path: docs/HAL_OPERATOR_LOG.md
+  - kind: descriptive
+    text: API/OpenAPI documentation updates
+```
+
+Bare strings remain valid for backward compatibility. Do **not** rely on a
+slash inside free-text prose to mean “file path.”
 
 ### Operator log deliverable (operational practice)
 
 Repository-changing missions should declare `docs/HAL_OPERATOR_LOG.md` as a
-file deliverable so the HAL operator log is updated and verified before
-completion. This is an operating convention (`docs/HAL_OPERATOR.md`), not a
-structural validation requirement.
+file deliverable (typed `file:` preferred) so the HAL operator log is updated
+and verified before completion. This is an operating convention
+(`docs/HAL_OPERATOR.md`), not a structural validation requirement.
 
 ### Completed-run file verification guarantee (current implementation)
 
 For asynchronous **`POST /runs`** (and the same
 `execute_registered_run` lifecycle used by that path), Mission Control
-verifies declared **file-path** deliverables after successful agent execution
+verifies declared **file** deliverables after successful agent execution
 and **before** platform persistence / `completed` status:
 
 1. isolated workspace preparation succeeds,
 2. `execute_cursor_agent` returns `ok`,
-3. each path-like deliverable exists as a regular file under the workspace
-   (or the gate is skipped for non-path / unsafe entries — see below),
+3. each file deliverable exists as a regular file under the workspace
+   (or the gate is skipped for descriptive / unsafe entries — see below),
 4. `persist_workspace_changes` returns `ok`,
 
 then the temporary workspace is deleted.
 
-If a required path-like deliverable is missing, the run is stored as
+If a required file deliverable is missing, the run is stored as
 `failed` with error `Missing declared file deliverable: <path>`, persistence
 is not invoked, and the run is not marked `completed`.
 
-#### Conservative path-detection rule
+#### Compatibility rule for bare-string deliverables
 
-A deliverable string is treated as a file-path candidate when it is a
+A bare-string deliverable is treated as a file-path candidate when it is a
 non-empty string without NUL and either:
 
-- contains a `/` path separator, or
 - has a basename with a short alphanumeric extension matching
-  `.[A-Za-z0-9]{1,16}` (for example `MISSION_SPEC.md`, `app.py`),
+  `.[A-Za-z0-9]{1,16}` (for example `MISSION_SPEC.md`, `docs/out.txt`), or
+- contains a `/` path separator **and** contains **no** whitespace (for
+  example `docs/subdir/file`, `src/app.py`),
 
 including absolute forms (`/…`, `~/…`, Windows drive paths) so they can be
 classified as path-like and rejected from workspace checks.
 
-Descriptive deliverables without separators or extensions — including
-`summary`, `report`, `confirmation`, and phrases such as `repository status`
-— are **not** verified on disk (prior behavior preserved).
+Descriptive deliverables are **not** verified on disk, including:
+
+- words without separators or extensions (`summary`, `report`, `confirmation`),
+- multi-word phrases (`repository status`),
+- slash-containing prose with whitespace such as
+  `API/OpenAPI documentation updates` (a lone `/` in free text is not enough).
+
+Typed `description:` / `kind: descriptive` entries are never checked on disk.
+Typed `file:` / `kind: file` entries are always treated as file deliverables
+(subject to workspace safety resolution), even when the path string would not
+pass the bare-string heuristic.
 
 Unsafe paths (absolute paths, home paths, or resolved paths that escape the
 isolated workspace) are **not** read outside the workspace: they are skipped
@@ -289,7 +331,10 @@ Limitations:
 - File *content* is not validated—only that a regular file exists at the
   relative path.
 - Extension-less filenames without `/` (for example a bare `SUMMARY`) are not
-  treated as path deliverables under the conservative rule.
+  treated as path deliverables under the bare-string rule; use typed
+  `file: SUMMARY` when such a path must be verified.
+- Structural validation does not yet reject unknown deliverable mapping keys;
+  unknown shapes are skipped by the filesystem gate.
 
 ---
 
@@ -301,7 +346,7 @@ For **`POST /runs`** (async execute):
    temporary directory (`mission-control-run-*`).
 2. Rewrite `repository.path` for that run to the temp workspace.
 3. Execute the agent there.
-4. Verify path-like declared file deliverables exist as regular files in that
+4. Verify declared file deliverables exist as regular files in that
    workspace (fail the run before persistence if any are missing).
 5. Apply platform persistence for that workspace.
 6. Always attempt `cleanup_workspace` (delete the temp directory) in `finally`.

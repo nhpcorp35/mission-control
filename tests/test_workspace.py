@@ -18,8 +18,10 @@ from mission_control.workspace import (
     PersistenceResult,
     WorkspacePrepResult,
     cleanup_workspace,
+    collect_deliverable_evidence,
     configure_workspace_origin,
     execute_registered_run,
+    file_path_from_deliverable,
     get_origin_url,
     is_platform_push_authorized,
     looks_like_file_path_deliverable,
@@ -620,12 +622,51 @@ class TestDeclaredFileDeliverables(unittest.TestCase):
         self.assertTrue(looks_like_file_path_deliverable("src/app.py"))
         self.assertTrue(looks_like_file_path_deliverable("/etc/passwd"))
         self.assertTrue(looks_like_file_path_deliverable("../outside.txt"))
+        self.assertTrue(looks_like_file_path_deliverable("docs/subdir/file"))
 
         self.assertFalse(looks_like_file_path_deliverable("summary"))
         self.assertFalse(looks_like_file_path_deliverable("report"))
         self.assertFalse(looks_like_file_path_deliverable("confirmation"))
         self.assertFalse(looks_like_file_path_deliverable("repository status"))
+        self.assertFalse(
+            looks_like_file_path_deliverable(
+                "API/OpenAPI documentation updates"
+            )
+        )
         self.assertFalse(looks_like_file_path_deliverable(""))
+
+    def test_file_path_from_deliverable_typed_and_string_forms(self) -> None:
+        self.assertEqual(
+            file_path_from_deliverable("docs/out.txt"),
+            "docs/out.txt",
+        )
+        self.assertIsNone(
+            file_path_from_deliverable("API/OpenAPI documentation updates")
+        )
+        self.assertEqual(
+            file_path_from_deliverable({"file": "docs/out.txt"}),
+            "docs/out.txt",
+        )
+        self.assertEqual(
+            file_path_from_deliverable(
+                {"kind": "file", "path": "mission_control/workspace.py"}
+            ),
+            "mission_control/workspace.py",
+        )
+        self.assertIsNone(
+            file_path_from_deliverable(
+                {"description": "API/OpenAPI documentation updates"}
+            )
+        )
+        self.assertIsNone(
+            file_path_from_deliverable(
+                {
+                    "kind": "descriptive",
+                    "text": "API/OpenAPI documentation updates",
+                }
+            )
+        )
+        self.assertIsNone(file_path_from_deliverable({"unknown": True}))
 
     def test_existing_declared_file_deliverable_passes(self) -> None:
         mission = {"deliverables": ["README.md", "docs/out.txt"]}
@@ -666,6 +707,66 @@ class TestDeclaredFileDeliverables(unittest.TestCase):
         }
         self.assertIsNone(
             verify_declared_file_deliverables(mission, str(self.workspace))
+        )
+
+    def test_slash_containing_descriptive_deliverable_does_not_fail(
+        self,
+    ) -> None:
+        """Regression: prose with '/' must not be treated as a file path."""
+        mission = {
+            "deliverables": [
+                "API/OpenAPI documentation updates",
+                "summary",
+            ]
+        }
+        self.assertIsNone(
+            verify_declared_file_deliverables(mission, str(self.workspace))
+        )
+        evidence = collect_deliverable_evidence(mission, str(self.workspace))
+        self.assertTrue(evidence.passed)
+        self.assertEqual(evidence.checked_paths, [])
+        self.assertEqual(evidence.missing, [])
+
+    def test_typed_descriptive_deliverable_does_not_fail(self) -> None:
+        mission = {
+            "deliverables": [
+                {"description": "API/OpenAPI documentation updates"},
+                {"kind": "descriptive", "text": "release notes"},
+            ]
+        }
+        self.assertIsNone(
+            verify_declared_file_deliverables(mission, str(self.workspace))
+        )
+
+    def test_typed_file_deliverable_missing_still_fails(self) -> None:
+        mission = {
+            "deliverables": [
+                {"file": "missing-typed.txt"},
+                {"description": "API/OpenAPI documentation updates"},
+            ]
+        }
+        error = verify_declared_file_deliverables(mission, str(self.workspace))
+        self.assertEqual(
+            error,
+            "Missing declared file deliverable: missing-typed.txt",
+        )
+
+    def test_typed_file_deliverable_existing_passes(self) -> None:
+        mission = {
+            "deliverables": [
+                {"file": "README.md"},
+                {"kind": "file", "path": "docs/out.txt"},
+                {"description": "API/OpenAPI documentation updates"},
+            ]
+        }
+        self.assertIsNone(
+            verify_declared_file_deliverables(mission, str(self.workspace))
+        )
+        evidence = collect_deliverable_evidence(mission, str(self.workspace))
+        self.assertTrue(evidence.passed)
+        self.assertEqual(
+            evidence.checked_paths,
+            ["README.md", "docs/out.txt"],
         )
 
     def test_empty_deliverables_preserve_current_behavior(self) -> None:
@@ -950,6 +1051,8 @@ class TestExecuteRegisteredRun(unittest.TestCase):
 
             for deliverables in (
                 ["summary", "report", "confirmation"],
+                ["API/OpenAPI documentation updates"],
+                [{"description": "API/OpenAPI documentation updates"}],
                 [],
             ):
                 mock_persist.reset_mock()

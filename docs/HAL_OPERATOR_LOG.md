@@ -1,6 +1,66 @@
 # HAL Operator Log
 
+## 2026-07-23 — File vs descriptive deliverables
+
+### Objective
+
+Fix false `Missing declared file deliverable` failures when a descriptive
+deliverable contains a `/` (for example `API/OpenAPI documentation updates`),
+as exposed by run `f5a1e020-3131-49df-974a-0eb689f45735`.
+
+### Implementation
+
+- Prefer explicit typed deliverable entries for new missions:
+  `file: <path>` / `kind: file` + `path:` versus `description:` /
+  `kind: descriptive`.
+- Keep bare-string deliverables compatible with a tightened heuristic: a string
+  is path-like when it has a short alphanumeric extension, or contains `/`
+  **without** whitespace (absolute forms still classified so they can be
+  rejected safely). Slash-containing prose with whitespace is descriptive.
+- Only file deliverables are filesystem-checked; structured run-result
+  evidence (`DeliverableEvidence`) remains intact.
+
+### Tests executed
+
+```text
+/mise/installs/python/3.13.14/bin/python -m unittest \
+  tests.test_workspace.TestDeclaredFileDeliverables -v
+# Ran 12 tests — OK
+
+/mise/installs/python/3.13.14/bin/python -m unittest \
+  tests.test_workspace \
+  tests.test_canonical_mission_schema_docs \
+  tests.test_structured_run_results \
+  tests.test_runs_api \
+  tests.test_wait_for_run \
+  tests.test_validate_regression \
+  tests.test_execution_lifecycle \
+  tests.test_run_registry \
+  tests.test_run_persistence \
+  tests.test_api -v
+# Ran 155 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+
+### Limitations
+
+- Structural validation still does not type-check deliverable list items;
+  unknown mapping shapes are skipped by the filesystem gate.
+- Agent prompt rendering still stringifies mapping entries via `str(item)` in
+  `build_cursor_instruction` (unchanged by this mission).
+- Extension-less relative paths that contain whitespace still require typed
+  `file:` to be verified (bare-string heuristic will not treat them as paths).
+
+### Next Objective
+
+Use typed `file:` / `description:` deliverables on new missions; revisit
+prompt formatting only if mapping entries become common in production YAML.
+
 ## 2026-07-23 — Structured run results
+
 
 ### Objective
 
