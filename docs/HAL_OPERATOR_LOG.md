@@ -1,5 +1,58 @@
 # HAL Operator Log
 
+## 2026-07-23 — Retry failed async runs
+
+### Objective
+
+Add a minimal `POST /runs/{run_id}/retry` operation that creates a new async
+run from the exact stored mission YAML of a terminal failed run.
+
+### Implementation
+
+- Persist `mission_yaml` and `retried_from` on SQLite run records (ALTER TABLE
+  migration for existing registries).
+- `POST /runs` stores the submitted YAML; retry reuses that exact text through
+  the shared `_accept_async_run` submission pipeline (validate, preflight,
+  queue) with a fresh `run_id` and workspace lifecycle.
+- Only status `failed` may be retried; other statuses and missing YAML return
+  `409`; unknown source returns `404`; acceptance returns `202` like
+  `POST /runs`.
+- Expose `retried_from` on `GET /runs/{run_id}` / OpenAPI; document in
+  `MISSION_CONTROL_API.md` and `docs/CANONICAL_MISSION_SCHEMA.md`.
+
+### Tests executed
+
+```text
+/mise/installs/python/3.13.14/bin/python -m unittest \
+  tests.test_retry_run \
+  tests.test_runs_api \
+  tests.test_run_registry \
+  tests.test_run_persistence \
+  tests.test_api \
+  tests.test_structured_run_results \
+  tests.test_execution_lifecycle \
+  tests.test_workspace \
+  tests.test_wait_for_run \
+  tests.test_lifecycle_instrumentation \
+  -v
+# Ran 140 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+
+### Limitations
+
+- Legacy failed rows without stored `mission_yaml` cannot be retried (`409`).
+- No automatic retry policy, mission editing, retry counters, or MCP tool yet.
+- Retry re-validates and re-preflights through the same pipeline as submit.
+
+### Next Objective
+
+Use `POST /runs/{run_id}/retry` for manual recovery of failed async runs; add
+MCP exposure only if HAL operators need it in-connector.
+
 ## 2026-07-23 — File vs descriptive deliverables
 
 ### Objective

@@ -189,6 +189,7 @@ class RunStatusResponse(BaseModel):
     return_code: int | None = None
     commit_sha: str | None = None
     result: StructuredRunResultModel | None = None
+    retried_from: str | None = None
 
 
 class WaitForRunRequest(BaseModel):
@@ -231,6 +232,7 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
         return_code=record.return_code,
         commit_sha=record.commit_sha,
         result=_structured_result_model(record.result),
+        retried_from=record.retried_from,
     )
 
 
@@ -245,6 +247,67 @@ def _wait_for_run_response(
         **base.model_dump(),
         reached_terminal=reached_terminal,
         wait_expired=wait_expired,
+    )
+
+
+def _reject_run_response(
+    *,
+    error: str,
+    error_detail: ErrorDetail | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=200,
+        content=RunResponse(
+            ok=False,
+            error=error,
+            error_detail=error_detail,
+        ).model_dump(),
+    )
+
+
+def _accept_async_run(
+    mission_yaml: str,
+    *,
+    retried_from: str | None = None,
+) -> RunAcceptedResponse | JSONResponse:
+    """Validate and queue a mission through the async submission pipeline."""
+    structural_result, mission = load_mission_yaml(mission_yaml)
+    if not structural_result.ok:
+        return _reject_run_response(error=structural_result.error)
+    execute_result = validate_mission_for_execute(mission)
+    if not execute_result.ok:
+        return _reject_run_response(error=execute_result.error)
+    preflight_error = preflight_for_execution()
+    if preflight_error is not None:
+        return _reject_run_response(
+            error=preflight_error.message,
+            error_detail=ErrorDetail(**preflight_error.to_dict()),
+        )
+    record = run_registry.create_run(
+        mission_yaml=mission_yaml,
+        retried_from=retried_from,
+    )
+    count, keys = run_registry.diagnostic_state()
+    logger.info(
+        (
+            "lifecycle run_id=%s event=accepted status=%s pending=%s "
+            "active=%s retried_from=%s api_pid=%s registry_id=%s "
+            "registry_count=%s registry_keys=%s"
+        ),
+        record.run_id,
+        RunStatus.QUEUED.value,
+        run_queue.pending_count(),
+        run_queue.active_run_id,
+        retried_from,
+        os.getpid(),
+        id(run_registry),
+        count,
+        keys,
+    )
+    run_queue.enqueue(record.run_id, mission, run_registry)
+    return RunAcceptedResponse(
+        run_id=record.run_id,
+        status=RunStatus.QUEUED.value,
     )
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -387,72 +450,17 @@ def submit_run_endpoint(
         logger.info(
             "lifecycle event=recursive_submission_rejected"
         )
-        return JSONResponse(
-            status_code=200,
-            content=RunResponse(
-                ok=False,
-                error=RECURSIVE_SUBMISSION_ERROR,
-                error_detail=ErrorDetail(
-                    code="RECURSIVE_SUBMISSION",
-                    message=RECURSIVE_SUBMISSION_ERROR,
-                    stage="submit",
-                ),
-            ).model_dump(),
+        return _reject_run_response(
+            error=RECURSIVE_SUBMISSION_ERROR,
+            error_detail=ErrorDetail(
+                code="RECURSIVE_SUBMISSION",
+                message=RECURSIVE_SUBMISSION_ERROR,
+                stage="submit",
+            ),
         )
-    structural_result, mission = load_mission_yaml(
-        request.mission_yaml
-    )
-    if not structural_result.ok:
-        return JSONResponse(
-            status_code=200,
-            content=RunResponse(
-                ok=False,
-                error=structural_result.error,
-            ).model_dump(),
-        )
-    execute_result = validate_mission_for_execute(mission)
-    if not execute_result.ok:
-        return JSONResponse(
-            status_code=200,
-            content=RunResponse(
-                ok=False,
-                error=execute_result.error,
-            ).model_dump(),
-        )
-    preflight_error = preflight_for_execution()
-    if preflight_error is not None:
-        return JSONResponse(
-            status_code=200,
-            content=RunResponse(
-                ok=False,
-                error=preflight_error.message,
-                error_detail=ErrorDetail(
-                    **preflight_error.to_dict()
-                ),
-            ).model_dump(),
-        )
-    record = run_registry.create_run()
-    count, keys = run_registry.diagnostic_state()
-    logger.info(
-        (
-            "lifecycle run_id=%s event=accepted status=%s pending=%s "
-            "active=%s api_pid=%s registry_id=%s registry_count=%s "
-            "registry_keys=%s"
-        ),
-        record.run_id,
-        RunStatus.QUEUED.value,
-        run_queue.pending_count(),
-        run_queue.active_run_id,
-        os.getpid(),
-        id(run_registry),
-        count,
-        keys,
-    )
-    run_queue.enqueue(record.run_id, mission, run_registry)
-    return RunAcceptedResponse(
-        run_id=record.run_id,
-        status=RunStatus.QUEUED.value,
-    )
+    return _accept_async_run(request.mission_yaml)
+
+
 @app.get(
     "/runs/{run_id}",
     response_model=RunStatusResponse,
@@ -466,7 +474,9 @@ def submit_run_endpoint(
         "deliverable verification, persistence outcome). Agent-authored "
         "`stdout` / `stderr` remain available for diagnostics but are not "
         "verified structured evidence. Completed and failed runs remain "
-        "available in the SQLite-backed run registry."
+        "available in the SQLite-backed run registry. When a run was created "
+        "via POST /runs/{run_id}/retry, `retried_from` identifies the source "
+        "failed run."
     ),
     responses={
         200: {
@@ -542,6 +552,7 @@ def submit_run_endpoint(
                                         ),
                                     ],
                                 },
+                                "retried_from": None,
                             },
                         }
                     }
@@ -571,6 +582,103 @@ def get_run_endpoint(
         record.status.value,
     )
     return _run_status_response(record)
+
+
+@app.post(
+    "/runs/{run_id}/retry",
+    status_code=202,
+    operation_id="retry_run",
+    summary="Retry a failed asynchronous run",
+    description=(
+        "Create a new asynchronous run from the exact stored mission YAML of "
+        "an existing terminal failed run. The source run is left unchanged. "
+        "The new run receives a fresh run_id, workspace lifecycle, and "
+        "retried_from linkage back to the source. Only status failed may be "
+        "retried; queued, running, completed, and timed_out return 409."
+    ),
+    response_model=RunAcceptedResponse,
+    responses={
+        200: {
+            "model": RunResponse,
+            "description": (
+                "Structural validation, execute eligibility, Cursor CLI "
+                "preflight failure, or recursive submission rejection."
+            ),
+        },
+        202: {
+            "model": RunAcceptedResponse,
+            "description": "Retry accepted and queued for background execution.",
+        },
+        404: {"description": "Unknown source run_id."},
+        409: {
+            "description": (
+                "Source run is not eligible for retry (not failed, or missing "
+                "stored mission YAML)."
+            ),
+        },
+    },
+)
+def retry_run_endpoint(
+    run_id: str,
+    raw_request: Request,
+    _auth: None = Depends(require_api_key),
+) -> RunAcceptedResponse:
+    if is_recursive_submission(dict(raw_request.headers)):
+        logger.info(
+            "lifecycle event=recursive_submission_rejected stage=retry"
+        )
+        return _reject_run_response(
+            error=RECURSIVE_SUBMISSION_ERROR,
+            error_detail=ErrorDetail(
+                code="RECURSIVE_SUBMISSION",
+                message=RECURSIVE_SUBMISSION_ERROR,
+                stage="retry",
+            ),
+        )
+
+    source = run_registry.get_run(run_id)
+    if source is None:
+        logger.info(
+            "lifecycle run_id=%s event=retry_lookup_miss",
+            run_id,
+        )
+        raise HTTPException(
+            status_code=404,
+            detail="Run not found",
+        )
+
+    if source.status is not RunStatus.FAILED:
+        logger.info(
+            "lifecycle run_id=%s event=retry_rejected status=%s",
+            run_id,
+            source.status.value,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only failed runs may be retried "
+                f"(current status: {source.status.value})"
+            ),
+        )
+
+    if not source.mission_yaml:
+        logger.info(
+            "lifecycle run_id=%s event=retry_rejected reason=missing_yaml",
+            run_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Source run has no stored mission YAML to retry",
+        )
+
+    logger.info(
+        "lifecycle run_id=%s event=retry_requested",
+        run_id,
+    )
+    return _accept_async_run(
+        source.mission_yaml,
+        retried_from=source.run_id,
+    )
 
 
 @app.post(

@@ -371,7 +371,8 @@ Consequences:
 | `POST /run` | API key | structural + `validate_mission_for_run` | `plan` | `repository.path` in place | none |
 | `POST /execute` | API key | structural + `validate_mission_for_execute` | `execute` | `repository.path` in place (legacy sync) | **not applied** |
 | `POST /runs` | API key | structural + `validate_mission_for_execute` | `execute` | isolated clone | applied per `persistence.mode` |
-| `GET /runs/{run_id}` | API key | n/a | n/a | n/a | returns `commit_sha` when set |
+| `GET /runs/{run_id}` | API key | n/a | n/a | n/a | returns `commit_sha` / `retried_from` when set |
+| `POST /runs/{run_id}/retry` | API key | same pipeline as `POST /runs` on stored YAML | `execute` | new isolated clone | applied per `persistence.mode`; source failed run unchanged |
 | `POST /runs/{run_id}/wait` | API key | n/a | n/a | n/a | wait-only; does not mutate run state on timeout |
 
 CLI:

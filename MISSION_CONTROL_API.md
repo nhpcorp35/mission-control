@@ -21,7 +21,7 @@ Authorization: Bearer <MISSION_CONTROL_API_KEY>
 | Missing or invalid credentials | `401 Unauthorized` with `WWW-Authenticate: Bearer` |
 | Server key unset / empty | `503 Service Unavailable` |
 
-Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `GET /runs/{run_id}`, `POST /runs/{run_id}/wait`.
+Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
 
 Public endpoints (no API key): `GET /health`, `POST /validate`.
 
@@ -216,6 +216,7 @@ Return lifecycle status and retained output for a previously accepted run.
 | `return_code` | integer or null | Process exit code when available |
 | `commit_sha` | string or null | Commit SHA after successful platform persistence (`persistence.mode` of `commit` or `push`); null when mode is `none` or there were no changes |
 | `result` | object or null | Structured objective evidence collected by Mission Control (see below). Null for non-terminal runs that have not stored evidence yet; present on terminal runs when Mission Control recorded evidence |
+| `retried_from` | string or null | Source `run_id` when this run was created via `POST /runs/{run_id}/retry`; otherwise null |
 
 #### Trust boundary: `result` vs `stdout` / `stderr`
 
@@ -290,11 +291,40 @@ Failed and timed-out runs retain any partial evidence Mission Control actually c
       "Aggregate test counts are unavailable; Mission Control does not parse agent stdout for test results.",
       "No separate Mission Control verification shell commands were executed; only the Cursor agent subprocess and platform checks are recorded."
     ]
-  }
+  },
+  "retried_from": null
 }
 ```
 
 **Response** `404 Not Found` only when the `run_id` was never accepted by this process. Completed and failed runs are retained and keep returning `200` with their terminal status and failure details.
+
+### POST /runs/{run_id}/retry
+
+Requires authentication.
+
+Create a new asynchronous run from the exact stored mission YAML of an existing **failed** run. The source run is left unchanged. The new run gets a fresh `run_id`, isolated workspace lifecycle, and durable `retried_from` linkage to the source. Retry routes through the same validation, preflight, and FIFO queue pipeline as `POST /runs`.
+
+No request body.
+
+**Response** `202 Accepted` when the retry is queued
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `run_id` | string | Opaque identifier for the **new** run |
+| `status` | string | Always `queued` on acceptance |
+
+Validation, eligibility, preflight, and recursive-submission failures return `200 OK` with a `RunResponse` body (`ok: false`) instead of queueing a run (same shape as `POST /runs`).
+
+**Response** `404 Not Found` when the source `run_id` is unknown.
+
+**Response** `409 Conflict` when the source run is not eligible for retry:
+
+| Condition | Detail |
+| --- | --- |
+| Status is `queued`, `running`, `completed`, or `timed_out` | `Only failed runs may be retried (current status: …)` |
+| Failed run has no stored mission YAML (legacy row) | `Source run has no stored mission YAML to retry` |
+
+Only terminal status `failed` may be retried. There is no automatic retry policy, mission editing, or retry counter.
 
 ### POST /runs/{run_id}/wait
 

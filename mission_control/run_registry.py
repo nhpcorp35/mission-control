@@ -70,6 +70,8 @@ class RunRecord:
     return_code: int | None = None
     commit_sha: str | None = None
     result: StructuredRunResult | None = None
+    mission_yaml: str | None = None
+    retried_from: str | None = None
 
 
 def resolve_db_path() -> str:
@@ -101,6 +103,7 @@ def _ensure_db_parent(db_path: str) -> None:
 
 
 def _row_to_record(row: sqlite3.Row) -> RunRecord:
+    keys = row.keys()
     return RunRecord(
         run_id=row["run_id"],
         status=RunStatus(row["status"]),
@@ -114,8 +117,10 @@ def _row_to_record(row: sqlite3.Row) -> RunRecord:
         return_code=row["return_code"],
         commit_sha=row["commit_sha"],
         result=deserialize_structured_result(
-            row["result_json"] if "result_json" in row.keys() else None
+            row["result_json"] if "result_json" in keys else None
         ),
+        mission_yaml=row["mission_yaml"] if "mission_yaml" in keys else None,
+        retried_from=row["retried_from"] if "retried_from" in keys else None,
     )
 
 
@@ -155,7 +160,9 @@ class RunRegistry:
                     error TEXT,
                     return_code INTEGER,
                     commit_sha TEXT,
-                    result_json TEXT
+                    result_json TEXT,
+                    mission_yaml TEXT,
+                    retried_from TEXT
                 )
                 """
             )
@@ -172,6 +179,14 @@ class RunRegistry:
             if "result_json" not in columns:
                 self._conn.execute(
                     f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN result_json TEXT"
+                )
+            if "mission_yaml" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN mission_yaml TEXT"
+                )
+            if "retried_from" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN retried_from TEXT"
                 )
             self._conn.commit()
 
@@ -265,8 +280,10 @@ class RunRegistry:
                 error,
                 return_code,
                 commit_sha,
-                result_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                result_json,
+                mission_yaml,
+                retried_from
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 status = excluded.status,
                 created_at = excluded.created_at,
@@ -278,7 +295,9 @@ class RunRegistry:
                 error = excluded.error,
                 return_code = excluded.return_code,
                 commit_sha = excluded.commit_sha,
-                result_json = excluded.result_json
+                result_json = excluded.result_json,
+                mission_yaml = excluded.mission_yaml,
+                retried_from = excluded.retried_from
             """,
             (
                 record.run_id,
@@ -293,16 +312,25 @@ class RunRegistry:
                 record.return_code,
                 record.commit_sha,
                 serialize_structured_result(record.result),
+                record.mission_yaml,
+                record.retried_from,
             ),
         )
         self._conn.commit()
 
-    def create_run(self) -> RunRecord:
+    def create_run(
+        self,
+        *,
+        mission_yaml: str | None = None,
+        retried_from: str | None = None,
+    ) -> RunRecord:
         """Create a new run in ``queued`` status with a UUID4 ``run_id``."""
         record = RunRecord(
             run_id=str(uuid.uuid4()),
             status=RunStatus.QUEUED,
             created_at=_utc_now(),
+            mission_yaml=mission_yaml,
+            retried_from=retried_from,
         )
         with self._lock:
             self._persist_record(record)
