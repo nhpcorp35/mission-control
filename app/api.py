@@ -237,9 +237,26 @@ class WaitForRunRequest(BaseModel):
     )
 
 
+class SubmitAndWaitRequest(BaseModel):
+    """Exact YAML submit plus bounded wait (POST /runs/submit-and-wait)."""
+
+    mission_yaml: str = Field(..., min_length=1)
+    timeout_seconds: float = Field(
+        default=WAIT_DEFAULT_TIMEOUT_SECONDS,
+        ge=WAIT_MIN_TIMEOUT_SECONDS,
+        le=WAIT_MAX_TIMEOUT_SECONDS,
+    )
+    poll_interval_seconds: float = Field(
+        default=WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+        ge=WAIT_MIN_POLL_INTERVAL_SECONDS,
+        le=WAIT_MAX_POLL_INTERVAL_SECONDS,
+    )
+
+
 class WaitForRunResponse(RunStatusResponse):
     reached_terminal: bool
     wait_expired: bool
+    timeout_seconds: float
 
 
 def _structured_result_model(
@@ -278,13 +295,68 @@ def _wait_for_run_response(
     *,
     reached_terminal: bool,
     wait_expired: bool,
+    timeout_seconds: float,
 ) -> WaitForRunResponse:
     base = _run_status_response(record)
     return WaitForRunResponse(
         **base.model_dump(),
         reached_terminal=reached_terminal,
         wait_expired=wait_expired,
+        timeout_seconds=timeout_seconds,
     )
+
+
+def _wait_for_run(
+    run_id: str,
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+) -> WaitForRunResponse:
+    """Poll registry get_run until terminal status or wait budget elapses."""
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        # get_run acquires and releases the registry lock per lookup so the
+        # wait loop never holds SQLite locks while sleeping.
+        record = run_registry.get_run(run_id)
+        if record is None:
+            logger.info(
+                "lifecycle run_id=%s event=wait_lookup_miss",
+                run_id,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="Run not found",
+            )
+
+        if is_terminal_status(record.status):
+            logger.info(
+                "lifecycle run_id=%s event=wait_terminal status=%s",
+                run_id,
+                record.status.value,
+            )
+            return _wait_for_run_response(
+                record,
+                reached_terminal=True,
+                wait_expired=False,
+                timeout_seconds=timeout_seconds,
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.info(
+                "lifecycle run_id=%s event=wait_expired status=%s",
+                run_id,
+                record.status.value,
+            )
+            return _wait_for_run_response(
+                record,
+                reached_terminal=False,
+                wait_expired=True,
+                timeout_seconds=timeout_seconds,
+            )
+
+        time.sleep(min(poll_interval_seconds, remaining))
 
 
 def _reject_run_response(
@@ -561,6 +633,73 @@ def submit_structured_run_endpoint(
     return _accept_async_run(mission_yaml)
 
 
+@app.post(
+    "/runs/submit-and-wait",
+    operation_id="submit_and_wait",
+    summary="Submit mission YAML and wait for a terminal status",
+    description=(
+        "Accept an exact Mission Control YAML document, queue it through the "
+        "same asynchronous pipeline as POST /runs, then wait via the same "
+        "logic as POST /runs/{run_id}/wait until the run reaches a terminal "
+        "status or timeout_seconds elapses. Returns the final authoritative "
+        "run payload in one request. Validation or submission failures return "
+        "immediately without entering the wait loop. Intended Custom GPT / "
+        "HAL flow when exact YAML is already available."
+    ),
+    response_model=WaitForRunResponse,
+    responses={
+        200: {
+            "description": (
+                "Wait finished (terminal or wait budget exhausted), or "
+                "structural validation / execute eligibility / Cursor CLI "
+                "preflight / recursive submission rejection without queueing."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/WaitForRunResponse"},
+                            {"$ref": "#/components/schemas/RunResponse"},
+                        ]
+                    }
+                }
+            },
+        },
+    },
+)
+def submit_and_wait_endpoint(
+    request: SubmitAndWaitRequest,
+    raw_request: Request,
+    _auth: None = Depends(require_api_key),
+) -> WaitForRunResponse | JSONResponse:
+    if is_recursive_submission(dict(raw_request.headers)):
+        logger.info(
+            "lifecycle event=recursive_submission_rejected stage=submit_and_wait"
+        )
+        return _reject_run_response(
+            error=RECURSIVE_SUBMISSION_ERROR,
+            error_detail=ErrorDetail(
+                code="RECURSIVE_SUBMISSION",
+                message=RECURSIVE_SUBMISSION_ERROR,
+                stage="submit",
+            ),
+        )
+
+    accepted = _accept_async_run(request.mission_yaml)
+    if isinstance(accepted, JSONResponse):
+        return accepted
+
+    logger.info(
+        "lifecycle run_id=%s event=submit_and_wait_accepted",
+        accepted.run_id,
+    )
+    return _wait_for_run(
+        accepted.run_id,
+        timeout_seconds=request.timeout_seconds,
+        poll_interval_seconds=request.poll_interval_seconds,
+    )
+
+
 @app.get(
     "/runs/{run_id}",
     response_model=RunStatusResponse,
@@ -822,8 +961,9 @@ def retry_run_endpoint(
         "Poll the existing run lookup path until the run reaches a terminal "
         "status (completed, failed, or timed_out) or timeout_seconds elapses. "
         "Returns immediately when the run is already terminal. Wait timeout "
-        "does not mutate run state. Intended HAL flow: submit_run, then "
-        "wait_for_run, then inspect status/output/commit_sha."
+        "does not mutate run state. Intended HAL / Custom GPT flow: "
+        "submit_run, then wait_for_run, then inspect status/output/commit_sha. "
+        "For exact YAML end-to-end in one request, use submit_and_wait."
     ),
 )
 def wait_for_run_endpoint(
@@ -831,47 +971,8 @@ def wait_for_run_endpoint(
     request: WaitForRunRequest = Body(default_factory=WaitForRunRequest),
     _auth: None = Depends(require_api_key),
 ) -> WaitForRunResponse:
-    timeout_seconds = request.timeout_seconds
-    poll_interval_seconds = request.poll_interval_seconds
-    deadline = time.monotonic() + timeout_seconds
-
-    while True:
-        # get_run acquires and releases the registry lock per lookup so the
-        # wait loop never holds SQLite locks while sleeping.
-        record = run_registry.get_run(run_id)
-        if record is None:
-            logger.info(
-                "lifecycle run_id=%s event=wait_lookup_miss",
-                run_id,
-            )
-            raise HTTPException(
-                status_code=404,
-                detail="Run not found",
-            )
-
-        if is_terminal_status(record.status):
-            logger.info(
-                "lifecycle run_id=%s event=wait_terminal status=%s",
-                run_id,
-                record.status.value,
-            )
-            return _wait_for_run_response(
-                record,
-                reached_terminal=True,
-                wait_expired=False,
-            )
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            logger.info(
-                "lifecycle run_id=%s event=wait_expired status=%s",
-                run_id,
-                record.status.value,
-            )
-            return _wait_for_run_response(
-                record,
-                reached_terminal=False,
-                wait_expired=True,
-            )
-
-        time.sleep(min(poll_interval_seconds, remaining))
+    return _wait_for_run(
+        run_id,
+        timeout_seconds=request.timeout_seconds,
+        poll_interval_seconds=request.poll_interval_seconds,
+    )

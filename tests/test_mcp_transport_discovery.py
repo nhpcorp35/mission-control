@@ -162,6 +162,32 @@ class TestMcpTransportDiscovery(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn("text/event-stream", response.headers.get("content-type", ""))
 
+    def test_rest_openapi_exposes_wait_operation_ids(self) -> None:
+        # Custom GPT Actions import Mission Control REST OpenAPI; wait tools
+        # must be discoverable as operationIds alongside MCP tool names.
+        from app.api import app as mission_control_app
+
+        schema = mission_control_app.openapi()
+        operation_ids = {
+            method_obj.get("operationId")
+            for path_item in schema["paths"].values()
+            for method_obj in path_item.values()
+            if isinstance(method_obj, dict)
+        }
+        self.assertIn("wait_for_run", operation_ids)
+        self.assertIn("submit_and_wait", operation_ids)
+        self.assertIn("wait_for_run", EXPECTED_TOOLS)
+        self.assertIn("submit_and_wait", EXPECTED_TOOLS)
+        paths = schema["paths"]
+        self.assertEqual(
+            paths["/runs/{run_id}/wait"]["post"]["operationId"],
+            "wait_for_run",
+        )
+        self.assertEqual(
+            paths["/runs/submit-and-wait"]["post"]["operationId"],
+            "submit_and_wait",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

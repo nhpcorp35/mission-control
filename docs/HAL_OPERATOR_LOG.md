@@ -1,5 +1,59 @@
 # HAL Operator Log
 
+## 2026-07-24 — Expose wait operations through REST API
+
+### Objective
+
+Expose `wait_for_run` and `submit_and_wait` through the Mission Control REST
+OpenAPI schema so the Hal-Cursor Custom GPT Action can discover and invoke
+them (alongside the existing MCP tools).
+
+### Finding
+
+`POST /runs/{run_id}/wait` (`wait_for_run`) already existed. Custom GPT Actions
+that import REST OpenAPI still lacked a one-shot submit-and-wait HTTP operation
+equivalent to MCP `submit_and_wait`.
+
+### Implementation
+
+- Kept `POST /runs/{run_id}/wait` with OpenAPI operation ID `wait_for_run`;
+  extracted shared `_wait_for_run` helper; response includes `timeout_seconds`.
+- Added `POST /runs/submit-and-wait` with OpenAPI operation ID
+  `submit_and_wait`, reusing `_accept_async_run` + `_wait_for_run`.
+- Submission/validation failures return immediately without waiting.
+- Updated `MISSION_CONTROL_API.md` and `docs/HAL_OPERATOR.md`.
+- Regression coverage for wait success/terminal/timeout, submit-and-wait
+  success, immediate validation failure, authentication, and OpenAPI
+  operation discovery (including transport/discovery tests).
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest \
+  tests.test_wait_for_run \
+  tests.test_mcp_transport_discovery \
+  -v
+# Ran 20 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Suggested message: Expose wait operations through REST API
+
+### Limitations
+
+- REST `submit_and_wait` covers exact YAML only; structured missions still use
+  `POST /runs/structured` + `wait_for_run`.
+- MCP connector continues to poll `GET /runs/{run_id}` for its own
+  `wait_for_run` / `submit_and_wait` tools (REST wait endpoints are for HTTP /
+  Custom GPT Actions).
+
+### Next Objective
+
+Point the Hal-Cursor Custom GPT Action OpenAPI import at the updated schema
+and prefer `submit_and_wait` for exact-YAML end-to-end calls.
+
 ## 2026-07-24 — Add submit_and_wait MCP operation
 
 ### Objective

@@ -21,7 +21,7 @@ Authorization: Bearer <MISSION_CONTROL_API_KEY>
 | Missing or invalid credentials | `401 Unauthorized` with `WWW-Authenticate: Bearer` |
 | Server key unset / empty | `503 Service Unavailable` |
 
-Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `POST /runs/structured`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
+Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `POST /runs/structured`, `POST /runs/submit-and-wait`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
 
 Public endpoints (no API key): `GET /health`, `POST /validate`.
 
@@ -374,16 +374,18 @@ Only terminal status `failed` may be retried. There is no automatic retry policy
 
 Requires authentication.
 
+**OpenAPI operation ID:** `wait_for_run`
+
 Bounded server-side wait for an asynchronous run. Polls the existing run lookup path (`GET /runs/{run_id}` / registry `get_run`) until the run reaches a terminal status or `timeout_seconds` elapses. Returns immediately when the run is already terminal. Does **not** mutate run state when the wait expires (a wait timeout is distinct from run status `timed_out`).
 
-HTTP clients may use this endpoint for a server-side wait. The MCP
-`wait_for_run` tool instead polls `GET /runs/{run_id}` on the connector side
-(see **MCP tools** below).
+HTTP clients and Custom GPT Actions use this endpoint for a server-side wait.
+The MCP `wait_for_run` tool instead polls `GET /runs/{run_id}` on the connector
+side (see **MCP tools** below).
 
-**Intended HAL flow**
+**Intended HAL / Custom GPT flow**
 
-1. Prefer `submit_and_wait` (MCP) for exact YAML end-to-end in one tool call — or `submit_run` (`POST /runs`) then `wait_for_run`
-2. When using separate tools: `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — poll until terminal or wait budget exhausted; when `wait_expired` is true, call again with the same `run_id`
+1. Prefer `submit_and_wait` (`POST /runs/submit-and-wait`, or the MCP tool) for exact YAML end-to-end in one call — or `submit_run` (`POST /runs`) then `wait_for_run`
+2. When using separate operations: `wait_for_run` (`POST /runs/{run_id}/wait` or MCP) — poll until terminal or wait budget exhausted; when `wait_expired` is true, call again with the same `run_id`
 3. Inspect `status`, authoritative `summary`, `result.persistence`, `commit_sha`, then diagnostic `stdout` / `stderr` / `error` (prefer `summary` over agent stdout for persistence claims)
 
 **Request body** `application/json` (all fields optional; defaults shown)
@@ -403,15 +405,48 @@ Includes the same fields as `GET /runs/{run_id}`, plus:
 | --- | --- | --- |
 | `reached_terminal` | boolean | `true` when the run status is terminal (`completed`, `failed`, or `timed_out`) |
 | `wait_expired` | boolean | `true` when the wait budget elapsed while the run was still `queued` or `running` |
+| `timeout_seconds` | number | Effective wait budget used for this call |
 
 | Outcome | `reached_terminal` | `wait_expired` | Run state mutated? |
 | --- | --- | --- | --- |
 | Already terminal / becomes terminal during wait | `true` | `false` | No (wait only observes) |
-| Wait budget exhausted while non-terminal | `false` | `true` | No |
+| Wait budget exhausted while non-terminal | `false` | `true` | No (latest successful run payload still returned) |
 
 Terminal statuses are defined by a single helper (`is_terminal_status`) covering `completed`, `failed`, and `timed_out`.
 
 **Response** `404 Not Found` when the `run_id` is unknown.
+
+### POST /runs/submit-and-wait
+
+Requires authentication.
+
+**OpenAPI operation ID:** `submit_and_wait`
+
+Accept an exact Mission Control YAML document, queue it through the same asynchronous pipeline as `POST /runs` (`_accept_async_run`), then wait via the same shared wait helper as `POST /runs/{run_id}/wait` until the run reaches a terminal status or `timeout_seconds` elapses. Returns the final authoritative run payload in one request. Does **not** duplicate submit or wait execution logic.
+
+Prefer this endpoint for Custom GPT Actions / HAL when exact YAML is already available and a single HTTP call should cover submit + wait. Routine structured missions still use `POST /runs/structured` (or MCP `submit_structured_run`) then `wait_for_run`.
+
+**Request body** `application/json`
+
+| Field | Type | Required | Default | Bounds | Description |
+| --- | --- | --- | --- | --- | --- |
+| `mission_yaml` | string | yes | — | non-empty | Exact mission YAML document (same as `POST /runs`) |
+| `timeout_seconds` | number | no | `300` | `0.1` … `3600` | Maximum time to wait after acceptance |
+| `poll_interval_seconds` | number | no | `1` | `0.05` … `60` | Delay between registry lookups while non-terminal |
+
+Out-of-bounds wait values return `422 Unprocessable Entity` **before** submission (Pydantic validation), so an invalid timeout never queues a run.
+
+**Response** `200 OK` — wait finished
+
+Same shape as `POST /runs/{run_id}/wait` (`WaitForRunResponse`): run fields plus `reached_terminal`, `wait_expired`, and `timeout_seconds`.
+
+**Response** `200 OK` — submission / validation failure
+
+Same `RunResponse` rejection shapes as `POST /runs` (`ok: false`, no `run_id`). Returned **immediately** without entering the wait loop.
+
+Recursive local submissions are rejected the same way as `POST /runs`.
+
+**Wait-window expiry.** When the wait budget expires while the run is still non-terminal, returns `wait_expired: true` with the accepted `run_id` and latest successful run fields. Resume with `POST /runs/{run_id}/wait` (`wait_for_run`) using that `run_id`.
 
 ### MCP tools
 
@@ -422,8 +457,8 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | `submit_run` | Submit mission YAML (`POST /runs`) |
 | `submit_structured_run` | Submit structured mission fields (`POST /runs/structured`); prefer for routine execute missions |
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
-| `wait_for_run` | Poll `get_run` until terminal or caller-requested wait window expires |
-| `submit_and_wait` | Submit exact mission YAML then wait in one call (`submit_run` + `wait_for_run`) |
+| `wait_for_run` | Poll `get_run` until terminal or caller-requested wait window expires (REST equivalent: `POST /runs/{run_id}/wait`) |
+| `submit_and_wait` | Submit exact mission YAML then wait in one call (`submit_run` + `wait_for_run`; REST equivalent: `POST /runs/submit-and-wait`) |
 
 #### ChatGPT custom MCP app
 

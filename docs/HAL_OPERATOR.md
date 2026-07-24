@@ -34,10 +34,12 @@ in `docs/HAL_OPERATOR_LOG.md`.
 - **Raw YAML remains fully supported** via MCP `submit_run` / HTTP `POST /runs`
   when exact document control is required (or when fields outside the structured
   v1 surface must be set by hand).
-- **Exact YAML end-to-end:** MCP `submit_and_wait` submits via `submit_run` and
-  waits via `wait_for_run` in one tool call. Prefer it when HAL already has the
-  full mission document and should only involve Allen for genuine approval,
-  decision, or unrecoverable failure.
+- **Exact YAML end-to-end:** Prefer `submit_and_wait` — HTTP
+  `POST /runs/submit-and-wait` (OpenAPI operation ID `submit_and_wait`) or MCP
+  `submit_and_wait` — which submits via `submit_run` / `POST /runs` and waits via
+  the shared wait path in one call. Prefer it when HAL / Custom GPT Actions
+  already have the full mission document and should only involve Allen for
+  genuine approval, decision, or unrecoverable failure.
 - Do not weaken platform-push approval: `persistence_mode=push` still requires
   explicit platform-push approval fields.
 
@@ -50,13 +52,18 @@ ambiguity requires user input.
 
 ## Waiting for async runs
 
-- Prefer MCP `submit_and_wait` for exact YAML when a single tool call should
-  cover submit + wait; resume with `wait_for_run` on `wait_expired`.
+- Prefer `submit_and_wait` (`POST /runs/submit-and-wait` or MCP) for exact YAML
+  when a single call should cover submit + wait; resume with `wait_for_run` on
+  `wait_expired`.
+- REST `POST /runs/{run_id}/wait` (OpenAPI operation ID `wait_for_run`) performs
+  a server-side wait and returns `run_id`, `timeout_seconds`, `wait_expired`,
+  `reached_terminal`, and the latest successful run payload.
 - MCP `wait_for_run` (and `submit_and_wait`) honor the requested
   `timeout_seconds` up to **3600** (aligned with `POST /runs/{run_id}/wait`).
   There is no artificial ~25s connector cutoff.
-- Default wait window is **20s**; pass a larger budget (for example `900`) when
-  a single call should stay active until terminal or that budget expires.
+- Default wait window is **20s** for MCP tools and **300s** for REST wait
+  endpoints; pass a larger budget (for example `900`) when a single call should
+  stay active until terminal or that budget expires.
 - When `wait_expired` is `true`, call `wait_for_run` again with the same
   `run_id` (do not treat expiry as run failure).
 - Railway’s edge proxy may still close a silent HTTP/MCP tool response after
