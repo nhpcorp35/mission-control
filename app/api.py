@@ -129,10 +129,15 @@ async def lifespan(_: FastAPI):
             recovered,
         )
     yield
+PRODUCTION_SERVER_URL = (
+    "https://mission-control-production-76ff.up.railway.app"
+)
+
 app = FastAPI(
     title="Mission Control API",
     version="1.0.0",
     lifespan=lifespan,
+    servers=[{"url": PRODUCTION_SERVER_URL}],
 )
 class MissionYamlRequest(BaseModel):
     mission_yaml: str = Field(..., min_length=1)

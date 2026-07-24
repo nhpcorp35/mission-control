@@ -358,6 +358,16 @@ class TestWaitOpenApiDiscovery(unittest.TestCase):
         schema = app.openapi()
         paths = schema["paths"]
 
+        # Custom GPT Actions require an absolute HTTPS URL in servers.
+        self.assertEqual(
+            schema.get("servers"),
+            [{"url": api_module.PRODUCTION_SERVER_URL}],
+        )
+        self.assertEqual(
+            schema["servers"][0]["url"],
+            "https://mission-control-production-76ff.up.railway.app",
+        )
+
         self.assertIn("/runs/{run_id}/wait", paths)
         wait_op = paths["/runs/{run_id}/wait"]["post"]
         self.assertEqual(wait_op["operationId"], "wait_for_run")
@@ -383,6 +393,32 @@ class TestWaitOpenApiDiscovery(unittest.TestCase):
         self.assertIn("mission_yaml", saw_request)
         self.assertIn("timeout_seconds", saw_request)
         self.assertIn("poll_interval_seconds", saw_request)
+
+    def test_openapi_json_endpoint_includes_servers(self) -> None:
+        # Match other tests in this module: avoid lifespan context that can
+        # collide with a closed shared SQLite connection after prior clients.
+        client = TestClient(app)
+        response = client.get("/openapi.json")
+        self.assertEqual(response.status_code, 200)
+        schema = response.json()
+        self.assertEqual(
+            schema.get("servers"),
+            [
+                {
+                    "url": (
+                        "https://mission-control-production-76ff.up.railway.app"
+                    )
+                }
+            ],
+        )
+        operation_ids = {
+            method_obj.get("operationId")
+            for path_item in schema["paths"].values()
+            for method_obj in path_item.values()
+            if isinstance(method_obj, dict)
+        }
+        self.assertIn("wait_for_run", operation_ids)
+        self.assertIn("submit_and_wait", operation_ids)
 
 
 if __name__ == "__main__":

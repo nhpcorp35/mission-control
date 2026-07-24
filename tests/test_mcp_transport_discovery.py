@@ -165,9 +165,18 @@ class TestMcpTransportDiscovery(unittest.TestCase):
     def test_rest_openapi_exposes_wait_operation_ids(self) -> None:
         # Custom GPT Actions import Mission Control REST OpenAPI; wait tools
         # must be discoverable as operationIds alongside MCP tool names.
+        from app.api import PRODUCTION_SERVER_URL
         from app.api import app as mission_control_app
 
         schema = mission_control_app.openapi()
+        self.assertEqual(
+            schema.get("servers"),
+            [{"url": PRODUCTION_SERVER_URL}],
+        )
+        self.assertEqual(
+            schema["servers"][0]["url"],
+            "https://mission-control-production-76ff.up.railway.app",
+        )
         operation_ids = {
             method_obj.get("operationId")
             for path_item in schema["paths"].values()
