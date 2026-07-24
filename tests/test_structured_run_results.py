@@ -672,6 +672,76 @@ class TestStructuredResultApi(unittest.TestCase):
             result["warnings"],
         )
 
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.collect_changed_files")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_wait_for_run_summary_matches_platform_persistence(
+        self,
+        _mock_preflight,
+        mock_prepare,
+        mock_execute,
+        mock_changed,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        """Wait payload summary must match platform persistence, not stdout."""
+        workspace = tempfile.mkdtemp(prefix="mc-structured-wait-")
+        (Path(workspace) / "created.txt").write_text("hi\n", encoding="utf-8")
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path=workspace,
+        )
+        agent_stdout = (
+            "commit hash: n/a (no commit or push occurred)\n"
+            "push confirmation: not pushed\n"
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout=agent_stdout,
+            return_code=0,
+            command=["cursor-agent", "--force", "<instruction>"],
+        )
+        mock_changed.return_value = (["created.txt"], None)
+        mock_persist.return_value = PersistenceResult(
+            ok=True,
+            commit_sha="cafef00d",
+        )
+
+        submit = self.client.post(
+            "/runs",
+            json={
+                "mission_yaml": _executable_mission_yaml(
+                    deliverables=["created.txt"]
+                )
+            },
+        )
+        self.assertEqual(submit.status_code, 202)
+        run_id = submit.json()["run_id"]
+        self._wait_for_terminal(run_id)
+
+        wait_response = self.client.post(
+            f"/runs/{run_id}/wait",
+            json={"timeout_seconds": 1.0, "poll_interval_seconds": 0.05},
+        )
+        self.assertEqual(wait_response.status_code, 200)
+        body = wait_response.json()
+        self.assertEqual(body["status"], "completed")
+        self.assertTrue(body["reached_terminal"])
+        self.assertFalse(body["wait_expired"])
+        self.assertEqual(body["stdout"], agent_stdout)
+        self.assertIn("no commit or push occurred", body["stdout"])
+        self.assertEqual(body["commit_sha"], "cafef00d")
+        self.assertIn("Platform persistence succeeded", body["summary"])
+        self.assertIn("commit_sha=cafef00d", body["summary"])
+        self.assertNotIn("no commit or push occurred", body["summary"])
+        self.assertEqual(body["result"]["summary"], body["summary"])
+        self.assertEqual(body["result"]["persistence"]["commit_sha"], "cafef00d")
+        self.assertTrue(body["result"]["persistence"]["ok"])
+        mock_persist.assert_called_once()
+
     def test_queued_run_keeps_null_result_for_compatibility(self) -> None:
         record = api_module.run_registry.create_run()
         response = self.client.get(f"/runs/{record.run_id}")

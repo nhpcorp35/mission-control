@@ -384,7 +384,7 @@ HTTP clients may use this endpoint for a server-side wait. The MCP
 
 1. `submit_run` (`POST /runs`) — queue the mission
 2. `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — poll until terminal or wait budget exhausted; for MCP, repeat short waits when `wait_expired` is true
-3. Inspect `status`, `stdout` / `stderr` / `error`, and `commit_sha`
+3. Inspect `status`, authoritative `summary`, `result.persistence`, `commit_sha`, then diagnostic `stdout` / `stderr` / `error` (prefer `summary` over agent stdout for persistence claims)
 
 **Request body** `application/json` (all fields optional; defaults shown)
 
@@ -464,7 +464,9 @@ prompting** until the run is terminal.
 **Intended HAL loop.** Prefer `submit_structured_run` for routine execute
 missions (or `submit_run` with exact YAML when needed) → repeat `wait_for_run`
 until `wait_expired` is `false` and `status` is terminal → inspect
-`stdout` / `stderr` / `error` / `commit_sha` / `result`.
+`summary` / `result.persistence` / `commit_sha` / `result`, then diagnostic
+`stdout` / `stderr` / `error`. Prefer `summary` over agent stdout for
+persistence claims (platform persistence runs after the agent completes).
 
 **Terminal behavior.** Reuses Mission Control terminal statuses (`completed`,
 `failed`, `timed_out`) via `is_terminal_status`. Returns immediately when the

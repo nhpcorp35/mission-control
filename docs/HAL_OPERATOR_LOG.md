@@ -1,5 +1,60 @@
 # HAL Operator Log
 
+## 2026-07-24 — Reconcile persistence reporting (retry)
+
+### Objective
+
+Retry of persistence-reporting reconciliation: ensure the client-facing run
+summary stays authoritative and consistent with platform persistence, including
+wait-path responses and HAL flow docs.
+
+### Finding
+
+Confirmed: platform Git persistence still runs **after** agent completion in
+`execute_registered_run`. The prior pass already added `summary` /
+`finalize_structured_summary` and was platform-persisted as
+`396762a078064ee6110f641c14030932d534b833` even though agent stdout claimed no
+commit/push — illustrating the exact discrepancy this work reconciles.
+
+### Implementation
+
+- Kept existing `build_run_summary` / `finalize_structured_summary` behavior
+  and persistence sequencing unchanged.
+- Aligned remaining `MISSION_CONTROL_API.md` HAL flow / wait_for_run guidance
+  to prefer `summary` / `result.persistence` / `commit_sha` over agent stdout.
+- Added wait-path regression:
+  `test_wait_for_run_summary_matches_platform_persistence`.
+
+### Tests executed
+
+```text
+/mise/installs/python/3.13.14/bin/python -m unittest \
+  tests.test_structured_run_results \
+  tests.test_runs_api \
+  tests.test_wait_for_run \
+  tests.test_execution_lifecycle \
+  tests.test_mcp_transport_discovery \
+  -v
+# Ran 52 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Prior platform persistence of the initial reconcile:
+`396762a078064ee6110f641c14030932d534b833`.
+Push confirmation: not pushed by this agent (same constraints); platform
+persistence may commit/push after agent completion.
+
+### Limitations
+
+- Legacy terminal rows stored before `summary` may lack it until re-run.
+- Agent stdout remains unmodified diagnostic text.
+
+### Next Objective
+
+Prefer `summary` over agent stdout when judging async-run persistence.
+
 ## 2026-07-24 — Reconcile persistence reporting
 
 ### Objective
@@ -43,8 +98,9 @@ still records a successful platform outcome.
 
 ### Resulting commit
 
-Not committed in this mission (constraints forbid git staging/commits/pushes).
-Push confirmation: not pushed (same constraints).
+Agent stdout of the original pass claimed no commit; platform persistence
+later recorded `396762a078064ee6110f641c14030932d534b833` (prefer
+`summary` / `commit_sha` over that stdout claim).
 
 ### Limitations
 
