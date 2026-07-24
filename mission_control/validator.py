@@ -43,11 +43,11 @@ RUN_FALSE_PERMISSIONS = (
     "push",
 )
 
+# Agent Git permission flags (stage_changes / commit / push) are legacy and
+# optional for execute. Platform staging, committing, and pushing are governed
+# solely by ``persistence.mode`` (see ``persist_workspace_changes``).
 EXECUTE_FALSE_PERMISSIONS = (
     "delete_files",
-    "stage_changes",
-    "commit",
-    "push",
 )
 
 
@@ -328,6 +328,10 @@ def validate_mission_for_execute(
                     f"{permission}"
                 ),
             )
+
+    # Legacy agent Git flags may be present (including truthy) without
+    # affecting execute eligibility. They must not contradict persistence
+    # mode: platform Git actions follow resolve_persistence_mode only.
 
     path_result = _validate_repository_path(data)
     if not path_result.ok:

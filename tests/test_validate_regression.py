@@ -23,8 +23,11 @@ def _executable_mission(
     platform_push_approved: bool | None = None,
     allow_automatic_platform_push: bool | None = None,
     permissions_push: bool = False,
+    stage_changes: bool = False,
+    commit: bool = False,
     create_files: bool = True,
     modify_files: bool = False,
+    delete_files: bool = False,
 ) -> dict:
     mission: dict = {
         "version": "1.0",
@@ -45,10 +48,10 @@ def _executable_mission(
             "read": True,
             "create_files": create_files,
             "modify_files": modify_files,
-            "delete_files": False,
+            "delete_files": delete_files,
             "run_commands": True,
-            "stage_changes": False,
-            "commit": False,
+            "stage_changes": stage_changes,
+            "commit": commit,
             "push": permissions_push,
         },
         "instructions": "Create a file.",
@@ -288,17 +291,72 @@ class TestPlatformPushApprovalForExecute(unittest.TestCase):
             )
         )
         self.assertTrue(result.ok, result.error)
-        # permissions.push=true remains forbidden for execute.
-        blocked = validate_mission_for_execute(
+        # Legacy permissions.push=true is accepted but does not authorize
+        # platform push by itself (approval still required when mode=push).
+        with_legacy_push = validate_mission_for_execute(
             _executable_mission(
                 persistence_mode="push",
                 platform_push_approved=True,
                 permissions_push=True,
             )
         )
-        self.assertFalse(blocked.ok)
-        self.assertIn("push", blocked.error or "")
-        self.assertIn("not allowed for execute", blocked.error or "")
+        self.assertTrue(with_legacy_push.ok, with_legacy_push.error)
+
+    def test_execute_accepts_legacy_stage_changes_with_persistence_modes(
+        self,
+    ) -> None:
+        """Regression: stage_changes must not reject execute eligibility.
+
+        Previously rejected with:
+        Permission not allowed for execute: stage_changes
+        Platform Git is selected via persistence.mode instead.
+        """
+        cases = (
+            ("none", False, False),
+            ("commit", False, False),
+            ("push", True, False),
+            ("push", False, True),
+        )
+        for mode, approved, automatic in cases:
+            with self.subTest(mode=mode, approved=approved, automatic=automatic):
+                result = validate_mission_for_execute(
+                    _executable_mission(
+                        persistence_mode=mode,
+                        platform_push_approved=True if approved else None,
+                        allow_automatic_platform_push=(
+                            True if automatic else None
+                        ),
+                        stage_changes=True,
+                        commit=True,
+                        permissions_push=True,
+                    )
+                )
+                self.assertTrue(result.ok, result.error)
+
+    def test_execute_still_rejects_delete_files(self) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="commit",
+                delete_files=True,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("delete_files", result.error or "")
+        self.assertIn("not allowed for execute", result.error or "")
+
+    def test_execute_legacy_git_flags_do_not_bypass_platform_push_approval(
+        self,
+    ) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                stage_changes=True,
+                commit=True,
+                permissions_push=True,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
 
 
 class TestValidateCli(unittest.TestCase):

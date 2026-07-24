@@ -89,9 +89,9 @@ Common permission fields used in reference missions and tests:
 | `modify_files` | Agent may modify existing files |
 | `delete_files` | Agent may delete files |
 | `run_commands` | Agent may run commands (not enforced by validator) |
-| `stage_changes` | Agent may `git add` |
-| `commit` | Agent may `git commit` |
-| `push` | Agent may `git push` |
+| `stage_changes` | Legacy agent flag; ignored for platform Git (`persistence.mode`) |
+| `commit` | Legacy agent flag; ignored for platform Git (`persistence.mode`) |
+| `push` | Legacy agent flag; ignored for platform Git (`persistence.mode`) |
 
 ### Fields that must remain false for run (`plan` / `POST /run`)
 
@@ -109,16 +109,18 @@ Common permission fields used in reference missions and tests:
 `validate_mission_for_execute` rejects a mission when any of these is truthy:
 
 - `delete_files`
-- `stage_changes`
-- `commit`
-- `push`
+
+Legacy agent Git flags (`stage_changes`, `commit`, `push`) are **not** execute
+eligibility gates. Platform staging, committing, and pushing are controlled only
+by `persistence.mode`. Truthy legacy Git flags are accepted but ignored for
+platform persistence (they do not enable or disable platform Git actions).
 
 Additionally, unless `persistence.mode` resolves to `push`, execute requires at
 least one of `create_files` or `modify_files` to be true.
 
 **Push-only exception:** when `persistence.mode` is `push` (and platform-push
 approval is present), execute may have both `create_files: false` and
-`modify_files: false`. Agent `permissions.push` must still remain `false`.
+`modify_files: false`.
 
 ### Constraint text sent to the agent
 
@@ -564,7 +566,7 @@ approval:
 | Non-cursor agent | `Unsupported agent: … (expected cursor)` | Set `execution.agent: cursor` |
 | Worktree requested | `Worktrees are not supported in Phase 2` / `… for execute` | Set `execution.worktree: false` |
 | Mutating permission on plan run | `Permission not allowed for run: create_files` (etc.) | Keep run false-permissions false |
-| Forbidden execute permission | `Permission not allowed for execute: push` (etc.) | Keep delete/stage/commit/push false |
+| Forbidden execute permission | `Permission not allowed for execute: delete_files` | Keep `delete_files: false`; use `persistence.mode` for platform Git |
 | Execute without file perms (non-push) | `Execute requires at least one of: create_files or modify_files` | Enable create and/or modify, or use approved `persistence.mode: push` |
 | Push without platform approval | `PLATFORM_PUSH_APPROVAL_REQUIRED: …` | Set `approval.platform_push_approved: true` or `allow_automatic_platform_push: true` |
 | Missing/invalid repo path | `repository.path must be a non-empty string` / `does not exist` / `not a directory` | Point `repository.path` at an existing directory |

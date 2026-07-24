@@ -495,7 +495,7 @@ mission's top-level `persistence` block:
 | `commit` | Stage and create a local commit; never push |
 | `push` | Stage, commit, and push to `repository.base_branch` (privileged; requires platform-push approval) |
 
-Agent `permissions.commit` and `permissions.push` remain agent permissions only. They do not select platform persistence behavior. Unsupported `persistence.mode` values fail mission validation.
+Agent `permissions.stage_changes`, `permissions.commit`, and `permissions.push` are legacy agent-facing fields only. They do not select platform persistence behavior and are not required (or rejected) for execute eligibility. Use `persistence.mode` as the authoritative mechanism for staging, committing, and pushing. Unsupported `persistence.mode` values fail mission validation.
 
 #### Completed-run file deliverable verification
 
@@ -532,7 +532,7 @@ escape the workspace are not inspected outside the workspace (skipped, not
 followed). File *content* is not validated. Unknown mapping shapes are skipped
 by the filesystem gate (not silently treated as paths).
 
-Push authorization is expressed through `persistence.mode=push` plus `approval.platform_push_approved=true` (or `approval.allow_automatic_platform_push=true`). There is no separate `permissions.push` platform gate; agent `permissions.push` must remain `false` for execute missions.
+Push authorization is expressed through `persistence.mode=push` plus `approval.platform_push_approved=true` (or `approval.allow_automatic_platform_push=true`). There is no separate `permissions.push` platform gate; truthy agent `permissions.push` does not authorize (or block) platform push.
 
 Execute missions with `persistence.mode=push` and platform-push approval may be **push-only**: they are valid even when `create_files=false` and `modify_files=false`.
 

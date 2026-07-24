@@ -223,12 +223,15 @@ permissions:
   push: false
 ```
 
-`permissions.commit` and `permissions.push` are agent permissions only.
-They authorize whether the coding agent itself may run Git commit or push
-commands. They do not cause Mission Control to stage, commit, or push after
-the agent finishes.
+`permissions.stage_changes`, `permissions.commit`, and `permissions.push`
+are legacy agent-facing fields only. They do not cause Mission Control to
+stage, commit, or push after the agent finishes, and execute eligibility
+does not require or reject them. Clients should select platform Git
+behavior with `persistence.mode` (`none`, `commit`, or `push`) instead of
+requesting those permission flags separately.
 
-Mission Control enforces permissions regardless of agent behavior.
+Mission Control enforces file permissions and platform persistence
+regardless of agent behavior.
 
 ---
 

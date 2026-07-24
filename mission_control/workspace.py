@@ -262,9 +262,11 @@ def persist_workspace_changes(
       (requires explicit platform-push approval; see
       ``require_platform_push_approval``)
 
-    Agent ``permissions.commit`` / ``permissions.push`` are separate and do not
-    control this platform persistence path. Approval is enforced again here so
-    a run cannot bypass the gate merely because earlier validation succeeded.
+    Agent ``permissions.commit`` / ``permissions.push`` / ``permissions.stage_changes``
+    are legacy agent-facing fields only. They do not control this platform
+    persistence path; ``persistence.mode`` is authoritative. Approval is
+    enforced again here so a run cannot bypass the gate merely because earlier
+    validation succeeded.
     """
     mode = resolve_persistence_mode(mission)
     if mode not in SUPPORTED_PERSISTENCE_MODES:
