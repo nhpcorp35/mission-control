@@ -424,6 +424,7 @@ def _accept_async_run(
         run_id=record.run_id,
         status=RunStatus.QUEUED.value,
     )
+# Used by Railway health checks and external uptime monitoring.
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
