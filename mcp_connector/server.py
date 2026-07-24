@@ -23,6 +23,7 @@ EXPECTED_TOOL_NAMES = (
     "submit_structured_run",
     "get_run",
     "wait_for_run",
+    "submit_and_wait",
 )
 
 settings = Settings.from_env()
@@ -34,13 +35,15 @@ mcp = FastMCP(
         "Submit Mission Control missions as structured fields "
         "(prefer submit_structured_run for routine execute missions) or as "
         "raw YAML (submit_run), retrieve asynchronous run status, and wait "
-        "for runs to reach a terminal state. Intended HAL flow: "
-        "submit_structured_run (or submit_run), then call wait_for_run "
-        "until status is terminal (or repeat when wait_expired is true), "
-        "then inspect status, summary, result.persistence, and commit_sha. "
+        "for runs to reach a terminal state. For exact YAML end-to-end in "
+        "one tool call, use submit_and_wait (submit_run + wait_for_run). "
+        "Intended HAL flow: submit_and_wait with exact YAML, or "
+        "submit_structured_run (or submit_run) then wait_for_run until "
+        "status is terminal (or repeat when wait_expired is true), then "
+        "inspect status, summary, result.persistence, and commit_sha. "
         "Prefer summary / result.persistence / commit_sha over agent stdout "
         "for persistence claims (platform persistence runs after the agent "
-        "completes). wait_for_run default timeout is "
+        "completes). wait_for_run / submit_and_wait default timeout is "
         f"{MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s; requested timeouts are "
         f"honored up to {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s. When "
         "wait_expired is true, call wait_for_run again with the same run_id."
@@ -173,6 +176,35 @@ async def wait_for_run(
 
         result = await client.wait_for_run(
             run_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def submit_and_wait(
+    mission_yaml: str,
+    timeout_seconds: float = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+) -> dict[str, Any]:
+    """Submit exact mission YAML and wait for a terminal run state.
+
+    One-shot HAL path: reuses authenticated submit_run then wait_for_run
+    (same timeout_seconds / poll_interval_seconds validation and limits as
+    wait_for_run). Returns the accepted run_id and final authoritative run
+    payload. Submission failures return the existing structured submission
+    error without waiting. When wait_expired is true, resume with
+    wait_for_run using the same run_id.
+    """
+    try:
+        if not mission_yaml.strip():
+            raise ValueError("mission_yaml must not be empty")
+
+        result = await client.submit_and_wait(
+            mission_yaml,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )

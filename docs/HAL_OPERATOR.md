@@ -34,6 +34,10 @@ in `docs/HAL_OPERATOR_LOG.md`.
 - **Raw YAML remains fully supported** via MCP `submit_run` / HTTP `POST /runs`
   when exact document control is required (or when fields outside the structured
   v1 surface must be set by hand).
+- **Exact YAML end-to-end:** MCP `submit_and_wait` submits via `submit_run` and
+  waits via `wait_for_run` in one tool call. Prefer it when HAL already has the
+  full mission document and should only involve Allen for genuine approval,
+  decision, or unrecoverable failure.
 - Do not weaken platform-push approval: `persistence_mode=push` still requires
   explicit platform-push approval fields.
 
@@ -46,9 +50,11 @@ ambiguity requires user input.
 
 ## Waiting for async runs
 
-- MCP `wait_for_run` honors the requested `timeout_seconds` up to **3600**
-  (aligned with `POST /runs/{run_id}/wait`). There is no artificial ~25s
-  connector cutoff.
+- Prefer MCP `submit_and_wait` for exact YAML when a single tool call should
+  cover submit + wait; resume with `wait_for_run` on `wait_expired`.
+- MCP `wait_for_run` (and `submit_and_wait`) honor the requested
+  `timeout_seconds` up to **3600** (aligned with `POST /runs/{run_id}/wait`).
+  There is no artificial ~25s connector cutoff.
 - Default wait window is **20s**; pass a larger budget (for example `900`) when
   a single call should stay active until terminal or that budget expires.
 - When `wait_expired` is `true`, call `wait_for_run` again with the same

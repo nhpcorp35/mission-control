@@ -382,8 +382,8 @@ HTTP clients may use this endpoint for a server-side wait. The MCP
 
 **Intended HAL flow**
 
-1. `submit_run` (`POST /runs`) — queue the mission
-2. `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — poll until terminal or wait budget exhausted; when `wait_expired` is true, call again with the same `run_id`
+1. Prefer `submit_and_wait` (MCP) for exact YAML end-to-end in one tool call — or `submit_run` (`POST /runs`) then `wait_for_run`
+2. When using separate tools: `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — poll until terminal or wait budget exhausted; when `wait_expired` is true, call again with the same `run_id`
 3. Inspect `status`, authoritative `summary`, `result.persistence`, `commit_sha`, then diagnostic `stdout` / `stderr` / `error` (prefer `summary` over agent stdout for persistence claims)
 
 **Request body** `application/json` (all fields optional; defaults shown)
@@ -423,6 +423,7 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | `submit_structured_run` | Submit structured mission fields (`POST /runs/structured`); prefer for routine execute missions |
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
 | `wait_for_run` | Poll `get_run` until terminal or caller-requested wait window expires |
+| `submit_and_wait` | Submit exact mission YAML then wait in one call (`submit_run` + `wait_for_run`) |
 
 #### ChatGPT custom MCP app
 
@@ -456,17 +457,19 @@ honored end-to-end (no artificial ~25s connector cutoff).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `run_id` | string | yes | — | Run identifier returned by `submit_run` / `submit_structured_run` |
+| `run_id` | string | yes | — | Run identifier returned by `submit_run` / `submit_structured_run` / `submit_and_wait` |
 | `timeout_seconds` | number | no | `20` | Maximum time to wait for this call; must be `>= 0.1`. Values above `3600` are capped to `3600` (same upper bound as `POST /runs/{run_id}/wait`). Zero/negative values are rejected. |
 | `poll_interval_seconds` | number | no | `2` | Delay between `get_run` polls; must be `>= 0.05`. Values above `10` are capped to `10`. Zero/negative values are rejected. |
 
-**Intended HAL loop.** Prefer `submit_structured_run` for routine execute
-missions (or `submit_run` with exact YAML when needed) → `wait_for_run` with an
-appropriate `timeout_seconds` until `wait_expired` is `false` and `status` is
-terminal (retry the same `run_id` when `wait_expired` is `true`) → inspect
-`summary` / `result.persistence` / `commit_sha` / `result`, then diagnostic
-`stdout` / `stderr` / `error`. Prefer `summary` over agent stdout for
-persistence claims (platform persistence runs after the agent completes).
+**Intended HAL loop.** Prefer `submit_and_wait` when you already have exact
+mission YAML and want one tool call end-to-end. Prefer `submit_structured_run`
+for routine execute missions (or `submit_run` with exact YAML when needed) →
+`wait_for_run` with an appropriate `timeout_seconds` until `wait_expired` is
+`false` and `status` is terminal (retry the same `run_id` when `wait_expired`
+is `true`) → inspect `summary` / `result.persistence` / `commit_sha` /
+`result`, then diagnostic `stdout` / `stderr` / `error`. Prefer `summary` over
+agent stdout for persistence claims (platform persistence runs after the agent
+completes).
 
 **Terminal behavior.** Reuses Mission Control terminal statuses (`completed`,
 `failed`, `timed_out`) via `is_terminal_status`. Returns immediately when the
@@ -502,6 +505,33 @@ can therefore be cut by the platform before a 900s application budget finishes;
 when that happens, treat it like a transport interrupt and call `wait_for_run`
 again with the same `run_id`. Upstream MCP clients may also impose their own
 tool-call deadlines independent of these connector bounds.
+
+#### `submit_and_wait`
+
+Submits an exact Mission Control YAML document via the authenticated
+`submit_run` path, then waits via the same `wait_for_run` poll loop — one MCP
+tool call for end-to-end execution. Does not duplicate submit or wait logic.
+
+| Argument | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `mission_yaml` | string | yes | — | Exact mission YAML document (same as `submit_run`) |
+| `timeout_seconds` | number | no | `20` | Same validation and limits as `wait_for_run` (must be `>= 0.1`; values above `3600` capped to `3600`; zero/negative rejected). Validated **before** submission so an invalid timeout never queues a run. |
+| `poll_interval_seconds` | number | no | `2` | Same validation and limits as `wait_for_run` |
+
+**Success.** Returns `{"ok": true, ...}` with the accepted `run_id` and the
+final authoritative run payload from `wait_for_run` (including
+`wait_expired`, `reached_terminal`, and `timeout_seconds`).
+
+**Submission failure.** If `submit_run` returns the existing structured
+rejection (`ok: false`, no `run_id`), that payload is returned immediately
+without entering the wait loop.
+
+**Wait-window expiry.** Same structured `wait_expired: true` payload as
+`wait_for_run` (latest successful run fields when available). Resume with
+`wait_for_run` using the returned `run_id`.
+
+Authentication and run isolation match `submit_run` / `wait_for_run` (server-side
+API key; isolated run workspaces).
 
 ### Platform Git persistence
 

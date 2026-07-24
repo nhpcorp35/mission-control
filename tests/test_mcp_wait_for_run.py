@@ -432,6 +432,7 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
                 "submit_structured_run",
                 "get_run",
                 "wait_for_run",
+                "submit_and_wait",
             ],
         )
 
@@ -475,6 +476,240 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
                 "modify_files",
             },
         )
+
+        submit_and_wait = next(
+            tool for tool in tools if tool.name == "submit_and_wait"
+        )
+        saw_props = submit_and_wait.parameters["properties"]
+        self.assertEqual(
+            set(submit_and_wait.parameters["required"]),
+            {"mission_yaml"},
+        )
+        self.assertEqual(
+            saw_props["timeout_seconds"]["default"],
+            MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            saw_props["poll_interval_seconds"]["default"],
+            MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+        )
+        saw_description = submit_and_wait.description or ""
+        self.assertIn("submit_run", saw_description)
+        self.assertIn("wait_for_run", saw_description)
+        self.assertIn("wait_expired", saw_description)
+
+
+class TestSubmitAndWaitClient(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.client = MissionControlClient(_settings())
+
+    async def test_successful_completion_returns_run_payload(self) -> None:
+        accepted = {"run_id": "run-saw-1", "status": "queued"}
+        terminal = {
+            **_run_payload("run-saw-1", "completed", stdout="done", commit_sha="abc"),
+            "wait_expired": False,
+            "timeout_seconds": 5.0,
+            "reached_terminal": True,
+        }
+        with patch.object(
+            self.client,
+            "submit_run",
+            new=AsyncMock(return_value=accepted),
+        ) as submit_run:
+            with patch.object(
+                self.client,
+                "wait_for_run",
+                new=AsyncMock(return_value=terminal),
+            ) as wait_for_run:
+                result = await self.client.submit_and_wait(
+                    "mission: yaml",
+                    timeout_seconds=5.0,
+                    poll_interval_seconds=0.1,
+                )
+
+        self.assertEqual(result["run_id"], "run-saw-1")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["stdout"], "done")
+        self.assertEqual(result["commit_sha"], "abc")
+        self.assertFalse(result["wait_expired"])
+        self.assertTrue(result["reached_terminal"])
+        submit_run.assert_awaited_once_with("mission: yaml")
+        wait_for_run.assert_awaited_once_with(
+            "run-saw-1",
+            timeout_seconds=5.0,
+            poll_interval_seconds=0.1,
+        )
+
+    async def test_submission_failure_skips_wait(self) -> None:
+        rejection = {
+            "ok": False,
+            "stdout": "",
+            "stderr": "",
+            "error": "invalid mission",
+            "error_detail": None,
+        }
+        with patch.object(
+            self.client,
+            "submit_run",
+            new=AsyncMock(return_value=rejection),
+        ) as submit_run:
+            with patch.object(
+                self.client,
+                "wait_for_run",
+                new=AsyncMock(),
+            ) as wait_for_run:
+                result = await self.client.submit_and_wait(
+                    "bad: yaml",
+                    timeout_seconds=5.0,
+                    poll_interval_seconds=0.1,
+                )
+
+        self.assertEqual(result, rejection)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid mission")
+        submit_run.assert_awaited_once_with("bad: yaml")
+        wait_for_run.assert_not_awaited()
+
+    async def test_terminal_immediate_via_wait_path(self) -> None:
+        accepted = {"run_id": "run-saw-term", "status": "queued"}
+        already_terminal = {
+            **_run_payload("run-saw-term", "completed", stdout="instant"),
+            "wait_expired": False,
+            "timeout_seconds": 10.0,
+            "reached_terminal": True,
+        }
+        with patch.object(
+            self.client,
+            "submit_run",
+            new=AsyncMock(return_value=accepted),
+        ):
+            with patch.object(
+                self.client,
+                "wait_for_run",
+                new=AsyncMock(return_value=already_terminal),
+            ) as wait_for_run:
+                result = await self.client.submit_and_wait(
+                    "mission: yaml",
+                    timeout_seconds=10.0,
+                    poll_interval_seconds=0.05,
+                )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["wait_expired"])
+        self.assertTrue(result["reached_terminal"])
+        wait_for_run.assert_awaited_once()
+
+    async def test_wait_expiration_returns_structured_payload(self) -> None:
+        accepted = {"run_id": "run-saw-exp", "status": "queued"}
+        expired = {
+            **_run_payload("run-saw-exp", "running", stdout="still going"),
+            "wait_expired": True,
+            "timeout_seconds": 0.15,
+            "reached_terminal": False,
+        }
+        with patch.object(
+            self.client,
+            "submit_run",
+            new=AsyncMock(return_value=accepted),
+        ):
+            with patch.object(
+                self.client,
+                "wait_for_run",
+                new=AsyncMock(return_value=expired),
+            ):
+                result = await self.client.submit_and_wait(
+                    "mission: yaml",
+                    timeout_seconds=0.15,
+                    poll_interval_seconds=0.05,
+                )
+
+        self.assertEqual(result["run_id"], "run-saw-exp")
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["stdout"], "still going")
+        self.assertTrue(result["wait_expired"])
+        self.assertFalse(result["reached_terminal"])
+        self.assertEqual(result["timeout_seconds"], 0.15)
+
+    async def test_invalid_timeout_rejected_before_submit(self) -> None:
+        with patch.object(
+            self.client,
+            "submit_run",
+            new=AsyncMock(),
+        ) as submit_run:
+            with self.assertRaises(ValueError) as ctx:
+                await self.client.submit_and_wait(
+                    "mission: yaml",
+                    timeout_seconds=0,
+                    poll_interval_seconds=1.0,
+                )
+        self.assertIn("timeout_seconds", str(ctx.exception))
+        submit_run.assert_not_awaited()
+
+
+class TestSubmitAndWaitMcpTool(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_success_wraps_terminal_payload(self) -> None:
+        payload = {
+            **_run_payload("run-saw-t", "completed", stdout="ok"),
+            "wait_expired": False,
+            "timeout_seconds": 5.0,
+            "reached_terminal": True,
+        }
+        with patch.object(
+            mcp_server.client,
+            "submit_and_wait",
+            new=AsyncMock(return_value=payload),
+        ):
+            result = await mcp_server.submit_and_wait(
+                "mission: yaml",
+                timeout_seconds=5.0,
+                poll_interval_seconds=0.1,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["run_id"], "run-saw-t")
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["wait_expired"])
+
+    async def test_tool_maps_submission_failure(self) -> None:
+        rejection = {
+            "ok": False,
+            "stdout": "",
+            "stderr": "",
+            "error": "invalid mission",
+            "error_detail": None,
+        }
+        with patch.object(
+            mcp_server.client,
+            "submit_and_wait",
+            new=AsyncMock(return_value=rejection),
+        ) as submit_and_wait:
+            result = await mcp_server.submit_and_wait("bad: yaml")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid mission")
+        submit_and_wait.assert_awaited_once()
+
+    async def test_tool_maps_wait_expired_as_ok_payload(self) -> None:
+        payload = {
+            **_run_payload("run-saw-t", "running"),
+            "wait_expired": True,
+            "timeout_seconds": 1.0,
+            "reached_terminal": False,
+        }
+        with patch.object(
+            mcp_server.client,
+            "submit_and_wait",
+            new=AsyncMock(return_value=payload),
+        ):
+            result = await mcp_server.submit_and_wait(
+                "mission: yaml",
+                timeout_seconds=1.0,
+                poll_interval_seconds=0.1,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["run_id"], "run-saw-t")
+        self.assertTrue(result["wait_expired"])
 
 
 if __name__ == "__main__":

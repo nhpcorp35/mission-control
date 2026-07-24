@@ -1,5 +1,62 @@
 # HAL Operator Log
 
+## 2026-07-24 — Add submit_and_wait MCP operation
+
+### Objective
+
+Add a Mission Control MCP tool that accepts exact mission YAML, submits it,
+and waits for the resulting run to reach a terminal state in one tool call,
+so HAL can run a normal mission end-to-end without involving Allen except for
+genuine approval, decision, or unrecoverable failure.
+
+### Finding
+
+Submit and wait already existed as separate authenticated paths
+(`submit_run` / `POST /runs` and connector-side `wait_for_run` polling
+`get_run`). HAL previously needed two MCP calls for exact YAML end-to-end.
+
+### Implementation
+
+- Added `MissionControlClient.submit_and_wait` reusing `submit_run` +
+  `wait_for_run` (same timeout/poll validation and limits; validate before
+  submit).
+- Added MCP tool `submit_and_wait`; updated `EXPECTED_TOOL_NAMES` and server
+  instructions.
+- Submission failures return the existing structured rejection without
+  waiting; wait expiry returns `run_id` + latest run fields with
+  `wait_expired: true`.
+- Updated `MISSION_CONTROL_API.md` and `docs/HAL_OPERATOR.md`.
+- Regression coverage for success, submission failure, terminal-immediate,
+  and wait expiration.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest \
+  tests.test_mcp_wait_for_run \
+  tests.test_mcp_transport_discovery \
+  -v
+# Ran 33 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Platform persistence may commit/push after agent completion.
+Suggested message: Add submit and wait MCP operation
+
+### Limitations
+
+- `submit_and_wait` covers exact YAML only; routine structured missions still
+  use `submit_structured_run` + `wait_for_run`.
+- Railway edge / upstream client deadlines still apply to long silent waits;
+  resume with `wait_for_run` and the same `run_id`.
+
+### Next Objective
+
+Use `submit_and_wait` for exact-YAML HAL loops; involve Allen only for
+approval, decision, or unrecoverable failure.
+
 ## 2026-07-24 — Remove wait_for_run 25-second cutoff
 
 ### Objective

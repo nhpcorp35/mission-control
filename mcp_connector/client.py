@@ -178,6 +178,42 @@ class MissionControlClient:
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/runs/{run_id}")
 
+    async def submit_and_wait(
+        self,
+        mission_yaml: str,
+        *,
+        timeout_seconds: float = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+    ) -> dict[str, Any]:
+        """Submit exact mission YAML, then wait via ``wait_for_run``.
+
+        Reuses the authenticated ``submit_run`` and ``wait_for_run`` paths.
+        Wait parameter validation/clamping matches ``wait_for_run`` and runs
+        before submission so an invalid timeout does not queue a run.
+
+        On structured submission failure (``ok: false``, no ``run_id``),
+        returns that payload without entering the wait loop. On success,
+        returns the ``wait_for_run`` payload (accepted ``run_id`` plus the
+        final authoritative run fields, including ``wait_expired`` when the
+        caller-requested wait window expires).
+        """
+        # Validate wait bounds before submit so bad timeouts never queue a run.
+        effective_timeout = normalize_mcp_wait_timeout(timeout_seconds)
+        effective_poll = normalize_mcp_wait_poll_interval(
+            poll_interval_seconds
+        )
+
+        submitted = await self.submit_run(mission_yaml)
+        run_id = submitted.get("run_id")
+        if submitted.get("ok") is False or not run_id:
+            return submitted
+
+        return await self.wait_for_run(
+            str(run_id),
+            timeout_seconds=effective_timeout,
+            poll_interval_seconds=effective_poll,
+        )
+
     async def wait_for_run(
         self,
         run_id: str,
