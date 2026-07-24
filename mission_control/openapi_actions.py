@@ -1,9 +1,12 @@
 """Transform FastAPI OpenAPI 3.1 schemas for ChatGPT Custom GPT Actions.
 
-The Custom GPT Actions importer is OpenAPI 3.0-oriented and rejects several
-constructs that FastAPI / Pydantic emit under OpenAPI 3.1. When parsing fails,
-the editor often reports a misleading ``Could not find a valid URL in
-`servers``` error even when ``servers`` is present and valid.
+The Custom GPT Actions importer requires top-level ``openapi`` to be
+``3.1.0`` or ``3.1.1``, and still rejects several FastAPI / Pydantic
+constructs (long descriptions, inline ``additionalProperties`` maps,
+``$ref``+composition siblings, empty ``items``, unconstrained title-only
+schemas). When parsing fails, the editor often reports a misleading
+``Could not find a valid URL in `servers``` error even when ``servers``
+is present and valid.
 
 This module produces a documentation-only Actions-compatible view. It does not
 change runtime request or response handling.
@@ -14,7 +17,9 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-ACTIONS_OPENAPI_VERSION = "3.0.3"
+# ChatGPT Actions pydantic validation: Input should be '3.1.1' or '3.1.0'.
+# Declaring 3.0.x (even with otherwise-valid docs) fails import after ops load.
+ACTIONS_OPENAPI_VERSION = "3.1.0"
 
 # Custom GPT Actions rejects operation descriptions at or above this length.
 MAX_OPERATION_DESCRIPTION_LENGTH = 300
@@ -290,7 +295,12 @@ def _sanitize_node(node: Any) -> None:
 
 
 def _rewrite_nullable_any_of(node: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert OAS 3.1 ``anyOf[T, null]`` into OAS 3.0 ``nullable`` forms."""
+    """Convert ``anyOf[T, null]`` into Actions-friendly ``nullable`` forms.
+
+    FastAPI emits JSON Schema null unions. The Actions importer is more
+    reliable with ``nullable: true`` on the non-null branch even when the
+    document version is OpenAPI 3.1.0.
+    """
     options = node.get("anyOf")
     if not isinstance(options, list) or len(options) != 2:
         return None
@@ -316,12 +326,12 @@ def _rewrite_nullable_any_of(node: dict[str, Any]) -> dict[str, Any] | None:
     rewritten.update(extras)
 
     if "$ref" in rewritten and len(rewritten) == 1:
-        # OpenAPI 3.0 cannot attach nullable beside a bare $ref without allOf;
-        # keep the ref only (field remains optional in the parent object).
+        # Cannot attach nullable beside a bare $ref without allOf; keep the
+        # ref only (field remains optional in the parent object).
         return rewritten
 
     if "$ref" in rewritten:
-        # Drop sibling keywords that conflict with $ref under OAS 3.0.
+        # Drop sibling keywords that conflict with $ref in the importer.
         return {"$ref": rewritten["$ref"]}
 
     rewritten["nullable"] = True

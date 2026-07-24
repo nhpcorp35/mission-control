@@ -1,5 +1,74 @@
 # HAL Operator Log
 
+## 2026-07-24 — ChatGPT Actions openapi version must be 3.1.0
+
+### Objective
+
+Eliminate the final Custom GPT Actions importer validation error after
+operations already imported successfully:
+
+```text
+('openapi',): Input should be '3.1.1' or '3.1.0'
+```
+
+### Root cause
+
+The precise offending construct was the **top-level** document field set by
+`ACTIONS_OPENAPI_VERSION = "3.0.3"` in `mission_control/openapi_actions.py`
+(served by `GET /openapi-actions.json`).
+
+ChatGPT Actions validates `openapi` with a pydantic constraint that only
+accepts `"3.1.0"` or `"3.1.1"`. Declaring `"3.0.3"` (from the earlier
+3.0-oriented transform) fails that check even when:
+
+- operations are discovered and listed
+- `servers`, bearer auth, and operationIds are otherwise fine
+- `/openapi.json` already shows `"openapi": "3.1.0"` (that endpoint is not
+  what Actions imports)
+
+There was **no** nested object with an `openapi` key; a walk of the Actions
+schema finds a single `openapi` declaration at the document root.
+
+### Implementation
+
+- Set `ACTIONS_OPENAPI_VERSION` to `"3.1.0"`.
+- Keep existing Actions sanitizations (nullable form, `$ref`/composition
+  cleanup, description length, `HealthResponse`, etc.).
+- Regression in `tests/test_openapi_actions.py` asserts the version is in
+  `{3.1.0, 3.1.1}`, not `3.0.x`, and that `openapi` appears only at the root.
+
+### Import URL for Allen
+
+```text
+https://mission-control-production-76ff.up.railway.app/openapi-actions.json
+```
+
+Verify: Actions → Import from URL → no `('openapi',): Input should be…`
+error; Bearer auth; operations `submit_run`, `get_run`, `wait_for_run`,
+`submit_and_wait` present.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest tests.test_openapi_actions -v
+# Ran 16 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Suggested message: Fix ChatGPT Actions openapi version to 3.1.0
+
+### Limitations
+
+- Version string and other sanitizations apply only to `/openapi-actions.json`.
+- Production serves the fix only after deploy.
+
+### Next Objective
+
+After deploy, Allen re-imports the Actions URL and confirms a fully clean
+import (no remaining validation errors).
+
 ## 2026-07-24 — ChatGPT Actions importer description + health schema fixes
 
 ### Objective

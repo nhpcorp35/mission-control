@@ -52,9 +52,23 @@ class TestOpenApiActionsCompatibility(unittest.TestCase):
         self.raw = app.openapi()
         self.actions = build_actions_openapi(self.raw)
 
-    def test_actions_schema_uses_openapi_30(self) -> None:
+    def test_actions_schema_uses_openapi_31_version_string(self) -> None:
+        # Regression: ChatGPT Actions rejects openapi 3.0.x with
+        # ('openapi',): Input should be '3.1.1' or '3.1.0'
+        # even when operations otherwise import successfully.
         self.assertEqual(self.actions["openapi"], ACTIONS_OPENAPI_VERSION)
-        self.assertNotEqual(self.actions["openapi"], self.raw.get("openapi"))
+        self.assertIn(self.actions["openapi"], {"3.1.0", "3.1.1"})
+        self.assertNotIn(
+            self.actions["openapi"],
+            {"3.0.0", "3.0.1", "3.0.2", "3.0.3"},
+        )
+        # Only the document root may declare openapi; nested copies confuse
+        # the importer into re-validating a child as an OpenAPI document.
+        openapi_nodes = [
+            node for node in _walk(self.actions) if "openapi" in node
+        ]
+        self.assertEqual(len(openapi_nodes), 1)
+        self.assertIs(openapi_nodes[0], self.actions)
 
     def test_actions_schema_has_exactly_one_https_server(self) -> None:
         servers = self.actions.get("servers")
@@ -155,7 +169,7 @@ class TestOpenApiActionsCompatibility(unittest.TestCase):
             "$ref" in actions_schema or actions_schema.get("type") == "object"
         )
 
-    def test_nullable_fields_use_openapi_30_nullable(self) -> None:
+    def test_nullable_fields_use_actions_nullable_form(self) -> None:
         error = self.actions["components"]["schemas"]["RunResponse"][
             "properties"
         ]["error"]

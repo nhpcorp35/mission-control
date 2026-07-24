@@ -45,8 +45,9 @@ in `docs/HAL_OPERATOR_LOG.md`.
   Discoverable operation IDs include `submit_run`, `get_run`, `wait_for_run`,
   and `submit_and_wait`. Auth is HTTP Bearer.
 - **Import check:** After deploy, import the Actions URL above. Expect a clean
-  import (operation descriptions under 300 characters; `/health` uses named
-  `HealthResponse`). Do not import `/openapi.json` into Actions.
+  import (`openapi` is `3.1.0`, operation descriptions under 300 characters;
+  `/health` uses named `HealthResponse`). Do not import `/openapi.json` into
+  Actions.
 - Do not weaken platform-push approval: `persistence_mode=push` still requires
   explicit platform-push approval fields.
 
