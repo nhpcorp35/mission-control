@@ -1,5 +1,61 @@
 # HAL Operator Log
 
+## 2026-07-24 — Remove wait_for_run 25-second cutoff
+
+### Objective
+
+Honor MCP `wait_for_run` caller-requested timeouts (for example 900s)
+end-to-end instead of returning after ~25s while the run is still
+non-terminal.
+
+### Finding
+
+The artificial cutoff lived in the MCP connector only:
+`MCP_WAIT_MAX_TIMEOUT_SECONDS = 25.0` in `mcp_connector/client.py`, which
+clamped budgets such as 900s before the poll loop. Per-request httpx timeout
+(`MISSION_CONTROL_TIMEOUT_SECONDS`, default 30s) applies only to each
+`get_run` call and does not bound the wait loop. Railway’s public edge closes
+HTTP requests after 5 minutes with no data transferred, or 15 minutes with
+keep-alive traffic — a platform constraint outside the former 25s app cap.
+
+### Implementation
+
+- Raised `MCP_WAIT_MAX_TIMEOUT_SECONDS` to `3600` (aligned with
+  `POST /runs/{run_id}/wait`); requested values such as 900 are preserved.
+- Kept authenticated `get_run` polling, immediate terminal return, structured
+  `wait_expired` payloads, and `poll_interval_seconds` behavior.
+- Updated MCP tool instructions, `MISSION_CONTROL_API.md`, and
+  `docs/HAL_OPERATOR.md` with connector bounds and Railway edge limits.
+- Added regression
+  `test_timeout_above_former_25s_cap_is_honored`.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest \
+  tests.test_mcp_wait_for_run \
+  tests.test_wait_for_run \
+  -v
+# Ran 27 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Platform persistence may commit/push after agent completion.
+
+### Limitations
+
+- A silent Streamable HTTP MCP tool response can still be cut by Railway’s
+  5-minute idle / 15-minute absolute edge limits before a long application
+  budget finishes; resume with the same `run_id`.
+- Upstream MCP clients may impose their own tool-call deadlines.
+
+### Next Objective
+
+Prefer long requested `wait_for_run` budgets when appropriate; on
+`wait_expired` or transport interrupt, resume the same `run_id`.
+
 ## 2026-07-24 — Reconcile persistence reporting (retry)
 
 ### Objective

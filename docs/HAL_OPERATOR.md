@@ -43,3 +43,17 @@ HAL should continue operating runs, interpreting results, and submitting
 corrective follow-up missions without requiring the user to ask for status,
 except when a real approval, product decision, destructive action, or unresolved
 ambiguity requires user input.
+
+## Waiting for async runs
+
+- MCP `wait_for_run` honors the requested `timeout_seconds` up to **3600**
+  (aligned with `POST /runs/{run_id}/wait`). There is no artificial ~25s
+  connector cutoff.
+- Default wait window is **20s**; pass a larger budget (for example `900`) when
+  a single call should stay active until terminal or that budget expires.
+- When `wait_expired` is `true`, call `wait_for_run` again with the same
+  `run_id` (do not treat expiry as run failure).
+- Railway’s edge proxy may still close a silent HTTP/MCP tool response after
+  **5 minutes idle** or **15 minutes** absolute — see `MISSION_CONTROL_API.md`
+  (`wait_for_run` timeout layers). On a transport interrupt, resume with the
+  same `run_id`.

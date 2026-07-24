@@ -383,7 +383,7 @@ HTTP clients may use this endpoint for a server-side wait. The MCP
 **Intended HAL flow**
 
 1. `submit_run` (`POST /runs`) — queue the mission
-2. `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — poll until terminal or wait budget exhausted; for MCP, repeat short waits when `wait_expired` is true
+2. `wait_for_run` (MCP tool, or optionally `POST /runs/{run_id}/wait`) — poll until terminal or wait budget exhausted; when `wait_expired` is true, call again with the same `run_id`
 3. Inspect `status`, authoritative `summary`, `result.persistence`, `commit_sha`, then diagnostic `stdout` / `stderr` / `error` (prefer `summary` over agent stdout for persistence claims)
 
 **Request body** `application/json` (all fields optional; defaults shown)
@@ -422,7 +422,7 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | `submit_run` | Submit mission YAML (`POST /runs`) |
 | `submit_structured_run` | Submit structured mission fields (`POST /runs/structured`); prefer for routine execute missions |
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
-| `wait_for_run` | Short ChatGPT-safe poll of `get_run` until terminal or wait window expires; call repeatedly until terminal |
+| `wait_for_run` | Poll `get_run` until terminal or caller-requested wait window expires |
 
 #### ChatGPT custom MCP app
 
@@ -449,21 +449,21 @@ bash scripts/railway-start.sh
 
 #### `wait_for_run`
 
-ChatGPT's MCP tool-call runtime cannot safely hold a single tool call for
-long durations (a live wait that spanned ~35s failed at the transport layer
-with no usable payload). The MCP tool therefore uses a **short default wait
-window** and expects HAL to **call `wait_for_run` repeatedly without user
-prompting** until the run is terminal.
+Polls the authenticated `GET /runs/{run_id}` path on the connector side until
+the run is terminal or the caller-requested `timeout_seconds` elapses. Returns
+immediately when already terminal. Requested budgets such as `900` seconds are
+honored end-to-end (no artificial ~25s connector cutoff).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `run_id` | string | yes | — | Run identifier returned by `submit_run` |
-| `timeout_seconds` | number | no | `20` | Maximum time to wait for this call; must be `>= 0.1`. Values above `25` are capped to `25` (ChatGPT-safe). Zero/negative values are rejected. |
+| `run_id` | string | yes | — | Run identifier returned by `submit_run` / `submit_structured_run` |
+| `timeout_seconds` | number | no | `20` | Maximum time to wait for this call; must be `>= 0.1`. Values above `3600` are capped to `3600` (same upper bound as `POST /runs/{run_id}/wait`). Zero/negative values are rejected. |
 | `poll_interval_seconds` | number | no | `2` | Delay between `get_run` polls; must be `>= 0.05`. Values above `10` are capped to `10`. Zero/negative values are rejected. |
 
 **Intended HAL loop.** Prefer `submit_structured_run` for routine execute
-missions (or `submit_run` with exact YAML when needed) → repeat `wait_for_run`
-until `wait_expired` is `false` and `status` is terminal → inspect
+missions (or `submit_run` with exact YAML when needed) → `wait_for_run` with an
+appropriate `timeout_seconds` until `wait_expired` is `false` and `status` is
+terminal (retry the same `run_id` when `wait_expired` is `true`) → inspect
 `summary` / `result.persistence` / `commit_sha` / `result`, then diagnostic
 `stdout` / `stderr` / `error`. Prefer `summary` over agent stdout for
 persistence claims (platform persistence runs after the agent completes).
@@ -489,6 +489,19 @@ the tool returns a **normal usable payload** (not a transport/tool error):
 HAL should treat `wait_expired: true` as “call `wait_for_run` again,” not as
 failure. A single transient polling failure does not end the wait while time
 remains; `404` (unknown `run_id`) is fatal immediately.
+
+**Timeout layers (connector vs platform).** Application bounds above are the
+only connector-imposed wait limits. Each individual `get_run` HTTP call still
+uses `MISSION_CONTROL_TIMEOUT_SECONDS` (default `30`) as the per-request httpx
+timeout — that does **not** truncate the overall wait loop. Railway’s public
+edge proxy closes HTTP requests after **5 minutes with no data transferred**,
+or after **15 minutes** even with keep-alive traffic
+([Railway public networking specs](https://docs.railway.com/networking/public-networking/specs-and-limits)).
+A single Streamable HTTP MCP tool response that stays silent for the whole wait
+can therefore be cut by the platform before a 900s application budget finishes;
+when that happens, treat it like a transport interrupt and call `wait_for_run`
+again with the same `run_id`. Upstream MCP clients may also impose their own
+tool-call deadlines independent of these connector bounds.
 
 ### Platform Git persistence
 

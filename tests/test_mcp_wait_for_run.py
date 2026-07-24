@@ -62,12 +62,13 @@ def _run_payload(
 
 
 class TestNormalizeMcpWaitBounds(unittest.TestCase):
-    def test_default_timeout_is_chatgpt_safe(self) -> None:
+    def test_default_timeout_within_bounds(self) -> None:
         self.assertEqual(MCP_WAIT_DEFAULT_TIMEOUT_SECONDS, 20.0)
         self.assertLessEqual(
             MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
             MCP_WAIT_MAX_TIMEOUT_SECONDS,
         )
+        self.assertEqual(MCP_WAIT_MAX_TIMEOUT_SECONDS, 3600.0)
         self.assertEqual(MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS, 2.0)
 
     def test_normalize_timeout_preserves_safe_values(self) -> None:
@@ -76,14 +77,21 @@ class TestNormalizeMcpWaitBounds(unittest.TestCase):
             normalize_mcp_wait_timeout(MCP_WAIT_DEFAULT_TIMEOUT_SECONDS),
             MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
         )
+        self.assertEqual(normalize_mcp_wait_timeout(900.0), 900.0)
         self.assertEqual(
             normalize_mcp_wait_timeout(MCP_WAIT_MAX_TIMEOUT_SECONDS),
             MCP_WAIT_MAX_TIMEOUT_SECONDS,
         )
 
-    def test_normalize_timeout_caps_unsafe_large_values(self) -> None:
-        self.assertEqual(normalize_mcp_wait_timeout(900.0), MCP_WAIT_MAX_TIMEOUT_SECONDS)
-        self.assertEqual(normalize_mcp_wait_timeout(60.0), MCP_WAIT_MAX_TIMEOUT_SECONDS)
+    def test_normalize_timeout_caps_above_max(self) -> None:
+        self.assertEqual(
+            normalize_mcp_wait_timeout(MCP_WAIT_MAX_TIMEOUT_SECONDS + 1),
+            MCP_WAIT_MAX_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            normalize_mcp_wait_timeout(10_000.0),
+            MCP_WAIT_MAX_TIMEOUT_SECONDS,
+        )
 
     def test_normalize_timeout_rejects_invalid(self) -> None:
         for value in (0, -1, -0.5, MCP_WAIT_MIN_TIMEOUT_SECONDS - 0.05):
@@ -205,7 +213,48 @@ class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
             MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
         )
 
-    async def test_unsafe_timeout_is_capped(self) -> None:
+    async def test_timeout_above_former_25s_cap_is_honored(self) -> None:
+        """Requested budgets like 900s must not stop at the old ~25s cutoff.
+
+        Simulated elapsed time crosses 25s while the run is still non-terminal;
+        polling continues and a later terminal result is returned.
+        """
+        running = _run_payload("run-long", "running")
+        completed = _run_payload(
+            "run-long",
+            "completed",
+            stdout="finished-after-25s",
+        )
+        # monotonic: deadline start; after poll1 (t=10); after poll2 (t=26 > 25)
+        monotonic_values = iter([0.0, 10.0, 26.0])
+        with patch.object(
+            self.client,
+            "get_run",
+            new=AsyncMock(side_effect=[running, running, completed]),
+        ) as get_run:
+            with patch(
+                "mcp_connector.client.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep:
+                with patch(
+                    "mcp_connector.client.time.monotonic",
+                    side_effect=lambda: next(monotonic_values),
+                ):
+                    result = await self.client.wait_for_run(
+                        "run-long",
+                        timeout_seconds=900.0,
+                        poll_interval_seconds=0.1,
+                    )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["stdout"], "finished-after-25s")
+        self.assertFalse(result["wait_expired"])
+        self.assertTrue(result["reached_terminal"])
+        self.assertEqual(result["timeout_seconds"], 900.0)
+        self.assertEqual(get_run.await_count, 3)
+        self.assertGreaterEqual(sleep.await_count, 2)
+
+    async def test_oversized_timeout_is_capped_to_max(self) -> None:
         running = _run_payload("run-cap", "running")
         with patch.object(
             self.client,
@@ -226,7 +275,7 @@ class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
                 ):
                     result = await self.client.wait_for_run(
                         "run-cap",
-                        timeout_seconds=900.0,
+                        timeout_seconds=MCP_WAIT_MAX_TIMEOUT_SECONDS + 100.0,
                         poll_interval_seconds=0.1,
                     )
 
@@ -398,8 +447,9 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(wait_tool.parameters["required"], ["run_id"])
         description = wait_tool.description or ""
-        self.assertIn("repeatedly", description.lower())
+        self.assertIn("get_run", description.lower())
         self.assertIn("wait_expired", description)
+        self.assertIn("3600", description)
 
         structured = next(
             tool for tool in tools if tool.name == "submit_structured_run"

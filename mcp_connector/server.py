@@ -36,15 +36,14 @@ mcp = FastMCP(
         "raw YAML (submit_run), retrieve asynchronous run status, and wait "
         "for runs to reach a terminal state. Intended HAL flow: "
         "submit_structured_run (or submit_run), then call wait_for_run "
-        "repeatedly (no user prompting) until status is terminal or "
-        "wait_expired stays relevant, then inspect status, summary, "
-        "result.persistence, and commit_sha. Prefer summary / "
-        "result.persistence / commit_sha over agent stdout for persistence "
-        "claims (platform persistence runs after the agent completes). "
-        "Each wait_for_run uses a short ChatGPT-safe default window "
-        f"({MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s, "
-        f"capped at {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s); when wait_expired is "
-        "true, call wait_for_run again with the same run_id."
+        "until status is terminal (or repeat when wait_expired is true), "
+        "then inspect status, summary, result.persistence, and commit_sha. "
+        "Prefer summary / result.persistence / commit_sha over agent stdout "
+        "for persistence claims (platform persistence runs after the agent "
+        "completes). wait_for_run default timeout is "
+        f"{MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s; requested timeouts are "
+        f"honored up to {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s. When "
+        "wait_expired is true, call wait_for_run again with the same run_id."
     ),
     host="0.0.0.0",
     port=int(os.environ.get("PORT", "8001")),
@@ -151,23 +150,22 @@ async def wait_for_run(
     timeout_seconds: float = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
     poll_interval_seconds: float = MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
-    """Wait briefly for a run to reach a terminal status (ChatGPT-safe).
+    """Wait for a run to reach a terminal status.
 
     Polls through the same authenticated get_run path until the run is
-    terminal (completed, failed, or timed_out) or the short wait window
-    elapses. Returns immediately when already terminal.
+    terminal (completed, failed, or timed_out) or timeout_seconds elapses.
+    Returns immediately when already terminal. poll_interval_seconds
+    controls delay between get_run polls.
 
-    HAL should call this tool repeatedly without user prompting until the
-    run is terminal. Each call uses a conservative default window
-    (timeout_seconds=20) so a single MCP tool call stays within ChatGPT
-    runtime limits. Values above 25s are capped to 25s; zero/negative
-    values are rejected.
+    Default timeout_seconds is 20. Requested timeouts are honored up to
+    3600s (aligned with POST /runs/{run_id}/wait); larger values are
+    capped. Zero/negative values are rejected. When wait_expired is true,
+    call wait_for_run again with the same run_id.
 
     On terminal status returns ok=true with run fields, wait_expired=false,
     and timeout_seconds (effective). When the wait window expires while
     still queued/running, returns ok=true with the latest run fields,
-    wait_expired=true, and timeout_seconds — not a transport/tool error —
-    so HAL can call wait_for_run again with the same run_id.
+    wait_expired=true, and timeout_seconds — not a transport/tool error.
     """
     try:
         if not run_id.strip():

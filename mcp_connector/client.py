@@ -10,24 +10,25 @@ from mcp_connector.config import Settings
 from mcp_connector.errors import MissionControlError
 from mission_control.run_registry import is_terminal_status
 
-# ChatGPT MCP tool-call runtime kills long-held calls without a usable
-# payload (observed failure when a single wait spanned ~35s). Keep the
-# default and hard cap inside a short safe window; callers (HAL) should
-# invoke wait_for_run repeatedly until the run is terminal.
+# Honor caller-requested wait budgets end-to-end (aligned with
+# POST /runs/{run_id}/wait). Default stays short for interactive clients;
+# values up to MCP_WAIT_MAX_TIMEOUT_SECONDS are not artificially cut off
+# at ~25s. Platform edge proxies may still close long idle HTTP tool
+# responses — see MISSION_CONTROL_API.md.
 MCP_WAIT_DEFAULT_TIMEOUT_SECONDS = 20.0
 MCP_WAIT_MIN_TIMEOUT_SECONDS = 0.1
-MCP_WAIT_MAX_TIMEOUT_SECONDS = 25.0
+MCP_WAIT_MAX_TIMEOUT_SECONDS = 3600.0
 MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 MCP_WAIT_MIN_POLL_INTERVAL_SECONDS = 0.05
 MCP_WAIT_MAX_POLL_INTERVAL_SECONDS = 10.0
 
 
 def normalize_mcp_wait_timeout(timeout_seconds: float) -> float:
-    """Validate and clamp ``timeout_seconds`` for ChatGPT-safe MCP waits.
+    """Validate and clamp ``timeout_seconds`` for MCP ``wait_for_run``.
 
     Values at or below zero, or below the minimum, are rejected. Values
     above ``MCP_WAIT_MAX_TIMEOUT_SECONDS`` are capped (not rejected) so
-    callers that still pass legacy large timeouts remain usable.
+    oversized requests still wait for the maximum supported window.
     """
     value = float(timeout_seconds)
     if value <= 0:
