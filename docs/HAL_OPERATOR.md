@@ -40,6 +40,10 @@ in `docs/HAL_OPERATOR_LOG.md`.
   the shared wait path in one call. Prefer it when HAL / Custom GPT Actions
   already have the full mission document and should only involve Allen for
   genuine approval, decision, or unrecoverable failure.
+- **Custom GPT Actions import URL** (use this, not `/openapi.json`):
+  `https://mission-control-production-76ff.up.railway.app/openapi-actions.json`
+  Discoverable operation IDs include `submit_run`, `get_run`, `wait_for_run`,
+  and `submit_and_wait`. Auth is HTTP Bearer.
 - Do not weaken platform-push approval: `persistence_mode=push` still requires
   explicit platform-push approval fields.
 

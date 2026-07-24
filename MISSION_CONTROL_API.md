@@ -23,9 +23,26 @@ Authorization: Bearer <MISSION_CONTROL_API_KEY>
 
 Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `POST /runs/structured`, `POST /runs/submit-and-wait`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
 
-Public endpoints (no API key): `GET /health`, `POST /validate`.
+Public endpoints (no API key): `GET /health`, `POST /validate`, `GET /openapi.json`, `GET /openapi-actions.json`.
 
 Do not log, print, or return the API key value. The MCP connector reads the same `MISSION_CONTROL_API_KEY` and sends it on Mission Control API requests.
+
+## Custom GPT Actions OpenAPI import
+
+Allen should import **this** schema URL into the Custom GPT Actions editor (not `/openapi.json`):
+
+```text
+https://mission-control-production-76ff.up.railway.app/openapi-actions.json
+```
+
+| Item | Value |
+| --- | --- |
+| Actions import URL | `https://mission-control-production-76ff.up.railway.app/openapi-actions.json` |
+| Standard OpenAPI (clients / Swagger) | `https://mission-control-production-76ff.up.railway.app/openapi.json` |
+| Auth | HTTP Bearer (`MISSION_CONTROL_API_KEY`) |
+| Core operation IDs | `submit_run`, `get_run`, `wait_for_run`, `submit_and_wait` |
+
+`/openapi.json` remains OpenAPI 3.1 for normal clients. `/openapi-actions.json` is a documentation-only OpenAPI 3.0 view that strips importer-rejected constructs (nullable `anyOf`/`null`, `$ref`+`oneOf` siblings, empty `items`, unconstrained schemas). Runtime API behavior is unchanged.
 
 ## Endpoints
 
@@ -40,6 +57,12 @@ Liveness check. No authentication required (Railway health checks).
   "status": "ok"
 }
 ```
+
+### GET /openapi-actions.json
+
+Custom GPT Actions–compatible OpenAPI document. No authentication required.
+
+Import this URL in the ChatGPT Custom GPT editor under **Actions → Import from URL**.
 
 ### POST /validate
 

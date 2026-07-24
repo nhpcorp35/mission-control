@@ -1,0 +1,200 @@
+"""Regression tests for Custom GPT Actions OpenAPI compatibility."""
+
+from __future__ import annotations
+
+import unittest
+from typing import Any
+
+from fastapi.testclient import TestClient
+
+from app import api as api_module
+from app.api import app
+from mission_control.openapi_actions import (
+    ACTIONS_OPENAPI_VERSION,
+    build_actions_openapi,
+)
+
+REQUIRED_OPERATION_IDS = {
+    "submit_run",
+    "get_run",
+    "wait_for_run",
+    "submit_and_wait",
+}
+
+PRODUCTION_HTTPS = "https://mission-control-production-76ff.up.railway.app"
+
+
+def _walk(node: Any):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk(item)
+
+
+def _operation_ids(schema: dict[str, Any]) -> set[str]:
+    found: set[str] = set()
+    for path_item in schema.get("paths", {}).values():
+        if not isinstance(path_item, dict):
+            continue
+        for method_obj in path_item.values():
+            if isinstance(method_obj, dict) and method_obj.get("operationId"):
+                found.add(method_obj["operationId"])
+    return found
+
+
+class TestOpenApiActionsCompatibility(unittest.TestCase):
+    def setUp(self) -> None:
+        self.raw = app.openapi()
+        self.actions = build_actions_openapi(self.raw)
+
+    def test_actions_schema_uses_openapi_30(self) -> None:
+        self.assertEqual(self.actions["openapi"], ACTIONS_OPENAPI_VERSION)
+        self.assertNotEqual(self.actions["openapi"], self.raw.get("openapi"))
+
+    def test_actions_schema_has_exactly_one_https_server(self) -> None:
+        servers = self.actions.get("servers")
+        self.assertEqual(servers, [{"url": PRODUCTION_HTTPS}])
+        self.assertEqual(servers, [{"url": api_module.PRODUCTION_SERVER_URL}])
+
+    def test_actions_schema_preserves_required_operation_ids(self) -> None:
+        ids = _operation_ids(self.actions)
+        self.assertTrue(REQUIRED_OPERATION_IDS.issubset(ids))
+
+    def test_actions_schema_preserves_bearer_auth(self) -> None:
+        schemes = self.actions["components"]["securitySchemes"]
+        self.assertIn("HTTPBearer", schemes)
+        bearer = schemes["HTTPBearer"]
+        self.assertEqual(bearer.get("type"), "http")
+        self.assertEqual(bearer.get("scheme"), "bearer")
+
+        # Protected run operations must still declare bearer security.
+        paths = self.actions["paths"]
+        self.assertEqual(
+            paths["/runs"]["post"]["security"],
+            [{"HTTPBearer": []}],
+        )
+        self.assertEqual(
+            paths["/runs/{run_id}"]["get"]["security"],
+            [{"HTTPBearer": []}],
+        )
+        self.assertEqual(
+            paths["/runs/{run_id}/wait"]["post"]["security"],
+            [{"HTTPBearer": []}],
+        )
+        self.assertEqual(
+            paths["/runs/submit-and-wait"]["post"]["security"],
+            [{"HTTPBearer": []}],
+        )
+
+    def test_actions_schema_avoids_nullable_any_of_null(self) -> None:
+        for node in _walk(self.actions):
+            any_of = node.get("anyOf")
+            if not isinstance(any_of, list):
+                continue
+            types = [
+                option.get("type")
+                for option in any_of
+                if isinstance(option, dict)
+            ]
+            self.assertNotIn(
+                "null",
+                types,
+                msg=f"nullable anyOf with null remains: {node}",
+            )
+
+    def test_actions_schema_avoids_ref_composition_siblings(self) -> None:
+        for node in _walk(self.actions):
+            if "$ref" not in node:
+                continue
+            self.assertNotIn("oneOf", node, msg=node)
+            self.assertNotIn("anyOf", node, msg=node)
+            self.assertNotIn("allOf", node, msg=node)
+
+    def test_actions_schema_avoids_one_of(self) -> None:
+        for node in _walk(self.actions):
+            self.assertNotIn("oneOf", node, msg=node)
+
+    def test_actions_schema_avoids_empty_item_schemas(self) -> None:
+        for node in _walk(self.actions):
+            if "items" in node:
+                self.assertNotEqual(node["items"], {}, msg=node)
+
+    def test_actions_schema_avoids_title_only_unconstrained_schemas(self) -> None:
+        # ValidationError.input is title-only in the FastAPI 3.1 schema.
+        raw_input = (
+            self.raw["components"]["schemas"]["ValidationError"]["properties"][
+                "input"
+            ]
+        )
+        self.assertEqual(set(raw_input), {"title"})
+
+        actions_input = self.actions["components"]["schemas"]["ValidationError"][
+            "properties"
+        ]["input"]
+        self.assertIn("type", actions_input)
+
+    def test_submit_and_wait_response_schema_has_no_ref_one_of_siblings(
+        self,
+    ) -> None:
+        raw_schema = self.raw["paths"]["/runs/submit-and-wait"]["post"][
+            "responses"
+        ]["200"]["content"]["application/json"]["schema"]
+        self.assertIn("$ref", raw_schema)
+        self.assertIn("oneOf", raw_schema)
+
+        actions_schema = self.actions["paths"]["/runs/submit-and-wait"]["post"][
+            "responses"
+        ]["200"]["content"]["application/json"]["schema"]
+        self.assertNotIn("oneOf", actions_schema)
+        self.assertTrue(
+            "$ref" in actions_schema or actions_schema.get("type") == "object"
+        )
+
+    def test_nullable_fields_use_openapi_30_nullable(self) -> None:
+        error = self.actions["components"]["schemas"]["RunResponse"][
+            "properties"
+        ]["error"]
+        self.assertEqual(error.get("type"), "string")
+        self.assertTrue(error.get("nullable"))
+        self.assertNotIn("anyOf", error)
+
+    def test_structured_deliverables_items_are_typed(self) -> None:
+        deliverables = self.actions["components"]["schemas"][
+            "StructuredRunRequest"
+        ]["properties"]["deliverables"]
+        self.assertEqual(deliverables["items"], {"type": "object"})
+
+    def test_openapi_json_unchanged_for_normal_clients(self) -> None:
+        # /openapi.json remains the FastAPI OpenAPI 3.1 document.
+        self.assertEqual(self.raw.get("openapi"), "3.1.0")
+        client = TestClient(app)
+        response = client.get("/openapi.json")
+        self.assertEqual(response.status_code, 200)
+        schema = response.json()
+        self.assertEqual(schema.get("openapi"), "3.1.0")
+        self.assertEqual(
+            schema.get("servers"),
+            [{"url": PRODUCTION_HTTPS}],
+        )
+
+    def test_openapi_actions_json_endpoint(self) -> None:
+        client = TestClient(app)
+        response = client.get("/openapi-actions.json")
+        self.assertEqual(response.status_code, 200)
+        schema = response.json()
+        self.assertEqual(schema.get("openapi"), ACTIONS_OPENAPI_VERSION)
+        self.assertEqual(schema.get("servers"), [{"url": PRODUCTION_HTTPS}])
+        self.assertTrue(REQUIRED_OPERATION_IDS.issubset(_operation_ids(schema)))
+        for node in _walk(schema):
+            self.assertNotIn("oneOf", node)
+            if "$ref" in node:
+                self.assertNotIn("anyOf", node)
+            if "items" in node:
+                self.assertNotEqual(node["items"], {})
+
+
+if __name__ == "__main__":
+    unittest.main()

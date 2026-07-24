@@ -1,5 +1,73 @@
 # HAL Operator Log
 
+## 2026-07-24 — Custom GPT Actions–compatible OpenAPI schema
+
+### Objective
+
+Make the Mission Control OpenAPI document importable by ChatGPT Custom GPT
+Actions without changing runtime API behavior.
+
+### Finding
+
+`GET /openapi.json` is valid OpenAPI **3.1.0** with a correct absolute HTTPS
+`servers` entry, but the Custom GPT Actions importer is OpenAPI 3.0-oriented.
+Importer-sensitive constructs in the live schema caused parse failure; the
+editor then reported the misleading error
+`Could not find a valid URL in \`servers\``.
+
+Rejected / fragile constructs present in the FastAPI 3.1 document included:
+
+- `anyOf` unions with `{type: null}` (OAS 3.1 nullable style)
+- Response schemas combining `$ref` with sibling `oneOf` (notably
+  `submit_and_wait`)
+- Empty array `items: {}` (structured deliverables)
+- Title-only unconstrained schemas (e.g. `ValidationError.input`)
+
+### Implementation
+
+- Added `mission_control/openapi_actions.py` to transform the generated schema
+  into an Actions-compatible OpenAPI **3.0.3** view (nullable → OAS 3.0
+  `nullable`, collapse `oneOf` / non-null `anyOf`, fix empty items /
+  unconstrained schemas, keep a single HTTPS server URL).
+- Exposed documentation-only `GET /openapi-actions.json` while preserving
+  `GET /openapi.json` for normal clients.
+- Regression tests in `tests/test_openapi_actions.py`.
+- Documented the import URL in `MISSION_CONTROL_API.md` and
+  `docs/HAL_OPERATOR.md`.
+
+### Import URL for Allen
+
+```text
+https://mission-control-production-76ff.up.railway.app/openapi-actions.json
+```
+
+Operation IDs preserved: `submit_run`, `get_run`, `wait_for_run`,
+`submit_and_wait` (plus existing Mission Control operations). Auth: HTTP Bearer.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest tests.test_openapi_actions -v
+# Ran 14 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Suggested message: Add Custom GPT compatible OpenAPI schema
+
+### Limitations
+
+- `/openapi-actions.json` is documentation-only; it does not change runtime
+  handlers. Union response shapes (e.g. `submit_and_wait` rejection vs wait
+  payload) are collapsed to the primary branch for importer compatibility.
+- Production will serve the new endpoint only after this change is deployed.
+
+### Next Objective
+
+After deploy, Allen imports the Actions URL above into the Hal-Cursor Custom GPT
+and verifies `submit_and_wait` / `wait_for_run` discovery.
+
 ## 2026-07-24 — Expose wait operations through REST API
 
 ### Objective

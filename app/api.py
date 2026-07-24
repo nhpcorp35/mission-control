@@ -41,6 +41,7 @@ from mission_control.mission_builder import (
     DEFAULT_RUN_COMMANDS,
     render_mission_yaml,
 )
+from mission_control.openapi_actions import build_actions_openapi
 from mission_control.validator import (
     load_mission_yaml,
     validate_mission_for_execute,
@@ -426,6 +427,22 @@ def _accept_async_run(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get(
+    "/openapi-actions.json",
+    include_in_schema=False,
+    summary="Custom GPT Actions OpenAPI schema",
+)
+def openapi_actions_schema() -> JSONResponse:
+    """Serve an Actions-importer-compatible OpenAPI document.
+
+    Preserves ``/openapi.json`` (OpenAPI 3.1) for normal clients. Custom GPT
+    Actions should import this endpoint instead.
+    """
+    return JSONResponse(build_actions_openapi(app.openapi()))
+
+
 @app.post("/validate", response_model=ValidateResponse)
 def validate_mission_endpoint(
     request: MissionYamlRequest,
