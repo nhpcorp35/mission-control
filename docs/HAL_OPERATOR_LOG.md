@@ -1,5 +1,67 @@
 # HAL Operator Log
 
+## 2026-07-24 — ChatGPT Actions importer description + health schema fixes
+
+### Objective
+
+Clear remaining Custom GPT Actions importer failures for
+`/openapi-actions.json`: operation descriptions ≥ 300 characters, and the
+inline `/health` response schema.
+
+### Finding
+
+After the OpenAPI 3.0 transform landed, Actions still rejected:
+
+- Long FastAPI `description` strings on `submit_run`, `submit_and_wait`,
+  `get_run`, `retry_run`, and `wait_for_run` (Actions limit: under 300 chars).
+- The FastAPI-generated inline `/health` schema
+  (`type: object` + `additionalProperties: {type: string}`).
+
+Runtime handlers and `/openapi.json` were already correct.
+
+### Implementation
+
+- `mission_control/openapi_actions.py` now shortens Actions operation
+  descriptions (curated text under 300 chars, with a clamp safety net) and
+  replaces `/health`’s inline schema with named component `HealthResponse`.
+- Regression coverage in `tests/test_openapi_actions.py` for the length limit
+  and health `$ref` / component shape.
+- Import verification steps in `MISSION_CONTROL_API.md` and
+  `docs/HAL_OPERATOR.md`.
+
+### Import URL for Allen
+
+```text
+https://mission-control-production-76ff.up.railway.app/openapi-actions.json
+```
+
+Verify: Actions → Import from URL → clean import; Bearer auth; operations
+`submit_run`, `get_run`, `wait_for_run`, `submit_and_wait` present. Do not
+import `/openapi.json`.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest tests.test_openapi_actions -v
+# Ran 16 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Suggested message: Fix ChatGPT Actions description and health schema import
+
+### Limitations
+
+- Description shortening and `HealthResponse` apply only to the documentation
+  `/openapi-actions.json` view; `/openapi.json` keeps full FastAPI text and the
+  original inline health schema.
+- Production serves the fix only after deploy.
+
+### Next Objective
+
+After deploy, Allen re-imports the Actions URL and confirms a clean import.
+
 ## 2026-07-24 — Custom GPT Actions–compatible OpenAPI schema
 
 ### Objective

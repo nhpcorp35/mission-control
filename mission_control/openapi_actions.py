@@ -16,6 +16,48 @@ from typing import Any
 
 ACTIONS_OPENAPI_VERSION = "3.0.3"
 
+# Custom GPT Actions rejects operation descriptions at or above this length.
+MAX_OPERATION_DESCRIPTION_LENGTH = 300
+
+HEALTH_RESPONSE_SCHEMA_NAME = "HealthResponse"
+
+# Curated Actions descriptions keep meaning under the importer limit.
+# Keys are operationId values from the generated FastAPI schema.
+_ACTIONS_OPERATION_DESCRIPTIONS: dict[str, str] = {
+    "submit_run": (
+        "Validate an execute-mode mission and queue it for asynchronous "
+        "execution in an isolated workspace. Only one Cursor execution is "
+        "active at a time; additional runs wait in FIFO order. Poll "
+        "GET /runs/{run_id} for status. Run records persist in SQLite across "
+        "restarts."
+    ),
+    "submit_and_wait": (
+        "Queue Mission Control YAML via the same pipeline as POST /runs, then "
+        "wait until terminal status or timeout_seconds. Returns the final run "
+        "payload. Validation/submission failures return immediately. Preferred "
+        "Custom GPT flow when exact YAML is available."
+    ),
+    "get_run": (
+        "Return status, output, error, commit SHA, summary, and structured "
+        "result for a run from POST /runs. Prefer summary, result.persistence, "
+        "and commit_sha over agent stdout/stderr for persistence claims. "
+        "Failed/completed runs stay in the SQLite registry; retried_from links "
+        "retries."
+    ),
+    "retry_run": (
+        "Create a new async run from the stored mission YAML of a failed run. "
+        "Source run is unchanged. New run gets a fresh run_id and "
+        "retried_from. Only failed status may be retried; other statuses "
+        "return 409."
+    ),
+    "wait_for_run": (
+        "Poll until the run reaches completed, failed, or timed_out, or "
+        "timeout_seconds elapses. Returns immediately if already terminal. "
+        "Does not mutate run state. Flow: submit_run, wait_for_run, then "
+        "inspect results. For one-shot YAML, use submit_and_wait."
+    ),
+}
+
 
 def build_actions_openapi(schema: dict[str, Any]) -> dict[str, Any]:
     """Return an OpenAPI document shaped for Custom GPT Actions import."""
@@ -23,6 +65,8 @@ def build_actions_openapi(schema: dict[str, Any]) -> dict[str, Any]:
     actions["openapi"] = ACTIONS_OPENAPI_VERSION
     actions["servers"] = _normalized_servers(actions.get("servers"))
     _sanitize_node(actions)
+    _shorten_operation_descriptions(actions)
+    _normalize_health_response_schema(actions)
     return actions
 
 
@@ -41,6 +85,106 @@ def _normalized_servers(servers: Any) -> list[dict[str, str]]:
         return []
     # Prefer the first absolute HTTPS URL; Actions wants a single clear target.
     return [https_urls[0]]
+
+
+def _shorten_operation_descriptions(actions: dict[str, Any]) -> None:
+    """Ensure every operation description is under the Actions length limit."""
+    paths = actions.get("paths")
+    if not isinstance(paths, dict):
+        return
+    for path_item in paths.values():
+        if not isinstance(path_item, dict):
+            continue
+        for method_obj in path_item.values():
+            if not isinstance(method_obj, dict):
+                continue
+            if "operationId" not in method_obj and "responses" not in method_obj:
+                continue
+            operation_id = method_obj.get("operationId")
+            if (
+                isinstance(operation_id, str)
+                and operation_id in _ACTIONS_OPERATION_DESCRIPTIONS
+            ):
+                method_obj["description"] = _ACTIONS_OPERATION_DESCRIPTIONS[
+                    operation_id
+                ]
+            description = method_obj.get("description")
+            if isinstance(description, str):
+                method_obj["description"] = _clamp_description(description)
+
+
+def _clamp_description(description: str) -> str:
+    """Truncate a description to fewer than MAX_OPERATION_DESCRIPTION_LENGTH."""
+    limit = MAX_OPERATION_DESCRIPTION_LENGTH
+    if len(description) < limit:
+        return description
+    # Prefer the last complete sentence that fits.
+    truncated = description[: limit - 1]
+    sentence_end = max(
+        truncated.rfind(". "),
+        truncated.rfind("! "),
+        truncated.rfind("? "),
+    )
+    if sentence_end >= limit // 3:
+        return description[: sentence_end + 1].rstrip()
+    # Otherwise break on a word boundary and mark truncation.
+    word_end = truncated.rfind(" ")
+    if word_end >= limit // 3:
+        return truncated[:word_end].rstrip() + "…"
+    return truncated.rstrip() + "…"
+
+
+def _normalize_health_response_schema(actions: dict[str, Any]) -> None:
+    """Replace the inline /health response schema with a named component.
+
+    ChatGPT Actions rejects the FastAPI-generated inline
+    ``additionalProperties: {type: string}`` object for ``GET /health``.
+    A small named object schema with an explicit ``status`` property imports
+    cleanly and matches the runtime ``{\"status\": \"ok\"}`` payload.
+    """
+    paths = actions.get("paths")
+    if not isinstance(paths, dict):
+        return
+    health = paths.get("/health")
+    if not isinstance(health, dict):
+        return
+    get_op = health.get("get")
+    if not isinstance(get_op, dict):
+        return
+    responses = get_op.get("responses")
+    if not isinstance(responses, dict):
+        return
+    ok_response = responses.get("200")
+    if not isinstance(ok_response, dict):
+        return
+    content = ok_response.setdefault("content", {})
+    if not isinstance(content, dict):
+        return
+    json_media = content.setdefault("application/json", {})
+    if not isinstance(json_media, dict):
+        return
+
+    components = actions.setdefault("components", {})
+    if not isinstance(components, dict):
+        return
+    schemas = components.setdefault("schemas", {})
+    if not isinstance(schemas, dict):
+        return
+    schemas[HEALTH_RESPONSE_SCHEMA_NAME] = {
+        "type": "object",
+        "title": HEALTH_RESPONSE_SCHEMA_NAME,
+        "properties": {
+            "status": {
+                "type": "string",
+                "title": "Status",
+                "description": "Liveness indicator; typically \"ok\".",
+            }
+        },
+        "required": ["status"],
+    }
+    json_media["schema"] = {
+        "$ref": f"#/components/schemas/{HEALTH_RESPONSE_SCHEMA_NAME}"
+    }
 
 
 def _sanitize_node(node: Any) -> None:

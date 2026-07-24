@@ -11,6 +11,8 @@ from app import api as api_module
 from app.api import app
 from mission_control.openapi_actions import (
     ACTIONS_OPENAPI_VERSION,
+    HEALTH_RESPONSE_SCHEMA_NAME,
+    MAX_OPERATION_DESCRIPTION_LENGTH,
     build_actions_openapi,
 )
 
@@ -194,6 +196,81 @@ class TestOpenApiActionsCompatibility(unittest.TestCase):
                 self.assertNotIn("anyOf", node)
             if "items" in node:
                 self.assertNotEqual(node["items"], {})
+
+    def test_operation_descriptions_under_actions_limit(self) -> None:
+        # Raw FastAPI schema has several descriptions at or above the limit.
+        raw_over_limit = []
+        for path_item in self.raw.get("paths", {}).values():
+            if not isinstance(path_item, dict):
+                continue
+            for method_obj in path_item.values():
+                if not isinstance(method_obj, dict):
+                    continue
+                description = method_obj.get("description")
+                if (
+                    isinstance(description, str)
+                    and len(description) >= MAX_OPERATION_DESCRIPTION_LENGTH
+                ):
+                    raw_over_limit.append(method_obj.get("operationId"))
+        self.assertIn("get_run", raw_over_limit)
+        self.assertIn("submit_and_wait", raw_over_limit)
+
+        for path_item in self.actions.get("paths", {}).values():
+            if not isinstance(path_item, dict):
+                continue
+            for method_obj in path_item.values():
+                if not isinstance(method_obj, dict):
+                    continue
+                description = method_obj.get("description")
+                if not isinstance(description, str):
+                    continue
+                self.assertLess(
+                    len(description),
+                    MAX_OPERATION_DESCRIPTION_LENGTH,
+                    msg=(
+                        f"{method_obj.get('operationId')} description length "
+                        f"{len(description)} >= {MAX_OPERATION_DESCRIPTION_LENGTH}"
+                    ),
+                )
+                # Shortened text must still carry operational meaning.
+                self.assertGreater(len(description.strip()), 0)
+
+    def test_health_response_uses_named_component_schema(self) -> None:
+        raw_schema = self.raw["paths"]["/health"]["get"]["responses"]["200"][
+            "content"
+        ]["application/json"]["schema"]
+        self.assertNotIn("$ref", raw_schema)
+        self.assertEqual(raw_schema.get("type"), "object")
+        self.assertIn("additionalProperties", raw_schema)
+
+        actions_schema = self.actions["paths"]["/health"]["get"]["responses"][
+            "200"
+        ]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            actions_schema,
+            {"$ref": f"#/components/schemas/{HEALTH_RESPONSE_SCHEMA_NAME}"},
+        )
+
+        health_component = self.actions["components"]["schemas"][
+            HEALTH_RESPONSE_SCHEMA_NAME
+        ]
+        self.assertEqual(health_component.get("type"), "object")
+        self.assertIn("status", health_component.get("properties", {}))
+        self.assertEqual(
+            health_component["properties"]["status"].get("type"), "string"
+        )
+        self.assertIn("status", health_component.get("required", []))
+        # Named explicit properties — not the importer-rejected inline map.
+        self.assertNotEqual(
+            health_component.get("additionalProperties"),
+            {"type": "string"},
+        )
+
+        # Runtime liveness payload shape is unchanged.
+        client = TestClient(app)
+        response = client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
 
 
 if __name__ == "__main__":

@@ -42,7 +42,17 @@ https://mission-control-production-76ff.up.railway.app/openapi-actions.json
 | Auth | HTTP Bearer (`MISSION_CONTROL_API_KEY`) |
 | Core operation IDs | `submit_run`, `get_run`, `wait_for_run`, `submit_and_wait` |
 
-`/openapi.json` remains OpenAPI 3.1 for normal clients. `/openapi-actions.json` is a documentation-only OpenAPI 3.0 view that strips importer-rejected constructs (nullable `anyOf`/`null`, `$ref`+`oneOf` siblings, empty `items`, unconstrained schemas). Runtime API behavior is unchanged.
+`/openapi.json` remains OpenAPI 3.1 for normal clients. `/openapi-actions.json` is a documentation-only OpenAPI 3.0 view that strips importer-rejected constructs (nullable `anyOf`/`null`, `$ref`+`oneOf` siblings, empty `items`, unconstrained schemas, operation descriptions ≥ 300 characters, and the inline `/health` map schema). Runtime API behavior is unchanged.
+
+### Import verification (Custom GPT Actions)
+
+1. In ChatGPT, open the Custom GPT → **Actions** → **Import from URL**.
+2. Paste: `https://mission-control-production-76ff.up.railway.app/openapi-actions.json`
+3. Confirm import succeeds (no `servers` parse error, no description-length or `/health` schema rejection).
+4. Confirm authentication is **API Key → Bearer**, and that discoverable operations include `submit_run`, `get_run`, `wait_for_run`, and `submit_and_wait`.
+5. Optionally hit `GET /health` via the imported action and expect `{"status":"ok"}`.
+
+Do **not** import `/openapi.json` into Actions; that document remains OpenAPI 3.1 for normal clients.
 
 ## Endpoints
 
