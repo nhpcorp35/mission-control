@@ -255,12 +255,13 @@ Return lifecycle status and retained output for a previously accepted run.
 | `return_code` | integer or null | Process exit code when available |
 | `commit_sha` | string or null | Commit SHA after successful platform persistence (`persistence.mode` of `commit` or `push`); null when mode is `none` or there were no changes |
 | `result` | object or null | Structured objective evidence collected by Mission Control (see below). Null for non-terminal runs that have not stored evidence yet; present on terminal runs when Mission Control recorded evidence |
+| `summary` | string or null | Authoritative Mission Control-authored run summary, aligned with platform persistence outcome. Prefer this over agent `stdout` for persistence claims. Mirrors `result.summary` when present; null when no structured evidence has been stored yet |
 | `retried_from` | string or null | Source `run_id` when this run was created via `POST /runs/{run_id}/retry`; otherwise null |
 
-#### Trust boundary: `result` vs `stdout` / `stderr`
+#### Trust boundary: `summary` / `result` vs `stdout` / `stderr`
 
-- **`result`** is objective evidence Mission Control collected from its own execution records and repository state (Git status, process exit codes, declared file-deliverable checks, platform persistence). HAL and automation should prefer `result` for verification.
-- **`stdout` / `stderr`** are agent-authored diagnostic text. Do **not** treat natural-language claims in stdout as verified structured evidence.
+- **`summary`** and **`result`** are objective Mission Control evidence. Platform persistence runs **after** the Cursor agent completes, so agent stdout may correctly report that no agent commit/push occurred while Mission Control still records a successful platform persistence outcome. Prefer `summary`, `result.persistence`, and `commit_sha` for persistence claims.
+- **`stdout` / `stderr`** are agent-authored diagnostic text captured before platform persistence. Do **not** treat natural-language claims in stdout as verified structured evidence.
 
 #### `result` object
 
@@ -272,6 +273,7 @@ Return lifecycle status and retained output for a previously accepted run.
 | `deliverables` | object or null | Declared file-deliverable verification: `verified`, `passed`, `checked_paths`, `missing` |
 | `persistence` | object or null | Platform persistence outcome: `mode`, `attempted`, `ok`, `commit_sha` |
 | `warnings` | string[] | Limitations explaining unavailable evidence (never fabricated values) |
+| `summary` | string or null | Authoritative Mission Control-authored summary consistent with `persistence` (same text as top-level `summary`) |
 
 Failed and timed-out runs retain any partial evidence Mission Control actually collected.
 
@@ -290,6 +292,7 @@ Failed and timed-out runs retain any partial evidence Mission Control actually c
   "error": null,
   "return_code": 0,
   "commit_sha": "abc123def456",
+  "summary": "Platform persistence succeeded (mode=commit, commit_sha=abc123def456). Agent stdout is diagnostic only and was captured before platform persistence when persistence ran; prefer this summary, result.persistence, and commit_sha for persistence claims.",
   "result": {
     "files_changed": [
       "docs/HAL_OPERATOR_LOG.md",
@@ -328,8 +331,10 @@ Failed and timed-out runs retain any partial evidence Mission Control actually c
     },
     "warnings": [
       "Aggregate test counts are unavailable; Mission Control does not parse agent stdout for test results.",
-      "No separate Mission Control verification shell commands were executed; only the Cursor agent subprocess and platform checks are recorded."
-    ]
+      "No separate Mission Control verification shell commands were executed; only the Cursor agent subprocess and platform checks are recorded.",
+      "Agent stdout was captured before platform persistence; prefer result.summary, result.persistence, and commit_sha for the persistence outcome."
+    ],
+    "summary": "Platform persistence succeeded (mode=commit, commit_sha=abc123def456). Agent stdout is diagnostic only and was captured before platform persistence when persistence ran; prefer this summary, result.persistence, and commit_sha for persistence claims."
   },
   "retried_from": null
 }

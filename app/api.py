@@ -204,6 +204,7 @@ class StructuredRunResultModel(BaseModel):
     deliverables: DeliverableEvidenceModel | None = None
     persistence: PersistenceEvidenceModel | None = None
     warnings: list[str] = Field(default_factory=list)
+    summary: str | None = None
 
 
 class RunStatusResponse(BaseModel):
@@ -219,6 +220,7 @@ class RunStatusResponse(BaseModel):
     return_code: int | None = None
     commit_sha: str | None = None
     result: StructuredRunResultModel | None = None
+    summary: str | None = None
     retried_from: str | None = None
 
 
@@ -249,6 +251,10 @@ def _structured_result_model(
 
 
 def _run_status_response(record: RunRecord) -> RunStatusResponse:
+    structured = _structured_result_model(record.result)
+    summary = None
+    if structured is not None and structured.summary is not None:
+        summary = structured.summary
     return RunStatusResponse(
         run_id=record.run_id,
         status=record.status.value,
@@ -261,7 +267,8 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
         error=record.error,
         return_code=record.return_code,
         commit_sha=record.commit_sha,
-        result=_structured_result_model(record.result),
+        result=structured,
+        summary=summary,
         retried_from=record.retried_from,
     )
 
@@ -561,14 +568,18 @@ def submit_structured_run_endpoint(
     summary="Get asynchronous run status",
     description=(
         "Return the lifecycle status, execution output, error, commit SHA, "
-        "and structured result evidence for a run previously submitted via "
-        "POST /runs. The `result` object is objective evidence collected by "
-        "Mission Control (changed files, commands Mission Control executed, "
-        "deliverable verification, persistence outcome). Agent-authored "
-        "`stdout` / `stderr` remain available for diagnostics but are not "
-        "verified structured evidence. Completed and failed runs remain "
-        "available in the SQLite-backed run registry. When a run was created "
-        "via POST /runs/{run_id}/retry, `retried_from` identifies the source "
+        "authoritative summary, and structured result evidence for a run "
+        "previously submitted via POST /runs. The top-level `summary` and "
+        "`result` object are objective Mission Control evidence (changed "
+        "files, commands Mission Control executed, deliverable verification, "
+        "persistence outcome). Prefer `summary`, `result.persistence`, and "
+        "`commit_sha` over agent-authored `stdout` / `stderr` for persistence "
+        "claims: platform persistence runs after the agent completes, so "
+        "agent prose may correctly report that no agent commit/push occurred "
+        "while Mission Control still recorded a successful platform "
+        "persistence outcome. Completed and failed runs remain available in "
+        "the SQLite-backed run registry. When a run was created via "
+        "POST /runs/{run_id}/retry, `retried_from` identifies the source "
         "failed run."
     ),
     responses={
@@ -591,6 +602,15 @@ def submit_structured_run_endpoint(
                                 "error": None,
                                 "return_code": 0,
                                 "commit_sha": "abc123def456",
+                                "summary": (
+                                    "Platform persistence succeeded "
+                                    "(mode=commit, commit_sha=abc123def456). "
+                                    "Agent stdout is diagnostic only and was "
+                                    "captured before platform persistence when "
+                                    "persistence ran; prefer this summary, "
+                                    "result.persistence, and commit_sha for "
+                                    "persistence claims."
+                                ),
                                 "result": {
                                     "files_changed": [
                                         "docs/HAL_OPERATOR_LOG.md",
@@ -643,7 +663,26 @@ def submit_structured_run_endpoint(
                                             "agent subprocess and platform "
                                             "checks are recorded."
                                         ),
+                                        (
+                                            "Agent stdout was captured before "
+                                            "platform persistence; prefer "
+                                            "result.summary, "
+                                            "result.persistence, and "
+                                            "commit_sha for the persistence "
+                                            "outcome."
+                                        ),
                                     ],
+                                    "summary": (
+                                        "Platform persistence succeeded "
+                                        "(mode=commit, "
+                                        "commit_sha=abc123def456). "
+                                        "Agent stdout is diagnostic only and "
+                                        "was captured before platform "
+                                        "persistence when persistence ran; "
+                                        "prefer this summary, "
+                                        "result.persistence, and commit_sha "
+                                        "for persistence claims."
+                                    ),
                                 },
                                 "retried_from": None,
                             },

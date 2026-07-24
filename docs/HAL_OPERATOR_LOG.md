@@ -1,5 +1,62 @@
 # HAL Operator Log
 
+## 2026-07-24 — Reconcile persistence reporting
+
+### Objective
+
+Resolve the apparent conflict where structured run results report successful
+platform persistence while Cursor agent stdout reports that no commit or push
+occurred, and make the client-facing run summary authoritative.
+
+### Finding
+
+Not a persistence bug: platform Git persistence runs **after** successful
+agent completion (and deliverable checks) inside `execute_registered_run`.
+Agent constraints forbid agent-side commit/push, so stdout that says no
+commit/push occurred can be true for the agent while `result.persistence`
+still records a successful platform outcome.
+
+### Implementation
+
+- Added Mission Control-authored `result.summary` via `build_run_summary` /
+  `finalize_structured_summary` in `mission_control/run_result.py`.
+- Finalize the summary on every terminal store path in
+  `execute_registered_run`; when persistence was attempted, also warn that
+  agent stdout predates platform persistence.
+- Expose top-level `summary` on `GET /runs/{run_id}` (mirrors
+  `result.summary`); keep raw agent `stdout` unchanged for diagnostics.
+- Document the trust boundary in `MISSION_CONTROL_API.md` and MCP server
+  instructions.
+
+### Tests executed
+
+```text
+/mise/installs/python/3.13.14/bin/python -m unittest \
+  tests.test_structured_run_results \
+  tests.test_runs_api \
+  tests.test_wait_for_run \
+  tests.test_execution_lifecycle \
+  tests.test_mcp_transport_discovery \
+  -v
+# Ran 51 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+Push confirmation: not pushed (same constraints).
+
+### Limitations
+
+- Legacy terminal rows stored before this change may lack `summary` until
+  re-run.
+- Agent stdout is intentionally left unmodified; reconciliation is via
+  `summary` / `result.persistence` / `commit_sha`.
+
+### Next Objective
+
+Treat `summary` as the client-facing persistence narrative for async runs.
+
 ## 2026-07-24 — Structured mission submission (Mission Builder API)
 
 ### Objective
@@ -214,7 +271,9 @@ Outcome: **123 tests OK** (including new structured-result regressions).
 
 ### Next Objective
 
-Prefer `result` over agent stdout when verifying async Mission Control runs.
+Prefer `summary`, `result.persistence`, and `commit_sha` over agent stdout
+when verifying async Mission Control persistence outcomes. Platform
+persistence runs after the agent completes.
 
 ## 2026-07-23 — Mission Control operator baseline
 

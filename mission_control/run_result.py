@@ -2,7 +2,9 @@
 
 Evidence is collected from Mission Control execution records and repository
 state only. Agent-authored stdout/stderr is retained for diagnostics but is
-never treated as verified structured evidence.
+never treated as verified structured evidence. The Mission Control-authored
+``summary`` field is the authoritative client-facing narrative for platform
+persistence outcomes (which occur after the agent completes).
 """
 
 from __future__ import annotations
@@ -33,6 +35,11 @@ WARNING_DELIVERABLES_NOT_CHECKED = (
 )
 WARNING_PERSISTENCE_NOT_ATTEMPTED = (
     "Platform persistence was not attempted for this run."
+)
+WARNING_STDOUT_PREDATES_PERSISTENCE = (
+    "Agent stdout was captured before platform persistence; prefer "
+    "result.summary, result.persistence, and commit_sha for the "
+    "persistence outcome."
 )
 
 
@@ -76,6 +83,8 @@ class StructuredRunResult:
     deliverables: DeliverableEvidence | None = None
     persistence: PersistenceEvidence | None = None
     warnings: list[str] = field(default_factory=list)
+    # Mission Control-authored client summary; authoritative for persistence.
+    summary: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +98,7 @@ class StructuredRunResult:
                 asdict(self.persistence) if self.persistence is not None else None
             ),
             "warnings": list(self.warnings),
+            "summary": self.summary,
         }
 
     @classmethod
@@ -155,6 +165,9 @@ class StructuredRunResult:
         if test_counts is not None and not isinstance(test_counts, dict):
             test_counts = None
 
+        summary_raw = data.get("summary")
+        summary = str(summary_raw) if summary_raw is not None else None
+
         return cls(
             files_changed=[str(path) for path in files_changed],
             commands=commands,
@@ -162,6 +175,7 @@ class StructuredRunResult:
             deliverables=deliverables,
             persistence=persistence,
             warnings=[str(item) for item in warnings],
+            summary=summary,
         )
 
 
@@ -249,3 +263,78 @@ def append_warning(result: StructuredRunResult, warning: str) -> None:
     """Append ``warning`` when not already present."""
     if warning not in result.warnings:
         result.warnings.append(warning)
+
+
+def build_run_summary(
+    *,
+    persistence: PersistenceEvidence | None,
+    error: str | None = None,
+) -> str:
+    """Build the authoritative client-facing run summary.
+
+    Platform persistence runs after the Cursor agent completes, so agent
+    stdout may correctly claim that no agent commit/push occurred while
+    Mission Control still records a successful platform persistence outcome.
+    Clients must prefer this summary (and ``result.persistence`` /
+    ``commit_sha``) over agent prose for persistence claims.
+    """
+    if persistence is None:
+        persistence_line = "Platform persistence evidence is unavailable."
+    elif not persistence.attempted:
+        mode = persistence.mode or "unknown"
+        persistence_line = (
+            f"Platform persistence was not attempted (mode={mode})."
+        )
+    elif persistence.ok is True:
+        mode = persistence.mode or "unknown"
+        if persistence.commit_sha:
+            persistence_line = (
+                "Platform persistence succeeded "
+                f"(mode={mode}, commit_sha={persistence.commit_sha})."
+            )
+        elif mode == "none":
+            persistence_line = "Platform persistence skipped (mode=none)."
+        else:
+            persistence_line = (
+                "Platform persistence succeeded with no repository changes "
+                f"(mode={mode})."
+            )
+    elif persistence.ok is False:
+        mode = persistence.mode or "unknown"
+        if error:
+            persistence_line = (
+                f"Platform persistence failed (mode={mode}): {error}"
+            )
+        else:
+            persistence_line = f"Platform persistence failed (mode={mode})."
+    else:
+        mode = persistence.mode or "unknown"
+        persistence_line = (
+            f"Platform persistence outcome is incomplete (mode={mode})."
+        )
+
+    trust_line = (
+        "Agent stdout is diagnostic only and was captured before platform "
+        "persistence when persistence ran; prefer this summary, "
+        "result.persistence, and commit_sha for persistence claims."
+    )
+    return f"{persistence_line} {trust_line}"
+
+
+def finalize_structured_summary(
+    result: StructuredRunResult,
+    *,
+    error: str | None = None,
+) -> None:
+    """Set ``result.summary`` from platform persistence evidence.
+
+    When persistence was attempted, also record that agent stdout predates
+    the platform persistence step so clients do not treat agent "no commit
+    or push" prose as conflicting with a successful platform outcome.
+    """
+    if result.persistence is not None and result.persistence.attempted:
+        append_warning(result, WARNING_STDOUT_PREDATES_PERSISTENCE)
+    result.summary = build_run_summary(
+        persistence=result.persistence,
+        error=error,
+    )

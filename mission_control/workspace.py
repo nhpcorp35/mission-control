@@ -25,6 +25,7 @@ from mission_control.run_result import (
     append_warning,
     command_evidence_from_execution,
     empty_structured_result,
+    finalize_structured_summary,
     parse_git_status_porcelain_paths,
 )
 
@@ -644,6 +645,7 @@ def execute_registered_run(
                 verified=False,
                 passed=None,
             )
+            finalize_structured_summary(structured, error=prep.error)
             registry.store_result(
                 run_id,
                 error=prep.error,
@@ -685,6 +687,10 @@ def execute_registered_run(
                 attempted=False,
                 ok=None,
             )
+            finalize_structured_summary(
+                structured,
+                error=execution_result.error,
+            )
             registry.store_result(
                 run_id,
                 stdout=execution_result.stdout,
@@ -714,14 +720,16 @@ def execute_registered_run(
                 attempted=False,
                 ok=None,
             )
+            deliverable_error = (
+                "Missing declared file deliverable: "
+                f"{deliverable_evidence.missing[0]}"
+            )
+            finalize_structured_summary(structured, error=deliverable_error)
             registry.store_result(
                 run_id,
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
-                error=(
-                    "Missing declared file deliverable: "
-                    f"{deliverable_evidence.missing[0]}"
-                ),
+                error=deliverable_error,
                 return_code=execution_result.return_code,
                 result=structured,
             )
@@ -749,6 +757,10 @@ def execute_registered_run(
                 append_warning(structured, files_warning)
 
         if not persistence_result.ok:
+            finalize_structured_summary(
+                structured,
+                error=persistence_result.error,
+            )
             registry.store_result(
                 run_id,
                 stdout=execution_result.stdout,
@@ -760,6 +772,7 @@ def execute_registered_run(
             registry.update_status(run_id, RunStatus.FAILED)
             return
 
+        finalize_structured_summary(structured)
         registry.store_result(
             run_id,
             stdout=execution_result.stdout,
@@ -786,6 +799,7 @@ def execute_registered_run(
                 attempted=False,
                 ok=None,
             )
+        finalize_structured_summary(structured, error=str(exc))
         registry.store_result(
             run_id,
             error=str(exc),

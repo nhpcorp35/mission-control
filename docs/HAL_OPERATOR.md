@@ -7,6 +7,9 @@ claims against repository state, and submits corrective follow-up missions.
 
 - **Repository state is the source of truth.**
 - Mission summaries alone are not proof.
+- For async Mission Control runs, prefer `summary`, `result.persistence`, and
+  `commit_sha` over agent `stdout` when judging persistence: platform
+  persistence runs after the agent completes.
 - Significant claims must be independently verified through tests, source
   inspection, repository state, or equivalent direct evidence.
 

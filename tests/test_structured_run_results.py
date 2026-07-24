@@ -22,8 +22,11 @@ from mission_control.run_result import (
     PersistenceEvidence,
     StructuredRunResult,
     WARNING_NO_TEST_COUNTS,
+    WARNING_STDOUT_PREDATES_PERSISTENCE,
+    build_run_summary,
     deserialize_structured_result,
     empty_structured_result,
+    finalize_structured_summary,
     parse_git_status_porcelain_paths,
     serialize_structured_result,
 )
@@ -160,6 +163,49 @@ class TestPorcelainParsing(unittest.TestCase):
         )
 
 
+class TestAuthoritativePersistenceSummary(unittest.TestCase):
+    def test_build_run_summary_matches_successful_platform_persistence(self) -> None:
+        persistence = PersistenceEvidence(
+            mode="commit",
+            attempted=True,
+            ok=True,
+            commit_sha="abc123def456",
+        )
+        summary = build_run_summary(persistence=persistence)
+        self.assertIn("Platform persistence succeeded", summary)
+        self.assertIn("mode=commit", summary)
+        self.assertIn("commit_sha=abc123def456", summary)
+        self.assertIn("prefer this summary", summary)
+
+    def test_build_run_summary_reports_failed_persistence(self) -> None:
+        persistence = PersistenceEvidence(
+            mode="push",
+            attempted=True,
+            ok=False,
+            commit_sha=None,
+        )
+        summary = build_run_summary(
+            persistence=persistence,
+            error="push rejected",
+        )
+        self.assertIn("Platform persistence failed (mode=push)", summary)
+        self.assertIn("push rejected", summary)
+
+    def test_finalize_warns_when_stdout_predates_persistence(self) -> None:
+        structured = empty_structured_result()
+        structured.persistence = PersistenceEvidence(
+            mode="push",
+            attempted=True,
+            ok=True,
+            commit_sha="deadbeef",
+        )
+        finalize_structured_summary(structured)
+        self.assertIsNotNone(structured.summary)
+        assert structured.summary is not None
+        self.assertIn("commit_sha=deadbeef", structured.summary)
+        self.assertIn(WARNING_STDOUT_PREDATES_PERSISTENCE, structured.warnings)
+
+
 class TestStructuredResultSerialization(SqliteRegistryTestCase):
     def test_serialize_round_trip_and_registry_persistence(self) -> None:
         structured = StructuredRunResult(
@@ -186,6 +232,10 @@ class TestStructuredResultSerialization(SqliteRegistryTestCase):
                 commit_sha="deadbeef",
             ),
             warnings=[WARNING_NO_TEST_COUNTS],
+            summary=(
+                "Platform persistence succeeded "
+                "(mode=commit, commit_sha=deadbeef)."
+            ),
         )
         raw = serialize_structured_result(structured)
         self.assertIsInstance(raw, str)
@@ -196,6 +246,10 @@ class TestStructuredResultSerialization(SqliteRegistryTestCase):
         self.assertTrue(restored.commands[0].passed)
         self.assertEqual(restored.persistence.commit_sha, "deadbeef")
         self.assertIsNone(restored.test_counts)
+        self.assertEqual(
+            restored.summary,
+            "Platform persistence succeeded (mode=commit, commit_sha=deadbeef).",
+        )
 
         record = self.registry.create_run()
         self.registry.store_result(
@@ -219,6 +273,11 @@ class TestStructuredResultSerialization(SqliteRegistryTestCase):
             self.assertEqual(fetched.result.files_changed, ["a.py", "b.md"])
             self.assertEqual(fetched.result.persistence.commit_sha, "deadbeef")
             self.assertEqual(fetched.result.commands[0].kind, "cursor_agent")
+            self.assertEqual(
+                fetched.result.summary,
+                "Platform persistence succeeded "
+                "(mode=commit, commit_sha=deadbeef).",
+            )
         finally:
             reloaded.close()
 
@@ -276,7 +335,10 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         )
         mock_execute.return_value = ExecutionResult(
             ok=True,
-            stdout="agent prose claiming success\n",
+            stdout=(
+                "Not committed in this mission "
+                "(constraints forbid git staging/commits/pushes).\n"
+            ),
             return_code=0,
             command=[
                 "cursor-agent",
@@ -305,7 +367,9 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         assert updated is not None
         self.assertEqual(updated.status, RunStatus.COMPLETED)
         self.assertEqual(updated.commit_sha, "abc123def456")
-        self.assertEqual(updated.stdout, "agent prose claiming success\n")
+        # Agent stdout may deny commit/push; platform persistence still wins.
+        self.assertIn("forbid git", updated.stdout)
+        self.assertIn("Not committed", updated.stdout)
         assert updated.result is not None
         self.assertEqual(
             updated.result.files_changed,
@@ -331,6 +395,75 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         self.assertEqual(updated.result.persistence.commit_sha, "abc123def456")
         self.assertEqual(updated.result.persistence.mode, "commit")
         self.assertIn(WARNING_NO_TEST_COUNTS, updated.result.warnings)
+        self.assertIn(
+            WARNING_STDOUT_PREDATES_PERSISTENCE,
+            updated.result.warnings,
+        )
+        assert updated.result.summary is not None
+        self.assertIn("Platform persistence succeeded", updated.result.summary)
+        self.assertIn("commit_sha=abc123def456", updated.result.summary)
+        self.assertNotIn("forbid git", updated.result.summary)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.collect_changed_files")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    def test_summary_reconciles_agent_no_commit_claim_with_platform_push(
+        self,
+        mock_prepare,
+        mock_execute,
+        mock_changed,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        """Stdout can deny commit/push while platform persistence succeeded."""
+        workspace = tempfile.mkdtemp(prefix="mc-structured-recon-")
+        (Path(workspace) / "docs").mkdir()
+        (Path(workspace) / "docs" / "out.txt").write_text("x\n", encoding="utf-8")
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path=workspace,
+        )
+        agent_stdout = (
+            "implementation done\n"
+            "commit hash: n/a (no commit or push occurred)\n"
+            "push confirmation: not pushed\n"
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout=agent_stdout,
+            return_code=0,
+            command=["cursor-agent", "--force", "<instruction>"],
+        )
+        mock_changed.return_value = (["docs/out.txt"], None)
+        mock_persist.return_value = PersistenceResult(
+            ok=True,
+            commit_sha="feedface99",
+        )
+
+        record = self.registry.create_run()
+        mission = _base_mission(deliverables=["docs/out.txt"])
+        mission["persistence"] = {"mode": "push"}
+        execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        self.assertEqual(updated.status, RunStatus.COMPLETED)
+        self.assertEqual(updated.stdout, agent_stdout)
+        self.assertIn("no commit or push occurred", updated.stdout)
+        self.assertEqual(updated.commit_sha, "feedface99")
+        assert updated.result is not None
+        assert updated.result.persistence is not None
+        self.assertTrue(updated.result.persistence.ok)
+        self.assertEqual(updated.result.persistence.commit_sha, "feedface99")
+        assert updated.result.summary is not None
+        self.assertIn("Platform persistence succeeded", updated.result.summary)
+        self.assertIn("mode=push", updated.result.summary)
+        self.assertIn("commit_sha=feedface99", updated.result.summary)
+        self.assertNotIn("no commit or push occurred", updated.result.summary)
+        mock_persist.assert_called_once()
+        mock_execute.assert_called_once()
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
@@ -380,6 +513,11 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         self.assertFalse(updated.result.deliverables.verified)
         assert updated.result.persistence is not None
         self.assertFalse(updated.result.persistence.attempted)
+        assert updated.result.summary is not None
+        self.assertIn(
+            "Platform persistence was not attempted",
+            updated.result.summary,
+        )
         mock_persist.assert_not_called()
 
     @patch("mission_control.workspace.cleanup_workspace")
@@ -480,7 +618,9 @@ class TestStructuredResultApi(unittest.TestCase):
         )
         mock_execute.return_value = ExecutionResult(
             ok=True,
-            stdout="agent response\n",
+            stdout=(
+                "Agent response claiming no commit or push occurred\n"
+            ),
             return_code=0,
             command=["cursor-agent", "--force", "<instruction>"],
         )
@@ -506,11 +646,14 @@ class TestStructuredResultApi(unittest.TestCase):
             self.assertIn(field, body)
 
         self.assertEqual(body["status"], "completed")
-        self.assertEqual(body["stdout"], "agent response\n")
+        self.assertIn("no commit or push occurred", body["stdout"])
         self.assertEqual(body["stderr"], "")
         self.assertIsNone(body["error"])
         self.assertEqual(body["return_code"], 0)
         self.assertEqual(body["commit_sha"], "abc123")
+        self.assertIn("Platform persistence succeeded", body["summary"])
+        self.assertIn("commit_sha=abc123", body["summary"])
+        self.assertNotIn("no commit or push occurred", body["summary"])
 
         result = body["result"]
         self.assertIsInstance(result, dict)
@@ -523,6 +666,11 @@ class TestStructuredResultApi(unittest.TestCase):
         self.assertEqual(result["deliverables"]["checked_paths"], ["created.txt"])
         self.assertEqual(result["persistence"]["commit_sha"], "abc123")
         self.assertTrue(result["persistence"]["ok"])
+        self.assertEqual(result["summary"], body["summary"])
+        self.assertIn(
+            WARNING_STDOUT_PREDATES_PERSISTENCE,
+            result["warnings"],
+        )
 
     def test_queued_run_keeps_null_result_for_compatibility(self) -> None:
         record = api_module.run_registry.create_run()
@@ -532,6 +680,7 @@ class TestStructuredResultApi(unittest.TestCase):
         for field in LEGACY_RUN_STATUS_FIELDS:
             self.assertIn(field, body)
         self.assertIsNone(body["result"])
+        self.assertIsNone(body["summary"])
 
     def test_empty_structured_result_defaults(self) -> None:
         result = empty_structured_result()
