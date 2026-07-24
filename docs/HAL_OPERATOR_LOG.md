@@ -1,5 +1,54 @@
 # HAL Operator Log
 
+## 2026-07-24 — Structured mission submission (Mission Builder API)
+
+### Objective
+
+Let HAL submit structured mission fields instead of hand-authored raw YAML,
+while preserving `submit_run` / `POST /runs` and existing validation/execution.
+
+### Implementation
+
+- Added `mission_control/mission_builder.py` to build Mission Spec v1.0 with
+  safe execute defaults and render YAML via `yaml.safe_dump`.
+- Added authenticated `POST /runs/structured` that renders YAML then calls the
+  existing `_accept_async_run` path (same auth, recursive-submission gate,
+  acceptance and rejection shapes as `POST /runs`).
+- Added MCP client/server tool `submit_structured_run`; kept `submit_run`
+  unchanged; updated discovery/`EXPECTED_TOOL_NAMES` and server instructions.
+- Documented in `MISSION_CONTROL_API.md` and `docs/HAL_OPERATOR.md` (prefer
+  structured for routine missions; raw YAML remains supported).
+
+### Tests executed
+
+```text
+/mise/installs/python/3.13.14/bin/python -m unittest \
+  tests.test_mission_builder \
+  tests.test_structured_runs_api \
+  tests.test_mcp_transport_discovery \
+  tests.test_mcp_wait_for_run \
+  tests.test_runs_api \
+  tests.test_api \
+  -v
+# Ran 72 tests — OK
+```
+
+### Resulting commit
+
+`feat: add structured mission submission`
+
+### Limitations
+
+- v1 structured surface does not cover plan-mode or arbitrary Mission Spec
+  overrides; use raw YAML for those cases.
+- Builder-controlled execute defaults cannot be overridden via structured
+  fields.
+
+### Next Objective
+
+Use `submit_structured_run` / `POST /runs/structured` for routine HAL execute
+missions; reserve raw YAML for exceptional documents.
+
 ## 2026-07-23 — Retry failed async runs
 
 ### Objective

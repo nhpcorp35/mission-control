@@ -18,7 +18,12 @@ from mcp_connector.config import Settings
 from mcp_connector.errors import MissionControlError
 
 
-EXPECTED_TOOL_NAMES = ("submit_run", "get_run", "wait_for_run")
+EXPECTED_TOOL_NAMES = (
+    "submit_run",
+    "submit_structured_run",
+    "get_run",
+    "wait_for_run",
+)
 
 settings = Settings.from_env()
 client = MissionControlClient(settings)
@@ -26,12 +31,15 @@ client = MissionControlClient(settings)
 mcp = FastMCP(
     "Mission Control",
     instructions=(
-        "Submit Mission Control YAML, retrieve asynchronous run status, "
-        "and wait for runs to reach a terminal state. Intended HAL flow: "
-        "submit_run, then call wait_for_run repeatedly (no user prompting) "
-        "until status is terminal or wait_expired stays relevant, then "
-        "inspect status/output/commit_sha. Each wait_for_run uses a short "
-        f"ChatGPT-safe default window ({MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s, "
+        "Submit Mission Control missions as structured fields "
+        "(prefer submit_structured_run for routine execute missions) or as "
+        "raw YAML (submit_run), retrieve asynchronous run status, and wait "
+        "for runs to reach a terminal state. Intended HAL flow: "
+        "submit_structured_run (or submit_run), then call wait_for_run "
+        "repeatedly (no user prompting) until status is terminal or "
+        "wait_expired stays relevant, then inspect status/output/commit_sha. "
+        "Each wait_for_run uses a short ChatGPT-safe default window "
+        f"({MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s, "
         f"capped at {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s); when wait_expired is "
         "true, call wait_for_run again with the same run_id."
     ),
@@ -63,6 +71,59 @@ async def submit_run(mission_yaml: str) -> dict[str, Any]:
             raise ValueError("mission_yaml must not be empty")
 
         result = await client.submit_run(mission_yaml)
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def submit_structured_run(
+    mission_id: str,
+    title: str,
+    instructions: str,
+    deliverables: list[Any],
+    create_files: bool,
+    modify_files: bool,
+    persistence_mode: str = "none",
+    repository_name: str = "Mission-Control",
+    repository_path: str = ".",
+    base_branch: str = "main",
+    run_commands: bool = True,
+    platform_push_approved: bool = False,
+    allow_automatic_platform_push: bool = False,
+) -> dict[str, Any]:
+    """Submit a mission via structured fields (POST /runs/structured).
+
+    Prefer this for routine execute missions. Mission Control builds Mission
+    Spec v1.0 YAML with safe defaults and queues it through the same async
+    pipeline as submit_run. Raw YAML submit_run remains available when exact
+    document control is required.
+    """
+    try:
+        if not mission_id.strip():
+            raise ValueError("mission_id must not be empty")
+        if not title.strip():
+            raise ValueError("title must not be empty")
+        if not instructions.strip():
+            raise ValueError("instructions must not be empty")
+        if not isinstance(deliverables, list):
+            raise ValueError("deliverables must be a list")
+
+        result = await client.submit_structured_run(
+            mission_id=mission_id,
+            title=title,
+            instructions=instructions,
+            deliverables=deliverables,
+            create_files=create_files,
+            modify_files=modify_files,
+            persistence_mode=persistence_mode,
+            repository_name=repository_name,
+            repository_path=repository_path,
+            base_branch=base_branch,
+            run_commands=run_commands,
+            platform_push_approved=platform_push_approved,
+            allow_automatic_platform_push=allow_automatic_platform_push,
+        )
         return {"ok": True, **result}
     except Exception as exc:
         return _tool_error(exc)

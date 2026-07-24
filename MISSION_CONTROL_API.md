@@ -21,7 +21,7 @@ Authorization: Bearer <MISSION_CONTROL_API_KEY>
 | Missing or invalid credentials | `401 Unauthorized` with `WWW-Authenticate: Bearer` |
 | Server key unset / empty | `503 Service Unavailable` |
 
-Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
+Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `POST /runs/structured`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
 
 Public endpoints (no API key): `GET /health`, `POST /validate`.
 
@@ -193,6 +193,45 @@ Validate an execute-mode mission and accept it for asynchronous execution in an 
 Validation, eligibility, preflight, and recursive-submission failures return `200 OK` with a `RunResponse` body (`ok: false`) instead of queueing a run.
 
 Recursive local submissions (same-thread re-entrancy during an active execution, or an explicit recursive-submission header) are rejected. Cursor agent subprocesses also do not receive Mission Control API credentials, which prevents nested local `POST /runs` calls from authenticating.
+
+### POST /runs/structured
+
+Requires authentication.
+
+Accept structured Mission Spec fields, render Mission Spec v1.0 YAML through the mission builder (safe execute defaults), then validate and queue the run through the same asynchronous pipeline as `POST /runs` (`_accept_async_run`). The rendered YAML text is stored on the run record so retries remain exact. Prefer this endpoint for routine execute missions; raw YAML via `POST /runs` remains fully supported.
+
+**Request body** `application/json`
+
+Required fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `mission_id` | string | Mission identifier |
+| `title` | string | Mission title |
+| `instructions` | string | Agent instructions |
+| `deliverables` | array | Declared deliverables (empty list allowed) |
+| `create_files` | boolean | Agent may create files |
+| `modify_files` | boolean | Agent may modify existing files |
+
+Optional fields and defaults:
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `persistence_mode` | string | `none` |
+| `repository_name` | string | `Mission-Control` |
+| `repository_path` | string | `.` |
+| `base_branch` | string | `main` |
+| `run_commands` | boolean | `true` |
+| `platform_push_approved` | boolean | `false` |
+| `allow_automatic_platform_push` | boolean | `false` |
+
+Builder-controlled fields (callers cannot override in v1): `version: 1.0`, `execution.agent: cursor`, `execution.mode: execute`, `execution.sandbox: true`, `execution.worktree: false`, `permissions.read: true`, `permissions.delete_files: false`, `permissions.stage_changes: false`, `permissions.commit: false`, `permissions.push: false`, `approval.execute_without_approval: true`, `approval.commit_requires_approval: true`, `approval.push_requires_approval: true`.
+
+Platform-push approval rules are unchanged: `persistence_mode=push` still requires `platform_push_approved=true` or `allow_automatic_platform_push=true`.
+
+**Response** `202 Accepted` when the run is queued — same shape as `POST /runs` (`run_id`, `status: queued`).
+
+Validation, eligibility, preflight, and recursive-submission failures return `200 OK` with a `RunResponse` body (`ok: false`) instead of queueing a run (same shapes as `POST /runs`).
 
 ### GET /runs/{run_id}
 
@@ -376,6 +415,7 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | Tool | Purpose |
 | --- | --- |
 | `submit_run` | Submit mission YAML (`POST /runs`) |
+| `submit_structured_run` | Submit structured mission fields (`POST /runs/structured`); prefer for routine execute missions |
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
 | `wait_for_run` | Short ChatGPT-safe poll of `get_run` until terminal or wait window expires; call repeatedly until terminal |
 
@@ -390,7 +430,7 @@ Use the Streamable HTTP endpoint (not `/sse`):
 | Authentication in ChatGPT | **No authentication** |
 | Backend API auth | Connector uses server-side `MISSION_CONTROL_API_KEY` as `Authorization: Bearer …` when calling Mission Control; that key is not sent by ChatGPT |
 
-Legacy SSE is also mounted at `https://mission-control-mcp-production.up.railway.app/sse` (with `/messages`) so older `/sse` app URLs keep discovering the same three tools. Prefer `/mcp` for new ChatGPT custom apps.
+Legacy SSE is also mounted at `https://mission-control-mcp-production.up.railway.app/sse` (with `/messages`) so older `/sse` app URLs keep discovering the same tools. Prefer `/mcp` for new ChatGPT custom apps.
 
 Local MCP HTTP (same routes as Railway):
 
@@ -416,9 +456,10 @@ prompting** until the run is terminal.
 | `timeout_seconds` | number | no | `20` | Maximum time to wait for this call; must be `>= 0.1`. Values above `25` are capped to `25` (ChatGPT-safe). Zero/negative values are rejected. |
 | `poll_interval_seconds` | number | no | `2` | Delay between `get_run` polls; must be `>= 0.05`. Values above `10` are capped to `10`. Zero/negative values are rejected. |
 
-**Intended HAL loop.** `submit_run` → repeat `wait_for_run` until
-`wait_expired` is `false` and `status` is terminal → inspect
-`stdout` / `stderr` / `error` / `commit_sha`.
+**Intended HAL loop.** Prefer `submit_structured_run` for routine execute
+missions (or `submit_run` with exact YAML when needed) → repeat `wait_for_run`
+until `wait_expired` is `false` and `status` is terminal → inspect
+`stdout` / `stderr` / `error` / `commit_sha` / `result`.
 
 **Terminal behavior.** Reuses Mission Control terminal statuses (`completed`,
 `failed`, `timed_out`) via `is_terminal_status`. Returns immediately when the

@@ -22,6 +22,18 @@ claims against repository state, and submits corrective follow-up missions.
 Operating procedure detail lives in this document; durable verified outcomes live
 in `docs/HAL_OPERATOR_LOG.md`.
 
+## Mission submission
+
+- **Prefer structured submission** for routine execute missions:
+  MCP `submit_structured_run` or HTTP `POST /runs/structured`.
+- Structured fields are rendered into Mission Spec v1.0 YAML with safe execute
+  defaults; the rendered YAML is stored on the run record so retries stay exact.
+- **Raw YAML remains fully supported** via MCP `submit_run` / HTTP `POST /runs`
+  when exact document control is required (or when fields outside the structured
+  v1 surface must be set by hand).
+- Do not weaken platform-push approval: `persistence_mode=push` still requires
+  explicit platform-push approval fields.
+
 ## Autonomy
 
 HAL should continue operating runs, interpreting results, and submitting

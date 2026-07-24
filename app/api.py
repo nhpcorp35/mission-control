@@ -31,6 +31,16 @@ from mission_control.run_registry import (
 )
 from mission_control.run_result import StructuredRunResult
 from mission_control.workspace import execute_registered_run
+from mission_control.mission_builder import (
+    DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH,
+    DEFAULT_BASE_BRANCH,
+    DEFAULT_PERSISTENCE_MODE,
+    DEFAULT_PLATFORM_PUSH_APPROVED,
+    DEFAULT_REPOSITORY_NAME,
+    DEFAULT_REPOSITORY_PATH,
+    DEFAULT_RUN_COMMANDS,
+    render_mission_yaml,
+)
 from mission_control.validator import (
     load_mission_yaml,
     validate_mission_for_execute,
@@ -126,6 +136,26 @@ app = FastAPI(
 )
 class MissionYamlRequest(BaseModel):
     mission_yaml: str = Field(..., min_length=1)
+
+
+class StructuredRunRequest(BaseModel):
+    """Structured Mission Spec fields for POST /runs/structured (v1)."""
+
+    mission_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    instructions: str = Field(..., min_length=1)
+    deliverables: list = Field(...)
+    create_files: bool
+    modify_files: bool
+    persistence_mode: str = DEFAULT_PERSISTENCE_MODE
+    repository_name: str = DEFAULT_REPOSITORY_NAME
+    repository_path: str = DEFAULT_REPOSITORY_PATH
+    base_branch: str = DEFAULT_BASE_BRANCH
+    run_commands: bool = DEFAULT_RUN_COMMANDS
+    platform_push_approved: bool = DEFAULT_PLATFORM_PUSH_APPROVED
+    allow_automatic_platform_push: bool = (
+        DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH
+    )
 class ValidateResponse(BaseModel):
     ok: bool
     error: str | None = None
@@ -459,6 +489,69 @@ def submit_run_endpoint(
             ),
         )
     return _accept_async_run(request.mission_yaml)
+
+
+@app.post(
+    "/runs/structured",
+    status_code=202,
+    operation_id="submit_structured_run",
+    summary="Submit asynchronous mission run from structured fields",
+    description=(
+        "Build Mission Spec v1.0 YAML from structured fields (safe execute "
+        "defaults), then validate and queue it through the same asynchronous "
+        "pipeline as POST /runs. Poll GET /runs/{run_id} for status. Raw YAML "
+        "submission via POST /runs remains supported."
+    ),
+    response_model=RunAcceptedResponse,
+    responses={
+        200: {
+            "model": RunResponse,
+            "description": (
+                "Structural validation, execute eligibility, Cursor CLI "
+                "preflight failure, or recursive submission rejection."
+            ),
+        },
+        202: {
+            "model": RunAcceptedResponse,
+            "description": "Run accepted and queued for background execution.",
+        },
+    },
+)
+def submit_structured_run_endpoint(
+    request: StructuredRunRequest,
+    raw_request: Request,
+    _auth: None = Depends(require_api_key),
+) -> RunAcceptedResponse:
+    if is_recursive_submission(dict(raw_request.headers)):
+        logger.info(
+            "lifecycle event=recursive_submission_rejected"
+        )
+        return _reject_run_response(
+            error=RECURSIVE_SUBMISSION_ERROR,
+            error_detail=ErrorDetail(
+                code="RECURSIVE_SUBMISSION",
+                message=RECURSIVE_SUBMISSION_ERROR,
+                stage="submit",
+            ),
+        )
+    mission_yaml = render_mission_yaml(
+        mission_id=request.mission_id,
+        title=request.title,
+        instructions=request.instructions,
+        deliverables=request.deliverables,
+        create_files=request.create_files,
+        modify_files=request.modify_files,
+        persistence_mode=request.persistence_mode,
+        repository_name=request.repository_name,
+        repository_path=request.repository_path,
+        base_branch=request.base_branch,
+        run_commands=request.run_commands,
+        platform_push_approved=request.platform_push_approved,
+        allow_automatic_platform_push=(
+            request.allow_automatic_platform_push
+        ),
+    )
+    return _accept_async_run(mission_yaml)
 
 
 @app.get(

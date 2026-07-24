@@ -373,10 +373,18 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertIn("poll_interval_seconds", result["error"]["message"])
 
-    def test_tool_discovery_lists_exactly_three_run_tools(self) -> None:
+    def test_tool_discovery_lists_run_tools_including_structured(self) -> None:
         tools = mcp_server.mcp._tool_manager.list_tools()
         names = [tool.name for tool in tools]
-        self.assertEqual(names, ["submit_run", "get_run", "wait_for_run"])
+        self.assertEqual(
+            names,
+            [
+                "submit_run",
+                "submit_structured_run",
+                "get_run",
+                "wait_for_run",
+            ],
+        )
 
         wait_tool = next(tool for tool in tools if tool.name == "wait_for_run")
         props = wait_tool.parameters["properties"]
@@ -392,6 +400,31 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
         description = wait_tool.description or ""
         self.assertIn("repeatedly", description.lower())
         self.assertIn("wait_expired", description)
+
+        structured = next(
+            tool for tool in tools if tool.name == "submit_structured_run"
+        )
+        structured_props = structured.parameters["properties"]
+        for required in (
+            "mission_id",
+            "title",
+            "instructions",
+            "deliverables",
+            "create_files",
+            "modify_files",
+        ):
+            self.assertIn(required, structured_props)
+        self.assertEqual(
+            set(structured.parameters["required"]),
+            {
+                "mission_id",
+                "title",
+                "instructions",
+                "deliverables",
+                "create_files",
+                "modify_files",
+            },
+        )
 
 
 if __name__ == "__main__":

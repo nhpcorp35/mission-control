@@ -135,6 +135,45 @@ class MissionControlClient:
             json={"mission_yaml": mission_yaml},
         )
 
+    async def submit_structured_run(
+        self,
+        *,
+        mission_id: str,
+        title: str,
+        instructions: str,
+        deliverables: list[Any],
+        create_files: bool,
+        modify_files: bool,
+        persistence_mode: str = "none",
+        repository_name: str = "Mission-Control",
+        repository_path: str = ".",
+        base_branch: str = "main",
+        run_commands: bool = True,
+        platform_push_approved: bool = False,
+        allow_automatic_platform_push: bool = False,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/runs/structured",
+            json={
+                "mission_id": mission_id,
+                "title": title,
+                "instructions": instructions,
+                "deliverables": deliverables,
+                "create_files": create_files,
+                "modify_files": modify_files,
+                "persistence_mode": persistence_mode,
+                "repository_name": repository_name,
+                "repository_path": repository_path,
+                "base_branch": base_branch,
+                "run_commands": run_commands,
+                "platform_push_approved": platform_push_approved,
+                "allow_automatic_platform_push": (
+                    allow_automatic_platform_push
+                ),
+            },
+        )
+
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/runs/{run_id}")
 
