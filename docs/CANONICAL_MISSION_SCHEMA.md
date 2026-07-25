@@ -123,6 +123,8 @@ not enable or disable platform Git actions).
 Additionally, unless one of the exceptions below applies, execute requires at
 least one of `create_files` or `modify_files` to be true.
 
+Mission Control supports genuine read-only execute missions for repository inspection.
+
 **Read-only execute exception:** a mission with this exact permission set is
 accepted as a read-only execution (inspection / planning) mission even when
 both `create_files` and `modify_files` are false:
