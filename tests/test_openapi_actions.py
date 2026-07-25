@@ -183,6 +183,45 @@ class TestOpenApiActionsCompatibility(unittest.TestCase):
         ]["properties"]["deliverables"]
         self.assertEqual(deliverables["items"], {"type": "object"})
 
+    def test_structured_request_exposes_nested_approval(self) -> None:
+        """OpenAPI documents flat and nested platform_push_approved inputs."""
+        for schema in (self.raw, self.actions):
+            with self.subTest(openapi=schema.get("openapi")):
+                request_schema = schema["components"]["schemas"][
+                    "StructuredRunRequest"
+                ]
+                props = request_schema["properties"]
+                self.assertIn("platform_push_approved", props)
+                self.assertIn("approval", props)
+                approval = props["approval"]
+                # $ref or inline object with platform_push_approved
+                if "$ref" in approval:
+                    ref_name = approval["$ref"].rsplit("/", 1)[-1]
+                    approval_schema = schema["components"]["schemas"][
+                        ref_name
+                    ]
+                elif "anyOf" in approval:
+                    # OpenAPI 3.1 nullable union: object | null
+                    object_branch = next(
+                        branch
+                        for branch in approval["anyOf"]
+                        if branch.get("type") == "object"
+                        or "$ref" in branch
+                    )
+                    if "$ref" in object_branch:
+                        ref_name = object_branch["$ref"].rsplit("/", 1)[-1]
+                        approval_schema = schema["components"]["schemas"][
+                            ref_name
+                        ]
+                    else:
+                        approval_schema = object_branch
+                else:
+                    approval_schema = approval
+                self.assertIn(
+                    "platform_push_approved",
+                    approval_schema.get("properties", {}),
+                )
+
     def test_openapi_json_unchanged_for_normal_clients(self) -> None:
         # /openapi.json remains the FastAPI OpenAPI 3.1 document.
         self.assertEqual(self.raw.get("openapi"), "3.1.0")

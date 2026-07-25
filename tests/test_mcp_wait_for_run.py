@@ -113,6 +113,55 @@ class TestNormalizeMcpWaitBounds(unittest.TestCase):
                 self.assertIn("poll_interval_seconds", str(ctx.exception))
 
 
+class TestSubmitStructuredRunClient(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.client = MissionControlClient(_settings())
+
+    async def test_client_serializes_nested_approval_without_flat_default(
+        self,
+    ) -> None:
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value={"run_id": "r1", "status": "queued"}),
+        ) as request:
+            await self.client.submit_structured_run(
+                mission_id="m1",
+                title="T",
+                instructions="Do it",
+                deliverables=["summary"],
+                create_files=True,
+                modify_files=False,
+                approval={"platform_push_approved": True},
+            )
+        request.assert_awaited_once()
+        payload = request.await_args.kwargs["json"]
+        self.assertNotIn("platform_push_approved", payload)
+        self.assertEqual(
+            payload["approval"],
+            {"platform_push_approved": True},
+        )
+
+    async def test_client_serializes_flat_platform_push_approved(self) -> None:
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value={"run_id": "r1", "status": "queued"}),
+        ) as request:
+            await self.client.submit_structured_run(
+                mission_id="m1",
+                title="T",
+                instructions="Do it",
+                deliverables=["summary"],
+                create_files=True,
+                modify_files=False,
+                platform_push_approved=True,
+            )
+        payload = request.await_args.kwargs["json"]
+        self.assertEqual(payload["platform_push_approved"], True)
+        self.assertNotIn("approval", payload)
+
+
 class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.client = MissionControlClient(_settings())
@@ -483,6 +532,28 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
             {"type": "string"},
         )
         self.assertNotEqual(structured_props["deliverables"].get("items"), {})
+        # Nested approval.platform_push_approved is part of the tool surface.
+        self.assertIn("platform_push_approved", structured_props)
+        self.assertIn("approval", structured_props)
+        approval_defs = structured.parameters.get("$defs", {})
+        approval_model = None
+        for name, definition in approval_defs.items():
+            if "platform_push_approved" in definition.get("properties", {}):
+                approval_model = definition
+                break
+        self.assertIsNotNone(
+            approval_model,
+            msg="submit_structured_run must expose nested approval fields",
+        )
+        assert approval_model is not None
+        self.assertEqual(
+            approval_model["properties"]["platform_push_approved"].get(
+                "type"
+            ),
+            "boolean",
+        )
+        description = (structured.description or "").lower()
+        self.assertIn("approval.platform_push_approved", description)
 
         submit_and_wait = next(
             tool for tool in tools if tool.name == "submit_and_wait"

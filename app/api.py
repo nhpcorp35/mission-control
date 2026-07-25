@@ -6,7 +6,7 @@ import os
 import time
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from app.auth import require_api_key
 from app.cursor_cli import (
     augment_path,
@@ -144,6 +144,12 @@ class MissionYamlRequest(BaseModel):
     mission_yaml: str = Field(..., min_length=1)
 
 
+class StructuredApproval(BaseModel):
+    """Canonical nested approval fields for structured submission."""
+
+    platform_push_approved: bool | None = None
+
+
 class StructuredRunRequest(BaseModel):
     """Structured Mission Spec fields for POST /runs/structured (v1)."""
 
@@ -159,9 +165,47 @@ class StructuredRunRequest(BaseModel):
     base_branch: str = DEFAULT_BASE_BRANCH
     run_commands: bool = DEFAULT_RUN_COMMANDS
     platform_push_approved: bool = DEFAULT_PLATFORM_PUSH_APPROVED
+    approval: StructuredApproval | None = None
     allow_automatic_platform_push: bool = (
         DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH
     )
+
+    @model_validator(mode="after")
+    def normalize_platform_push_approved(self) -> "StructuredRunRequest":
+        """Accept flat and/or nested platform_push_approved; reject conflicts."""
+        flat_provided = "platform_push_approved" in self.model_fields_set
+        nested_provided = False
+        nested_value: bool | None = None
+        if self.approval is not None:
+            nested_provided = (
+                "platform_push_approved" in self.approval.model_fields_set
+            )
+            if nested_provided:
+                nested_value = self.approval.platform_push_approved
+                if nested_value is None:
+                    raise ValueError(
+                        "approval.platform_push_approved must be a boolean "
+                        "when provided"
+                    )
+
+        if flat_provided and nested_provided:
+            if self.platform_push_approved != nested_value:
+                raise ValueError(
+                    "Conflicting platform_push_approved values: "
+                    f"flat platform_push_approved={self.platform_push_approved!r} "
+                    "does not match "
+                    f"approval.platform_push_approved={nested_value!r}"
+                )
+            return self
+
+        if nested_provided and not flat_provided:
+            # Honor nested-only approval; do not silently drop it.
+            self.platform_push_approved = bool(nested_value)
+            return self
+
+        return self
+
+
 class ValidateResponse(BaseModel):
     ok: bool
     error: str | None = None

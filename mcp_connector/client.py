@@ -150,29 +150,36 @@ class MissionControlClient:
         repository_path: str = ".",
         base_branch: str = "main",
         run_commands: bool = True,
-        platform_push_approved: bool = False,
+        platform_push_approved: bool | None = None,
         allow_automatic_platform_push: bool = False,
+        approval: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "mission_id": mission_id,
+            "title": title,
+            "instructions": instructions,
+            "deliverables": deliverables,
+            "create_files": create_files,
+            "modify_files": modify_files,
+            "persistence_mode": persistence_mode,
+            "repository_name": repository_name,
+            "repository_path": repository_path,
+            "base_branch": base_branch,
+            "run_commands": run_commands,
+            "allow_automatic_platform_push": (
+                allow_automatic_platform_push
+            ),
+        }
+        # Omit unset flat approval so nested-only approval is not conflicted
+        # by an invented default false.
+        if platform_push_approved is not None:
+            payload["platform_push_approved"] = platform_push_approved
+        if approval is not None:
+            payload["approval"] = approval
         return await self._request(
             "POST",
             "/runs/structured",
-            json={
-                "mission_id": mission_id,
-                "title": title,
-                "instructions": instructions,
-                "deliverables": deliverables,
-                "create_files": create_files,
-                "modify_files": modify_files,
-                "persistence_mode": persistence_mode,
-                "repository_name": repository_name,
-                "repository_path": repository_path,
-                "base_branch": base_branch,
-                "run_commands": run_commands,
-                "platform_push_approved": platform_push_approved,
-                "allow_automatic_platform_push": (
-                    allow_automatic_platform_push
-                ),
-            },
+            json=payload,
         )
 
     async def get_run(self, run_id: str) -> dict[str, Any]:

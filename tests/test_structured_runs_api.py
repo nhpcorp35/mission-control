@@ -80,7 +80,7 @@ class TestStructuredRunsApi(unittest.TestCase):
         self.assertEqual(record.mission_yaml, mission_yaml)
 
     @patch("app.api.preflight_for_execution", return_value=None)
-    def test_invalid_structured_mission_rejected_by_validation(
+    def test_valid_read_only_structured_mission_accepted(
         self,
         _mock_preflight,
     ) -> None:
@@ -90,6 +90,28 @@ class TestStructuredRunsApi(unittest.TestCase):
                 create_files=False,
                 modify_files=False,
                 persistence_mode="none",
+                run_commands=True,
+            ),
+        )
+        self.assertEqual(response.status_code, 202)
+        body = response.json()
+        self.assertIn("run_id", body)
+        self.assertEqual(body["status"], "queued")
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_invalid_structured_mission_rejected_by_validation(
+        self,
+        _mock_preflight,
+    ) -> None:
+        # Non-push execute without create/modify must be exact read-only;
+        # run_commands=false fails that gate.
+        response = self.client.post(
+            "/runs/structured",
+            json=_structured_payload(
+                create_files=False,
+                modify_files=False,
+                persistence_mode="none",
+                run_commands=False,
             ),
         )
         self.assertEqual(response.status_code, 200)
@@ -108,6 +130,133 @@ class TestStructuredRunsApi(unittest.TestCase):
             json=_structured_payload(
                 persistence_mode="push",
                 platform_push_approved=False,
+                allow_automatic_platform_push=False,
+            ),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"], PLATFORM_PUSH_APPROVAL_REQUIRED)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_flat_platform_push_approved_accepted(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    persistence_mode="push",
+                    platform_push_approved=True,
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertIn("platform_push_approved: true", mission_yaml)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_nested_approval_platform_push_approved_accepted(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    persistence_mode="push",
+                    approval={"platform_push_approved": True},
+                ),
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertIn("platform_push_approved: true", mission_yaml)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_matching_flat_and_nested_platform_push_approved_accepted(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    persistence_mode="push",
+                    platform_push_approved=True,
+                    approval={"platform_push_approved": True},
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertIn("platform_push_approved: true", mission_yaml)
+
+    def test_conflicting_flat_and_nested_platform_push_approved_rejected(
+        self,
+    ) -> None:
+        response = self.client.post(
+            "/runs/structured",
+            json=_structured_payload(
+                persistence_mode="push",
+                platform_push_approved=False,
+                approval={"platform_push_approved": True},
+            ),
+        )
+        self.assertEqual(response.status_code, 422)
+        detail = response.json()["detail"]
+        detail_text = str(detail).lower()
+        self.assertIn("conflict", detail_text)
+        self.assertIn("platform_push_approved", detail_text)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_nested_approval_not_silently_dropped(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    persistence_mode="push",
+                    approval={"platform_push_approved": True},
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        # Nested-only input must become canonical Mission Spec approval.
+        self.assertRegex(
+            mission_yaml,
+            r"approval:[\s\S]*platform_push_approved:\s*true",
+        )
+        self.assertNotIn("platform_push_approved: false", mission_yaml)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_nested_false_still_rejects_push_without_authorization(
+        self,
+        _mock_preflight,
+    ) -> None:
+        response = self.client.post(
+            "/runs/structured",
+            json=_structured_payload(
+                persistence_mode="push",
+                approval={"platform_push_approved": False},
                 allow_automatic_platform_push=False,
             ),
         )

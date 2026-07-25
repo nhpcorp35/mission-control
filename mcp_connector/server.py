@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, TypedDict
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -25,6 +25,13 @@ EXPECTED_TOOL_NAMES = (
     "wait_for_run",
     "submit_and_wait",
 )
+
+
+class StructuredApprovalInput(TypedDict, total=False):
+    """Canonical nested approval fields for submit_structured_run."""
+
+    platform_push_approved: bool
+
 
 settings = Settings.from_env()
 client = MissionControlClient(settings)
@@ -94,8 +101,9 @@ async def submit_structured_run(
     repository_path: str = ".",
     base_branch: str = "main",
     run_commands: bool = True,
-    platform_push_approved: bool = False,
+    platform_push_approved: bool | None = None,
     allow_automatic_platform_push: bool = False,
+    approval: StructuredApprovalInput | None = None,
 ) -> dict[str, Any]:
     """Submit a mission via structured fields (POST /runs/structured).
 
@@ -103,6 +111,10 @@ async def submit_structured_run(
     Spec v1.0 YAML with safe defaults and queues it through the same async
     pipeline as submit_run. Raw YAML submit_run remains available when exact
     document control is required.
+
+    Platform-push approval may be supplied as flat platform_push_approved
+    and/or nested approval.platform_push_approved. Matching values are
+    accepted; conflicting values are rejected.
     """
     try:
         if not mission_id.strip():
@@ -113,6 +125,8 @@ async def submit_structured_run(
             raise ValueError("instructions must not be empty")
         if not isinstance(deliverables, list):
             raise ValueError("deliverables must be a list")
+        if approval is not None and not isinstance(approval, dict):
+            raise ValueError("approval must be an object when provided")
 
         result = await client.submit_structured_run(
             mission_id=mission_id,
@@ -128,6 +142,7 @@ async def submit_structured_run(
             run_commands=run_commands,
             platform_push_approved=platform_push_approved,
             allow_automatic_platform_push=allow_automatic_platform_push,
+            approval=dict(approval) if approval is not None else None,
         )
         return {"ok": True, **result}
     except Exception as exc:
