@@ -265,9 +265,10 @@ class TestPlatformPushApprovalForExecute(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
 
-    def test_execute_without_file_perms_rejected_for_non_push_persistence(
+    def test_execute_read_only_accepted_without_create_or_modify_files(
         self,
     ) -> None:
+        """Read-only inspection missions use execution.mode: execute."""
         for mode in ("none", "commit", None):
             with self.subTest(mode=mode):
                 result = validate_mission_for_execute(
@@ -277,8 +278,85 @@ class TestPlatformPushApprovalForExecute(unittest.TestCase):
                         modify_files=False,
                     )
                 )
+                self.assertTrue(result.ok, result.error)
+
+    def test_execute_implementation_mission_still_accepted(self) -> None:
+        """Normal implementation missions (create and/or modify) still work."""
+        cases = (
+            (True, False),
+            (False, True),
+            (True, True),
+        )
+        for create_files, modify_files in cases:
+            with self.subTest(
+                create_files=create_files,
+                modify_files=modify_files,
+            ):
+                result = validate_mission_for_execute(
+                    _executable_mission(
+                        persistence_mode="none",
+                        create_files=create_files,
+                        modify_files=modify_files,
+                    )
+                )
+                self.assertTrue(result.ok, result.error)
+
+    def test_execute_write_permissions_still_accepted_as_before(self) -> None:
+        """Execute with write permissions keeps prior acceptance behavior."""
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="commit",
+                create_files=True,
+                modify_files=False,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
+        result_modify = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="commit",
+                create_files=False,
+                modify_files=True,
+            )
+        )
+        self.assertTrue(result_modify.ok, result_modify.error)
+
+    def test_execute_without_file_perms_rejected_when_not_read_only(
+        self,
+    ) -> None:
+        """Non-push execute without create/modify must be exact read-only."""
+        for mode in ("none", "commit", None):
+            with self.subTest(mode=mode):
+                result = validate_mission_for_execute(
+                    _executable_mission(
+                        persistence_mode=mode,
+                        create_files=False,
+                        modify_files=False,
+                        stage_changes=True,
+                    )
+                )
                 self.assertFalse(result.ok)
-                self.assertIn("create_files or modify_files", result.error or "")
+                self.assertIn(
+                    "create_files or modify_files",
+                    result.error or "",
+                )
+
+    def test_execute_unauthorized_writes_still_rejected(self) -> None:
+        """Unauthorized write-related permissions remain rejected."""
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="none",
+                create_files=False,
+                modify_files=False,
+                delete_files=True,
+            )
+        )
+        self.assertFalse(result.ok)
+        # delete_files fails either the read-only gate or EXECUTE_FALSE check
+        self.assertTrue(
+            "create_files or modify_files" in (result.error or "")
+            or "delete_files" in (result.error or ""),
+            result.error,
+        )
 
     def test_execute_push_does_not_require_permissions_push(self) -> None:
         result = validate_mission_for_execute(

@@ -80,6 +80,33 @@ class TestBuildCursorInstruction(unittest.TestCase):
                 instruction,
             )
 
+    def test_execute_read_only_permissions_use_read_only_constraints(
+        self,
+    ) -> None:
+        mission = _sample_mission()
+        mission["permissions"] = {
+            "read": True,
+            "create_files": False,
+            "modify_files": False,
+            "delete_files": False,
+            "run_commands": True,
+            "stage_changes": False,
+            "commit": False,
+            "push": False,
+        }
+        with patch(
+            "mission_control.executor.find_cursor_agent_binary",
+            return_value=CURSOR_AGENT,
+        ), patch(
+            "mission_control.executor.subprocess.Popen",
+        ) as mock_popen:
+            mock_popen.return_value = _mock_completed_process(stdout="ok\n")
+            execute_cursor_agent(mission)
+            instruction = mock_popen.call_args.args[0][-1]
+            self.assertIn("read-only", instruction.lower())
+            self.assertIn("Do not modify files.", instruction)
+            self.assertNotIn("may create new files", instruction.lower())
+
 
 class TestBuildCursorAgentCommand(unittest.TestCase):
     def test_build_argv_shape(self) -> None:

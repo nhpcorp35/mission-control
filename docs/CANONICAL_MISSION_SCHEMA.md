@@ -60,10 +60,14 @@ described below.
 
 Semantics in practice:
 
-- **Inspection / planning:** submit `execution.mode: plan` to `POST /run` (or
-  `mc.py run`). Agent permissions must be read-only (see permissions matrix).
-- **Mutation:** submit `execution.mode: execute` to `POST /runs` (preferred) or
-  legacy `POST /execute`.
+- **Inspection / planning (legacy sync):** submit `execution.mode: plan` to
+  `POST /run` (or `mc.py run`). Agent permissions must be read-only (see
+  permissions matrix).
+- **Inspection / planning (execute):** submit `execution.mode: execute` with
+  the read-only permission set (see below) to `POST /runs` (preferred) or
+  legacy `POST /execute`. No separate planning execution mode is required.
+- **Mutation:** submit `execution.mode: execute` with create and/or modify
+  permissions to `POST /runs` (preferred) or legacy `POST /execute`.
 
 ### Other `execution` fields
 
@@ -111,16 +115,37 @@ Common permission fields used in reference missions and tests:
 - `delete_files`
 
 Legacy agent Git flags (`stage_changes`, `commit`, `push`) are **not** execute
-eligibility gates. Platform staging, committing, and pushing are controlled only
-by `persistence.mode`. Truthy legacy Git flags are accepted but ignored for
-platform persistence (they do not enable or disable platform Git actions).
+eligibility gates when create/modify writes are enabled. Platform staging,
+committing, and pushing are controlled only by `persistence.mode`. Truthy
+legacy Git flags are accepted but ignored for platform persistence (they do
+not enable or disable platform Git actions).
 
-Additionally, unless `persistence.mode` resolves to `push`, execute requires at
+Additionally, unless one of the exceptions below applies, execute requires at
 least one of `create_files` or `modify_files` to be true.
+
+**Read-only execute exception:** a mission with this exact permission set is
+accepted as a read-only execution (inspection / planning) mission even when
+both `create_files` and `modify_files` are false:
+
+| Field | Required value |
+| --- | --- |
+| `read` | `true` |
+| `create_files` | `false` |
+| `modify_files` | `false` |
+| `delete_files` | `false` |
+| `run_commands` | `true` |
+| `stage_changes` | `false` |
+| `commit` | `false` |
+| `push` | `false` |
+
+Read-only execute missions may read and search the repository, run
+non-mutating commands, inspect Git status, analyze source, and produce
+reports. They must not create, modify, or delete files, or stage, commit, or
+push.
 
 **Push-only exception:** when `persistence.mode` is `push` (and platform-push
 approval is present), execute may have both `create_files: false` and
-`modify_files: false`.
+`modify_files: false` without matching the read-only set above.
 
 ### Constraint text sent to the agent
 
@@ -131,8 +156,8 @@ On execute, Mission Control appends constraint text based on
 | --- | --- | --- |
 | true | true | create and modify allowed; no deletes / Git / worktrees / recursive missions |
 | false | true | modify only |
-| true | false | create only (default when neither modify nor both) |
-| false | false | create-only constraint text (only valid for push-only execute) |
+| true | false | create only |
+| false | false | read-only constraints (read-only execute or push-only with no agent file writes) |
 
 On plan/run, read-only constraints are always applied.
 
@@ -384,11 +409,13 @@ CLI:
 
 Plan versus execute summary:
 
-- **Plan / inspection:** `execution.mode: plan`, mutation permissions false,
-  `POST /run`.
-- **Execute:** `execution.mode: execute`, allowed create/modify (or push-only),
-  forbidden delete/stage/commit/push agent flags, prefer `POST /runs` for
-  isolated execution + persistence.
+- **Plan / inspection (legacy sync):** `execution.mode: plan`, mutation
+  permissions false, `POST /run`.
+- **Execute / inspection (read-only):** `execution.mode: execute`, exact
+  read-only permission set, prefer `POST /runs`.
+- **Execute / mutation:** `execution.mode: execute`, allowed create/modify
+  (or push-only), prefer `POST /runs` for isolated execution + persistence.
+  `delete_files` remains forbidden for execute eligibility.
 
 Recursive local submissions during an active execution are rejected
 (`RECURSIVE_SUBMISSION`).
@@ -567,7 +594,7 @@ approval:
 | Worktree requested | `Worktrees are not supported in Phase 2` / `… for execute` | Set `execution.worktree: false` |
 | Mutating permission on plan run | `Permission not allowed for run: create_files` (etc.) | Keep run false-permissions false |
 | Forbidden execute permission | `Permission not allowed for execute: delete_files` | Keep `delete_files: false`; use `persistence.mode` for platform Git |
-| Execute without file perms (non-push) | `Execute requires at least one of: create_files or modify_files` | Enable create and/or modify, or use approved `persistence.mode: push` |
+| Execute without file perms (non-push, not read-only) | `Execute requires at least one of: create_files or modify_files` | Enable create and/or modify, use the read-only permission set, or use approved `persistence.mode: push` |
 | Push without platform approval | `PLATFORM_PUSH_APPROVAL_REQUIRED: …` | Set `approval.platform_push_approved: true` or `allow_automatic_platform_push: true` |
 | Missing/invalid repo path | `repository.path must be a non-empty string` / `does not exist` / `not a directory` | Point `repository.path` at an existing directory |
 | Top level not a mapping | `Mission must be a YAML mapping at the top level` | Root document must be a YAML object |

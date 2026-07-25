@@ -50,6 +50,19 @@ EXECUTE_FALSE_PERMISSIONS = (
     "delete_files",
 )
 
+# Exact permission set for genuine read-only execute (inspection / planning)
+# missions. ``execution.mode`` remains ``execute``; no separate plan mode.
+READ_ONLY_EXECUTE_PERMISSIONS = (
+    ("read", True),
+    ("create_files", False),
+    ("modify_files", False),
+    ("delete_files", False),
+    ("run_commands", True),
+    ("stage_changes", False),
+    ("commit", False),
+    ("push", False),
+)
+
 
 @dataclass
 class ValidationResult:
@@ -261,6 +274,14 @@ def validate_mission_for_run(data: dict) -> ValidationResult:
     return _validate_repository_path(data)
 
 
+def _is_read_only_execute_permissions(permissions: dict) -> bool:
+    """Return True when permissions match a read-only execute mission."""
+    for name, expected in READ_ONLY_EXECUTE_PERMISSIONS:
+        if bool(permissions.get(name)) is not expected:
+            return False
+    return True
+
+
 def validate_mission_for_execute(
     data: dict,
 ) -> ValidationResult:
@@ -305,19 +326,22 @@ def validate_mission_for_execute(
     create_files = bool(permissions.get("create_files"))
     modify_files = bool(permissions.get("modify_files"))
 
-    # Push-only execute missions (persistence.mode=push) may omit both
-    # create_files and modify_files. Platform push authorization is enforced
-    # separately via approval.platform_push_approved (or the automatic
-    # platform-push policy). Agent permissions.push is never required.
+    # Execute missions without create_files/modify_files are allowed when:
+    # 1. Read-only inspection (exact READ_ONLY_EXECUTE_PERMISSIONS), or
+    # 2. Push-only (persistence.mode=push). Platform push authorization is
+    #    enforced separately via approval.platform_push_approved (or the
+    #    automatic platform-push policy). Agent permissions.push is never
+    #    required.
     if not create_files and not modify_files:
-        if resolve_persistence_mode(data) != "push":
-            return ValidationResult(
-                ok=False,
-                error=(
-                    "Execute requires at least one of: "
-                    "create_files or modify_files"
-                ),
-            )
+        if not _is_read_only_execute_permissions(permissions):
+            if resolve_persistence_mode(data) != "push":
+                return ValidationResult(
+                    ok=False,
+                    error=(
+                        "Execute requires at least one of: "
+                        "create_files or modify_files"
+                    ),
+                )
 
     for permission in EXECUTE_FALSE_PERMISSIONS:
         if permissions.get(permission):

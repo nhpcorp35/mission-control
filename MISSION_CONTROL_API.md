@@ -654,6 +654,14 @@ Push authorization is expressed through `persistence.mode=push` plus `approval.p
 
 Execute missions with `persistence.mode=push` and platform-push approval may be **push-only**: they are valid even when `create_files=false` and `modify_files=false`.
 
+Execute missions may also be **read-only**: when permissions are exactly
+`read=true`, `create_files=false`, `modify_files=false`, `delete_files=false`,
+`run_commands=true`, `stage_changes=false`, `commit=false`, and `push=false`,
+the mission is accepted for `execution.mode: execute` without create/modify
+writes. Read-only execute missions may inspect and analyze the repository and
+run non-mutating commands; they must not create, modify, or delete files, or
+stage, commit, or push.
+
 #### Platform-push approval
 
 `persistence.mode=push` is a privileged platform action (commit, GitHub push, and possible deployment). It is distinct from agent `permissions.push`.

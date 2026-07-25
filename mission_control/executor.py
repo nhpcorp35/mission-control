@@ -425,7 +425,12 @@ def _execution_constraints(
     if modify_files:
         return MODIFY_ONLY_CONSTRAINTS
 
-    return CREATE_ONLY_CONSTRAINTS
+    if create_files:
+        return CREATE_ONLY_CONSTRAINTS
+
+    # create_files and modify_files both false: read-only execute (inspection)
+    # or push-only with no agent file writes.
+    return READ_ONLY_CONSTRAINTS
 
 
 def run_cursor_agent(mission: dict) -> ExecutionResult:
