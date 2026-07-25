@@ -476,6 +476,13 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
                 "modify_files",
             },
         )
+        # ChatGPT / OpenAI MCP clients reject array schemas with empty items {}.
+        # list[Any] previously emitted items:{}; list[str] emits a typed items.
+        self.assertEqual(
+            structured_props["deliverables"].get("items"),
+            {"type": "string"},
+        )
+        self.assertNotEqual(structured_props["deliverables"].get("items"), {})
 
         submit_and_wait = next(
             tool for tool in tools if tool.name == "submit_and_wait"

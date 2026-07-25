@@ -1,0 +1,195 @@
+[
+  {
+    "name": "submit_run",
+    "description": "Submit an exact Mission Control YAML document.",
+    "inputSchema": {
+      "properties": {
+        "mission_yaml": {
+          "title": "Mission Yaml",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mission_yaml"
+      ],
+      "title": "submit_runArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "submit_runDictOutput",
+      "type": "object"
+    }
+  },
+  {
+    "name": "submit_structured_run",
+    "description": "Submit a mission via structured fields (POST /runs/structured).\n\nPrefer this for routine execute missions. Mission Control builds Mission\nSpec v1.0 YAML with safe defaults and queues it through the same async\npipeline as submit_run. Raw YAML submit_run remains available when exact\ndocument control is required.\n",
+    "inputSchema": {
+      "properties": {
+        "mission_id": {
+          "title": "Mission Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "instructions": {
+          "title": "Instructions",
+          "type": "string"
+        },
+        "deliverables": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Deliverables",
+          "type": "array"
+        },
+        "create_files": {
+          "title": "Create Files",
+          "type": "boolean"
+        },
+        "modify_files": {
+          "title": "Modify Files",
+          "type": "boolean"
+        },
+        "persistence_mode": {
+          "default": "none",
+          "title": "Persistence Mode",
+          "type": "string"
+        },
+        "repository_name": {
+          "default": "Mission-Control",
+          "title": "Repository Name",
+          "type": "string"
+        },
+        "repository_path": {
+          "default": ".",
+          "title": "Repository Path",
+          "type": "string"
+        },
+        "base_branch": {
+          "default": "main",
+          "title": "Base Branch",
+          "type": "string"
+        },
+        "run_commands": {
+          "default": true,
+          "title": "Run Commands",
+          "type": "boolean"
+        },
+        "platform_push_approved": {
+          "default": false,
+          "title": "Platform Push Approved",
+          "type": "boolean"
+        },
+        "allow_automatic_platform_push": {
+          "default": false,
+          "title": "Allow Automatic Platform Push",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mission_id",
+        "title",
+        "instructions",
+        "deliverables",
+        "create_files",
+        "modify_files"
+      ],
+      "title": "submit_structured_runArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "submit_structured_runDictOutput",
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_run",
+    "description": "Retrieve the current state of a Mission Control run.",
+    "inputSchema": {
+      "properties": {
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "get_runArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "get_runDictOutput",
+      "type": "object"
+    }
+  },
+  {
+    "name": "wait_for_run",
+    "description": "Wait for a run to reach a terminal status.\n\nPolls through the same authenticated get_run path until the run is\nterminal (completed, failed, or timed_out) or timeout_seconds elapses.\nReturns immediately when already terminal. poll_interval_seconds\ncontrols delay between get_run polls.\n\nDefault timeout_seconds is 20. Requested timeouts are honored up to\n3600s (aligned with POST /runs/{run_id}/wait); larger values are\ncapped. Zero/negative values are rejected. When wait_expired is true,\ncall wait_for_run again with the same run_id.\n\nOn terminal status returns ok=true with run fields, wait_expired=false,\nand timeout_seconds (effective). When the wait window expires while\nstill queued/running, returns ok=true with the latest run fields,\nwait_expired=true, and timeout_seconds \u2014 not a transport/tool error.\n",
+    "inputSchema": {
+      "properties": {
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 20.0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "poll_interval_seconds": {
+          "default": 2.0,
+          "title": "Poll Interval Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "wait_for_runArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "wait_for_runDictOutput",
+      "type": "object"
+    }
+  },
+  {
+    "name": "submit_and_wait",
+    "description": "Submit exact mission YAML and wait for a terminal run state.\n\nOne-shot HAL path: reuses authenticated submit_run then wait_for_run\n(same timeout_seconds / poll_interval_seconds validation and limits as\nwait_for_run). Returns the accepted run_id and final authoritative run\npayload. Submission failures return the existing structured submission\nerror without waiting. When wait_expired is true, resume with\nwait_for_run using the same run_id.\n",
+    "inputSchema": {
+      "properties": {
+        "mission_yaml": {
+          "title": "Mission Yaml",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 20.0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "poll_interval_seconds": {
+          "default": 2.0,
+          "title": "Poll Interval Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "mission_yaml"
+      ],
+      "title": "submit_and_waitArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "submit_and_waitDictOutput",
+      "type": "object"
+    }
+  }
+]

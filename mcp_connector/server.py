@@ -86,7 +86,7 @@ async def submit_structured_run(
     mission_id: str,
     title: str,
     instructions: str,
-    deliverables: list[Any],
+    deliverables: list[str],
     create_files: bool,
     modify_files: bool,
     persistence_mode: str = "none",

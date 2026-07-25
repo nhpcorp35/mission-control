@@ -1,0 +1,33 @@
+FIELD-BY-FIELD COMPARISON (production before vs local after fix)
+
+=== submit_run ===
+  inputSchema: UNCHANGED
+  AFTER bad_arrays: []
+  required: ['mission_yaml']
+  prop_count: 1
+
+=== submit_structured_run ===
+  BEFORE deliverables: {"items": {}, "title": "Deliverables", "type": "array"}
+  AFTER  deliverables: {"items": {"type": "string"}, "title": "Deliverables", "type": "array"}
+  property deliverables: BEFORE={"items": {}, "title": "Deliverables", "type": "array"} AFTER={"items": {"type": "string"}, "title": "Deliverables", "type": "array"}
+  AFTER bad_arrays: []
+  required: ['mission_id', 'title', 'instructions', 'deliverables', 'create_files', 'modify_files']
+  prop_count: 13
+
+=== get_run ===
+  inputSchema: UNCHANGED
+  AFTER bad_arrays: []
+  required: ['run_id']
+  prop_count: 1
+
+=== wait_for_run ===
+  inputSchema: UNCHANGED
+  AFTER bad_arrays: []
+  required: ['run_id']
+  prop_count: 3
+
+=== submit_and_wait ===
+  inputSchema: UNCHANGED
+  AFTER bad_arrays: []
+  required: ['mission_yaml']
+  prop_count: 3
