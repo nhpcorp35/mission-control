@@ -55,9 +55,23 @@ class WorkspacePrepResult:
 
 @dataclass(frozen=True)
 class PersistenceResult:
+    """Outcome of platform Git persistence for one run.
+
+    ``mode`` is the persistence level applied by this call (from the validated
+    mission configuration and the actions actually performed). When omitted
+    (``None``), structured reporting falls back to
+    ``resolve_persistence_mode(mission)`` so callers never silently treat a
+    missing execution-result mode as ``none`` while a push/commit succeeded.
+
+    ``pushed`` is True only after a successful ``git push``, False when push
+    did not succeed, and None when unknown (legacy/partial results).
+    """
+
     ok: bool
     commit_sha: str | None = None
     error: str | None = None
+    mode: str | None = None
+    pushed: bool | None = None
 
 
 def resolve_persistence_mode(mission: dict) -> str:
@@ -230,22 +244,39 @@ def _github_push_environment() -> tuple[dict[str, str] | None, str | None]:
     return env, None
 
 
-def _read_head_commit_sha(workspace_path: str) -> PersistenceResult:
+def _read_head_commit_sha(
+    workspace_path: str,
+    *,
+    mode: str,
+    pushed: bool = False,
+) -> PersistenceResult:
     rev_parse = _run_git(["-C", workspace_path, "rev-parse", "HEAD"])
     if rev_parse.returncode != 0:
         message = rev_parse.stderr.strip() or rev_parse.stdout.strip()
         if not message:
             message = f"git rev-parse failed with code {rev_parse.returncode}"
-        return PersistenceResult(ok=False, error=message)
+        return PersistenceResult(
+            ok=False,
+            error=message,
+            mode=mode,
+            pushed=False,
+        )
 
     commit_sha = rev_parse.stdout.strip()
     if not commit_sha:
         return PersistenceResult(
             ok=False,
             error="git rev-parse returned an empty commit SHA",
+            mode=mode,
+            pushed=False,
         )
 
-    return PersistenceResult(ok=True, commit_sha=commit_sha)
+    return PersistenceResult(
+        ok=True,
+        commit_sha=commit_sha,
+        mode=mode,
+        pushed=pushed,
+    )
 
 
 def persist_workspace_changes(
@@ -277,36 +308,68 @@ def persist_workspace_changes(
                 f"Unsupported persistence.mode: {mode} "
                 "(expected one of: none, commit, push)"
             ),
+            mode=mode,
+            pushed=False,
         )
 
     if mode == "none":
-        return PersistenceResult(ok=True, commit_sha=None)
+        return PersistenceResult(
+            ok=True,
+            commit_sha=None,
+            mode="none",
+            pushed=False,
+        )
 
     if mode == "push":
         approval_error = require_platform_push_approval(mission)
         if approval_error is not None:
-            return PersistenceResult(ok=False, error=approval_error)
+            return PersistenceResult(
+                ok=False,
+                error=approval_error,
+                mode="push",
+                pushed=False,
+            )
 
     status = _git_status_porcelain(workspace_path)
     if status.returncode != 0:
         message = status.stderr.strip() or status.stdout.strip()
         if not message:
             message = f"git status failed with code {status.returncode}"
-        return PersistenceResult(ok=False, error=message)
+        return PersistenceResult(
+            ok=False,
+            error=message,
+            mode=mode,
+            pushed=False,
+        )
 
     if not status.stdout.strip():
-        return PersistenceResult(ok=True, commit_sha=None)
+        return PersistenceResult(
+            ok=True,
+            commit_sha=None,
+            mode=mode,
+            pushed=False,
+        )
 
     add = _run_git(["-C", workspace_path, "add", "-A"])
     if add.returncode != 0:
         message = add.stderr.strip() or add.stdout.strip()
         if not message:
             message = f"git add failed with code {add.returncode}"
-        return PersistenceResult(ok=False, error=message)
+        return PersistenceResult(
+            ok=False,
+            error=message,
+            mode=mode,
+            pushed=False,
+        )
 
     identity_error = configure_git_identity(workspace_path)
     if identity_error is not None:
-        return PersistenceResult(ok=False, error=identity_error)
+        return PersistenceResult(
+            ok=False,
+            error=identity_error,
+            mode=mode,
+            pushed=False,
+        )
 
     commit = _run_git(
         [
@@ -321,14 +384,34 @@ def persist_workspace_changes(
         message = commit.stderr.strip() or commit.stdout.strip()
         if not message:
             message = f"git commit failed with code {commit.returncode}"
-        return PersistenceResult(ok=False, error=message)
+        return PersistenceResult(
+            ok=False,
+            error=message,
+            mode=mode,
+            pushed=False,
+        )
 
     if mode == "commit":
-        return _read_head_commit_sha(workspace_path)
+        return _read_head_commit_sha(
+            workspace_path,
+            mode="commit",
+            pushed=False,
+        )
 
     push_env, push_auth_error = _github_push_environment()
     if push_auth_error is not None:
-        return PersistenceResult(ok=False, error=push_auth_error)
+        sha_result = _read_head_commit_sha(
+            workspace_path,
+            mode="push",
+            pushed=False,
+        )
+        return PersistenceResult(
+            ok=False,
+            error=push_auth_error,
+            mode="push",
+            pushed=False,
+            commit_sha=sha_result.commit_sha if sha_result.ok else None,
+        )
 
     base_branch = mission["repository"]["base_branch"]
     push = _run_git(
@@ -345,9 +428,24 @@ def persist_workspace_changes(
         message = push.stderr.strip() or push.stdout.strip()
         if not message:
             message = f"git push failed with code {push.returncode}"
-        return PersistenceResult(ok=False, error=message)
+        sha_result = _read_head_commit_sha(
+            workspace_path,
+            mode="push",
+            pushed=False,
+        )
+        return PersistenceResult(
+            ok=False,
+            error=message,
+            mode="push",
+            pushed=False,
+            commit_sha=sha_result.commit_sha if sha_result.ok else None,
+        )
 
-    return _read_head_commit_sha(workspace_path)
+    return _read_head_commit_sha(
+        workspace_path,
+        mode="push",
+        pushed=True,
+    )
 
 
 def cleanup_workspace(workspace_path: str) -> None:
@@ -599,13 +697,24 @@ def build_persistence_evidence(
     attempted: bool,
     ok: bool | None = None,
     commit_sha: str | None = None,
+    mode: str | None = None,
+    pushed: bool | None = None,
 ) -> PersistenceEvidence:
-    """Record platform persistence outcome for the structured result."""
+    """Record platform persistence outcome for the structured result.
+
+    Prefer ``mode`` / ``pushed`` from ``PersistenceResult`` when persistence
+    ran. When ``mode`` is omitted, use the validated mission configuration —
+    never invent ``none`` solely because the execution result omitted mode.
+    """
+    reported_mode = (
+        mode if mode is not None else resolve_persistence_mode(mission)
+    )
     return PersistenceEvidence(
-        mode=resolve_persistence_mode(mission),
+        mode=reported_mode,
         attempted=attempted,
         ok=ok,
         commit_sha=commit_sha,
+        pushed=pushed,
     )
 
 
@@ -746,6 +855,8 @@ def execute_registered_run(
             attempted=True,
             ok=persistence_result.ok,
             commit_sha=persistence_result.commit_sha,
+            mode=persistence_result.mode,
+            pushed=persistence_result.pushed,
         )
         # Re-read changed files after persistence so commit-only cleanliness
         # does not erase the pre-persist change list already captured.

@@ -243,6 +243,8 @@ class TestWorkspacePersistence(unittest.TestCase):
                 )
             self.assertTrue(result.ok, result.error)
             self.assertIsNone(result.commit_sha)
+            self.assertEqual(result.mode, "none")
+            self.assertFalse(result.pushed)
             mock_git.assert_not_called()
             status = _run_git(["-C", workspace_path, "status", "--porcelain"])
             self.assertIn("created.txt", status.stdout)
@@ -264,6 +266,8 @@ class TestWorkspacePersistence(unittest.TestCase):
                 )
             self.assertTrue(result.ok, result.error)
             self.assertIsNone(result.commit_sha)
+            self.assertEqual(result.mode, "none")
+            self.assertFalse(result.pushed)
             mock_git.assert_not_called()
         finally:
             cleanup_workspace(workspace_path)
@@ -307,6 +311,8 @@ class TestWorkspacePersistence(unittest.TestCase):
 
             self.assertTrue(result.ok, result.error)
             self.assertIsNotNone(result.commit_sha)
+            self.assertEqual(result.mode, "commit")
+            self.assertFalse(result.pushed)
             self.assertFalse(
                 any("push" in args for args in recorded_args),
                 recorded_args,
@@ -347,6 +353,8 @@ class TestWorkspacePersistence(unittest.TestCase):
                 )
             self.assertTrue(result.ok, result.error)
             self.assertIsNotNone(result.commit_sha)
+            self.assertEqual(result.mode, "push")
+            self.assertTrue(result.pushed)
 
             remote_head = _run_git(
                 [
@@ -374,6 +382,8 @@ class TestWorkspacePersistence(unittest.TestCase):
                     workspace_path,
                 )
             self.assertFalse(result.ok)
+            self.assertEqual(result.mode, "push")
+            self.assertFalse(result.pushed)
             self.assertTrue(
                 (result.error or "").startswith("PLATFORM_PUSH_APPROVAL_REQUIRED"),
                 result.error,

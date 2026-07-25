@@ -65,12 +65,21 @@ class DeliverableEvidence:
 
 @dataclass(frozen=True)
 class PersistenceEvidence:
-    """Platform Git persistence outcome recorded by Mission Control."""
+    """Platform Git persistence outcome recorded by Mission Control.
+
+    ``mode`` is the authoritative persistence level for this run: the validated
+    mission ``persistence.mode`` when persistence was not attempted, or the
+    mode actually completed (or attempted and failed) by the platform
+    persistence layer. It is never inferred from agent stdout.
+
+    ``pushed`` is True only when a platform push completed successfully.
+    """
 
     mode: str | None
     attempted: bool
     ok: bool | None
     commit_sha: str | None = None
+    pushed: bool | None = None
 
 
 @dataclass
@@ -146,11 +155,18 @@ class StructuredRunResult:
         persistence_raw = data.get("persistence")
         if isinstance(persistence_raw, dict):
             mode = persistence_raw.get("mode")
+            pushed_raw = persistence_raw.get("pushed")
+            pushed: bool | None
+            if pushed_raw is None and "pushed" not in persistence_raw:
+                pushed = None
+            else:
+                pushed = bool(pushed_raw) if pushed_raw is not None else None
             persistence = PersistenceEvidence(
                 mode=str(mode) if mode is not None else None,
                 attempted=bool(persistence_raw.get("attempted")),
                 ok=persistence_raw.get("ok"),
                 commit_sha=persistence_raw.get("commit_sha"),
+                pushed=pushed,
             )
 
         files_changed = data.get("files_changed") or []
@@ -287,17 +303,23 @@ def build_run_summary(
         )
     elif persistence.ok is True:
         mode = persistence.mode or "unknown"
+        push_note = ""
+        if persistence.pushed is True:
+            push_note = ", pushed=true"
+        elif persistence.pushed is False and mode == "push":
+            push_note = ", pushed=false"
         if persistence.commit_sha:
             persistence_line = (
                 "Platform persistence succeeded "
-                f"(mode={mode}, commit_sha={persistence.commit_sha})."
+                f"(mode={mode}, commit_sha={persistence.commit_sha}"
+                f"{push_note})."
             )
         elif mode == "none":
             persistence_line = "Platform persistence skipped (mode=none)."
         else:
             persistence_line = (
                 "Platform persistence succeeded with no repository changes "
-                f"(mode={mode})."
+                f"(mode={mode}{push_note})."
             )
     elif persistence.ok is False:
         mode = persistence.mode or "unknown"

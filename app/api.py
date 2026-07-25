@@ -199,6 +199,7 @@ class PersistenceEvidenceModel(BaseModel):
     attempted: bool
     ok: bool | None = None
     commit_sha: str | None = None
+    pushed: bool | None = None
 
 
 class StructuredRunResultModel(BaseModel):
@@ -810,6 +811,7 @@ def submit_and_wait_endpoint(
                                         "attempted": True,
                                         "ok": True,
                                         "commit_sha": "abc123def456",
+                                        "pushed": False,
                                     },
                                     "warnings": [
                                         (

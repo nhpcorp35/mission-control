@@ -304,7 +304,7 @@ Return lifecycle status and retained output for a previously accepted run.
 | `commands` | object[] | Commands Mission Control executed (for example the Cursor agent subprocess), each with `argv`, `exit_code`, `passed`, and `kind` |
 | `test_counts` | object or null | Aggregate pass/fail/skip counts when reliably available without fragile parsing; otherwise `null` |
 | `deliverables` | object or null | Declared file-deliverable verification: `verified`, `passed`, `checked_paths`, `missing` |
-| `persistence` | object or null | Platform persistence outcome: `mode`, `attempted`, `ok`, `commit_sha` |
+| `persistence` | object or null | Platform persistence outcome: `mode` (authoritative completed/attempted persistence level from validated mission config and the persistence execution result — never inferred from agent stdout), `attempted`, `ok`, `commit_sha`, `pushed` (true only after a successful platform push) |
 | `warnings` | string[] | Limitations explaining unavailable evidence (never fabricated values) |
 | `summary` | string or null | Authoritative Mission Control-authored summary consistent with `persistence` (same text as top-level `summary`) |
 
@@ -360,7 +360,8 @@ Failed and timed-out runs retain any partial evidence Mission Control actually c
       "mode": "commit",
       "attempted": true,
       "ok": true,
-      "commit_sha": "abc123def456"
+      "commit_sha": "abc123def456",
+      "pushed": false
     },
     "warnings": [
       "Aggregate test counts are unavailable; Mission Control does not parse agent stdout for test results.",

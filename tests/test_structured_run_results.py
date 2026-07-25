@@ -33,6 +33,7 @@ from mission_control.run_result import (
 from mission_control.workspace import (
     PersistenceResult,
     WorkspacePrepResult,
+    build_persistence_evidence,
     collect_deliverable_evidence,
     execute_registered_run,
 )
@@ -357,6 +358,8 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         mock_persist.return_value = PersistenceResult(
             ok=True,
             commit_sha="abc123def456",
+            mode="commit",
+            pushed=False,
         )
 
         record = self.registry.create_run()
@@ -394,6 +397,7 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         self.assertTrue(updated.result.persistence.ok)
         self.assertEqual(updated.result.persistence.commit_sha, "abc123def456")
         self.assertEqual(updated.result.persistence.mode, "commit")
+        self.assertFalse(updated.result.persistence.pushed)
         self.assertIn(WARNING_NO_TEST_COUNTS, updated.result.warnings)
         self.assertIn(
             WARNING_STDOUT_PREDATES_PERSISTENCE,
@@ -440,6 +444,8 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         mock_persist.return_value = PersistenceResult(
             ok=True,
             commit_sha="feedface99",
+            mode="push",
+            pushed=True,
         )
 
         record = self.registry.create_run()
@@ -457,9 +463,12 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         assert updated.result.persistence is not None
         self.assertTrue(updated.result.persistence.ok)
         self.assertEqual(updated.result.persistence.commit_sha, "feedface99")
+        self.assertEqual(updated.result.persistence.mode, "push")
+        self.assertTrue(updated.result.persistence.pushed)
         assert updated.result.summary is not None
         self.assertIn("Platform persistence succeeded", updated.result.summary)
         self.assertIn("mode=push", updated.result.summary)
+        self.assertIn("pushed=true", updated.result.summary)
         self.assertIn("commit_sha=feedface99", updated.result.summary)
         self.assertNotIn("no commit or push occurred", updated.result.summary)
         mock_persist.assert_called_once()
@@ -519,6 +528,281 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
             updated.result.summary,
         )
         mock_persist.assert_not_called()
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.collect_changed_files")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    def test_persistence_mode_none_reporting(
+        self,
+        mock_prepare,
+        mock_execute,
+        mock_changed,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        """persistence.mode none reports none (not commit/push)."""
+        workspace = tempfile.mkdtemp(prefix="mc-persist-none-")
+        (Path(workspace) / "docs").mkdir()
+        (Path(workspace) / "docs" / "out.txt").write_text("x\n", encoding="utf-8")
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path=workspace,
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout="done\n",
+            return_code=0,
+            command=["cursor-agent", "--force", "<instruction>"],
+        )
+        mock_changed.return_value = (["docs/out.txt"], None)
+        mock_persist.return_value = PersistenceResult(
+            ok=True,
+            commit_sha=None,
+            mode="none",
+            pushed=False,
+        )
+
+        record = self.registry.create_run()
+        mission = _base_mission(deliverables=["docs/out.txt"])
+        mission["persistence"] = {"mode": "none"}
+        execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        assert updated.result is not None
+        assert updated.result.persistence is not None
+        self.assertEqual(updated.result.persistence.mode, "none")
+        self.assertTrue(updated.result.persistence.attempted)
+        self.assertTrue(updated.result.persistence.ok)
+        self.assertFalse(updated.result.persistence.pushed)
+        self.assertIsNone(updated.result.persistence.commit_sha)
+        self.assertIsNone(updated.commit_sha)
+        assert updated.result.summary is not None
+        self.assertIn("mode=none", updated.result.summary)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.collect_changed_files")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    def test_persistence_mode_commit_reporting(
+        self,
+        mock_prepare,
+        mock_execute,
+        mock_changed,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        """commit reports commit only when a commit is successfully created."""
+        workspace = tempfile.mkdtemp(prefix="mc-persist-commit-")
+        (Path(workspace) / "docs").mkdir()
+        (Path(workspace) / "docs" / "out.txt").write_text("x\n", encoding="utf-8")
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path=workspace,
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout="done\n",
+            return_code=0,
+            command=["cursor-agent", "--force", "<instruction>"],
+        )
+        mock_changed.return_value = (["docs/out.txt"], None)
+        mock_persist.return_value = PersistenceResult(
+            ok=True,
+            commit_sha="commitonly01",
+            mode="commit",
+            pushed=False,
+        )
+
+        record = self.registry.create_run()
+        mission = _base_mission(deliverables=["docs/out.txt"])
+        mission["persistence"] = {"mode": "commit"}
+        execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        assert updated.result is not None
+        assert updated.result.persistence is not None
+        self.assertEqual(updated.result.persistence.mode, "commit")
+        self.assertTrue(updated.result.persistence.ok)
+        self.assertFalse(updated.result.persistence.pushed)
+        self.assertEqual(updated.result.persistence.commit_sha, "commitonly01")
+        self.assertEqual(updated.commit_sha, "commitonly01")
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.collect_changed_files")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    def test_persistence_mode_push_reporting(
+        self,
+        mock_prepare,
+        mock_execute,
+        mock_changed,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        """push reports push only when the commit is successfully pushed."""
+        workspace = tempfile.mkdtemp(prefix="mc-persist-push-")
+        (Path(workspace) / "docs").mkdir()
+        (Path(workspace) / "docs" / "out.txt").write_text("x\n", encoding="utf-8")
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path=workspace,
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout="done\n",
+            return_code=0,
+            command=["cursor-agent", "--force", "<instruction>"],
+        )
+        mock_changed.return_value = (["docs/out.txt"], None)
+        # Execution result carries mode=push; must not fall back to none.
+        mock_persist.return_value = PersistenceResult(
+            ok=True,
+            commit_sha="pushsha0001",
+            mode="push",
+            pushed=True,
+        )
+
+        record = self.registry.create_run()
+        mission = _base_mission(deliverables=["docs/out.txt"])
+        mission["persistence"] = {"mode": "push"}
+        mission["approval"] = {
+            **mission["approval"],
+            "platform_push_approved": True,
+        }
+        execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        assert updated.result is not None
+        assert updated.result.persistence is not None
+        self.assertEqual(updated.result.persistence.mode, "push")
+        self.assertNotEqual(updated.result.persistence.mode, "none")
+        self.assertTrue(updated.result.persistence.ok)
+        self.assertTrue(updated.result.persistence.pushed)
+        self.assertEqual(updated.result.persistence.commit_sha, "pushsha0001")
+        self.assertEqual(updated.commit_sha, "pushsha0001")
+        assert updated.result.summary is not None
+        self.assertIn("mode=push", updated.result.summary)
+        self.assertIn("pushed=true", updated.result.summary)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.collect_changed_files")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    @patch("mission_control.workspace.prepare_isolated_workspace")
+    def test_unsuccessful_push_not_reported_as_successful(
+        self,
+        mock_prepare,
+        mock_execute,
+        mock_changed,
+        mock_persist,
+        _mock_cleanup,
+    ) -> None:
+        """Failed push keeps mode=push with ok=false and pushed=false."""
+        workspace = tempfile.mkdtemp(prefix="mc-persist-push-fail-")
+        (Path(workspace) / "docs").mkdir()
+        (Path(workspace) / "docs" / "out.txt").write_text("x\n", encoding="utf-8")
+        mock_prepare.return_value = WorkspacePrepResult(
+            ok=True,
+            workspace_path=workspace,
+        )
+        mock_execute.return_value = ExecutionResult(
+            ok=True,
+            stdout="done\n",
+            return_code=0,
+            command=["cursor-agent", "--force", "<instruction>"],
+        )
+        mock_changed.return_value = (["docs/out.txt"], None)
+        mock_persist.return_value = PersistenceResult(
+            ok=False,
+            error="git push failed with code 1",
+            commit_sha="partialc0mm1t",
+            mode="push",
+            pushed=False,
+        )
+
+        record = self.registry.create_run()
+        mission = _base_mission(deliverables=["docs/out.txt"])
+        mission["persistence"] = {"mode": "push"}
+        mission["approval"] = {
+            **mission["approval"],
+            "platform_push_approved": True,
+        }
+        execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        self.assertEqual(updated.status, RunStatus.FAILED)
+        assert updated.result is not None
+        assert updated.result.persistence is not None
+        self.assertEqual(updated.result.persistence.mode, "push")
+        self.assertTrue(updated.result.persistence.attempted)
+        self.assertFalse(updated.result.persistence.ok)
+        self.assertFalse(updated.result.persistence.pushed)
+        self.assertEqual(
+            updated.result.persistence.commit_sha,
+            "partialc0mm1t",
+        )
+        # Top-level commit_sha is only stored on successful persistence.
+        self.assertIsNone(updated.commit_sha)
+        assert updated.result.summary is not None
+        self.assertIn(
+            "Platform persistence failed (mode=push)",
+            updated.result.summary,
+        )
+        self.assertNotIn(
+            "Platform persistence succeeded",
+            updated.result.summary,
+        )
+
+    def test_execution_result_mode_not_shadowed_by_none_default(self) -> None:
+        """Missing PersistenceResult.mode falls back to mission, not bare none.
+
+        A truthy default of ``mode="none"`` on PersistenceResult would wrongly
+        shadow mission ``persistence.mode: push`` when combined with
+        ``result.mode or mission_mode``.
+        """
+        mission = _base_mission()
+        mission["persistence"] = {"mode": "push"}
+        evidence = build_persistence_evidence(
+            mission,
+            attempted=True,
+            ok=True,
+            commit_sha="abc",
+            mode=None,
+            pushed=None,
+        )
+        self.assertEqual(evidence.mode, "push")
+
+        from_result = build_persistence_evidence(
+            mission,
+            attempted=True,
+            ok=True,
+            commit_sha="abc",
+            mode="push",
+            pushed=True,
+        )
+        self.assertEqual(from_result.mode, "push")
+        self.assertTrue(from_result.pushed)
+
+        none_mission = _base_mission()
+        none_mission["persistence"] = {"mode": "none"}
+        none_evidence = build_persistence_evidence(
+            none_mission,
+            attempted=True,
+            ok=True,
+            commit_sha=None,
+            mode="none",
+            pushed=False,
+        )
+        self.assertEqual(none_evidence.mode, "none")
+        self.assertFalse(none_evidence.pushed)
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
