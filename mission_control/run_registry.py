@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import logging
 import os
@@ -24,6 +24,10 @@ DEFAULT_DB_PATH = "./data/mission-control.db"
 INTERRUPTED_RUN_ERROR = "Run interrupted by service restart."
 
 _RUNS_TABLE = "runs"
+_STARTUP_RECOVERY_LEASE_TABLE = "startup_recovery_leases"
+STARTUP_RECOVERY_LEASE_NAME = "interrupted_run_recovery"
+STARTUP_RECOVERY_LEASE_TTL_SECONDS = 30
+_SQLITE_BUSY_TIMEOUT_MS = 5000
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -138,6 +142,7 @@ class RunRegistry:
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
         self._ensure_schema()
 
     @property
@@ -166,6 +171,16 @@ class RunRegistry:
                 )
                 """
             )
+            self._conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_STARTUP_RECOVERY_LEASE_TABLE} (
+                    name TEXT PRIMARY KEY,
+                    owner_token TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+                """
+            )
             columns = {
                 row[1]
                 for row in self._conn.execute(
@@ -190,54 +205,166 @@ class RunRegistry:
                 )
             self._conn.commit()
 
-    def recover_interrupted_runs(self) -> int:
-        """Mark queued or running runs failed after a service restart."""
+    def _try_acquire_startup_recovery_lease_unlocked(self) -> str | None:
+        """Acquire the cross-process startup recovery lease, or return None."""
+        token = f"{os.getpid()}:{uuid.uuid4()}"
+        now = _utc_now()
+        expires_at = now + timedelta(seconds=STARTUP_RECOVERY_LEASE_TTL_SECONDS)
+        try:
+            # End any implicit transaction so BEGIN IMMEDIATE can take a
+            # reserved lock across processes sharing this database file.
+            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                f"""
+                SELECT owner_token, expires_at
+                FROM {_STARTUP_RECOVERY_LEASE_TABLE}
+                WHERE name = ?
+                """,
+                (STARTUP_RECOVERY_LEASE_NAME,),
+            ).fetchone()
+            if row is not None:
+                lease_expires = _parse_dt(row["expires_at"])
+                if lease_expires is not None and lease_expires > now:
+                    self._conn.rollback()
+                    return None
+
+            self._conn.execute(
+                f"""
+                INSERT INTO {_STARTUP_RECOVERY_LEASE_TABLE} (
+                    name,
+                    owner_token,
+                    acquired_at,
+                    expires_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    owner_token = excluded.owner_token,
+                    acquired_at = excluded.acquired_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    STARTUP_RECOVERY_LEASE_NAME,
+                    token,
+                    _format_dt(now),
+                    _format_dt(expires_at),
+                ),
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            logger.debug(
+                "Startup recovery lease acquire failed for %s: %s",
+                self._db_path,
+                exc,
+            )
+            return None
+
+        logger.info(
+            "Acquired startup recovery lease for %s (owner=%s)",
+            self._db_path,
+            token,
+        )
+        return token
+
+    def _release_startup_recovery_lease_unlocked(self, owner_token: str) -> None:
+        """Release a startup recovery lease owned by ``owner_token``."""
+        try:
+            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                f"""
+                DELETE FROM {_STARTUP_RECOVERY_LEASE_TABLE}
+                WHERE name = ? AND owner_token = ?
+                """,
+                (STARTUP_RECOVERY_LEASE_NAME, owner_token),
+            )
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            logger.warning(
+                "Failed to release startup recovery lease for %s: %s",
+                self._db_path,
+                exc,
+            )
+
+    def _recover_interrupted_runs_unlocked(self) -> int:
+        """Mark queued/running runs failed. Caller must hold ``self._lock``."""
         now = _utc_now()
         recovered = 0
-        with self._lock:
-            rows = self._conn.execute(
+        rows = self._conn.execute(
+            f"""
+            SELECT run_id, started_at
+            FROM {_RUNS_TABLE}
+            WHERE status IN (?, ?)
+            """,
+            (RunStatus.QUEUED.value, RunStatus.RUNNING.value),
+        ).fetchall()
+
+        for row in rows:
+            started_at = _parse_dt(row["started_at"])
+            elapsed_seconds = None
+            if started_at is not None:
+                elapsed_seconds = (now - started_at).total_seconds()
+
+            self._conn.execute(
                 f"""
-                SELECT run_id, started_at
-                FROM {_RUNS_TABLE}
-                WHERE status IN (?, ?)
+                UPDATE {_RUNS_TABLE}
+                SET status = ?,
+                    completed_at = ?,
+                    elapsed_seconds = ?,
+                    error = ?
+                WHERE run_id = ?
                 """,
-                (RunStatus.QUEUED.value, RunStatus.RUNNING.value),
-            ).fetchall()
+                (
+                    RunStatus.FAILED.value,
+                    _format_dt(now),
+                    elapsed_seconds,
+                    INTERRUPTED_RUN_ERROR,
+                    row["run_id"],
+                ),
+            )
+            recovered += 1
 
-            for row in rows:
-                started_at = _parse_dt(row["started_at"])
-                elapsed_seconds = None
-                if started_at is not None:
-                    elapsed_seconds = (now - started_at).total_seconds()
-
-                self._conn.execute(
-                    f"""
-                    UPDATE {_RUNS_TABLE}
-                    SET status = ?,
-                        completed_at = ?,
-                        elapsed_seconds = ?,
-                        error = ?
-                    WHERE run_id = ?
-                    """,
-                    (
-                        RunStatus.FAILED.value,
-                        _format_dt(now),
-                        elapsed_seconds,
-                        INTERRUPTED_RUN_ERROR,
-                        row["run_id"],
-                    ),
-                )
-                recovered += 1
-
-            if recovered:
-                self._conn.commit()
-                logger.info(
-                    "Recovered %s interrupted run(s) from %s",
-                    recovered,
-                    self._db_path,
-                )
+        if recovered:
+            self._conn.commit()
+            logger.info(
+                "Recovered %s interrupted run(s) from %s",
+                recovered,
+                self._db_path,
+            )
 
         return recovered
+
+    def recover_interrupted_runs(self) -> int:
+        """Mark queued or running runs failed after a service restart.
+
+        Exactly one process across replicas sharing this SQLite database
+        performs recovery. Non-owners skip cleanly and return ``0``. A
+        time-bounded lease ensures a crashed owner cannot block recovery
+        permanently.
+        """
+        with self._lock:
+            owner_token = self._try_acquire_startup_recovery_lease_unlocked()
+            if owner_token is None:
+                logger.info(
+                    (
+                        "Skipping interrupted-run recovery for %s; "
+                        "another process holds the startup recovery lease"
+                    ),
+                    self._db_path,
+                )
+                return 0
+
+            try:
+                return self._recover_interrupted_runs_unlocked()
+            finally:
+                self._release_startup_recovery_lease_unlocked(owner_token)
 
     def count_runs(self) -> int:
         """Return the number of persisted run records."""
