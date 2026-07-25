@@ -394,6 +394,8 @@ Consequences:
 
 ## 8. Endpoint distinctions (mission submission)
 
+Mission Control supports structured mission submission for routine implementation workflows.
+
 | Endpoint | Auth | Validation | Eligible `execution.mode` | Workspace | Platform persistence |
 | --- | --- | --- | --- | --- | --- |
 | `POST /validate` | public | structural only | any structurally valid doc | none | none |
