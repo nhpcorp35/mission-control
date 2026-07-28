@@ -5,3 +5,7 @@ __pycache__/
 venv/
 data/
 .test_deps/
+
+# HAL Sync Service — machine-local state
+tools/hal-sync-service/logs/
+tools/hal-sync-service/config.env

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__HAL_SYNC_LABEL__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__HAL_SYNC_SCRIPT__</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__HAL_SYNC_WORKING_DIRECTORY__</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HAL_SYNC_CONFIG</key>
+		<string>__HAL_SYNC_CONFIG__</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+	</dict>
+	<key>StartInterval</key>
+	<integer>__HAL_SYNC_INTERVAL_SECONDS__</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__HAL_SYNC_STDOUT_LOG__</string>
+	<key>StandardErrorPath</key>
+	<string>__HAL_SYNC_STDERR_LOG__</string>
+	<!-- Outbound git only; no sockets / inbound ports. -->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+</dict>
+</plist>

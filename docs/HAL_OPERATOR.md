@@ -78,3 +78,11 @@ ambiguity requires user input.
   **5 minutes idle** or **15 minutes** absolute — see `MISSION_CONTROL_API.md`
   (`wait_for_run` timeout layers). On a transport interrupt, resume with the
   same `run_id`.
+
+## Local repository auto-sync (macOS)
+
+Allen’s Mac can keep explicitly configured clones on `main` fast-forwarded from
+`origin` via the user LaunchAgent under `tools/hal-sync-service/` (launchd,
+default 60s, dirty trees skipped, `--ff-only` only). Install and operate with
+`./install.sh install|status|restart|uninstall` — never sudo. Full procedure:
+`tools/hal-sync-service/README.md`.

@@ -1,5 +1,62 @@
 # HAL Operator Log
 
+## 2026-07-28 — HAL Sync Service (macOS launchd auto-sync)
+
+### Objective
+
+Build a safe, maintainable macOS repository auto-sync utility under
+`tools/hal-sync-service/` so Allen’s local clones (starting with
+`/Users/allenk/Desktop/Mission-Control`) stay fast-forwarded from `origin/main`
+via launchd — without sudo, tokens, inbound ports, merges, or destructive Git.
+
+### Implementation
+
+- `sync.sh`: validates absolute Git worktrees on `main` with `origin`; skips
+  dirty trees; `git fetch origin`; updates only with `git pull --ff-only origin
+  main` when `origin/main` is ahead; directory lock; bounded log rotation.
+- `install.sh` / `uninstall.sh`: user LaunchAgent install, status, restart,
+  uninstall; creates `config.env` from example only when missing; validates
+  commands and repos; `bootstrap`/`bootout` with `load`/`unload` fallback.
+- `config.env.example`, `launchd/com.nhpcorp.hal-sync.plist.template`,
+  service `README.md`.
+- `.gitignore`: `tools/hal-sync-service/logs/` and `config.env`.
+- Operator pointer in `docs/HAL_OPERATOR.md`.
+- Focused tests: `tests/test_hal_sync_service.py` (local Git fixtures only).
+
+### Tests executed
+
+```text
+bash -n tools/hal-sync-service/sync.sh
+bash -n tools/hal-sync-service/install.sh
+bash -n tools/hal-sync-service/uninstall.sh
+# syntax ok
+
+/app/.venv/bin/python -m unittest tests.test_hal_sync_service -v
+# Ran 11 tests — OK
+```
+
+Shared Mission Control Python behavior was not changed; no additional suite run
+beyond the focused sync-service tests.
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+
+### Limitations
+
+- **launchd was not loaded in this Linux Mission Control environment.** Final
+  install and LaunchAgent verification must occur on Allen’s Mac:
+  `cd tools/hal-sync-service && ./install.sh install && ./install.sh status`.
+- Paths with embedded spaces are not supported in `HAL_SYNC_REPOS` (use
+  space/newline-separated absolute paths without spaces).
+- Sync never contacts GitHub with embedded credentials; remotes must already
+  work with the user’s existing Git auth.
+
+### Next Objective
+
+On Allen’s Mac: install the LaunchAgent, confirm `logs/hal-sync.log` after one
+interval, and keep `config.env` local (gitignored).
+
 ## 2026-07-28 — First-class documentation policy support
 
 ### Objective
