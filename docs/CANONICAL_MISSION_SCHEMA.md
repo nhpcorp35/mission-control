@@ -465,6 +465,20 @@ Consequences:
 
 Mission Control supports structured mission submission for routine implementation workflows.
 
+Structured submission (`POST /runs/structured`, MCP `submit_structured_run`)
+renders Mission Spec v1.0 via the mission builder. When the caller omits
+`persistence_mode`, the builder infers:
+
+| Permissions | Resolved `persistence.mode` |
+| --- | --- |
+| `create_files` and/or `modify_files` true (or delete when supported) | `push` |
+| read-only (`create_files` and `modify_files` false) | `none` |
+
+Explicit `persistence_mode` (`none`, `commit`, `push`) is never overridden.
+Inferred or explicit `push` still requires platform-push approval. This
+inference applies only to the structured path; raw Mission Spec YAML with an
+omitted `persistence` block still resolves to `none` (see §4).
+
 | Endpoint | Auth | Validation | Eligible `execution.mode` | Workspace | Platform persistence |
 | --- | --- | --- | --- | --- | --- |
 | `POST /validate` | public | structural only | any structurally valid doc | none | none |

@@ -96,7 +96,7 @@ async def submit_structured_run(
     deliverables: list[str],
     create_files: bool,
     modify_files: bool,
-    persistence_mode: str = "none",
+    persistence_mode: str | None = None,
     repository_name: str = "Mission-Control",
     repository_path: str = ".",
     base_branch: str = "main",
@@ -111,6 +111,11 @@ async def submit_structured_run(
     Spec v1.0 YAML with safe defaults and queues it through the same async
     pipeline as submit_run. Raw YAML submit_run remains available when exact
     document control is required.
+
+    When persistence_mode is omitted, create_files/modify_files mutations
+    default to persistence.mode=push; read-only missions default to none.
+    Explicit persistence_mode values (none, commit, push) are never
+    overridden. persistence_mode=push still requires platform-push approval.
 
     Platform-push approval may be supplied as flat platform_push_approved
     and/or nested approval.platform_push_approved. Matching values are

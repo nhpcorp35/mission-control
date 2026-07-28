@@ -250,7 +250,7 @@ Optional fields and defaults:
 
 | Field | Type | Default |
 | --- | --- | --- |
-| `persistence_mode` | string | `none` |
+| `persistence_mode` | string or null | inferred (see below) |
 | `repository_name` | string | `Mission-Control` |
 | `repository_path` | string | `.` |
 | `base_branch` | string | `main` |
@@ -258,9 +258,19 @@ Optional fields and defaults:
 | `platform_push_approved` | boolean | `false` |
 | `allow_automatic_platform_push` | boolean | `false` |
 
+**Structured `persistence_mode` resolution** (mission builder; not raw YAML):
+
+| Caller `persistence_mode` | `create_files` / `modify_files` | Resolved `persistence.mode` |
+| --- | --- | --- |
+| omitted / `null` | either true | `push` |
+| omitted / `null` | both false (read-only) | `none` |
+| explicit `none` / `commit` / `push` | any | that explicit value (never overridden) |
+
+Raw Mission Spec YAML still defaults an omitted `persistence` block to `mode: none` via `resolve_persistence_mode`. Only the structured / natural-language submission path applies the mutation→`push` inference above.
+
 Builder-controlled fields (callers cannot override in v1): `version: 1.0`, `execution.agent: cursor`, `execution.mode: execute`, `execution.sandbox: true`, `execution.worktree: false`, `permissions.read: true`, `permissions.delete_files: false`, `permissions.stage_changes: false`, `permissions.commit: false`, `permissions.push: false`, `approval.execute_without_approval: true`, `approval.commit_requires_approval: true`, `approval.push_requires_approval: true`.
 
-Platform-push approval rules are unchanged: `persistence_mode=push` still requires `platform_push_approved=true` or `allow_automatic_platform_push=true`.
+Platform-push approval rules are unchanged: `persistence_mode=push` (including when inferred for create/modify missions) still requires `platform_push_approved=true` or `allow_automatic_platform_push=true`.
 
 **Response** `202 Accepted` when the run is queued — same shape as `POST /runs` (`run_id`, `status: queued`).
 

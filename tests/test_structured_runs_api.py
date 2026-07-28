@@ -64,7 +64,11 @@ class TestStructuredRunsApi(unittest.TestCase):
         ) as accept_mock:
             response = self.client.post(
                 "/runs/structured",
-                json=_structured_payload(),
+                json=_structured_payload(
+                    # create_files=true omits persistence_mode → push; approval
+                    # required so the inferred push mission can be accepted.
+                    platform_push_approved=True,
+                ),
             )
         self.assertEqual(response.status_code, 202)
         body = response.json()
@@ -75,9 +79,181 @@ class TestStructuredRunsApi(unittest.TestCase):
         self.assertIsInstance(mission_yaml, str)
         self.assertIn("mission_id: 2026-07-24-structured", mission_yaml)
         self.assertIn("mode: execute", mission_yaml)
+        self.assertIn("mode: push", mission_yaml)
         record = api_module.run_registry.get_run(body["run_id"])
         assert record is not None
         self.assertEqual(record.mission_yaml, mission_yaml)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_omitted_persistence_mode_create_defaults_to_push(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    create_files=True,
+                    modify_files=False,
+                    platform_push_approved=True,
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertRegex(
+            mission_yaml,
+            r"persistence:\s*\n\s*mode:\s*push\b",
+        )
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_omitted_persistence_mode_modify_defaults_to_push(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    create_files=False,
+                    modify_files=True,
+                    platform_push_approved=True,
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertRegex(
+            mission_yaml,
+            r"persistence:\s*\n\s*mode:\s*push\b",
+        )
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_omitted_persistence_mode_read_only_defaults_to_none(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    create_files=False,
+                    modify_files=False,
+                    run_commands=True,
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertRegex(
+            mission_yaml,
+            r"persistence:\s*\n\s*mode:\s*none\b",
+        )
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_explicit_persistence_mode_none_preserved(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    create_files=True,
+                    modify_files=False,
+                    persistence_mode="none",
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertRegex(
+            mission_yaml,
+            r"persistence:\s*\n\s*mode:\s*none\b",
+        )
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_explicit_persistence_mode_commit_preserved(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    create_files=True,
+                    modify_files=False,
+                    persistence_mode="commit",
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertRegex(
+            mission_yaml,
+            r"persistence:\s*\n\s*mode:\s*commit\b",
+        )
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_explicit_persistence_mode_push_preserved(
+        self,
+        _mock_preflight,
+    ) -> None:
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    create_files=True,
+                    modify_files=False,
+                    persistence_mode="push",
+                    platform_push_approved=True,
+                ),
+            )
+        self.assertEqual(response.status_code, 202)
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertRegex(
+            mission_yaml,
+            r"persistence:\s*\n\s*mode:\s*push\b",
+        )
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_inferred_push_without_approval_rejected(
+        self,
+        _mock_preflight,
+    ) -> None:
+        response = self.client.post(
+            "/runs/structured",
+            json=_structured_payload(
+                create_files=True,
+                modify_files=False,
+                platform_push_approved=False,
+                allow_automatic_platform_push=False,
+            ),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"], PLATFORM_PUSH_APPROVAL_REQUIRED)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
 
     @patch("app.api.preflight_for_execution", return_value=None)
     def test_valid_read_only_structured_mission_accepted(

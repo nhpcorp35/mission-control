@@ -141,6 +141,7 @@ class TestSubmitStructuredRunClient(unittest.IsolatedAsyncioTestCase):
             payload["approval"],
             {"platform_push_approved": True},
         )
+        self.assertNotIn("persistence_mode", payload)
 
     async def test_client_serializes_flat_platform_push_approved(self) -> None:
         with patch.object(
@@ -160,6 +161,42 @@ class TestSubmitStructuredRunClient(unittest.IsolatedAsyncioTestCase):
         payload = request.await_args.kwargs["json"]
         self.assertEqual(payload["platform_push_approved"], True)
         self.assertNotIn("approval", payload)
+        self.assertNotIn("persistence_mode", payload)
+
+    async def test_client_omits_persistence_mode_when_unset(self) -> None:
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value={"run_id": "r1", "status": "queued"}),
+        ) as request:
+            await self.client.submit_structured_run(
+                mission_id="m1",
+                title="T",
+                instructions="Do it",
+                deliverables=["summary"],
+                create_files=True,
+                modify_files=False,
+            )
+        payload = request.await_args.kwargs["json"]
+        self.assertNotIn("persistence_mode", payload)
+
+    async def test_client_sends_explicit_persistence_mode(self) -> None:
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value={"run_id": "r1", "status": "queued"}),
+        ) as request:
+            await self.client.submit_structured_run(
+                mission_id="m1",
+                title="T",
+                instructions="Do it",
+                deliverables=["summary"],
+                create_files=True,
+                modify_files=False,
+                persistence_mode="none",
+            )
+        payload = request.await_args.kwargs["json"]
+        self.assertEqual(payload["persistence_mode"], "none")
 
 
 class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):

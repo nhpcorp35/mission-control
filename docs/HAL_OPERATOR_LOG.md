@@ -1,5 +1,54 @@
 # HAL Operator Log
 
+## 2026-07-28 — Structured mission persistence defaults (mutation → push)
+
+### Objective
+
+Natural-language / structured repository-mutating missions were resolving to
+`persistence.mode: none` when the caller omitted `persistence_mode`, so
+successful file-creation runs never reached GitHub / HAL Sync / Obsidian.
+
+### Implementation
+
+- `mission_control/mission_builder.py`:
+  `resolve_structured_persistence_mode` — omitted mode → `push` when
+  create/modify/delete flags are set; otherwise `none`. Explicit modes are
+  never overridden. Raw YAML omitted-`persistence` default remains `none`.
+- `POST /runs/structured` and MCP `submit_structured_run` take optional
+  `persistence_mode` (`null`/omitted → infer). Platform-push approval checks
+  are unchanged.
+- Docs: `MISSION_CONTROL_API.md`, `docs/HAL_OPERATOR.md`,
+  `docs/CANONICAL_MISSION_SCHEMA.md`.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest \
+  tests.test_mission_builder \
+  tests.test_structured_runs_api \
+  tests.test_mcp_wait_for_run \
+  tests.test_mcp_transport_discovery \
+  tests.test_canonical_mission_schema_docs \
+  tests.test_runs_api \
+  tests.test_api \
+  tests.test_validate_regression \
+  -v
+# Ran 141 tests — OK
+```
+
+### Authoritative persistence outcome
+
+Structured create/modify missions without an explicit mode now report
+`persistence.mode: push` in the generated Mission Spec (and therefore in the
+final authoritative run result after a successful approved push). Explicit
+`none` / `commit` / `push` remain as submitted. Read-only structured missions
+still default to `none`.
+
+### Next Objective
+
+Ensure HAL / ChatGPT pairs inferred-push mutations with platform-push approval
+on routine repository changes.
+
 ## 2026-07-28 — HAL Sync Service (macOS launchd auto-sync)
 
 ### Objective

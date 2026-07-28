@@ -31,6 +31,11 @@ in `docs/HAL_OPERATOR_LOG.md`.
   MCP `submit_structured_run` or HTTP `POST /runs/structured`.
 - Structured fields are rendered into Mission Spec v1.0 YAML with safe execute
   defaults; the rendered YAML is stored on the run record so retries stay exact.
+- **Structured persistence defaults:** when `persistence_mode` is omitted,
+  create/modify (repository-mutating) missions resolve to `persistence.mode:
+  push`; read-only inspection missions resolve to `none`. Explicit
+  `persistence_mode` values (`none`, `commit`, `push`) are never overridden.
+  Raw YAML omitted `persistence` blocks still default to `none`.
 - **Raw YAML remains fully supported** via MCP `submit_run` / HTTP `POST /runs`
   when exact document control is required (or when fields outside the structured
   v1 surface must be set by hand).
@@ -48,8 +53,9 @@ in `docs/HAL_OPERATOR_LOG.md`.
   import (`openapi` is `3.1.0`, operation descriptions under 300 characters;
   `/health` uses named `HealthResponse`). Do not import `/openapi.json` into
   Actions.
-- Do not weaken platform-push approval: `persistence_mode=push` still requires
-  explicit platform-push approval fields.
+- Do not weaken platform-push approval: `persistence_mode=push` (including when
+  inferred for create/modify structured missions) still requires explicit
+  platform-push approval fields.
 
 ## Autonomy
 

@@ -34,7 +34,6 @@ from mission_control.workspace import execute_registered_run
 from mission_control.mission_builder import (
     DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH,
     DEFAULT_BASE_BRANCH,
-    DEFAULT_PERSISTENCE_MODE,
     DEFAULT_PLATFORM_PUSH_APPROVED,
     DEFAULT_REPOSITORY_NAME,
     DEFAULT_REPOSITORY_PATH,
@@ -159,7 +158,9 @@ class StructuredRunRequest(BaseModel):
     deliverables: list = Field(...)
     create_files: bool
     modify_files: bool
-    persistence_mode: str = DEFAULT_PERSISTENCE_MODE
+    # None → mission builder infers push for create/modify, else none.
+    # Explicit values (including "none") are never overridden.
+    persistence_mode: str | None = None
     repository_name: str = DEFAULT_REPOSITORY_NAME
     repository_path: str = DEFAULT_REPOSITORY_PATH
     base_branch: str = DEFAULT_BASE_BRANCH
@@ -651,9 +652,10 @@ def submit_run_endpoint(
     summary="Submit asynchronous mission run from structured fields",
     description=(
         "Build Mission Spec v1.0 YAML from structured fields (safe execute "
-        "defaults), then validate and queue it through the same asynchronous "
-        "pipeline as POST /runs. Poll GET /runs/{run_id} for status. Raw YAML "
-        "submission via POST /runs remains supported."
+        "defaults; omitted persistence_mode → push for create/modify, none "
+        "for read-only), then validate and queue it through the same "
+        "asynchronous pipeline as POST /runs. Poll GET /runs/{run_id} for "
+        "status. Raw YAML submission via POST /runs remains supported."
     ),
     response_model=RunAcceptedResponse,
     responses={

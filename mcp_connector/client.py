@@ -145,7 +145,7 @@ class MissionControlClient:
         deliverables: list[Any],
         create_files: bool,
         modify_files: bool,
-        persistence_mode: str = "none",
+        persistence_mode: str | None = None,
         repository_name: str = "Mission-Control",
         repository_path: str = ".",
         base_branch: str = "main",
@@ -161,7 +161,6 @@ class MissionControlClient:
             "deliverables": deliverables,
             "create_files": create_files,
             "modify_files": modify_files,
-            "persistence_mode": persistence_mode,
             "repository_name": repository_name,
             "repository_path": repository_path,
             "base_branch": base_branch,
@@ -170,6 +169,10 @@ class MissionControlClient:
                 allow_automatic_platform_push
             ),
         }
+        # Omit unset persistence_mode so the API/builder can infer push for
+        # mutations and none for read-only; explicit values stay authoritative.
+        if persistence_mode is not None:
+            payload["persistence_mode"] = persistence_mode
         # Omit unset flat approval so nested-only approval is not conflicted
         # by an invented default false.
         if platform_push_approved is not None:

@@ -11,13 +11,41 @@ from typing import Any
 
 import yaml
 
+# Read-only structured default (and raw YAML omitted-block default elsewhere).
 DEFAULT_PERSISTENCE_MODE = "none"
+# Structured missions that create/modify/delete files default here when the
+# caller omits persistence_mode. Explicit caller values are never overridden.
+MUTATING_STRUCTURED_PERSISTENCE_MODE = "push"
 DEFAULT_REPOSITORY_NAME = "Mission-Control"
 DEFAULT_REPOSITORY_PATH = "."
 DEFAULT_BASE_BRANCH = "main"
 DEFAULT_RUN_COMMANDS = True
 DEFAULT_PLATFORM_PUSH_APPROVED = False
 DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH = False
+
+
+def resolve_structured_persistence_mode(
+    *,
+    create_files: bool,
+    modify_files: bool,
+    delete_files: bool = False,
+    persistence_mode: str | None = None,
+) -> str:
+    """Resolve ``persistence.mode`` for structured mission submission.
+
+    Explicit ``persistence_mode`` is authoritative and never overridden.
+    When omitted (``None``), repository-mutating permission flags
+    (create / modify / delete) default to ``push``; read-only structured
+    missions default to ``none``.
+
+    This does not change raw Mission Spec YAML resolution for an omitted
+    ``persistence`` block (still ``none`` via ``resolve_persistence_mode``).
+    """
+    if persistence_mode is not None:
+        return persistence_mode
+    if create_files or modify_files or delete_files:
+        return MUTATING_STRUCTURED_PERSISTENCE_MODE
+    return DEFAULT_PERSISTENCE_MODE
 
 
 def build_mission_spec(
@@ -28,7 +56,7 @@ def build_mission_spec(
     deliverables: list[Any],
     create_files: bool,
     modify_files: bool,
-    persistence_mode: str = DEFAULT_PERSISTENCE_MODE,
+    persistence_mode: str | None = None,
     repository_name: str = DEFAULT_REPOSITORY_NAME,
     repository_path: str = DEFAULT_REPOSITORY_PATH,
     base_branch: str = DEFAULT_BASE_BRANCH,
@@ -39,6 +67,11 @@ def build_mission_spec(
     ),
 ) -> dict[str, Any]:
     """Build a Mission Spec v1.0 dictionary with safe execute defaults."""
+    resolved_persistence_mode = resolve_structured_persistence_mode(
+        create_files=create_files,
+        modify_files=modify_files,
+        persistence_mode=persistence_mode,
+    )
     return {
         "version": "1.0",
         "mission_id": mission_id,
@@ -74,7 +107,7 @@ def build_mission_spec(
             "allow_automatic_platform_push": allow_automatic_platform_push,
         },
         "persistence": {
-            "mode": persistence_mode,
+            "mode": resolved_persistence_mode,
         },
     }
 
@@ -87,7 +120,7 @@ def render_mission_yaml(
     deliverables: list[Any],
     create_files: bool,
     modify_files: bool,
-    persistence_mode: str = DEFAULT_PERSISTENCE_MODE,
+    persistence_mode: str | None = None,
     repository_name: str = DEFAULT_REPOSITORY_NAME,
     repository_path: str = DEFAULT_REPOSITORY_PATH,
     base_branch: str = DEFAULT_BASE_BRANCH,
