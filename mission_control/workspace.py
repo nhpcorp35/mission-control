@@ -23,6 +23,7 @@ from mission_control.run_result import (
     WARNING_PERSISTENCE_NOT_ATTEMPTED,
     WARNING_PREP_FAILED,
     append_warning,
+    build_documentation_evidence,
     command_evidence_from_execution,
     empty_structured_result,
     finalize_structured_summary,
@@ -740,6 +741,13 @@ def execute_registered_run(
     workspace_path: str | None = None
     structured = empty_structured_result()
 
+    def _attach_documentation(*, handling_completed: bool) -> None:
+        structured.documentation = build_documentation_evidence(
+            mission,
+            files_changed=structured.files_changed,
+            handling_completed=handling_completed,
+        )
+
     try:
         prep = prepare_isolated_workspace(mission)
         if not prep.ok:
@@ -754,6 +762,7 @@ def execute_registered_run(
                 verified=False,
                 passed=None,
             )
+            _attach_documentation(handling_completed=False)
             finalize_structured_summary(structured, error=prep.error)
             registry.store_result(
                 run_id,
@@ -796,6 +805,7 @@ def execute_registered_run(
                 attempted=False,
                 ok=None,
             )
+            _attach_documentation(handling_completed=False)
             finalize_structured_summary(
                 structured,
                 error=execution_result.error,
@@ -833,6 +843,8 @@ def execute_registered_run(
                 "Missing declared file deliverable: "
                 f"{deliverable_evidence.missing[0]}"
             )
+            # Agent completed; documentation status uses files_changed.
+            _attach_documentation(handling_completed=True)
             finalize_structured_summary(structured, error=deliverable_error)
             registry.store_result(
                 run_id,
@@ -868,6 +880,9 @@ def execute_registered_run(
                 append_warning(structured, files_warning)
 
         if not persistence_result.ok:
+            # Agent succeeded and deliverables passed; documentation review
+            # completed even though platform persistence failed.
+            _attach_documentation(handling_completed=True)
             finalize_structured_summary(
                 structured,
                 error=persistence_result.error,
@@ -883,6 +898,7 @@ def execute_registered_run(
             registry.update_status(run_id, RunStatus.FAILED)
             return
 
+        _attach_documentation(handling_completed=True)
         finalize_structured_summary(structured)
         registry.store_result(
             run_id,
@@ -910,6 +926,8 @@ def execute_registered_run(
                 attempted=False,
                 ok=None,
             )
+        if structured.documentation is None:
+            _attach_documentation(handling_completed=False)
         finalize_structured_summary(structured, error=str(exc))
         registry.store_result(
             run_id,

@@ -33,6 +33,7 @@ These keys must be present. Absence fails `validate_mission` /
 | Key | Required | Default / behavior |
 | --- | --- | --- |
 | `persistence` | no | When omitted, platform persistence mode is `none` |
+| `documentation` | no | When omitted, documentation policy mode is `none` |
 
 Unknown top-level keys are ignored by structural validation (not rejected).
 
@@ -215,7 +216,75 @@ platform effect on that path.
 
 ---
 
-## 5. Approval fields
+## 5. Documentation policy
+
+Optional top-level block:
+
+```yaml
+documentation:
+  mode: none   # or required
+```
+
+### Resolution
+
+`resolve_documentation_mode`:
+
+- omitted `documentation` → `none`
+- `documentation` present without `mode`, or `mode: null` → `none`
+- otherwise the string value of `mode`
+
+Structural validation accepts only `none` and `required` when `mode` is set to
+a non-null value. Unsupported values fail with
+`Unsupported documentation.mode: …`.
+
+### Execution semantics
+
+| Mode | Agent instruction effect |
+| --- | --- |
+| `none` | No documentation-specific instructions are added |
+| `required` | Cursor instructions include an explicit **Documentation** section requiring review of affected docs, updates when behavior/architecture/scope/workflow/decisions change, an explicit report when no doc update is needed (with rationale), and treating documentation review as part of completion |
+
+The validated mode is preserved from the Mission Spec through run registration,
+execution, structured-result storage, and API serialization. Mission Control
+does **not** infer the requested mode from agent stdout.
+
+Mission Control does **not** auto-select specific documentation files and does
+**not** encode repository-specific documentation rules beyond the generic
+agent instructions above.
+
+### Read-only compatibility
+
+Genuine read-only execute missions remain valid when `documentation` is omitted
+or `documentation.mode` is `none`. Documentation policy does not require
+`create_files` / `modify_files` and does not change persistence authorization
+or platform-push approval requirements.
+
+### Structured result (`result.documentation`)
+
+Async run results include authoritative documentation evidence:
+
+| Field | Meaning |
+| --- | --- |
+| `mode` | Validated requested mode (`none` or `required`) |
+| `status` | Execution outcome for documentation handling |
+
+Statuses:
+
+| Status | When |
+| --- | --- |
+| `not_requested` | Requested mode is `none` (including omitted / null default) |
+| `updated` | Mode is `required`, documentation handling completed, and at least one changed path looks like documentation |
+| `not_required` | Mode is `required`, documentation handling completed, and no documentation-looking paths appear in `files_changed` |
+| `failed` | Mode is `required` and documentation handling did not complete (for example prep/agent failure before successful agent completion) |
+
+**Limitation:** `updated` vs `not_required` uses a deterministic path heuristic on
+Mission Control `files_changed` (`docs/` prefix or `.md` suffix). Agent stdout
+claims are never treated as verified documentation evidence. Paths outside that
+heuristic are not classified as documentation updates.
+
+---
+
+## 6. Approval fields
 
 Common fields in missions:
 
@@ -254,7 +323,7 @@ authorize platform push.
 
 ---
 
-## 6. Deliverables and completed-run verification
+## 7. Deliverables and completed-run verification
 
 ### Requirements
 
@@ -367,7 +436,7 @@ Limitations:
 
 ---
 
-## 7. Workspace lifecycle and visibility
+## 8. Workspace lifecycle and visibility
 
 For **`POST /runs`** (async execute):
 
@@ -392,7 +461,7 @@ Consequences:
 
 ---
 
-## 8. Endpoint distinctions (mission submission)
+## 9. Endpoint distinctions (mission submission)
 
 Mission Control supports structured mission submission for routine implementation workflows.
 
@@ -426,13 +495,13 @@ Recursive local submissions during an active execution are rejected
 
 ---
 
-## 9. Minimal valid YAML examples
+## 10. Minimal valid YAML examples
 
 Paths below use `.` so examples validate when the process cwd is the Mission
 Control repository root. Substitute a real absolute path in deployed
 environments. All examples set `worktree: false`.
 
-### 9.1 Inspection / planning (`plan` → `POST /run`)
+### 10.1 Inspection / planning (`plan` → `POST /run`)
 
 ```yaml
 version: "1.0"
@@ -466,7 +535,7 @@ approval:
   push_requires_approval: true
 ```
 
-### 9.2 Execute with `persistence.mode: none`
+### 10.2 Execute with `persistence.mode: none`
 
 ```yaml
 version: "1.0"
@@ -504,7 +573,7 @@ approval:
   push_requires_approval: true
 ```
 
-### 9.3 Execute with `persistence.mode: commit`
+### 10.3 Execute with `persistence.mode: commit`
 
 ```yaml
 version: "1.0"
@@ -542,7 +611,7 @@ approval:
   push_requires_approval: true
 ```
 
-### 9.4 Execute with `persistence.mode: push`
+### 10.4 Execute with `persistence.mode: push`
 
 ```yaml
 version: "1.0"
@@ -583,7 +652,7 @@ approval:
 
 ---
 
-## 10. Common validation failures and corrections
+## 11. Common validation failures and corrections
 
 | Failure | Typical message | Correction |
 | --- | --- | --- |
@@ -592,6 +661,8 @@ approval:
 | Invalid YAML | `Invalid YAML: …` | Fix YAML syntax |
 | Non-mapping persistence | `persistence must be a mapping` | Use `persistence: { mode: … }` |
 | Bad persistence mode | `Unsupported persistence.mode: …` | Use `none`, `commit`, or `push` |
+| Non-mapping documentation | `documentation must be a mapping` | Use `documentation: { mode: … }` |
+| Bad documentation mode | `Unsupported documentation.mode: …` | Use `none` or `required` |
 | Plan endpoint with execute mode | `Unsupported mode: execute (expected plan)` | Use `mode: plan` for `POST /run` |
 | Execute endpoint with plan mode | `Unsupported mode: plan (expected execute)` | Use `mode: execute` for `POST /runs` |
 | Non-cursor agent | `Unsupported agent: … (expected cursor)` | Set `execution.agent: cursor` |
@@ -614,12 +685,14 @@ approval:
 3. **Approval policy flags** other than platform-push fields are not enforced
    by validators or the persistence layer.
 4. **Deliverable filesystem verification** is specified narratively in
-   `MISSION_SPEC.md` but not implemented (see §6).
+   `MISSION_SPEC.md` but not implemented (see §7).
 5. **Structural validation is shallow:** nested types for
    `repository` / `execution` / `permissions` / `approval` /
    `instructions` / `deliverables` are mostly unchecked until run/execute
    eligibility.
-6. **Legacy `POST /execute`** does not apply platform persistence despite
+6. **Legacy `POST /execute`:** does not apply platform persistence despite
    accepting execute missions that declare a `persistence` block.
 7. **Isolated async workspaces** require `MISSION_CONTROL_REPOSITORY_URL`;
    that env gate is separate from YAML schema validation.
+8. **Documentation `updated` vs `not_required`:** distinguished via a path
+   heuristic on `files_changed` (`docs/` or `.md`), not agent stdout.

@@ -17,12 +17,12 @@ from mission_control.validator import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_DOC = REPO_ROOT / "docs" / "CANONICAL_MISSION_SCHEMA.md"
 
-# Fenced YAML blocks under "## 9. Minimal valid YAML examples"
+# Fenced YAML blocks under "## 10. Minimal valid YAML examples"
 _EXAMPLE_HEADINGS = (
-    "### 9.1 Inspection / planning",
-    "### 9.2 Execute with `persistence.mode: none`",
-    "### 9.3 Execute with `persistence.mode: commit`",
-    "### 9.4 Execute with `persistence.mode: push`",
+    "### 10.1 Inspection / planning",
+    "### 10.2 Execute with `persistence.mode: none`",
+    "### 10.3 Execute with `persistence.mode: commit`",
+    "### 10.4 Execute with `persistence.mode: push`",
 )
 
 

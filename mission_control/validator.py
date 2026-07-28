@@ -18,6 +18,13 @@ SUPPORTED_PERSISTENCE_MODES = (
     "push",
 )
 
+SUPPORTED_DOCUMENTATION_MODES = (
+    "none",
+    "required",
+)
+
+DEFAULT_DOCUMENTATION_MODE = "none"
+
 REQUIRED_TOP_LEVEL_KEYS = (
     "version",
     "mission_id",
@@ -104,7 +111,27 @@ def validate_mission(data: object) -> ValidationResult:
             ),
         )
 
-    return _validate_persistence(data)
+    persistence_result = _validate_persistence(data)
+    if not persistence_result.ok:
+        return persistence_result
+
+    return _validate_documentation(data)
+
+
+def resolve_documentation_mode(mission: dict) -> str:
+    """Return the documentation policy mode for ``mission``.
+
+    When the top-level ``documentation`` block is omitted, or when ``mode`` is
+    omitted inside that block (or is null), the mode defaults to ``none`` for
+    backward compatibility with existing Mission Specs.
+    """
+    documentation = mission.get("documentation")
+    if not isinstance(documentation, dict):
+        return DEFAULT_DOCUMENTATION_MODE
+    mode = documentation.get("mode", DEFAULT_DOCUMENTATION_MODE)
+    if mode is None:
+        return DEFAULT_DOCUMENTATION_MODE
+    return str(mode)
 
 
 def _validate_persistence(data: dict) -> ValidationResult:
@@ -129,6 +156,34 @@ def _validate_persistence(data: dict) -> ValidationResult:
             error=(
                 f"Unsupported persistence.mode: {mode} "
                 "(expected one of: none, commit, push)"
+            ),
+        )
+
+    return ValidationResult(ok=True)
+
+
+def _validate_documentation(data: dict) -> ValidationResult:
+    """Validate optional top-level ``documentation`` (docs review policy)."""
+    if "documentation" not in data:
+        return ValidationResult(ok=True)
+
+    documentation = data["documentation"]
+    if not isinstance(documentation, dict):
+        return ValidationResult(
+            ok=False,
+            error="documentation must be a mapping",
+        )
+
+    if "mode" not in documentation or documentation.get("mode") is None:
+        return ValidationResult(ok=True)
+
+    mode = documentation.get("mode")
+    if mode not in SUPPORTED_DOCUMENTATION_MODES:
+        return ValidationResult(
+            ok=False,
+            error=(
+                f"Unsupported documentation.mode: {mode} "
+                "(expected one of: none, required)"
             ),
         )
 

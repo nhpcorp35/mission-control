@@ -246,6 +246,11 @@ class PersistenceEvidenceModel(BaseModel):
     pushed: bool | None = None
 
 
+class DocumentationEvidenceModel(BaseModel):
+    mode: str
+    status: str
+
+
 class StructuredRunResultModel(BaseModel):
     """Objective Mission Control evidence (not agent-authored stdout)."""
 
@@ -254,6 +259,7 @@ class StructuredRunResultModel(BaseModel):
     test_counts: dict[str, int] | None = None
     deliverables: DeliverableEvidenceModel | None = None
     persistence: PersistenceEvidenceModel | None = None
+    documentation: DocumentationEvidenceModel | None = None
     warnings: list[str] = Field(default_factory=list)
     summary: str | None = None
 
@@ -856,6 +862,10 @@ def submit_and_wait_endpoint(
                                         "ok": True,
                                         "commit_sha": "abc123def456",
                                         "pushed": False,
+                                    },
+                                    "documentation": {
+                                        "mode": "required",
+                                        "status": "updated",
                                     },
                                     "warnings": [
                                         (

@@ -1,5 +1,57 @@
 # HAL Operator Log
 
+## 2026-07-28 — First-class documentation policy support
+
+### Objective
+
+Make documentation review an explicit, validated Mission Spec policy and an
+authoritative structured run-result field, instead of relying only on free-form
+instructions.
+
+### Implementation
+
+- Optional top-level `documentation.mode`: `none` | `required` (default `none`
+  when omitted / null) with machine-readable validation errors for unsupported
+  modes.
+- When `required`, Cursor agent instructions include an explicit Documentation
+  section; when `none` / omitted, those instructions are not added.
+- Async structured results expose `result.documentation.{mode,status}` with
+  statuses `not_requested`, `updated`, `not_required`, and `failed`.
+- `updated` vs `not_required` uses a deterministic `files_changed` path
+  heuristic (`docs/` or `.md`); agent stdout is never treated as verified
+  documentation evidence.
+- Read-only execute missions remain valid with documentation omitted or `none`.
+- Persistence / push-approval behavior unchanged.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest tests.test_documentation_policy \
+  tests.test_validate_regression tests.test_executor \
+  tests.test_structured_run_results tests.test_canonical_mission_schema_docs \
+  tests.test_structured_runs_api -v
+# Ran 95 tests — OK
+
+/app/.venv/bin/python -m unittest tests.test_workspace tests.test_api \
+  tests.test_runs_api tests.test_mission_builder tests.test_run_persistence -v
+# Ran 91 tests — OK
+```
+
+### Resulting commit
+
+Not committed in this mission (constraints forbid git staging/commits/pushes).
+
+### Limitations
+
+- Documentation path heuristic does not cover non-`.md` docs outside `docs/`.
+- Sync `POST /run` / legacy `POST /execute` do not emit structured documentation
+  evidence (async `POST /runs` lifecycle only).
+
+### Next Objective
+
+Optional follow-up: richer documentation path classification or builder field
+for `documentation.mode` on structured mission submission.
+
 ## 2026-07-24 — ChatGPT Actions openapi version must be 3.1.0
 
 ### Objective

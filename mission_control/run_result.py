@@ -41,6 +41,24 @@ WARNING_STDOUT_PREDATES_PERSISTENCE = (
     "result.summary, result.persistence, and commit_sha for the "
     "persistence outcome."
 )
+WARNING_DOCUMENTATION_PATH_HEURISTIC = (
+    "Documentation status updated vs not_required is derived from changed "
+    "file paths (docs/ prefix or .md suffix), not from agent stdout claims."
+)
+
+DOCUMENTATION_STATUS_NOT_REQUESTED = "not_requested"
+DOCUMENTATION_STATUS_UPDATED = "updated"
+DOCUMENTATION_STATUS_NOT_REQUIRED = "not_required"
+DOCUMENTATION_STATUS_FAILED = "failed"
+
+SUPPORTED_DOCUMENTATION_RESULT_STATUSES = frozenset(
+    {
+        DOCUMENTATION_STATUS_NOT_REQUESTED,
+        DOCUMENTATION_STATUS_UPDATED,
+        DOCUMENTATION_STATUS_NOT_REQUIRED,
+        DOCUMENTATION_STATUS_FAILED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +100,20 @@ class PersistenceEvidence:
     pushed: bool | None = None
 
 
+@dataclass(frozen=True)
+class DocumentationEvidence:
+    """Documentation policy outcome recorded by Mission Control.
+
+    ``mode`` is the validated mission ``documentation.mode`` (default ``none``
+    when omitted). ``status`` is derived from that mode plus Mission Control
+    execution artifacts (agent success and ``files_changed``), never from
+    agent stdout claims alone.
+    """
+
+    mode: str
+    status: str
+
+
 @dataclass
 class StructuredRunResult:
     """Objective execution and verification evidence for a terminal run."""
@@ -91,6 +123,7 @@ class StructuredRunResult:
     test_counts: dict[str, int] | None = None
     deliverables: DeliverableEvidence | None = None
     persistence: PersistenceEvidence | None = None
+    documentation: DocumentationEvidence | None = None
     warnings: list[str] = field(default_factory=list)
     # Mission Control-authored client summary; authoritative for persistence.
     summary: str | None = None
@@ -105,6 +138,11 @@ class StructuredRunResult:
             ),
             "persistence": (
                 asdict(self.persistence) if self.persistence is not None else None
+            ),
+            "documentation": (
+                asdict(self.documentation)
+                if self.documentation is not None
+                else None
             ),
             "warnings": list(self.warnings),
             "summary": self.summary,
@@ -169,6 +207,17 @@ class StructuredRunResult:
                 pushed=pushed,
             )
 
+        documentation = None
+        documentation_raw = data.get("documentation")
+        if isinstance(documentation_raw, dict):
+            doc_mode = documentation_raw.get("mode")
+            doc_status = documentation_raw.get("status")
+            if doc_mode is not None and doc_status is not None:
+                documentation = DocumentationEvidence(
+                    mode=str(doc_mode),
+                    status=str(doc_status),
+                )
+
         files_changed = data.get("files_changed") or []
         if not isinstance(files_changed, list):
             files_changed = []
@@ -190,6 +239,7 @@ class StructuredRunResult:
             test_counts=test_counts,
             deliverables=deliverables,
             persistence=persistence,
+            documentation=documentation,
             warnings=[str(item) for item in warnings],
             summary=summary,
         )
@@ -281,6 +331,62 @@ def append_warning(result: StructuredRunResult, warning: str) -> None:
         result.warnings.append(warning)
 
 
+def looks_like_documentation_path(path: str) -> bool:
+    """Return True when ``path`` looks like a documentation file path.
+
+    Conservative heuristic used only for structured ``documentation.status``
+    reporting (``updated`` vs ``not_required``). Not used to select files for
+    the agent to edit.
+    """
+    normalized = path.replace("\\", "/").lstrip("./")
+    if not normalized:
+        return False
+    if normalized == "docs" or normalized.startswith("docs/"):
+        return True
+    return normalized.endswith(".md")
+
+
+def build_documentation_evidence(
+    mission: dict,
+    *,
+    files_changed: list[str] | None = None,
+    handling_completed: bool,
+) -> DocumentationEvidence:
+    """Build authoritative documentation evidence from mission + artifacts.
+
+    ``handling_completed`` is True only when Mission Control considers the
+    agent execution successful enough that documentation review could have
+    completed (typically agent ``ok`` and, for async runs, deliverables gate
+    passed). It is never set from agent stdout claims.
+    """
+    from mission_control.validator import resolve_documentation_mode
+
+    mode = resolve_documentation_mode(mission)
+    if mode == "none":
+        return DocumentationEvidence(
+            mode="none",
+            status=DOCUMENTATION_STATUS_NOT_REQUESTED,
+        )
+
+    # mode == "required" (validated missions only reach here with supported modes)
+    if not handling_completed:
+        return DocumentationEvidence(
+            mode=mode,
+            status=DOCUMENTATION_STATUS_FAILED,
+        )
+
+    changed = files_changed or []
+    if any(looks_like_documentation_path(path) for path in changed):
+        return DocumentationEvidence(
+            mode=mode,
+            status=DOCUMENTATION_STATUS_UPDATED,
+        )
+    return DocumentationEvidence(
+        mode=mode,
+        status=DOCUMENTATION_STATUS_NOT_REQUIRED,
+    )
+
+
 def build_run_summary(
     *,
     persistence: PersistenceEvidence | None,
@@ -356,6 +462,16 @@ def finalize_structured_summary(
     """
     if result.persistence is not None and result.persistence.attempted:
         append_warning(result, WARNING_STDOUT_PREDATES_PERSISTENCE)
+    if (
+        result.documentation is not None
+        and result.documentation.mode == "required"
+        and result.documentation.status
+        in {
+            DOCUMENTATION_STATUS_UPDATED,
+            DOCUMENTATION_STATUS_NOT_REQUIRED,
+        }
+    ):
+        append_warning(result, WARNING_DOCUMENTATION_PATH_HEURISTIC)
     result.summary = build_run_summary(
         persistence=result.persistence,
         error=error,

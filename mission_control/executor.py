@@ -71,6 +71,15 @@ CREATE_AND_MODIFY_CONSTRAINTS = (
     *_NO_RECURSIVE_MISSIONS,
 )
 
+DOCUMENTATION_REQUIRED_INSTRUCTIONS = (
+    "Review repository documentation affected by the implementation.",
+    "Update relevant documentation when behavior, architecture, scope, "
+    "workflow, or significant decisions change.",
+    "Explicitly report when no documentation update is required and explain "
+    "why.",
+    "Treat documentation review as part of completion.",
+)
+
 
 @dataclass
 class ExecutionResult:
@@ -87,6 +96,8 @@ def build_cursor_instruction(
     mission: dict,
     constraints: tuple[str, ...] = READ_ONLY_CONSTRAINTS,
 ) -> str:
+    from mission_control.validator import resolve_documentation_mode
+
     title = mission.get("title", "")
     instructions = mission.get("instructions", "")
     deliverables = mission.get("deliverables", [])
@@ -98,6 +109,17 @@ def build_cursor_instruction(
     ]
 
     lines.extend(f"- {constraint}" for constraint in constraints)
+
+    if resolve_documentation_mode(mission) == "required":
+        lines.extend(
+            [
+                "",
+                "Documentation:",
+            ]
+        )
+        lines.extend(
+            f"- {item}" for item in DOCUMENTATION_REQUIRED_INSTRUCTIONS
+        )
 
     lines.extend(
         [
