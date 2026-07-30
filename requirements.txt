@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 PyYAML
-mcp
+mcp==1.29.0
 httpx
