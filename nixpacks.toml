@@ -1,7 +1,8 @@
 providers = ["python"]
 
 [phases.setup]
-aptPkgs = ["curl", "python3"]
+# git is required at runtime for isolated workspace clone / platform persistence.
+aptPkgs = ["curl", "python3", "git"]
 
 [phases.build]
 cmds = ["bash scripts/install-cursor-agent.sh"]
