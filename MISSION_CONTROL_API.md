@@ -735,6 +735,7 @@ Mission Control is configured for Railway using Nixpacks. The runner image inclu
 | Python 3 | `python3` on `PATH` (system package and/or `/app/.venv/bin/python3`) |
 | Cursor CLI | `cursor-agent` on `PATH` (`/app/.cursor-runtime` or `~/.local/bin`) |
 | App dependencies | Installed into `/app/.venv` from `requirements.txt` |
+| OCR (PDF pages) | `tesseract` + `pdftoppm` on `PATH` (apt: `tesseract-ocr`, `tesseract-ocr-eng`, `poppler-utils`); Python `pytesseract` and `pdf2image` in the venv |
 
 Execution preflight fails with `PYTHON_UNAVAILABLE` when no Python 3 interpreter can be resolved before a mission runs.
 
@@ -752,7 +753,7 @@ Set `MISSION_CONTROL_API_KEY` and `CURSOR_API_KEY` in the Railway service **Vari
 
 Railway reads:
 
-- `nixpacks.toml` — enables the Python provider, installs `curl` and `python3`, then runs `scripts/install-cursor-agent.sh`
+- `nixpacks.toml` — enables the Python provider, installs `curl`, `python3`, `git`, and the OCR apt stack (`tesseract-ocr`, `tesseract-ocr-eng`, `poppler-utils`), then runs `scripts/install-cursor-agent.sh`
 - `railway.json` — starts the API with `scripts/railway-start.sh`
 
 The install script runs:
