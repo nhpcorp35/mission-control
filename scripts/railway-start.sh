@@ -6,16 +6,25 @@ export PATH="/app/.venv/bin:/app/.cursor-runtime:$HOME/.local/bin:$PATH"
 mkdir -p /app/tmp
 
 # Cursor agent shells receive a sanitized PATH (/usr/local/bin, /usr/bin)
-# without /app/.venv/bin. Symlink venv Python/pip into /usr/local/bin when
-# present so agents can run python3 and import packages from the venv.
+# without /app/.venv/bin. Symlinks into /usr/local/bin break venv sys.prefix
+# (Python resolves the base interpreter). Install tiny exec wrappers instead
+# so agents keep /app/.venv packages (e.g. pypdf) when running python3.
 VENV_BIN="${MC_VENV_BIN:-/app/.venv/bin}"
 LOCAL_BIN="${MC_LOCAL_BIN:-/usr/local/bin}"
 if [ -d "${VENV_BIN}" ]; then
+  # Absolute VENV_BIN so wrappers exec a stable path and never LOCAL_BIN.
+  VENV_BIN="$(cd "${VENV_BIN}" && pwd)"
   mkdir -p "${LOCAL_BIN}"
   for exe in python3 python pip3 pip; do
     target="${VENV_BIN}/${exe}"
-    if [ -x "${target}" ]; then
-      ln -sfn "${target}" "${LOCAL_BIN}/${exe}"
+    # Only wrap real venv executables; never point at LOCAL_BIN (no recursion).
+    if [ -x "${target}" ] && [ ! -d "${target}" ]; then
+      dest="${LOCAL_BIN}/${exe}"
+      tmp="${dest}.tmp.$$"
+      # shellcheck disable=SC2016
+      printf '#!/bin/sh\nexec %s "$@"\n' "'${target}'" >"${tmp}"
+      chmod a+x "${tmp}"
+      mv -f "${tmp}" "${dest}"
     fi
   done
 fi
