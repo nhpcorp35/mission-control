@@ -1,51 +1,62 @@
 """Regression: Railway/Railpack OCR runtime for LegalAI PDF page extraction.
 
-Verifies nixpacks apt packages and Python OCR integrations are declared so
-the deployed executor can invoke tesseract and import pytesseract/pdf2image
-from agent shells. Does not run OCR (no PDF conversion or recognition).
+Verifies Railpack deploy apt packages (the builder actually used on Railway)
+and Python OCR integrations are declared so the deployed executor can invoke
+tesseract and import pytesseract/pdf2image from agent shells. Does not run
+OCR (no PDF conversion or recognition).
+
+Nixpacks aptPkgs alone are insufficient: Railpack ignores nixpacks.toml.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import shutil
 import subprocess
-import tomllib
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-NIXPACKS_TOML = REPO_ROOT / "nixpacks.toml"
+RAILPACK_JSON = REPO_ROOT / "railpack.json"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
 
 # Minimal OCR stack: system binary + PDF rasterizer + Python bindings.
 REQUIRED_APT_OCR = ("tesseract-ocr", "tesseract-ocr-eng", "poppler-utils")
 REQUIRED_PIP_OCR = ("pytesseract", "pdf2image")
-PRESERVED_APT = ("curl", "python3", "git")
 
 
 class TestExecutorOcrRuntime(unittest.TestCase):
-    def test_nixpacks_apt_pkgs_include_ocr_stack(self) -> None:
-        raw = NIXPACKS_TOML.read_text(encoding="utf-8")
-        config = tomllib.loads(raw)
-        apt_pkgs = config["phases"]["setup"]["aptPkgs"]
+    def test_railpack_deploy_apt_packages_include_ocr_stack(self) -> None:
+        self.assertTrue(
+            RAILPACK_JSON.is_file(),
+            msg=(
+                "railpack.json is required: Railway builds with Railpack, "
+                "which ignores nixpacks.toml aptPkgs"
+            ),
+        )
+        config = json.loads(RAILPACK_JSON.read_text(encoding="utf-8"))
+        apt_pkgs = config["deploy"]["aptPackages"]
+        self.assertIn(
+            "...",
+            apt_pkgs,
+            msg=(
+                "deploy.aptPackages must include '...' so Railpack extends "
+                "its default runtime apt set instead of replacing it"
+            ),
+        )
         for pkg in REQUIRED_APT_OCR:
             self.assertIn(
                 pkg,
                 apt_pkgs,
                 msg=(
-                    f"nixpacks.toml [phases.setup] aptPkgs must include {pkg} "
-                    "for LegalAI PDF-page OCR on the Railway executor"
+                    f"railpack.json deploy.aptPackages must include {pkg} "
+                    "for LegalAI PDF-page OCR on the Railway executor "
+                    "(nixpacks.toml alone is ignored by Railpack)"
                 ),
             )
-        for pkg in PRESERVED_APT:
-            self.assertIn(pkg, apt_pkgs)
-        self.assertEqual(
-            config["phases"]["build"]["cmds"],
-            ["bash scripts/install-cursor-agent.sh"],
-        )
 
     def test_requirements_declare_ocr_packages(self) -> None:
         text = REQUIREMENTS.read_text(encoding="utf-8")

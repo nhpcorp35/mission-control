@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "deploy": {
+    "aptPackages": [
+      "...",
+      "tesseract-ocr",
+      "tesseract-ocr-eng",
+      "poppler-utils"
+    ]
+  }
+}
