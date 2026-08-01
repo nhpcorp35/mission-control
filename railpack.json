@@ -3,6 +3,7 @@
   "deploy": {
     "aptPackages": [
       "...",
+      "git",
       "tesseract-ocr",
       "tesseract-ocr-eng",
       "poppler-utils"
