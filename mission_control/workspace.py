@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 from dataclasses import dataclass
+import json
 import logging
 import os
 from pathlib import Path
@@ -44,6 +45,23 @@ PLATFORM_PUSH_APPROVAL_REQUIRED = (
     "PLATFORM_PUSH_APPROVAL_REQUIRED: persistence.mode=push requires "
     "explicit approval.platform_push_approved=true (or the "
     "allow_automatic_platform_push=true policy)"
+)
+
+# Optional JSON object mapping repository.name → clone URL.
+REPOSITORY_URL_MAP_ENV = "MISSION_CONTROL_REPOSITORY_URL_MAP"
+# Optional override when repository.name selects Mission Control itself.
+SELF_REPOSITORY_URL_ENV = "MISSION_CONTROL_SELF_REPOSITORY_URL"
+DEFAULT_MISSION_CONTROL_CLONE_URL = (
+    "https://github.com/nhpcorp35/mission-control.git"
+)
+
+# Names that must clone Mission Control rather than the legacy single-repo
+# MISSION_CONTROL_REPOSITORY_URL (commonly pointed at Legal AI).
+_MISSION_CONTROL_REPOSITORY_NAMES = frozenset(
+    {
+        "mission-control",
+        "nhpcorp35/mission-control",
+    }
 )
 
 
@@ -153,16 +171,84 @@ def configure_workspace_origin(
     return _run_git(["-C", workspace_path, "remote", "set-url", "origin", origin_url])
 
 
+def _repository_name(mission: dict) -> str:
+    repository = mission.get("repository")
+    if not isinstance(repository, dict):
+        return ""
+    name = repository.get("name")
+    if not isinstance(name, str):
+        return ""
+    return name.strip()
+
+
+def _is_mission_control_repository_name(name: str) -> bool:
+    """Return whether ``name`` selects the Mission Control GitHub repository."""
+    if not name:
+        return False
+    return name.casefold() in {
+        alias.casefold() for alias in _MISSION_CONTROL_REPOSITORY_NAMES
+    }
+
+
+def resolve_mission_clone_url(mission: dict) -> tuple[str | None, str | None]:
+    """Return ``(clone_url, error)`` for the mission's isolated workspace.
+
+    Persistence inspects the clone prepared here. If that clone is a different
+    repository than the one identified by ``repository.name``, the coding agent
+    may modify the intended repo while platform persistence sees an empty tree
+    ("no repository changes"). Resolve the clone URL from ``repository.name``
+    (and optional URL map) so agent and persistence share one checkout.
+    """
+    name = _repository_name(mission)
+    name_key = name.casefold()
+
+    raw_map = os.environ.get(REPOSITORY_URL_MAP_ENV, "").strip()
+    if raw_map:
+        try:
+            mapping = json.loads(raw_map)
+        except json.JSONDecodeError:
+            return None, f"{REPOSITORY_URL_MAP_ENV} must be a JSON object"
+        if not isinstance(mapping, dict):
+            return None, f"{REPOSITORY_URL_MAP_ENV} must be a JSON object"
+        for key in (name, name_key):
+            if not key:
+                continue
+            value = mapping.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip(), None
+        for map_key, value in mapping.items():
+            if (
+                isinstance(map_key, str)
+                and map_key.casefold() == name_key
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                return value.strip(), None
+
+    if _is_mission_control_repository_name(name):
+        self_url = os.environ.get(SELF_REPOSITORY_URL_ENV, "").strip()
+        return (self_url or DEFAULT_MISSION_CONTROL_CLONE_URL), None
+
+    repository_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL", "").strip()
+    if not repository_url:
+        return None, (
+            "MISSION_CONTROL_REPOSITORY_URL is not configured. "
+            "Set it to the Git clone URL for the repository."
+        )
+    return repository_url, None
+
+
 def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
-    """Clone the configured repository into a temporary isolated workspace."""
+    """Clone the mission's target repository into a temporary workspace."""
     repository = mission["repository"]
     base_branch = repository["base_branch"]
-    repository_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL", "").strip()
+    repository_url, url_error = resolve_mission_clone_url(mission)
 
-    if not repository_url:
+    if url_error is not None or not repository_url:
         return WorkspacePrepResult(
             ok=False,
-            error=(
+            error=url_error
+            or (
                 "MISSION_CONTROL_REPOSITORY_URL is not configured. "
                 "Set it to the Git clone URL for the repository."
             ),
@@ -187,7 +273,12 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
             message = f"git clone failed with code {clone.returncode}"
         return WorkspacePrepResult(ok=False, error=message)
 
-    return WorkspacePrepResult(ok=True, workspace_path=workspace_path)
+    # Canonicalize so agent --workspace / cwd and persistence git -C agree
+    # even when /tmp (or the mkdtemp path) involves symlinks.
+    return WorkspacePrepResult(
+        ok=True,
+        workspace_path=os.path.realpath(workspace_path),
+    )
 
 
 def prepare_ephemeral_checkout(
@@ -832,7 +923,8 @@ def execute_registered_run(
             registry.update_status(run_id, RunStatus.FAILED)
             return
 
-        workspace_path = prep.workspace_path
+        # realpath: same absolute checkout for agent --workspace and persistence.
+        workspace_path = os.path.realpath(prep.workspace_path)
         assert workspace_path is not None
 
         isolated_mission = copy.deepcopy(mission)

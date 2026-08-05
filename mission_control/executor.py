@@ -3,12 +3,16 @@
 from dataclasses import dataclass
 import logging
 import os
+import signal
 import subprocess
 
 from app.cursor_cli import cursor_cli_env, find_cursor_agent_binary
 
 CURSOR_AGENT = "cursor-agent"
 EXECUTION_TIMEOUT_SECONDS = 600
+# After killing a timed-out agent, wait at most this long for pipes to close.
+# Unbounded communicate() can hang forever when grandchildren keep stdio open.
+CLEANUP_TIMEOUT_SECONDS = 10
 _MAX_ERROR_LOG_CHARS = 500
 
 logger = logging.getLogger(__name__)
@@ -22,6 +26,52 @@ def _bound_error_text(text: str | None) -> str:
     if len(cleaned) > _MAX_ERROR_LOG_CHARS:
         return f"{cleaned[:_MAX_ERROR_LOG_CHARS]}...[truncated]"
     return cleaned
+
+
+def _decode_pipe_output(value: str | bytes | None) -> str:
+    """Normalize subprocess pipe bytes/str (or None) to str."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL the agent process group, falling back to the direct child.
+
+    Cursor Agent may spawn children that inherit stdout/stderr. Killing only
+    the parent leaves those children holding pipes open, so a later
+    ``communicate()`` never sees EOF.
+    """
+    pid = proc.pid
+    if pid is None:
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except (PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+    try:
+        # Keep Popen's internal state consistent when killpg already reaped it.
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
+def _close_process_pipes(proc: subprocess.Popen[str]) -> None:
+    """Best-effort close of child stdio pipes after a cleanup timeout."""
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 _NO_RECURSIVE_MISSIONS = (
     "Do not submit recursive Mission Control missions.",
@@ -250,6 +300,9 @@ def _run_cursor_agent(
             text=True,
             cwd=workspace,
             env=cursor_cli_env(),
+            # New session ⇒ process group id == pid, so timeout cleanup can
+            # SIGKILL grandchildren that would otherwise keep stdio pipes open.
+            start_new_session=True,
         )
     except FileNotFoundError:
         logger.error(
@@ -317,9 +370,26 @@ def _run_cursor_agent(
 
     try:
         stdout, stderr = proc.communicate(timeout=EXECUTION_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
+    except subprocess.TimeoutExpired as timed_out:
+        _terminate_process_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Grandchildren (or a stuck agent) still hold pipes open. Do not
+            # block the run worker indefinitely — return with partial output.
+            stdout = _decode_pipe_output(timed_out.stdout)
+            stderr = _decode_pipe_output(timed_out.stderr)
+            _close_process_pipes(proc)
+            logger.error(
+                (
+                    "lifecycle run_id=%s event=subprocess_cleanup_timeout "
+                    "api_pid=%s child_pid=%s cleanup_timeout_seconds=%s"
+                ),
+                run_label,
+                os.getpid(),
+                child_pid,
+                CLEANUP_TIMEOUT_SECONDS,
+            )
         logger.error(
             (
                 "lifecycle run_id=%s event=subprocess_completed "

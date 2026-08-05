@@ -258,7 +258,111 @@ class TestRunCursorAgent(unittest.TestCase):
         result = run_cursor_agent(_sample_mission())
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error or "")
-        proc.kill.assert_called_once()
+        mock_popen.assert_called_once()
+        self.assertTrue(
+            mock_popen.call_args.kwargs.get("start_new_session"),
+        )
+
+    @patch(
+        "mission_control.executor.find_cursor_agent_binary",
+        return_value=CURSOR_AGENT,
+    )
+    @patch("mission_control.executor.subprocess.Popen")
+    def test_run_timeout_cleanup_communicate_also_times_out(
+        self,
+        mock_popen,
+        _mock_binary,
+    ) -> None:
+        """Post-kill communicate must not hang the worker forever."""
+        from mission_control.executor import CLEANUP_TIMEOUT_SECONDS
+
+        timed_out = subprocess.TimeoutExpired(
+            cmd=[CURSOR_AGENT],
+            timeout=EXECUTION_TIMEOUT_SECONDS,
+            output="partial-out",
+            stderr="partial-err",
+        )
+        proc = MagicMock()
+        proc.pid = 99
+        proc.stdout = MagicMock()
+        proc.stderr = MagicMock()
+        proc.stdin = None
+        proc.communicate.side_effect = [
+            timed_out,
+            subprocess.TimeoutExpired(
+                cmd=[CURSOR_AGENT],
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            ),
+        ]
+        mock_popen.return_value = proc
+
+        with patch(
+            "mission_control.executor._terminate_process_tree",
+        ) as mock_terminate:
+            result = run_cursor_agent(_sample_mission())
+
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error or "")
+        self.assertEqual(result.stdout, "partial-out")
+        self.assertEqual(result.stderr, "partial-err")
+        mock_terminate.assert_called_once_with(proc)
+        proc.stdout.close.assert_called_once()
+        proc.stderr.close.assert_called_once()
+        self.assertEqual(proc.communicate.call_count, 2)
+        second_kwargs = proc.communicate.call_args_list[1].kwargs
+        self.assertEqual(
+            second_kwargs.get("timeout"),
+            CLEANUP_TIMEOUT_SECONDS,
+        )
+
+    def test_timeout_with_orphaned_child_pipe_holder_returns(self) -> None:
+        """Real subprocess: grandchild holds stdout after parent kill.
+
+        Legacy unbounded ``communicate()`` after ``kill()`` hangs forever in
+        this situation; the fix must return a timed-out result promptly.
+        """
+        import sys
+        import time
+
+        from mission_control import executor as executor_module
+
+        orphan_script = """
+import os, signal, sys, time
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    time.sleep(3600)
+    os._exit(0)
+sys.stdout.write("agent-started\\n")
+sys.stdout.flush()
+time.sleep(3600)
+"""
+
+        original_timeout = executor_module.EXECUTION_TIMEOUT_SECONDS
+        original_cleanup = executor_module.CLEANUP_TIMEOUT_SECONDS
+        executor_module.EXECUTION_TIMEOUT_SECONDS = 1
+        executor_module.CLEANUP_TIMEOUT_SECONDS = 1
+        mission = _sample_mission()
+        mission["repository"] = {"path": "/tmp"}
+        started = time.monotonic()
+        try:
+            with patch(
+                "mission_control.executor.find_cursor_agent_binary",
+                return_value=sys.executable,
+            ), patch(
+                "mission_control.executor.build_cursor_agent_command",
+                return_value=[sys.executable, "-c", orphan_script],
+            ):
+                result = run_cursor_agent(mission)
+        finally:
+            executor_module.EXECUTION_TIMEOUT_SECONDS = original_timeout
+            executor_module.CLEANUP_TIMEOUT_SECONDS = original_cleanup
+
+        elapsed = time.monotonic() - started
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error or "")
+        # Must finish well under the legacy infinite hang; allow generous CI.
+        self.assertLess(elapsed, 15.0)
 
 
 if __name__ == "__main__":

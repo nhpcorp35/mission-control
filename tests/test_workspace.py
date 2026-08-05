@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -14,7 +15,10 @@ from mission_control.executor import ExecutionResult
 from mission_control.run_registry import RunRegistry, RunStatus
 from mission_control.validator import validate_mission_for_execute
 from mission_control.workspace import (
+    DEFAULT_MISSION_CONTROL_CLONE_URL,
     PLATFORM_PUSH_APPROVAL_REQUIRED,
+    REPOSITORY_URL_MAP_ENV,
+    SELF_REPOSITORY_URL_ENV,
     PersistenceResult,
     WorkspacePrepResult,
     cleanup_workspace,
@@ -28,6 +32,7 @@ from mission_control.workspace import (
     persist_workspace_changes,
     prepare_isolated_workspace,
     require_platform_push_approval,
+    resolve_mission_clone_url,
     resolve_safe_workspace_deliverable,
     verify_declared_file_deliverables,
 )
@@ -1131,6 +1136,260 @@ class TestExecuteRegisteredRun(unittest.TestCase):
                     self.assertIsNone(result.commit_sha)
             finally:
                 cleanup_workspace(path)
+
+
+class TestMissionCloneUrlResolution(unittest.TestCase):
+    """repository.name must select the clone URL persistence will inspect."""
+
+    def setUp(self) -> None:
+        self._previous_repo_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL")
+        self._previous_map = os.environ.get(REPOSITORY_URL_MAP_ENV)
+        self._previous_self = os.environ.get(SELF_REPOSITORY_URL_ENV)
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = (
+            "https://github.com/nhpcorp35/legal-ai.git"
+        )
+        os.environ.pop(REPOSITORY_URL_MAP_ENV, None)
+        os.environ.pop(SELF_REPOSITORY_URL_ENV, None)
+
+    def tearDown(self) -> None:
+        if self._previous_repo_url is None:
+            os.environ.pop("MISSION_CONTROL_REPOSITORY_URL", None)
+        else:
+            os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._previous_repo_url
+        if self._previous_map is None:
+            os.environ.pop(REPOSITORY_URL_MAP_ENV, None)
+        else:
+            os.environ[REPOSITORY_URL_MAP_ENV] = self._previous_map
+        if self._previous_self is None:
+            os.environ.pop(SELF_REPOSITORY_URL_ENV, None)
+        else:
+            os.environ[SELF_REPOSITORY_URL_ENV] = self._previous_self
+
+    def test_mission_control_name_does_not_use_legal_ai_env_url(self) -> None:
+        mission = {
+            "repository": {
+                "name": "nhpcorp35/mission-control",
+                "path": ".",
+                "base_branch": "main",
+            }
+        }
+        url, error = resolve_mission_clone_url(mission)
+        self.assertIsNone(error)
+        self.assertEqual(url, DEFAULT_MISSION_CONTROL_CLONE_URL)
+        self.assertNotIn("legal-ai", url or "")
+
+    def test_mission_control_alias_casefold(self) -> None:
+        mission = {
+            "repository": {
+                "name": "Mission-Control",
+                "path": ".",
+                "base_branch": "main",
+            }
+        }
+        url, error = resolve_mission_clone_url(mission)
+        self.assertIsNone(error)
+        self.assertEqual(url, DEFAULT_MISSION_CONTROL_CLONE_URL)
+
+    def test_legal_ai_name_uses_legacy_env_url(self) -> None:
+        mission = {
+            "repository": {
+                "name": "nhpcorp35/legal-ai",
+                "path": ".",
+                "base_branch": "main",
+            }
+        }
+        url, error = resolve_mission_clone_url(mission)
+        self.assertIsNone(error)
+        self.assertEqual(url, "https://github.com/nhpcorp35/legal-ai.git")
+
+    def test_url_map_overrides_mission_control_default(self) -> None:
+        os.environ[REPOSITORY_URL_MAP_ENV] = json.dumps(
+            {"nhpcorp35/mission-control": "file:///tmp/mc-mirror.git"}
+        )
+        mission = {
+            "repository": {
+                "name": "nhpcorp35/mission-control",
+                "path": ".",
+                "base_branch": "main",
+            }
+        }
+        url, error = resolve_mission_clone_url(mission)
+        self.assertIsNone(error)
+        self.assertEqual(url, "file:///tmp/mc-mirror.git")
+
+
+class TestPersistenceHandoff(unittest.TestCase):
+    """Agent file modifications must be visible to platform persistence."""
+
+    def setUp(self) -> None:
+        self.fixture = GitRepoFixture()
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        self.registry = RunRegistry(self._db_path)
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+        self.registry.close()
+        os.unlink(self._db_path)
+
+    def _fake_agent_write(
+        self,
+        seen: dict[str, str],
+        relative_path: str = "agent_created.txt",
+        content: str = "from agent\n",
+    ):
+        def fake_agent(mission: dict, run_id: str | None = None) -> ExecutionResult:
+            workspace = mission["repository"]["path"]
+            seen["agent_workspace"] = os.path.realpath(workspace)
+            target = Path(workspace) / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            return ExecutionResult(
+                ok=True,
+                stdout="agent done\n",
+                return_code=0,
+                command=["cursor-agent", "--workspace", workspace],
+            )
+
+        return fake_agent
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    def test_agent_modifications_are_committed_on_same_workspace(
+        self,
+        _mock_cleanup,
+    ) -> None:
+        seen: dict[str, str] = {}
+        mission = self.fixture.mission(persistence_mode="commit")
+        mission["deliverables"] = ["agent_created.txt"]
+
+        with patch(
+            "mission_control.workspace.execute_cursor_agent",
+            side_effect=self._fake_agent_write(seen),
+        ):
+            record = self.registry.create_run()
+            execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        self.assertEqual(updated.status, RunStatus.COMPLETED)
+        self.assertIsNotNone(updated.commit_sha)
+        assert updated.result is not None
+        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+        assert updated.result.persistence is not None
+        self.assertTrue(updated.result.persistence.attempted)
+        self.assertTrue(updated.result.persistence.ok)
+        self.assertEqual(updated.result.persistence.mode, "commit")
+        self.assertFalse(updated.result.persistence.pushed)
+        self.assertEqual(
+            updated.result.persistence.commit_sha,
+            updated.commit_sha,
+        )
+        self.assertIn("agent_workspace", seen)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    def test_approved_push_handoff_records_pushed_true(
+        self,
+        _mock_cleanup,
+    ) -> None:
+        seen: dict[str, str] = {}
+        mission = self.fixture.mission(
+            persistence_mode="push",
+            platform_push_approved=True,
+            allow_automatic_platform_push=True,
+        )
+        mission["deliverables"] = ["agent_created.txt"]
+
+        with patch(
+            "mission_control.workspace.execute_cursor_agent",
+            side_effect=self._fake_agent_write(seen),
+        ), patch(
+            "mission_control.workspace._github_push_environment",
+            return_value=(os.environ.copy(), None),
+        ):
+            record = self.registry.create_run()
+            execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        self.assertEqual(updated.status, RunStatus.COMPLETED, updated.error)
+        self.assertIsNotNone(updated.commit_sha)
+        assert updated.result is not None
+        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+        assert updated.result.persistence is not None
+        self.assertTrue(updated.result.persistence.ok)
+        self.assertEqual(updated.result.persistence.mode, "push")
+        self.assertTrue(updated.result.persistence.pushed)
+
+        # Bare remote received the commit.
+        remote_sha = _run_git(
+            ["--git-dir", str(self.fixture.bare_remote), "rev-parse", "main"]
+        ).stdout.strip()
+        self.assertEqual(remote_sha, updated.commit_sha)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    def test_unapproved_push_handoff_is_rejected(
+        self,
+        _mock_cleanup,
+    ) -> None:
+        seen: dict[str, str] = {}
+        mission = self.fixture.mission(
+            persistence_mode="push",
+            platform_push_approved=False,
+            allow_automatic_platform_push=False,
+        )
+        mission["deliverables"] = ["agent_created.txt"]
+
+        with patch(
+            "mission_control.workspace.execute_cursor_agent",
+            side_effect=self._fake_agent_write(seen),
+        ):
+            record = self.registry.create_run()
+            execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        self.assertEqual(updated.status, RunStatus.FAILED)
+        self.assertEqual(updated.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
+        assert updated.result is not None
+        # Agent edits were detected even though push was rejected.
+        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+        assert updated.result.persistence is not None
+        self.assertTrue(updated.result.persistence.attempted)
+        self.assertFalse(updated.result.persistence.ok)
+        self.assertFalse(updated.result.persistence.pushed)
+
+    def test_prepare_clones_mapped_url_for_mission_control_name(self) -> None:
+        """Mission Control names must not silently clone the Legal AI env URL."""
+        other = GitRepoFixture()
+        try:
+            os.environ[REPOSITORY_URL_MAP_ENV] = json.dumps(
+                {"nhpcorp35/mission-control": str(other.bare_remote)}
+            )
+            # Point legacy env at a different remote; name must win.
+            os.environ["MISSION_CONTROL_REPOSITORY_URL"] = str(
+                self.fixture.bare_remote
+            )
+            mission = {
+                "repository": {
+                    "name": "nhpcorp35/mission-control",
+                    "path": str(self.fixture.source_repo),
+                    "base_branch": other.base_branch,
+                }
+            }
+            prep = prepare_isolated_workspace(mission)
+            self.assertTrue(prep.ok, prep.error)
+            assert prep.workspace_path is not None
+            try:
+                origin = get_origin_url(prep.workspace_path)
+                self.assertEqual(origin, str(other.bare_remote))
+                self.assertEqual(
+                    os.path.realpath(prep.workspace_path),
+                    prep.workspace_path,
+                )
+            finally:
+                cleanup_workspace(prep.workspace_path)
+        finally:
+            other.cleanup()
 
 
 if __name__ == "__main__":

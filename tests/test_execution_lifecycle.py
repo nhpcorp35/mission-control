@@ -372,6 +372,36 @@ class TestRunsLifecycleApi(unittest.TestCase):
         self.assertEqual(stored.error, "agent crashed")
         self.assertEqual(stored.return_code, 42)
 
+    @patch("app.api.execute_registered_run")
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_worker_guarantees_terminal_status_after_uncaught_error(
+        self,
+        _mock_preflight,
+        mock_execute_registered,
+    ) -> None:
+        """If the registered-run path raises after marking RUNNING, the
+        queue worker must still move the run to a terminal failed state.
+        """
+
+        def leave_running(run_id: str, mission: dict, registry: object) -> None:
+            del mission
+            registry.update_status(run_id, RunStatus.RUNNING)
+            raise RuntimeError("simulated worker crash after start")
+
+        mock_execute_registered.side_effect = leave_running
+
+        run_id = self.client.post(
+            "/runs",
+            json={"mission_yaml": _executable_mission_yaml("stuck-guard")},
+        ).json()["run_id"]
+        body = self._wait_for_terminal(run_id, timeout=5.0)
+        self.assertEqual(body["status"], "failed")
+        self.assertTrue(body.get("error"))
+        stored = api_module.run_registry.get_run(run_id)
+        assert stored is not None
+        self.assertEqual(stored.status, RunStatus.FAILED)
+        self.assertIsNotNone(stored.completed_at)
+
     def test_recursion_guard_blocks_nested_local_submission(self) -> None:
         from mission_control.recursion import is_recursive_submission
         from starlette.requests import Request

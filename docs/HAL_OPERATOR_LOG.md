@@ -1,5 +1,117 @@
 # HAL Operator Log
 
+## 2026-08-05 — Workspace persistence handoff (repository.name → clone URL)
+
+### Objective
+
+Approved structured missions targeting `nhpcorp35/mission-control` completed with
+`files_changed: []` and `persistence` reporting “no repository changes” even
+when the coding agent had modified Mission Control sources.
+
+### Root cause
+
+`prepare_isolated_workspace` always cloned `MISSION_CONTROL_REPOSITORY_URL`
+(Legal AI on this deployment), ignoring `repository.name`.
+
+- Agent `--workspace` / cwd: isolated Legal AI checkout under
+  `/tmp/mission-control-run-*`
+- Agent edits for Mission Control missions: discovered checkout at
+  `/tmp/mission-control` (or `/app`)
+- Platform persistence: `git status` / commit / push on the Legal AI clone
+
+Same process, different trees → clean porcelain → no commit/push.
+
+### Implementation
+
+- `mission_control/workspace.py`: `resolve_mission_clone_url` selects the clone
+  URL from `repository.name` (optional `MISSION_CONTROL_REPOSITORY_URL_MAP`,
+  Mission Control aliases → `nhpcorp35/mission-control`, else legacy
+  `MISSION_CONTROL_REPOSITORY_URL`). Workspace paths are `realpath`-canonicalized
+  so agent and persistence share one checkout. Isolation model unchanged
+  (temp clone; agent `stage_changes`/`commit`/`push` remain false).
+- Executor timeout/lifecycle fix (process-group kill + bounded cleanup
+  communicate + worker terminal-status guarantee) included in the same ship
+  because it was verified but not yet on `main`.
+
+### Tests executed
+
+```text
+/tmp/mc-venv/bin/python -m unittest \
+  tests.test_workspace \
+  tests.test_executor \
+  tests.test_execution_lifecycle \
+  tests.test_lifecycle_instrumentation \
+  tests.test_run_persistence \
+  tests.test_runs_api \
+  tests.test_api \
+  -v
+# Ran 126 tests — OK
+```
+
+### Next Objective
+
+Confirm Railway redeploy of `mission-control` picks up the push; Mission Control
+named missions must clone Mission Control and persist agent edits.
+
+## 2026-08-05 — Stuck `running` runs after agent timeout cleanup hang
+
+### Objective
+
+Mission Control runs could remain in `running` indefinitely with empty
+stdout/stderr/summary/commit after the Cursor Agent wall-clock timeout,
+because timeout cleanup blocked forever on open stdio pipes.
+
+### Root cause
+
+On `subprocess.TimeoutExpired`, the executor called `proc.kill()` then
+**unbounded** `proc.communicate()`. Cursor Agent grandchildren that still held
+stdout/stderr prevented EOF, so the queue worker never returned, never stored
+results, and never moved the run to `timed_out` / `failed` / `completed`.
+
+### Implementation
+
+- `mission_control/executor.py`: start the agent in a new session; on timeout
+  SIGKILL the process group; bound cleanup `communicate()` to
+  `CLEANUP_TIMEOUT_SECONDS`; if cleanup still times out, return a timed-out
+  `ExecutionResult` with any partial output instead of hanging.
+- `app/api.py` `_execute_queued_run`: if the worker exits while the run is
+  still non-terminal, force `failed` with a stored error (does not weaken
+  approvals or execution permissions).
+
+### Tests executed
+
+```text
+/tmp/mc-venv/bin/python -m unittest \
+  tests.test_executor \
+  tests.test_execution_lifecycle \
+  tests.test_lifecycle_instrumentation \
+  tests.test_workspace \
+  tests.test_run_persistence \
+  tests.test_runs_api \
+  tests.test_api \
+  -v
+# Ran 118 tests — OK
+```
+
+### Resulting commit
+
+Not committed / not pushed (mission constraints forbid git staging, commits,
+and pushes). Working tree holds the focused fix only on:
+`mission_control/executor.py`, `app/api.py`, `tests/test_executor.py`,
+`tests/test_execution_lifecycle.py`, and this log entry.
+
+### Railway / production
+
+Cannot verify Railway deployment until the fix is committed and pushed to
+`nhpcorp35/mission-control` `main` under a mission that permits git + deploy.
+
+### Next Objective
+
+Commit and push the executor/queue terminal-status fix to production Mission
+Control, then confirm previously stuck timeout paths surface as `timed_out`
+with observable lifecycle logs (`subprocess_completed` /
+`subprocess_cleanup_timeout`).
+
 ## 2026-07-28 — Structured mission persistence defaults (mutation → push)
 
 ### Objective

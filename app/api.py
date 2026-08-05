@@ -93,9 +93,30 @@ def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> No
                 os.getpid(),
                 id(registry),
             )
-            raise
+            # Fall through to the terminal-status guarantee below instead of
+            # re-raising: an uncaught exception must not leave the run stuck
+            # in queued/running with empty stdout/stderr/summary.
         finally:
             record = registry.get_run(run_id)
+            if record is not None and not is_terminal_status(record.status):
+                error = record.error or (
+                    "Run worker exited without reaching a terminal status."
+                )
+                try:
+                    registry.store_result(run_id, error=error)
+                    registry.update_status(run_id, RunStatus.FAILED)
+                    record = registry.get_run(run_id)
+                except Exception:
+                    logger.exception(
+                        (
+                            "lifecycle run_id=%s event=exception "
+                            "api_pid=%s registry_id=%s "
+                            "stage=terminal_status_guarantee"
+                        ),
+                        run_id,
+                        os.getpid(),
+                        id(registry),
+                    )
             status = record.status.value if record is not None else "unknown"
             error = record.error if record is not None else None
             count, keys = registry.diagnostic_state()
