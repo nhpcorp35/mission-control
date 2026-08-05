@@ -24,6 +24,7 @@ EXPECTED_TOOL_NAMES = (
     "get_run",
     "wait_for_run",
     "submit_and_wait",
+    "run_repository_command",
 )
 
 
@@ -44,6 +45,8 @@ mcp = FastMCP(
         "raw YAML (submit_run), retrieve asynchronous run status, and wait "
         "for runs to reach a terminal state. For exact YAML end-to-end in "
         "one tool call, use submit_and_wait (submit_run + wait_for_run). "
+        "For allowlisted LegalAI generation CLI execution in an ephemeral "
+        "checkout without free-form YAML, use run_repository_command. "
         "Intended HAL flow: submit_and_wait with exact YAML, or "
         "submit_structured_run (or submit_run) then wait_for_run until "
         "status is terminal (or repeat when wait_expired is true), then "
@@ -228,6 +231,54 @@ async def submit_and_wait(
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def run_repository_command(
+    repository: str,
+    ref: str,
+    argv: list[str],
+    working_directory: str = ".",
+    timeout_seconds: float = 300.0,
+    allowed_env_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run one allowlisted repository command in an ephemeral checkout.
+
+    Structured alternative to free-form mission YAML for LegalAI generation
+    CLI execution. argv is executed directly (no shell). Initial allowlist:
+    python3 scripts/generate_attorney_feedback_candidate.py with explicit
+    arguments. Persistence is always none. Sensitive argv values are
+    redacted. Returns run_id, checkout_commit, argv, stdout, stderr,
+    exit_code, elapsed_seconds, artifact_paths, and persistence.
+    """
+    try:
+        if not repository.strip():
+            raise ValueError("repository must not be empty")
+        if not ref.strip():
+            raise ValueError("ref must not be empty")
+        if not isinstance(argv, list) or not argv:
+            raise ValueError("argv must be a non-empty list")
+        if any(not isinstance(item, str) for item in argv):
+            raise ValueError("argv entries must be strings")
+
+        result = await client.run_repository_command(
+            repository=repository,
+            ref=ref,
+            argv=argv,
+            working_directory=working_directory,
+            timeout_seconds=timeout_seconds,
+            allowed_env_names=(
+                list(allowed_env_names)
+                if allowed_env_names is not None
+                else []
+            ),
+        )
+        # API already returns ok; avoid double-wrapping conflicting ok flags.
+        if "ok" in result:
+            return result
         return {"ok": True, **result}
     except Exception as exc:
         return _tool_error(exc)

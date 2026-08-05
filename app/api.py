@@ -31,6 +31,13 @@ from mission_control.run_registry import (
 )
 from mission_control.run_result import StructuredRunResult
 from mission_control.workspace import execute_registered_run
+from mission_control.command_runner import (
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_TIMEOUT_SECONDS,
+    MIN_TIMEOUT_SECONDS,
+    RepositoryCommandSpec,
+    run_repository_command,
+)
 from mission_control.mission_builder import (
     DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH,
     DEFAULT_BASE_BRANCH,
@@ -309,6 +316,50 @@ class SubmitAndWaitRequest(BaseModel):
         ge=WAIT_MIN_POLL_INTERVAL_SECONDS,
         le=WAIT_MAX_POLL_INTERVAL_SECONDS,
     )
+
+
+class RepositoryCommandRequest(BaseModel):
+    """Typed repository command execution (POST /repository-commands)."""
+
+    repository: str = Field(..., min_length=1)
+    ref: str = Field(
+        ...,
+        min_length=1,
+        description="Branch name or commit SHA to check out.",
+    )
+    argv: list[str] = Field(..., min_length=2)
+    working_directory: str = "."
+    timeout_seconds: float = Field(
+        default=DEFAULT_TIMEOUT_SECONDS,
+        ge=MIN_TIMEOUT_SECONDS,
+        le=MAX_TIMEOUT_SECONDS,
+    )
+    allowed_env_names: list[str] = Field(default_factory=list)
+
+
+class RepositoryCommandPersistenceModel(BaseModel):
+    mode: str = "none"
+    attempted: bool = False
+    ok: bool | None = True
+    commit_sha: str | None = None
+    pushed: bool | None = False
+
+
+class RepositoryCommandResponse(BaseModel):
+    """Allowlisted repository command result (persistence always none)."""
+
+    ok: bool
+    run_id: str
+    checkout_commit: str | None = None
+    argv: list[str] = Field(default_factory=list)
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int | None = None
+    elapsed_seconds: float = 0.0
+    artifact_paths: list[str] = Field(default_factory=list)
+    persistence: RepositoryCommandPersistenceModel
+    error: str | None = None
+    error_code: str | None = None
 
 
 class WaitForRunResponse(RunStatusResponse):
@@ -1030,6 +1081,89 @@ def retry_run_endpoint(
     return _accept_async_run(
         source.mission_yaml,
         retried_from=source.run_id,
+    )
+
+
+@app.post(
+    "/repository-commands",
+    operation_id="run_repository_command",
+    summary="Run an allowlisted repository command in an ephemeral checkout",
+    description=(
+        "Clone an allowlisted repository at the requested branch/commit, "
+        "execute argv directly without a shell, and return stdout/stderr. "
+        "Initial allowlist: python3 scripts/generate_attorney_feedback_candidate.py. "
+        "Persistence is always none (never commits or pushes). Sensitive argv "
+        "values are redacted in the response."
+    ),
+    response_model=RepositoryCommandResponse,
+)
+def run_repository_command_endpoint(
+    request: RepositoryCommandRequest,
+    raw_request: Request,
+    _auth: None = Depends(require_api_key),
+) -> RepositoryCommandResponse:
+    if is_recursive_submission(dict(raw_request.headers)):
+        logger.info(
+            "lifecycle event=recursive_submission_rejected "
+            "stage=repository_command"
+        )
+        return RepositoryCommandResponse(
+            ok=False,
+            run_id="",
+            argv=list(request.argv),
+            persistence=RepositoryCommandPersistenceModel(),
+            error=RECURSIVE_SUBMISSION_ERROR,
+            error_code="RECURSIVE_SUBMISSION",
+        )
+
+    record = run_registry.create_run(
+        mission_yaml=(
+            "# repository-command\n"
+            f"repository: {request.repository}\n"
+            f"ref: {request.ref}\n"
+        ),
+    )
+    run_registry.update_status(record.run_id, RunStatus.RUNNING)
+    result = run_repository_command(
+        RepositoryCommandSpec(
+            repository=request.repository,
+            ref=request.ref,
+            argv=list(request.argv),
+            working_directory=request.working_directory,
+            timeout_seconds=request.timeout_seconds,
+            allowed_env_names=list(request.allowed_env_names),
+        ),
+        run_id=record.run_id,
+    )
+    status = RunStatus.COMPLETED if result.ok else (
+        RunStatus.TIMED_OUT
+        if result.error_code == "TIMEOUT"
+        else RunStatus.FAILED
+    )
+    run_registry.store_result(
+        record.run_id,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        error=result.error,
+        return_code=result.exit_code,
+        commit_sha=result.checkout_commit,
+    )
+    run_registry.update_status(record.run_id, status)
+    return RepositoryCommandResponse(
+        ok=result.ok,
+        run_id=result.run_id,
+        checkout_commit=result.checkout_commit,
+        argv=list(result.argv),
+        stdout=result.stdout,
+        stderr=result.stderr,
+        exit_code=result.exit_code,
+        elapsed_seconds=result.elapsed_seconds,
+        artifact_paths=list(result.artifact_paths),
+        persistence=RepositoryCommandPersistenceModel(
+            **result.persistence
+        ),
+        error=result.error,
+        error_code=result.error_code,
     )
 
 

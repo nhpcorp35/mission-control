@@ -61,6 +61,12 @@ _ACTIONS_OPERATION_DESCRIPTIONS: dict[str, str] = {
         "Does not mutate run state. Flow: submit_run, wait_for_run, then "
         "inspect results. For one-shot YAML, use submit_and_wait."
     ),
+    "run_repository_command": (
+        "Run an allowlisted repository command in an ephemeral checkout. "
+        "Typed fields: repository, ref, argv, working_directory, timeout, "
+        "allowed_env_names. Persistence is always none. Sensitive argv "
+        "values are redacted."
+    ),
 }
 
 

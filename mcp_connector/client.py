@@ -188,6 +188,33 @@ class MissionControlClient:
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/runs/{run_id}")
 
+    async def run_repository_command(
+        self,
+        *,
+        repository: str,
+        ref: str,
+        argv: list[str],
+        working_directory: str = ".",
+        timeout_seconds: float = 300.0,
+        allowed_env_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Execute an allowlisted repository command (POST /repository-commands)."""
+        # Bound httpx timeout above the command timeout so the API can respond.
+        request_timeout = max(float(timeout_seconds) + 30.0, 60.0)
+        return await self._request(
+            "POST",
+            "/repository-commands",
+            json={
+                "repository": repository,
+                "ref": ref,
+                "argv": argv,
+                "working_directory": working_directory,
+                "timeout_seconds": timeout_seconds,
+                "allowed_env_names": list(allowed_env_names or []),
+            },
+            timeout=request_timeout,
+        )
+
     async def submit_and_wait(
         self,
         mission_yaml: str,

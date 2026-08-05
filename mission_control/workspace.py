@@ -190,6 +190,66 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
     return WorkspacePrepResult(ok=True, workspace_path=workspace_path)
 
 
+def prepare_ephemeral_checkout(
+    *,
+    repository_url: str,
+    ref: str,
+) -> WorkspacePrepResult:
+    """Clone ``repository_url`` and check out ``ref`` in a temporary workspace.
+
+    Used by the repository command runner. Does not stage, commit, or push.
+    Authentication reuses the same GitHub HTTPS extraheader environment as
+    platform push when ``GITHUB_TOKEN`` is configured.
+    """
+    if not isinstance(repository_url, str) or not repository_url.strip():
+        return WorkspacePrepResult(
+            ok=False,
+            error="repository_url is required for ephemeral checkout",
+        )
+    if not isinstance(ref, str) or not ref.strip():
+        return WorkspacePrepResult(
+            ok=False,
+            error="ref is required for ephemeral checkout",
+        )
+
+    workspace_path = tempfile.mkdtemp(prefix="mission-control-cmd-")
+    clone_env, _auth_error = _github_push_environment()
+    # Missing GITHUB_TOKEN is fine for local/file remotes used in tests.
+    clone = _run_git(
+        [
+            "clone",
+            repository_url.strip(),
+            workspace_path,
+        ],
+        env=clone_env,
+    )
+    if clone.returncode != 0:
+        _safe_cleanup(workspace_path)
+        message = clone.stderr.strip() or clone.stdout.strip()
+        if not message:
+            message = f"git clone failed with code {clone.returncode}"
+        return WorkspacePrepResult(ok=False, error=message)
+
+    checkout = _run_git(
+        [
+            "-C",
+            workspace_path,
+            "checkout",
+            "--detach",
+            ref.strip(),
+        ],
+        env=clone_env,
+    )
+    if checkout.returncode != 0:
+        _safe_cleanup(workspace_path)
+        message = checkout.stderr.strip() or checkout.stdout.strip()
+        if not message:
+            message = f"git checkout failed with code {checkout.returncode}"
+        return WorkspacePrepResult(ok=False, error=message)
+
+    return WorkspacePrepResult(ok=True, workspace_path=workspace_path)
+
+
 def _git_status_porcelain(workspace_path: str) -> subprocess.CompletedProcess[str]:
     return _run_git(["-C", workspace_path, "status", "--porcelain"])
 

@@ -50,6 +50,7 @@ class TestMcpFastMcpCompat(unittest.TestCase):
                 "get_run",
                 "wait_for_run",
                 "submit_and_wait",
+                "run_repository_command",
             ],
         )
 

@@ -21,7 +21,7 @@ Authorization: Bearer <MISSION_CONTROL_API_KEY>
 | Missing or invalid credentials | `401 Unauthorized` with `WWW-Authenticate: Bearer` |
 | Server key unset / empty | `503 Service Unavailable` |
 
-Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `POST /runs/structured`, `POST /runs/submit-and-wait`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
+Protected endpoints: `POST /run`, `POST /execute`, `POST /runs`, `POST /runs/structured`, `POST /runs/submit-and-wait`, `POST /repository-commands`, `GET /runs/{run_id}`, `POST /runs/{run_id}/retry`, `POST /runs/{run_id}/wait`.
 
 Public endpoints (no API key): `GET /health`, `POST /validate`, `GET /openapi.json`, `GET /openapi-actions.json`.
 
@@ -492,6 +492,44 @@ Recursive local submissions are rejected the same way as `POST /runs`.
 
 **Wait-window expiry.** When the wait budget expires while the run is still non-terminal, returns `wait_expired: true` with the accepted `run_id` and latest successful run fields. Resume with `POST /runs/{run_id}/wait` (`wait_for_run`) using that `run_id`.
 
+### POST /repository-commands
+
+Requires authentication.
+
+**OpenAPI operation ID:** `run_repository_command`
+
+Execute one allowlisted repository command in an ephemeral checkout. argv is launched directly (`shell=False`) — no shell interpolation. Persistence is always `none` (this path never stages, commits, or pushes).
+
+Initial allowlist: `python3` + `scripts/generate_attorney_feedback_candidate.py` with explicit generation CLI flags only.
+
+**Request body** `application/json`
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `repository` | string | yes | Allowlisted repository id (`nhpcorp35/legal-ai` or `legal-ai`) |
+| `ref` | string | yes | Branch name or commit SHA to check out |
+| `argv` | string[] | yes | Exact argv vector (no shell) |
+| `working_directory` | string | no | Repo-relative working directory (default `.`) |
+| `timeout_seconds` | number | no | Command timeout (default `300`, max `3600`) |
+| `allowed_env_names` | string[] | no | Names of env vars to forward (platform allowlist enforced; values never logged) |
+
+**Response** `200 OK`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `ok` | boolean | Whether the command exited 0 |
+| `run_id` | string | Registry run identifier |
+| `checkout_commit` | string or null | Detached HEAD commit of the ephemeral checkout |
+| `argv` | string[] | Exact argv with sensitive values redacted |
+| `stdout` / `stderr` | string | Captured process output |
+| `exit_code` | integer or null | Process exit code (`null` on timeout) |
+| `elapsed_seconds` | number | Wall time |
+| `artifact_paths` | string[] | Files under `--candidate-output-root` when present |
+| `persistence` | object | Always `{mode: "none", attempted: false, ...}` |
+| `error` / `error_code` | string or null | Rejection or failure detail |
+
+Configure clone URLs via `MISSION_CONTROL_REPOSITORY_URL_MAP` (JSON) or `MISSION_CONTROL_LEGAL_AI_REPOSITORY_URL`. Mounted artifact/data roots via `MISSION_CONTROL_MOUNTED_PATHS` (colon-separated absolute paths).
+
 ### MCP tools
 
 The Mission Control MCP connector exposes exactly these run-operation tools:
@@ -503,6 +541,7 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
 | `wait_for_run` | Poll `get_run` until terminal or caller-requested wait window expires (REST equivalent: `POST /runs/{run_id}/wait`) |
 | `submit_and_wait` | Submit exact mission YAML then wait in one call (`submit_run` + `wait_for_run`; REST equivalent: `POST /runs/submit-and-wait`) |
+| `run_repository_command` | Run allowlisted repository command in ephemeral checkout (`POST /repository-commands`) |
 
 #### ChatGPT custom MCP app
 
