@@ -20,11 +20,9 @@ from mcp_connector.errors import MissionControlError
 
 EXPECTED_TOOL_NAMES = (
     "submit_run",
-    "submit_structured_run",
     "get_run",
     "wait_for_run",
     "submit_and_wait",
-    "run_repository_command",
 )
 
 
@@ -91,7 +89,6 @@ async def submit_run(mission_yaml: str) -> dict[str, Any]:
         return _tool_error(exc)
 
 
-@mcp.tool()
 async def submit_structured_run(
     mission_id: str,
     title: str,
@@ -236,7 +233,6 @@ async def submit_and_wait(
         return _tool_error(exc)
 
 
-@mcp.tool()
 async def run_repository_command(
     repository: str,
     ref: str,
