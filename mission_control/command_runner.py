@@ -51,7 +51,7 @@ _FLAGS_WITH_VALUE = frozenset(
         "--inventory-path",
     }
 )
-_FLAGS_NO_VALUE = frozenset({"--generation-only"})
+_FLAGS_NO_VALUE = frozenset({"--generation-only", "--help"})
 _PATH_FLAGS = frozenset(
     {
         "--case-root",
