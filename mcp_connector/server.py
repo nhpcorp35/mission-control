@@ -24,6 +24,7 @@ EXPECTED_TOOL_NAMES = (
     "get_run",
     "wait_for_run",
     "submit_and_wait",
+    "run_repository_command",
 )
 
 
@@ -235,13 +236,14 @@ async def submit_and_wait(
         return _tool_error(exc)
 
 
+@mcp.tool()
 async def run_repository_command(
     repository: str,
     ref: str,
     argv: list[str],
     working_directory: str = ".",
     timeout_seconds: float = 300.0,
-    allowed_env_names: list[str] | None = None,
+    allowed_env_names: list[str] = [],
 ) -> dict[str, Any]:
     """Run one allowlisted repository command in an ephemeral checkout.
 
@@ -268,11 +270,7 @@ async def run_repository_command(
             argv=argv,
             working_directory=working_directory,
             timeout_seconds=timeout_seconds,
-            allowed_env_names=(
-                list(allowed_env_names)
-                if allowed_env_names is not None
-                else []
-            ),
+            allowed_env_names=allowed_env_names,
         )
         # API already returns ok; avoid double-wrapping conflicting ok flags.
         if "ok" in result:
