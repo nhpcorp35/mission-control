@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# logs
+pipeline/logs/
+
+# temp backups
+*.before_*.csv
+
+# generated intermediate files
+static/pdfs/output_clean.csv
+static/pdfs/output_v3.json
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# secrets / local config
+openclaw.json
+.env
+
+# Case-00 attorney-feedback evaluation outputs (generated)
+eval_output/
+data/case-00-triborough/derived/attorney-feedback-eval/

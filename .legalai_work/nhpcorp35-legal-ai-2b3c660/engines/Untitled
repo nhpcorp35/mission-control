@@ -1,0 +1,13 @@
+from engines.contradiction_engine import detect_contradictions
+from engines.contradiction_helpers import sort_contradictions
+
+
+def build_contradiction_analysis(documents):
+    findings = detect_contradictions(documents)
+
+    return {
+        "engine_version": "Contradiction Pipeline v1.0",
+        "total_contradictions": len(findings),
+        "top_contradictions": sort_contradictions(findings)[:10],
+        "all_contradictions": findings,
+    }

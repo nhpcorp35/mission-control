@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Matter Builder</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 32px;
+            color: #111;
+        }
+
+        a {
+            text-decoration: none;
+        }
+
+        .page-title {
+            font-size: 30px;
+            font-weight: 800;
+            margin-top: 28px;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 18px;
+            color: #555;
+            line-height: 1.5;
+            max-width: 1200px;
+            margin-bottom: 28px;
+        }
+
+        .panel {
+            border: 1px solid #e3e3e3;
+            border-radius: 10px;
+            padding: 22px;
+            margin-bottom: 26px;
+        }
+
+        .selected-case-panel {
+            border: 2px solid #111;
+            background: #fbfbfb;
+        }
+
+        .work-product-panel {
+            border: 2px solid #111;
+            background: #fcfcfc;
+        }
+
+        .draft-panel {
+            border: 3px solid #111;
+            background: #fff;
+        }
+
+        .issue-panel {
+            border: 3px solid #111;
+            background: #f8fbff;
+        }
+
+        .panel-title {
+            font-size: 15px;
+            font-weight: 800;
+            color: #555;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+
+        .selected-title {
+            font-size: 24px;
+            font-weight: 900;
+            margin-bottom: 14px;
+        }
+
+        .overview-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 16px;
+        }
+
+        .selected-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .work-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 18px;
+        }
+
+        .issue-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 18px;
+        }
+
+        .draft-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 18px;
+        }
+
+        .box {
+            border: 1px solid #e8e8e8;
+            border-radius: 9px;
+            padding: 16px;
+            background: #fafafa;
+        }
+
+        .selected-box {
+            background: #fff;
+        }
+
+        .work-box {
+            background: #fff;
+            min-height: 140px;
+        }
+
+        .issue-box {
+            background: #fff;
+            min-height: 140px;
+        }
+
+        .draft-box {
+            background: #fff;
+            min-height: 160px;
+        }
+
+        .wide-box {
+            grid-column: 1 / -1;
+        }
+
+        .label {
+            color: #666;
+            font-size: 13px;
+            font-weight: 800;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .value {
+            font-size: 18px;
+            font-weight: 800;
+        }
+
+        .summary-value {
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+
+        .long-value {
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.55;
+        }
+
+        .groups-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 18px;
+        }
+
+        .group-card {
+            border: 1px solid #e8e8e8;
+            border-radius: 10px;
+            padding: 18px;
+            min-height: 120px;
+        }
+
+        .group-title {
+            font-size: 20px;
+            font-weight: 800;
+            margin-bottom: 10px;
+        }
+
+        .count {
+            display: inline-block;
+            font-size: 13px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: #eee;
+            color: #666;
+            margin-left: 8px;
+        }
+
+        .doc-name {
+            font-size: 18px;
+            font-weight: 800;
+            line-height: 1.35;
+        }
+
+        .doc-type {
+            color: #666;
+            margin-top: 6px;
+        }
+
+        .empty {
+            color: #777;
+            font-style: italic;
+        }
+
+        .strong-doc {
+            margin-bottom: 10px;
+        }
+
+        .small {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .proof-badge,
+        .work-badge,
+        .draft-badge,
+        .issue-badge {
+            display: inline-block;
+            background: #111;
+            color: #fff;
+            border-radius: 999px;
+            padding: 5px 10px;
+            font-size: 13px;
+            font-weight: 800;
+            margin-bottom: 14px;
+        }
+
+        .trace-card {
+            border: 1px solid #d8d8d8;
+            border-radius: 10px;
+            padding: 14px;
+            margin-bottom: 14px;
+            background: #fff;
+        }
+
+        .trace-head {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+
+        .score-badge {
+            display: inline-block;
+            background: #111;
+            color: #fff;
+            border-radius: 999px;
+            padding: 4px 9px;
+            font-size: 12px;
+            font-weight: 800;
+        }
+
+        .category-badge {
+            display: inline-block;
+            background: #eee;
+            color: #333;
+            border-radius: 999px;
+            padding: 4px 9px;
+            font-size: 12px;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+
+        .risk-badge {
+            display: inline-block;
+            background: #f1f1f1;
+            color: #333;
+            border-radius: 999px;
+            padding: 4px 9px;
+            font-size: 12px;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+
+        .trace-issue {
+            font-size: 16px;
+            font-weight: 900;
+            line-height: 1.4;
+            margin-bottom: 10px;
+        }
+
+        .trace-meta {
+            font-size: 13px;
+            color: #555;
+            margin-bottom: 8px;
+            line-height: 1.4;
+        }
+
+        .trace-quote {
+            border-left: 4px solid #111;
+            padding-left: 12px;
+            color: #333;
+            font-size: 14px;
+            line-height: 1.45;
+            margin-top: 8px;
+            margin-bottom: 8px;
+        }
+
+        .trace-focus {
+            background: #f7f7f7;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 14px;
+            line-height: 1.45;
+            margin-top: 8px;
+        }
+
+        details {
+            margin-bottom: 14px;
+        }
+
+        summary {
+            cursor: pointer;
+            font-weight: 900;
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+
+        ul {
+            margin-top: 8px;
+            margin-bottom: 0;
+        }
+
+        li {
+            margin-bottom: 8px;
+            line-height: 1.4;
+        }
+
+        .citation-panel {
+            border: 3px solid #111;
+            background: #fffdf7;
+        }
+
+        .citation-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 18px;
+        }
+
+        .citation-box {
+            background: #fff;
+            min-height: 140px;
+        }
+
+        textarea.draft-editable {
+            width: 100%;
+            min-height: 180px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 14px;
+            font-family: Arial, sans-serif;
+            font-size: 15px;
+            line-height: 1.55;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+
+    </style>
+</head>
+<body>
+
+    <a href="/">← Back to search</a>
+
+    <div class="page-title">Matter Builder</div>
+
+    <div class="subtitle">
+        Matter Builder v3 architecture with isolated litigation issue analysis engine and source-traceable attorney reasoning.
+    </div>
+
+    {% if matter.selected_case %}
+        <div class="panel selected-case-panel">
+            <div class="panel-title">Selected Case</div>
+            <div class="proof-badge">Build Matter selected case injected</div>
+
+            <div class="selected-title">
+                {{ matter.selected_case.title or "Selected Case" }}
+            </div>
+
+            <div class="selected-grid">
+                <div class="box selected-box">
+                    <div class="label">Court</div>
+                    <div class="summary-value">{{ matter.selected_case.court or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Date</div>
+                    <div class="summary-value">{{ matter.selected_case.date or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Citation</div>
+                    <div class="summary-value">{{ matter.selected_case.citation or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Motion</div>
+                    <div class="summary-value">{{ matter.selected_case.motion or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Outcome</div>
+                    <div class="summary-value">{{ matter.selected_case.outcome or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Case ID</div>
+                    <div class="summary-value">{{ matter.selected_case.case_id or "—" }}</div>
+                </div>
+
+                <div class="box selected-box wide-box">
+                    <div class="label">Rule / Takeaway</div>
+                    <div class="long-value">{{ matter.selected_case.rule or "—" }}</div>
+                </div>
+
+                <div class="box selected-box wide-box">
+                    <div class="label">Holding</div>
+                    <div class="long-value">{{ matter.selected_case.holding or "—" }}</div>
+                </div>
+            </div>
+        </div>
+    {% endif %}
+
+    <div class="panel">
+        <div class="panel-title">Matter Overview</div>
+
+        <div class="overview-grid">
+            <div class="box">
+                <div class="label">Matter Name</div>
+                <div class="value">{{ matter.matter_name }}</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Version</div>
+                <div class="value">v3.4</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Documents</div>
+                <div class="value">{{ matter.document_count }}</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Index Number</div>
+                <div class="value">{{ matter.index_number }}</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel issue-panel">
+        <div class="panel-title">Core Litigation Issues</div>
+        <div class="issue-badge">{{ matter.issue_packet.engine or "Issue Engine v3.4" }}</div>
+
+        {% if matter.issue_packet %}
+            <div class="issue-grid">
+
+                <div class="box issue-box wide-box">
+                    <div class="label">Priority Issues With Source Traceability</div>
+
+                    {% if matter.issue_packet.scored_issues %}
+                        {% for item in matter.issue_packet.scored_issues %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "general" }}</span>
+                                    <span class="risk-badge">Risk {{ item.risk_level or "medium" }}</span>
+                                </div>
+
+                                <div class="trace-issue">
+                                    {{ item.issue }}
+                                </div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong>
+                                    {{ item.source_document or "—" }}
+                                    {% if item.source_type %}
+                                        · {{ item.source_type }}
+                                    {% endif %}
+                                </div>
+
+                                {% if item.source_snippet %}
+                                    <div class="trace-quote">
+                                        “{{ item.source_snippet }}”
+                                    </div>
+                                {% endif %}
+
+                                {% if item.supporting_allegation %}
+                                    <div class="trace-meta">
+                                        <strong>Supporting allegation/source:</strong>
+                                        {{ item.supporting_source_document or "—" }}
+                                        {% if item.supporting_source_type %}
+                                            · {{ item.supporting_source_type }}
+                                        {% endif %}
+                                    </div>
+
+                                    <div class="trace-quote">
+                                        “{{ item.supporting_allegation }}”
+                                    </div>
+                                {% endif %}
+
+                                {% if item.recommended_focus %}
+                                    <div class="trace-focus">
+                                        <strong>Attorney focus:</strong>
+                                        {{ item.recommended_focus }}
+                                    </div>
+                                {% endif %}
+
+                                {% if item.reason %}
+                                    <div class="trace-meta">
+                                        <strong>Reason:</strong>
+                                        {{ item.reason }}
+                                    </div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No scored issues generated yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Core Issues</div>
+
+                    {% if matter.issue_packet.core_issues %}
+                        {% for item in matter.issue_packet.core_issues %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "core" }}</span>
+                                </div>
+
+                                <div class="trace-issue">{{ item.issue }}</div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong> {{ item.source_document or "—" }}
+                                </div>
+
+                                {% if item.source_snippet %}
+                                    <div class="trace-quote">“{{ item.source_snippet }}”</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No core litigation issues detected yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Contradictions</div>
+
+                    {% if matter.contradiction_analysis.cards %}
+                        {% for item in matter.contradiction_analysis.cards %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "contradiction" }}</span>
+                                </div>
+
+                                <div class="trace-issue">{{ item.summary }}</div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong> {{ item.source_document or "—" }}
+                                </div>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No contradictions detected yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Attack Points</div>
+
+                    {% if matter.issue_packet.attack_points %}
+                        {% for item in matter.issue_packet.attack_points %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "attack" }}</span>
+                                </div>
+
+                                <div class="trace-issue">{{ item.issue }}</div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong> {{ item.source_document or "—" }}
+                                </div>
+
+                                {% if item.source_snippet %}
+                                    <div class="trace-quote">“{{ item.source_snippet }}”</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No attack points identified yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Missing Evidence</div>
+
+                    {% if matter.issue_packet.missing_evidence %}
+                        {% for item in matter.issue_packet.missing_evidence %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "missing" }}</span>
+                                </div>
+
+                                <div class="trace-issue">{{ item.issue }}</div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong> {{ item.source_document or "—" }}
+                                </div>
+
+                                {% if item.source_snippet %}
+                                    <div class="trace-quote">“{{ item.source_snippet }}”</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No missing evidence detected yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Weak Claims</div>
+
+                    {% if matter.issue_packet.weak_claims %}
+                        {% for item in matter.issue_packet.weak_claims %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "weak" }}</span>
+                                </div>
+
+                                <div class="trace-issue">{{ item.issue }}</div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong> {{ item.source_document or "—" }}
+                                </div>
+
+                                {% if item.source_snippet %}
+                                    <div class="trace-quote">“{{ item.source_snippet }}”</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No weak claims detected yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Priority Ranking</div>
+
+                    {% if matter.issue_packet.priority_ranking %}
+                        <ol>
+                            {% for item in matter.issue_packet.priority_ranking %}
+                                <li>
+                                    <strong>{{ item.label }}</strong>
+                                    {% if item.source_document %}
+                                        <div class="small">
+                                            Source: {{ item.source_document }}
+                                        </div>
+                                    {% endif %}
+                                </li>
+                            {% endfor %}
+                        </ol>
+                    {% else %}
+                        <div class="empty">
+                            No priority ranking generated yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Fact Risk Flags</div>
+
+                    {% if matter.issue_packet.fact_risk_flags %}
+                        {% for item in matter.issue_packet.fact_risk_flags %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "fact risk" }}</span>
+                                </div>
+
+                                <div class="trace-issue">{{ item.issue }}</div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong> {{ item.source_document or "—" }}
+                                </div>
+
+                                {% if item.source_snippet %}
+                                    <div class="trace-quote">“{{ item.source_snippet }}”</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No factual risk flags detected yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="box issue-box">
+                    <div class="label">Credibility Flags</div>
+
+                    {% if matter.issue_packet.credibility_flags %}
+                        {% for item in matter.issue_packet.credibility_flags %}
+                            <div class="trace-card">
+                                <div class="trace-head">
+                                    <span class="score-badge">Score {{ item.score }}</span>
+                                    <span class="category-badge">{{ item.category or "credibility" }}</span>
+                                </div>
+
+                                <div class="trace-issue">{{ item.issue }}</div>
+
+                                <div class="trace-meta">
+                                    <strong>Source:</strong> {{ item.source_document or "—" }}
+                                </div>
+
+                                {% if item.source_snippet %}
+                                    <div class="trace-quote">“{{ item.source_snippet }}”</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">
+                            No credibility flags detected yet.
+                        </div>
+                    {% endif %}
+                </div>
+
+            </div>
+        {% else %}
+            <div class="empty">
+                Issue Engine packet not available.
+            </div>
+        {% endif %}
+    </div>
+
+    <div class="panel">
+        <div class="panel-title">Document Groups</div>
+
+        <div class="groups-grid">
+            {% for group_name, docs in matter.groups.items() %}
+                <div class="group-card">
+                    <div class="group-title">
+                        {{ group_name }}
+                        <span class="count">{{ docs|length }}</span>
+                    </div>
+
+                    {% if docs %}
+                        <ul>
+                            {% for doc in docs %}
+                                <li>
+                                    <div class="doc-name">{{ doc.filename }}</div>
+                                    <div class="doc-type">Type: {{ doc.type }}</div>
+
+                                    {% if doc.relative_path %}
+                                        <div class="small">
+                                            {{ doc.relative_path }}
+                                        </div>
+                                    {% endif %}
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <div class="empty">
+                            No documents classified.
+                        </div>
+                    {% endif %}
+                </div>
+            {% endfor %}
+        </div>
+    </div>
+
+</body>
+</html>

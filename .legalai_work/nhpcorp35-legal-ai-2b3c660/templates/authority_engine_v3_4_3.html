@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Authority Engine</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 32px;
+            background: #f7f7f7;
+            color: #111;
+        }
+
+        h1 {
+            font-size: 38px;
+            margin-bottom: 10px;
+        }
+
+        h2 {
+            margin-top: 36px;
+            margin-bottom: 14px;
+        }
+
+        .version {
+            display: inline-block;
+            background: #111;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 800;
+            margin-bottom: 18px;
+        }
+
+        .warning {
+            background: #fff8e1;
+            border: 1px solid #f0d98c;
+            padding: 14px;
+            border-radius: 10px;
+            margin-bottom: 24px;
+        }
+
+        .authority-card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 22px;
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+        }
+
+        .case-title {
+            font-size: 24px;
+            font-weight: 900;
+            margin-bottom: 8px;
+        }
+
+        .citation {
+            color: #444;
+            font-size: 15px;
+            margin-bottom: 12px;
+        }
+
+        .disposition {
+            display: inline-block;
+            background: #ececec;
+            border-radius: 6px;
+            padding: 5px 8px;
+            font-size: 12px;
+            font-weight: 800;
+            margin-bottom: 14px;
+        }
+
+        .badges {
+            margin-bottom: 18px;
+        }
+
+        .badge {
+            display: inline-block;
+            background: #111;
+            color: white;
+            padding: 5px 9px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 800;
+            margin-right: 6px;
+            margin-bottom: 6px;
+        }
+
+        .section {
+            margin-top: 16px;
+        }
+
+        .section-title {
+            font-weight: 900;
+            margin-bottom: 5px;
+        }
+
+        .section-body {
+            line-height: 1.55;
+            color: #222;
+        }
+
+        .meta {
+            margin-top: 18px;
+            color: #666;
+            font-size: 13px;
+        }
+
+        .issues li {
+            margin-bottom: 6px;
+        }
+
+        .empty {
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            color: #777;
+            font-style: italic;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>Authority Engine</h1>
+
+<div class="version">
+    {{ matter.real_authority_layer.version }}
+</div>
+
+<div class="warning">
+    {{ matter.real_authority_layer.verification_warning }}
+</div>
+
+<h2>Jurisdiction</h2>
+
+<p>
+    <strong>{{ matter.real_authority_layer.jurisdiction.state }}</strong>
+    —
+    <strong>{{ matter.real_authority_layer.jurisdiction.court }}</strong>
+</p>
+
+<h2>Detected Issues</h2>
+
+<ul class="issues">
+    {% for issue in matter.real_authority_layer.issues_detected %}
+        <li>
+            <strong>{{ issue.issue }}</strong>
+            — {{ issue.hits }} signal(s)
+        </li>
+    {% endfor %}
+</ul>
+
+<h2>Ranked Authorities</h2>
+
+{% if matter.real_authority_layer.authorities %}
+
+    {% for a in matter.real_authority_layer.authorities %}
+
+        <div class="authority-card">
+
+            <div class="case-title">
+                {{ a.case_name }}
+            </div>
+
+            <div class="citation">
+                {{ a.full_citation }}
+            </div>
+
+            {% if a.disposition %}
+                <div class="disposition">
+                    {{ a.disposition }}
+                </div>
+            {% endif %}
+
+            <div class="badges">
+                <span class="badge">{{ a.authority_rank }}</span>
+                <span class="badge">{{ a.authority_type }}</span>
+                <span class="badge">{{ a.strength }}</span>
+                <span class="badge">{{ a.side }}</span>
+                <span class="badge">{{ a.used_for }}</span>
+            </div>
+
+            {% if a.rule %}
+                <div class="section">
+                    <div class="section-title">Rule</div>
+                    <div class="section-body">
+                        {{ a.rule }}
+                    </div>
+                </div>
+            {% endif %}
+
+            {% if a.holding %}
+                <div class="section">
+                    <div class="section-title">Holding</div>
+                    <div class="section-body">
+                        {{ a.holding }}
+                    </div>
+                </div>
+            {% endif %}
+
+            {% if a.reasoning %}
+                <div class="section">
+                    <div class="section-title">Reasoning</div>
+                    <div class="section-body">
+                        {{ a.reasoning }}
+                    </div>
+                </div>
+            {% endif %}
+
+            {% if a.procedural_posture %}
+                <div class="section">
+                    <div class="section-title">Procedural Posture</div>
+                    <div class="section-body">
+                        {{ a.procedural_posture }}
+                    </div>
+                </div>
+            {% endif %}
+
+            {% if a.context %}
+                <div class="section">
+                    <div class="section-title">Authority Context</div>
+                    <div class="section-body">
+                        {{ a.context }}
+                    </div>
+                </div>
+            {% endif %}
+
+            <div class="meta">
+                {{ a.verification_status }}
+            </div>
+
+        </div>
+
+    {% endfor %}
+
+{% else %}
+
+    <div class="empty">
+        No authorities found.
+    </div>
+
+{% endif %}
+
+</body>
+</html>

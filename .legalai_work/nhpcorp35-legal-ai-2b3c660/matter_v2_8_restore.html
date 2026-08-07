@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Matter Builder</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 32px;
+            color: #111;
+        }
+
+        a {
+            text-decoration: none;
+        }
+
+        .page-title {
+            font-size: 30px;
+            font-weight: 800;
+            margin-top: 28px;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 18px;
+            color: #555;
+            line-height: 1.5;
+            max-width: 1200px;
+            margin-bottom: 28px;
+        }
+
+        .panel {
+            border: 1px solid #e3e3e3;
+            border-radius: 10px;
+            padding: 22px;
+            margin-bottom: 26px;
+        }
+
+        .selected-case-panel {
+            border: 2px solid #111;
+            background: #fbfbfb;
+        }
+
+        .work-product-panel {
+            border: 2px solid #111;
+            background: #fcfcfc;
+        }
+
+        .draft-panel {
+            border: 3px solid #111;
+            background: #fff;
+        }
+
+        .panel-title {
+            font-size: 15px;
+            font-weight: 800;
+            color: #555;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+
+        .selected-title {
+            font-size: 24px;
+            font-weight: 900;
+            margin-bottom: 14px;
+        }
+
+        .overview-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 16px;
+        }
+
+        .selected-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .work-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 18px;
+        }
+
+        .draft-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 18px;
+        }
+
+        .box {
+            border: 1px solid #e8e8e8;
+            border-radius: 9px;
+            padding: 16px;
+            background: #fafafa;
+        }
+
+        .selected-box {
+            background: #fff;
+        }
+
+        .work-box {
+            background: #fff;
+            min-height: 140px;
+        }
+
+        .draft-box {
+            background: #fff;
+            min-height: 160px;
+        }
+
+        .wide-box {
+            grid-column: 1 / -1;
+        }
+
+        .label {
+            color: #666;
+            font-size: 13px;
+            font-weight: 800;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .value {
+            font-size: 18px;
+            font-weight: 800;
+        }
+
+        .summary-value {
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+
+        .long-value {
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.55;
+        }
+
+        .groups-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 18px;
+        }
+
+        .group-card {
+            border: 1px solid #e8e8e8;
+            border-radius: 10px;
+            padding: 18px;
+            min-height: 120px;
+        }
+
+        .group-title {
+            font-size: 20px;
+            font-weight: 800;
+            margin-bottom: 10px;
+        }
+
+        .count {
+            display: inline-block;
+            font-size: 13px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: #eee;
+            color: #666;
+            margin-left: 8px;
+        }
+
+        .doc-name {
+            font-size: 18px;
+            font-weight: 800;
+            line-height: 1.35;
+        }
+
+        .doc-type {
+            color: #666;
+            margin-top: 6px;
+        }
+
+        .empty {
+            color: #777;
+            font-style: italic;
+        }
+
+        .strong-doc {
+            margin-bottom: 10px;
+        }
+
+        .small {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .proof-badge,
+        .work-badge,
+        .draft-badge {
+            display: inline-block;
+            background: #111;
+            color: #fff;
+            border-radius: 999px;
+            padding: 5px 10px;
+            font-size: 13px;
+            font-weight: 800;
+            margin-bottom: 14px;
+        }
+
+        ul {
+            margin-top: 8px;
+            margin-bottom: 0;
+        }
+
+        li {
+            margin-bottom: 8px;
+            line-height: 1.4;
+        }
+
+        .authority-title {
+            font-weight: 800;
+            margin-bottom: 3px;
+        }
+
+        .authority-source {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+
+        .authority-detail {
+            line-height: 1.45;
+        }
+
+        .draft-title {
+            font-size: 22px;
+            font-weight: 900;
+            margin-bottom: 12px;
+        }
+
+        .draft-text {
+            white-space: pre-wrap;
+            line-height: 1.6;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .draft-heading {
+            font-size: 18px;
+            font-weight: 900;
+            margin-bottom: 8px;
+        }
+
+        textarea.draft-editable {
+            width: 100%;
+            min-height: 180px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 14px;
+            font-family: Arial, sans-serif;
+            font-size: 15px;
+            line-height: 1.55;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+
+        .editable-note {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 14px;
+            line-height: 1.4;
+        }
+
+        .citation-panel {
+            border: 3px solid #111;
+            background: #fffdf7;
+        }
+
+        .citation-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 18px;
+        }
+
+        .citation-box {
+            background: #fff;
+            min-height: 140px;
+        }
+
+        .citation-text {
+            font-size: 15px;
+            line-height: 1.5;
+            font-weight: 600;
+        }
+
+        .citation-card {
+            border-top: 1px solid #eee;
+            padding-top: 12px;
+            margin-top: 12px;
+        }
+
+        .citation-card:first-child {
+            border-top: 0;
+            padding-top: 0;
+            margin-top: 0;
+        }
+
+        .citation-line {
+            font-weight: 900;
+            margin-top: 5px;
+        }
+
+    </style>
+</head>
+<body>
+
+    <a href="/">← Back to search</a>
+
+    <div class="page-title">Matter Builder</div>
+
+    <div class="subtitle">
+        Build one organized matter page from complaints, answers, motions, affirmations,
+        oppositions, declarations, exhibits, memoranda of law, prior orders, decisions,
+        attorney work product, draft-ready opposition sections, citation support, and exhibit mapping.
+    </div>
+
+    {% if matter.selected_case %}
+        <div class="panel selected-case-panel">
+            <div class="panel-title">Selected Case</div>
+            <div class="proof-badge">Build Matter selected case injected</div>
+
+            <div class="selected-title">
+                {{ matter.selected_case.title or "Selected Case" }}
+            </div>
+
+            <div class="selected-grid">
+                <div class="box selected-box">
+                    <div class="label">Court</div>
+                    <div class="summary-value">{{ matter.selected_case.court or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Date</div>
+                    <div class="summary-value">{{ matter.selected_case.date or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Citation</div>
+                    <div class="summary-value">{{ matter.selected_case.citation or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Motion</div>
+                    <div class="summary-value">{{ matter.selected_case.motion or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Outcome</div>
+                    <div class="summary-value">{{ matter.selected_case.outcome or "—" }}</div>
+                </div>
+
+                <div class="box selected-box">
+                    <div class="label">Case ID</div>
+                    <div class="summary-value">{{ matter.selected_case.case_id or "—" }}</div>
+                </div>
+
+                <div class="box selected-box wide-box">
+                    <div class="label">Rule / Takeaway</div>
+                    <div class="long-value">{{ matter.selected_case.rule or "—" }}</div>
+                </div>
+
+                <div class="box selected-box wide-box">
+                    <div class="label">Holding</div>
+                    <div class="long-value">{{ matter.selected_case.holding or "—" }}</div>
+                </div>
+            </div>
+        </div>
+    {% else %}
+        <div class="panel">
+            <div class="panel-title">Selected Case</div>
+            <div class="empty">
+                No selected case was injected. Open a search result and click Build Matter to test selected case injection.
+            </div>
+        </div>
+    {% endif %}
+
+    <div class="panel">
+        <div class="panel-title">Matter Overview</div>
+
+        <div class="overview-grid">
+            <div class="box">
+                <div class="label">Matter Name</div>
+                <div class="value">{{ matter.matter_name }}</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Version</div>
+                <div class="value">v2.8</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Documents</div>
+                <div class="value">{{ matter.document_count }}</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Index Number</div>
+                <div class="value">{{ matter.index_number }}</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-title">Auto Matter Summary</div>
+
+        <div class="summary-grid">
+            <div class="box">
+                <div class="label">Case Name</div>
+                <div class="summary-value">{{ matter.summary.case_name }}</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Parties</div>
+                <div class="summary-value">
+                    Plaintiff: {{ matter.summary.plaintiff }}<br>
+                    Defendant: {{ matter.summary.defendant }}
+                </div>
+            </div>
+
+            <div class="box">
+                <div class="label">Motion Posture</div>
+                <div class="summary-value">{{ matter.summary.motion_posture }}</div>
+            </div>
+
+            <div class="box">
+                <div class="label">Procedural Posture</div>
+                <div class="summary-value">{{ matter.summary.procedural_posture }}</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-title">Strongest Motion Documents</div>
+
+        {% if matter.summary.strongest_motion_documents %}
+            {% for doc in matter.summary.strongest_motion_documents %}
+                <div class="strong-doc">
+                    <strong>{{ doc.filename }}</strong>
+                    <span class="small"> — {{ doc.group }} / score {{ doc.score }}</span>
+                </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty">No motion documents detected.</div>
+        {% endif %}
+    </div>
+
+    <div class="panel work-product-panel">
+        <div class="panel-title">Attorney Work Product</div>
+        <div class="work-badge">v2.6 Attorney Workflow Engine</div>
+
+        {% if matter.attorney_work_product %}
+            <div class="work-grid">
+                <div class="box work-box">
+                    <div class="label">Plaintiff Core Arguments</div>
+                    {% if matter.attorney_work_product.plaintiff_core_arguments %}
+                        <ul>
+                            {% for item in matter.attorney_work_product.plaintiff_core_arguments %}
+                                <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <div class="empty">No plaintiff arguments detected.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box work-box">
+                    <div class="label">Defense Core Arguments</div>
+                    {% if matter.attorney_work_product.defense_core_arguments %}
+                        <ul>
+                            {% for item in matter.attorney_work_product.defense_core_arguments %}
+                                <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <div class="empty">No defense arguments detected.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box work-box">
+                    <div class="label">Weakness / Contradiction Detection</div>
+                    {% if matter.attorney_work_product.weaknesses %}
+                        <ul>
+                            {% for item in matter.attorney_work_product.weaknesses %}
+                                <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <div class="empty">No weaknesses detected.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box work-box">
+                    <div class="label">Drafting Strategy</div>
+                    {% if matter.attorney_work_product.drafting_strategy %}
+                        <ul>
+                            {% for item in matter.attorney_work_product.drafting_strategy %}
+                                <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <div class="empty">No drafting strategy generated.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box work-box wide-box">
+                    <div class="label">Strongest Authorities</div>
+                    {% if matter.attorney_work_product.strongest_authorities %}
+                        {% for authority in matter.attorney_work_product.strongest_authorities %}
+                            <div class="strong-doc">
+                                <div class="authority-title">{{ authority.title }}</div>
+                                <div class="authority-source">{{ authority.source }}</div>
+                                <div class="authority-detail">{{ authority.detail }}</div>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No authorities identified.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box work-box wide-box">
+                    <div class="label">Recommended Opposition Outline</div>
+                    {% if matter.attorney_work_product.recommended_outline %}
+                        <ol>
+                            {% for item in matter.attorney_work_product.recommended_outline %}
+                                <li>{{ item }}</li>
+                            {% endfor %}
+                        </ol>
+                    {% else %}
+                        <div class="empty">No outline generated.</div>
+                    {% endif %}
+                </div>
+            </div>
+        {% else %}
+            <div class="empty">Attorney work product has not been generated.</div>
+        {% endif %}
+    </div>
+
+    <div class="panel draft-panel">
+        <div class="panel-title">Draft Generation Engine</div>
+        <div class="draft-badge">v2.7 Drafting Engine</div>
+
+        {% if matter.draft_generation %}
+            <div class="draft-grid">
+                <div class="box draft-box wide-box">
+                    <div class="label">Preliminary Statement</div>
+                    <div class="draft-text">{{ matter.draft_generation.preliminary_statement }}</div>
+                </div>
+
+                <div class="box draft-box wide-box">
+                    <div class="label">Statement of Facts</div>
+                    <div class="draft-text">{{ matter.draft_generation.statement_of_facts }}</div>
+                </div>
+
+                <div class="box draft-box">
+                    <div class="label">Point Headings</div>
+                    {% if matter.draft_generation.point_headings %}
+                        <ol>
+                            {% for heading in matter.draft_generation.point_headings %}
+                                <li><strong>{{ heading }}</strong></li>
+                            {% endfor %}
+                        </ol>
+                    {% else %}
+                        <div class="empty">No point headings generated.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box draft-box">
+                    <div class="label">Opposition Starter Paragraphs</div>
+                    {% if matter.draft_generation.starter_paragraphs %}
+                        {% for paragraph in matter.draft_generation.starter_paragraphs %}
+                            <p>{{ paragraph }}</p>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No starter paragraphs generated.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box draft-box wide-box">
+                    <div class="label">Argument Section Skeleton</div>
+                    {% if matter.draft_generation.argument_skeleton %}
+                        {% for section in matter.draft_generation.argument_skeleton %}
+                            <div class="strong-doc">
+                                <div class="draft-heading">{{ section.heading }}</div>
+                                <div class="authority-detail">{{ section.body }}</div>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No argument skeleton generated.</div>
+                    {% endif %}
+                </div>
+            </div>
+        {% else %}
+            <div class="empty">Draft generation has not been generated.</div>
+        {% endif %}
+    </div>
+
+
+    <div class="panel citation-panel">
+        <div class="panel-title">Citation + Exhibit Engine</div>
+        <div class="draft-badge">v2.8 Citation Support</div>
+
+        <div class="editable-note">
+            Suggested citations are drafting aids only. Verify exhibit lettering, NYSCEF document numbers,
+            page pins, paragraph numbers, and admissibility before filing.
+        </div>
+
+        {% if matter.citation_exhibit_engine %}
+            <div class="citation-grid">
+                <div class="box citation-box">
+                    <div class="label">Exhibit Detection</div>
+                    {% if matter.citation_exhibit_engine.exhibit_inventory %}
+                        {% for exhibit in matter.citation_exhibit_engine.exhibit_inventory %}
+                            <div class="citation-card">
+                                <div class="authority-title">Exhibit {{ exhibit.label }}</div>
+                                <div class="authority-source">{{ exhibit.filename }}</div>
+                                <div class="citation-line">{{ exhibit.citation }}</div>
+                                {% if exhibit.preview %}
+                                    <div class="authority-detail">{{ exhibit.preview }}</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No exhibit documents detected yet.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box citation-box">
+                    <div class="label">Affidavit / Affirmation Support</div>
+                    {% if matter.citation_exhibit_engine.affidavit_support %}
+                        {% for item in matter.citation_exhibit_engine.affidavit_support %}
+                            <div class="citation-card">
+                                <div class="authority-title">{{ item.filename }}</div>
+                                <div class="citation-line">{{ item.citation }}</div>
+                                <ul>
+                                    {% for point in item.support_points %}
+                                        <li>{{ point }}</li>
+                                    {% endfor %}
+                                </ul>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No affidavit or affirmation support detected yet.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box citation-box wide-box">
+                    <div class="label">Fact-to-Document Support Map</div>
+                    {% if matter.citation_exhibit_engine.fact_support_map %}
+                        {% for item in matter.citation_exhibit_engine.fact_support_map %}
+                            <div class="citation-card">
+                                <div class="citation-text">{{ item.fact }}</div>
+                                <div class="citation-line">Suggested: {{ item.suggested_citation }}</div>
+                                <div class="authority-source">Source: {{ item.source_document }}</div>
+                                {% if item.supporting_documents %}
+                                    <ul>
+                                        {% for support in item.supporting_documents %}
+                                            <li>
+                                                <strong>{{ support.filename }}</strong>
+                                                — {{ support.citation }}
+                                            </li>
+                                        {% endfor %}
+                                    </ul>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No fact support map generated yet.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box citation-box wide-box">
+                    <div class="label">Contradiction / Weakness Support Links</div>
+                    {% if matter.citation_exhibit_engine.contradiction_support_links %}
+                        {% for item in matter.citation_exhibit_engine.contradiction_support_links %}
+                            <div class="citation-card">
+                                <div class="citation-text">{{ item.weakness }}</div>
+                                {% if item.supporting_documents %}
+                                    <ul>
+                                        {% for support in item.supporting_documents %}
+                                            <li>
+                                                <strong>{{ support.filename }}</strong>
+                                                — {{ support.citation }}
+                                            </li>
+                                        {% endfor %}
+                                    </ul>
+                                {% else %}
+                                    <div class="empty">No direct supporting document detected. Attorney review required.</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No contradiction support links generated yet.</div>
+                    {% endif %}
+                </div>
+
+                <div class="box citation-box wide-box">
+                    <div class="label">Suggested Draft Citations</div>
+                    {% if matter.citation_exhibit_engine.citation_suggestions %}
+                        {% for item in matter.citation_exhibit_engine.citation_suggestions %}
+                            <div class="citation-card">
+                                <div class="citation-text">{{ item.draft_fact }}</div>
+                                <div class="citation-line">{{ item.suggested_citation }}</div>
+                                <div class="authority-source">{{ item.source_document }}</div>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty">No citation suggestions generated yet.</div>
+                    {% endif %}
+                </div>
+            </div>
+        {% else %}
+            <div class="empty">Citation + Exhibit Engine has not generated support yet.</div>
+        {% endif %}
+    </div>
+
+    <div class="panel draft-panel">
+        <div class="panel-title">Attorney-Editable Draft Blocks</div>
+        <div class="draft-badge">Editable Draft Workspace</div>
+
+        <div class="editable-note">
+            These draft blocks are generated from the selected case, strongest motion documents,
+            detected weaknesses, and recommended opposition strategy. Edit directly in the boxes.
+        </div>
+
+        {% if matter.draft_generation and matter.draft_generation.editable_blocks %}
+            {% for block in matter.draft_generation.editable_blocks %}
+                <div class="box draft-box wide-box">
+                    <div class="label">{{ block.title }}</div>
+                    <textarea class="draft-editable">{{ block.content }}</textarea>
+                </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty">No editable draft blocks generated.</div>
+        {% endif %}
+    </div>
+
+    <div class="panel">
+        <div class="panel-title">Document Groups</div>
+
+        <div class="groups-grid">
+            {% for group_name, docs in matter.groups.items() %}
+                <div class="group-card">
+                    <div class="group-title">
+                        {{ group_name }}
+                        <span class="count">{{ docs|length }}</span>
+                    </div>
+
+                    {% if docs %}
+                        <ul>
+                            {% for doc in docs %}
+                                <li>
+                                    <div class="doc-name">{{ doc.filename }}</div>
+                                    <div class="doc-type">Type: {{ doc.type }}</div>
+                                    {% if doc.relative_path %}
+                                        <div class="small">{{ doc.relative_path }}</div>
+                                    {% endif %}
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <div class="empty">No documents classified.</div>
+                    {% endif %}
+                </div>
+            {% endfor %}
+        </div>
+    </div>
+
+</body>
+</html>

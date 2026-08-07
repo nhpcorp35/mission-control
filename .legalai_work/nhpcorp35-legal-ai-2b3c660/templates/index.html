@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Legal AI Search</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            color: #111;
+            max-width: 1100px;
+        }
+
+        h2 {
+            margin-bottom: 18px;
+        }
+
+        form {
+            margin-bottom: 30px;
+        }
+
+        input, select {
+            padding: 8px;
+            margin-right: 10px;
+            font-size: 14px;
+        }
+
+        input[type="text"] {
+            min-width: 320px;
+        }
+
+        button {
+            padding: 8px 14px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .results-header {
+            margin-bottom: 18px;
+            color: #444;
+        }
+
+        .case {
+            border-bottom: 1px solid #eee;
+            padding: 18px 0 20px 0;
+        }
+
+        .case-title {
+            margin-bottom: 4px;
+        }
+
+        .case-title a {
+            font-weight: bold;
+            font-size: 18px;
+            line-height: 1.35;
+            text-decoration: none;
+            color: #111;
+        }
+
+        .case-title a:hover {
+            text-decoration: underline;
+        }
+
+        .meta {
+            color: #666;
+            margin: 5px 0;
+            font-size: 14px;
+        }
+
+        .details {
+            color: #555;
+            font-size: 13px;
+            margin-top: 6px;
+        }
+
+        .signals {
+            margin-top: 9px;
+            margin-bottom: 8px;
+        }
+
+        .signal {
+            display: inline-block;
+            padding: 5px 10px;
+            margin-right: 6px;
+            margin-bottom: 6px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            background: #e6f4ea;
+            color: #137333;
+            border: 1px solid #c8e6c9;
+        }
+
+        .snippet {
+            margin-top: 10px;
+            line-height: 1.5;
+            color: #222;
+        }
+
+        .build-action {
+            margin-top: 14px;
+            margin-bottom: 10px;
+        }
+
+        .build-button {
+            display: inline-block;
+            padding: 9px 14px;
+            border: 1px solid #d9d9d9;
+            border-radius: 8px;
+            text-decoration: none;
+            color: #111;
+            font-size: 14px;
+            font-weight: 700;
+            background: #fafafa;
+        }
+
+        .build-button:hover {
+            background: #f3f3f3;
+        }
+
+        .similar {
+            margin-top: 14px;
+            padding-left: 14px;
+            border-left: 2px solid #f0f0f0;
+        }
+
+        .similar-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #444;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }
+
+        .similar-case {
+            font-size: 13px;
+            margin: 10px 0;
+            line-height: 1.4;
+        }
+
+        .similar-case a {
+            color: #1a0dab;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .similar-case a:hover {
+            text-decoration: underline;
+        }
+
+        .similar-meta {
+            color: #666;
+            margin-top: 2px;
+        }
+
+        .similar-signals {
+            margin-top: 4px;
+        }
+
+        .similar-signal {
+            display: inline-block;
+            padding: 2px 7px;
+            margin-right: 5px;
+            margin-top: 3px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 600;
+            background: #eef6ff;
+            color: #2557a7;
+            border: 1px solid #cfe0ff;
+        }
+
+        .empty-state {
+            margin-top: 60px;
+            text-align: center;
+            color: #666;
+        }
+
+        .empty-state h3 {
+            font-weight: 500;
+            margin-bottom: 10px;
+        }
+
+        .pagination {
+            margin-top: 24px;
+            color: #444;
+        }
+
+        .pagination a {
+            margin: 0 5px;
+            text-decoration: none;
+        }
+
+        .top-actions {
+            margin-bottom: 18px;
+        }
+
+        .top-actions a {
+            display: inline-block;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            text-decoration: none;
+            color: #111;
+            font-size: 14px;
+            font-weight: 700;
+            background: #fafafa;
+        }
+
+        .top-actions a:hover {
+            background: #f3f3f3;
+        }
+    </style>
+</head>
+<body>
+
+<h2>Legal AI Search</h2>
+
+<div class="top-actions">
+    <a href="{{ url_for('matter') }}">Matter Builder →</a>
+</div>
+
+<form method="POST">
+    <input type="text" name="query" placeholder="Search cases..." value="{{ query }}">
+
+    <select name="court">
+        {% for c in courts %}
+            <option value="{{ c }}" {% if c == selected_court %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+    </select>
+
+    <select name="outcome">
+        {% for o in outcomes %}
+            <option value="{{ o }}" {% if o == selected_outcome %}selected{% endif %}>{{ o }}</option>
+        {% endfor %}
+    </select>
+
+    <button type="submit">Search</button>
+</form>
+
+{% if results %}
+    <div class="results-header">
+        <strong>{{ pager.total }} results</strong><br>
+        Page {{ pager.page }} of {{ pager.total_pages }}
+    </div>
+
+    {% for case in results %}
+        <div class="case">
+            <div class="case-title">
+                <a href="{{ url_for('case_detail', case_id=case.case_id) }}">{{ case.title }}</a>
+            </div>
+
+            <div class="meta">
+                {{ case.court }} · {{ case.date }}{% if case.citation %} · {{ case.citation }}{% endif %}
+            </div>
+
+            {% if case.trust_signals %}
+                <div class="signals">
+                    {% for sig in case.trust_signals %}
+                        <span class="signal">{{ sig }}</span>
+                    {% endfor %}
+                </div>
+            {% endif %}
+
+            <div class="details">
+                {% if case.motion %}Motion: {{ case.motion }}{% endif %}
+                {% if case.outcome %}{% if case.motion %} · {% endif %}Outcome: {{ case.outcome }}{% endif %}
+                {% if case.primary_cause %}{% if case.motion or case.outcome %} · {% endif %}Cause: {{ case.primary_cause }}{% endif %}
+            </div>
+
+            <div class="snippet">{{ case.display_snippet }}</div>
+
+            <div class="build-action">
+                <a
+                    class="build-button"
+                    href="{{ url_for('matter', case_id=case.case_id) }}"
+                >
+                    Build Matter →
+                </a>
+            </div>
+
+            {% if case.similar_cases %}
+                <div class="similar">
+                    <div class="similar-title">Why this case matches</div>
+
+                    {% for s in case.similar_cases %}
+                        <div class="similar-case">
+                            <div>
+                                <a href="{{ url_for('case_detail', case_id=s.case_id) }}">{{ s.title }}</a>
+                            </div>
+
+                            <div class="similar-meta">
+                                {% if s.outcome %}{{ s.outcome }}{% endif %}
+                            </div>
+
+                            {% if s.similarity_signals %}
+                                <div class="similar-signals">
+                                    {% for sig in s.similarity_signals %}
+                                        <span class="similar-signal">{{ sig }}</span>
+                                    {% endfor %}
+                                </div>
+                            {% endif %}
+                        </div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        </div>
+    {% endfor %}
+
+    <div class="pagination">
+        {% if pager.has_prev %}
+            <a href="?query={{ query }}&court={{ selected_court }}&outcome={{ selected_outcome }}&page={{ pager.prev_num }}">Previous</a>
+        {% endif %}
+
+        Page {{ pager.page }} of {{ pager.total_pages }}
+
+        {% if pager.has_next %}
+            <a href="?query={{ query }}&court={{ selected_court }}&outcome={{ selected_outcome }}&page={{ pager.next_num }}">Next</a>
+        {% endif %}
+    </div>
+
+{% else %}
+
+    {% if not query %}
+        <div class="empty-state">
+            <h3>Start your search</h3>
+            <p>Try: “labor law”, “summary judgment”, “breach of contract”</p>
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <h3>No results found for "{{ query }}"</h3>
+            <p>Try broader terms or different phrasing</p>
+        </div>
+    {% endif %}
+
+{% endif %}
+
+</body>
+</html>

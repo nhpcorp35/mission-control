@@ -1,0 +1,1230 @@
+[
+  {
+    "judge": "Rosado, J.",
+    "case_count": 22,
+    "outcomes": {
+      "affirmed": 18,
+      "reversed": 4
+    },
+    "cases": [
+      {
+        "case": "2022-00651",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2022-00651__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03531",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03531__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03080",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03080__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-01784",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-01784__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-05340",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-05340__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04941",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04941__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-03509",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-03509__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01632__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03450",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2024-03450__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2019-3112",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2019-3112__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00669",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00669__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06827",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06827__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-05704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-05704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06874",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06874__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04794",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04794__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-01538",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-01538__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04360",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-04360__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01026",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01026__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-00459",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-00459__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-00426",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-00426__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-02030",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-02030__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Shulman, J.",
+    "case_count": 22,
+    "outcomes": {
+      "affirmed": 19,
+      "reversed": 3
+    },
+    "cases": [
+      {
+        "case": "2022-00651",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2022-00651__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03531",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03531__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03080",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03080__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-01784",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-01784__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-05340",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-05340__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04941",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04941__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-03509",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-03509__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01632__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2019-3112",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2019-3112__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00669",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00669__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06827",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06827__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-05704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-05704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06874",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06874__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04794",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04794__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-01538",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-01538__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04360",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-04360__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01026",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01026__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-00459",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-00459__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-07632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-07632__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-00426",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-00426__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-02030",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-02030__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Hagler, J.",
+    "case_count": 21,
+    "outcomes": {
+      "affirmed": 18,
+      "reversed": 3
+    },
+    "cases": [
+      {
+        "case": "2022-00651",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2022-00651__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03531",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03531__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03080",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03080__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-01784",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-01784__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-05340",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-05340__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04941",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04941__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-03509",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-03509__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01632__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2019-3112",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2019-3112__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00669",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00669__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06827",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06827__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-05704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-05704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06874",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06874__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04794",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04794__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-01538",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-01538__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04360",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-04360__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01026",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01026__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-00459",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-00459__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-00426",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-00426__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-02030",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-02030__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Higgitt, J.",
+    "case_count": 21,
+    "outcomes": {
+      "affirmed": 18,
+      "reversed": 3
+    },
+    "cases": [
+      {
+        "case": "2022-00651",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2022-00651__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03531",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03531__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03080",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03080__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-01784",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-01784__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-05340",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-05340__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04941",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04941__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-03509",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-03509__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01632__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2019-3112",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2019-3112__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00669",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00669__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06827",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06827__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-05704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-05704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06874",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06874__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04794",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04794__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-01538",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-01538__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04360",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-04360__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01026",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01026__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-00459",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-00459__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-00426",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-00426__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-02030",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-02030__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Webber, J.",
+    "case_count": 21,
+    "outcomes": {
+      "affirmed": 18,
+      "reversed": 3
+    },
+    "cases": [
+      {
+        "case": "2022-00651",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2022-00651__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03531",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03531__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-03080",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03080__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-01784",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-01784__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-05340",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-05340__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04941",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04941__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-03509",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-03509__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01632__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2019-3112",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2019-3112__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00669",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00669__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06827",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06827__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-05704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-05704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-06874",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-06874__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-00704",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-00704__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04794",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2025-04794__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-01538",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-01538__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-04360",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-04360__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-01026",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2025-01026__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2023-00459",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2023-00459__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-00426",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-00426__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-02030",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-02030__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Moulton, J.",
+    "case_count": 16,
+    "outcomes": {
+      "affirmed": 14,
+      "reversed": 2
+    },
+    "cases": [
+      {
+        "case": "2023-03178",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03178__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-04833__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00340",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00340__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-01052",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-01052__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-04188",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-04188__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04818",
+        "date": "2026-03-05",
+        "outcome": "reversed",
+        "file": "2024-04818__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-03450",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2024-03450__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2025-02303",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-02303__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-06495",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-06495__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07336",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07336__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2020-00298",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2020-00298__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-03802",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03802__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07233",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07233__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-05571",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-05571__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00698",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00698__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2022-03833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2022-03833__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Chan, J.",
+    "case_count": 15,
+    "outcomes": {
+      "affirmed": 14,
+      "reversed": 1
+    },
+    "cases": [
+      {
+        "case": "2023-03178",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03178__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-04833__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00340",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00340__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-01052",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-01052__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-04188",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-04188__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04818",
+        "date": "2026-03-05",
+        "outcome": "reversed",
+        "file": "2024-04818__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-02303",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-02303__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-06495",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-06495__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07336",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07336__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2020-00298",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2020-00298__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-03802",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03802__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07233",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07233__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-05571",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-05571__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00698",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00698__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2022-03833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2022-03833__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Michael, J.",
+    "case_count": 14,
+    "outcomes": {
+      "affirmed": 13,
+      "reversed": 1
+    },
+    "cases": [
+      {
+        "case": "2023-03178",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03178__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-04833__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00340",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00340__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-04188",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-04188__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04818",
+        "date": "2026-03-05",
+        "outcome": "reversed",
+        "file": "2024-04818__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-02303",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-02303__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-06495",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-06495__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07336",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07336__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2020-00298",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2020-00298__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-03802",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03802__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07233",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07233__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-05571",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-05571__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00698",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00698__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2022-03833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2022-03833__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Pitt-burke, J.",
+    "case_count": 14,
+    "outcomes": {
+      "affirmed": 13,
+      "reversed": 1
+    },
+    "cases": [
+      {
+        "case": "2023-03178",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03178__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-04833__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00340",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00340__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-04188",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-04188__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-04818",
+        "date": "2026-03-05",
+        "outcome": "reversed",
+        "file": "2024-04818__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-02303",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-02303__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-06495",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-06495__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07336",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07336__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2020-00298",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2020-00298__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-03802",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-03802__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2024-07233",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-07233__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2023-05571",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-05571__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2025-00698",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00698__decision__2026-03-05.pdf"
+      },
+      {
+        "case": "2022-03833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2022-03833__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Scarpulla, J.",
+    "case_count": 2,
+    "outcomes": {
+      "reversed": 1,
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2024-03450",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2024-03450__decision__2026-03-03.pdf"
+      },
+      {
+        "case": "2024-07632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-07632__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Dominguez, J.",
+    "case_count": 1,
+    "outcomes": {
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2023-05571",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2023-05571__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Gesmer, J.",
+    "case_count": 1,
+    "outcomes": {
+      "reversed": 1
+    },
+    "cases": [
+      {
+        "case": "2024-03450",
+        "date": "2026-03-03",
+        "outcome": "reversed",
+        "file": "2024-03450__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Kapnick, J.",
+    "case_count": 1,
+    "outcomes": {
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2024-07632",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-07632__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Kelley, J.",
+    "case_count": 1,
+    "outcomes": {
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2025-00340",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-00340__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Mendez, J.",
+    "case_count": 1,
+    "outcomes": {
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2025-01052",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2025-01052__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Pollack, J.",
+    "case_count": 1,
+    "outcomes": {
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2024-04833",
+        "date": "2026-03-05",
+        "outcome": "affirmed",
+        "file": "2024-04833__decision__2026-03-05.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Rosenblueth, J.",
+    "case_count": 1,
+    "outcomes": {
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2024-01784",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-01784__decision__2026-03-03.pdf"
+      }
+    ]
+  },
+  {
+    "judge": "Smith, J.",
+    "case_count": 1,
+    "outcomes": {
+      "affirmed": 1
+    },
+    "cases": [
+      {
+        "case": "2024-03531",
+        "date": "2026-03-03",
+        "outcome": "affirmed",
+        "file": "2024-03531__decision__2026-03-03.pdf"
+      }
+    ]
+  }
+]
