@@ -137,6 +137,7 @@ _CASE00_B2_Q1_ENV_ALLOWLIST = frozenset(
         "B2_REGION",
         "OPENAI_API_KEY",
         "OPENAI_MODEL",
+        "OPENAI_TIMEOUT_SECONDS",
     }
 )
 

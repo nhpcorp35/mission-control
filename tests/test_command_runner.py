@@ -748,18 +748,25 @@ class TestCommandRunner(unittest.TestCase):
             "B2_REGION",
             "OPENAI_API_KEY",
             "OPENAI_MODEL",
+            "OPENAI_TIMEOUT_SECONDS",
         ]
         with patch.dict(
             os.environ,
             {
-                **{name: f"test-{name}" for name in env_names if name != "OPENAI_MODEL"},
+                **{
+                    name: f"test-{name}"
+                    for name in env_names
+                    if name not in {"OPENAI_MODEL", "OPENAI_TIMEOUT_SECONDS"}
+                },
                 "OPENAI_MODEL": "gpt-test",
+                "OPENAI_TIMEOUT_SECONDS": "120",
             },
             clear=False,
         ):
             env = build_command_env(env_names, script=ALLOWED_CASE00_B2_Q1_SCRIPT)
             self.assertEqual(env.get("B2_KEY_ID"), "test-B2_KEY_ID")
             self.assertEqual(env.get("OPENAI_MODEL"), "gpt-test")
+            self.assertEqual(env.get("OPENAI_TIMEOUT_SECONDS"), "120")
             result = run_repository_command(
                 RepositoryCommandSpec(
                     repository="nhpcorp35/legal-ai",
@@ -905,7 +912,18 @@ class TestCommandRunner(unittest.TestCase):
         self.assertEqual(result.error_code, "PATH_OUTSIDE_ALLOWED_ROOTS")
 
     def test_case00_b2_q1_unapproved_env_names_rejected(self) -> None:
-        """Single-shot accepts only B2 + OpenAI env names, not extras."""
+        """Single-shot accepts OPENAI_TIMEOUT_SECONDS; unrelated names stay rejected."""
+        with patch.dict(
+            os.environ,
+            {"OPENAI_TIMEOUT_SECONDS": "90"},
+            clear=False,
+        ):
+            env = build_command_env(
+                ["OPENAI_TIMEOUT_SECONDS"],
+                script=ALLOWED_CASE00_B2_Q1_SCRIPT,
+            )
+        self.assertEqual(env.get("OPENAI_TIMEOUT_SECONDS"), "90")
+
         with self.assertRaises(CommandRunnerError) as ctx:
             build_command_env(
                 ["ANTHROPIC_API_KEY"],
