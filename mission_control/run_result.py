@@ -79,6 +79,8 @@ class DeliverableEvidence:
     passed: bool | None
     checked_paths: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    # Absolute, home (~), or ..-escaping paths recorded without reading them.
+    outside_workspace: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -178,6 +180,7 @@ class StructuredRunResult:
         if isinstance(deliverables_raw, dict):
             checked = deliverables_raw.get("checked_paths") or []
             missing = deliverables_raw.get("missing") or []
+            outside = deliverables_raw.get("outside_workspace") or []
             deliverables = DeliverableEvidence(
                 verified=bool(deliverables_raw.get("verified")),
                 passed=deliverables_raw.get("passed"),
@@ -186,6 +189,9 @@ class StructuredRunResult:
                 else [],
                 missing=[str(path) for path in missing]
                 if isinstance(missing, list)
+                else [],
+                outside_workspace=[str(path) for path in outside]
+                if isinstance(outside, list)
                 else [],
             )
 

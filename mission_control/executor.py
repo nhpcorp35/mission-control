@@ -142,6 +142,30 @@ class ExecutionResult:
     command: list[str] | None = None
 
 
+def _workspace_binding_constraints(mission: dict) -> tuple[str, ...]:
+    """Bind agent writes to the concrete isolated workspace path.
+
+    ``repository.path`` is the only filesystem root for edits.
+    ``repository.name`` selects which remote to clone; it is not a path.
+    """
+    repository = mission.get("repository")
+    if not isinstance(repository, dict):
+        return ()
+    workspace_path = repository.get("path")
+    if not isinstance(workspace_path, str) or not workspace_path.strip():
+        return ()
+    path = workspace_path.strip()
+    return (
+        f"All file writes must stay inside this Mission Control workspace: {path}",
+        "Edit ONLY repository-relative paths in that workspace "
+        "(for example `mission_control/executor.py`); never absolute paths "
+        "such as `/tmp/.../mission_control/executor.py`.",
+        "repository.name is clone identity only — do NOT infer a filesystem "
+        "path from it, and do NOT create, clone, or edit any repository under "
+        "/tmp or any other absolute path outside this workspace.",
+    )
+
+
 def build_cursor_instruction(
     mission: dict,
     constraints: tuple[str, ...] = READ_ONLY_CONSTRAINTS,
@@ -159,6 +183,9 @@ def build_cursor_instruction(
     ]
 
     lines.extend(f"- {constraint}" for constraint in constraints)
+    lines.extend(
+        f"- {constraint}" for constraint in _workspace_binding_constraints(mission)
+    )
 
     if resolve_documentation_mode(mission) == "required":
         lines.extend(

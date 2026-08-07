@@ -60,6 +60,34 @@ class TestBuildCursorInstruction(unittest.TestCase):
             instruction,
         )
 
+    def test_binds_writes_to_concrete_repository_path(self) -> None:
+        mission = _sample_mission()
+        workspace = mission["repository"]["path"]
+        instruction = build_cursor_instruction(mission)
+        self.assertIn(workspace, instruction)
+        self.assertIn(
+            f"All file writes must stay inside this Mission Control workspace: "
+            f"{workspace}",
+            instruction,
+        )
+        self.assertIn("repository.name is clone identity only", instruction)
+        self.assertIn("do NOT infer a filesystem path from it", instruction)
+        self.assertIn("never absolute paths", instruction)
+
+    def test_workspace_binding_omitted_without_repository_path(self) -> None:
+        mission = {
+            "title": "No path",
+            "instructions": "Inspect only.",
+            "deliverables": ["summary"],
+            "repository": {"name": "nhpcorp35/mission-control"},
+        }
+        instruction = build_cursor_instruction(mission)
+        self.assertNotIn(
+            "All file writes must stay inside this Mission Control workspace:",
+            instruction,
+        )
+        self.assertNotIn("clone identity only", instruction)
+
     def test_execute_constraints_forbid_recursive_missions(self) -> None:
         mission = _sample_mission()
         mission["permissions"] = {

@@ -821,8 +821,28 @@ class TestDeclaredFileDeliverables(unittest.TestCase):
             ]
         }
         with patch.object(Path, "is_file", guarded_is_file):
-            self.assertIsNone(
-                verify_declared_file_deliverables(mission, str(self.workspace))
+            error = verify_declared_file_deliverables(
+                mission, str(self.workspace)
+            )
+            self.assertEqual(
+                error,
+                f"Declared file deliverable outside workspace: {outside}",
+            )
+            evidence = collect_deliverable_evidence(
+                mission, str(self.workspace)
+            )
+            self.assertTrue(evidence.verified)
+            self.assertFalse(evidence.passed)
+            self.assertEqual(evidence.checked_paths, [])
+            self.assertEqual(evidence.missing, [])
+            self.assertEqual(
+                evidence.outside_workspace,
+                [
+                    str(outside),
+                    f"../{outside.name}",
+                    "/etc/passwd",
+                    "~/secret.txt",
+                ],
             )
             self.assertIsNone(
                 resolve_safe_workspace_deliverable(
@@ -1044,6 +1064,60 @@ class TestExecuteRegisteredRun(unittest.TestCase):
                 "Missing declared file deliverable: missing-output.txt",
             )
             mock_persist.assert_not_called()
+            mock_cleanup.assert_called_once_with(prep.workspace_path)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    @patch("mission_control.workspace.persist_workspace_changes")
+    @patch("mission_control.workspace.execute_cursor_agent")
+    def test_outside_workspace_deliverable_fails_before_persistence(
+        self,
+        mock_execute,
+        mock_persist,
+        mock_cleanup,
+    ) -> None:
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            mock_execute.return_value = ExecutionResult(ok=True, stdout="done\n")
+
+            mission = self.fixture.mission(persistence_mode="commit")
+            mission["deliverables"] = [
+                "/tmp/not-in-workspace.txt",
+                "~/escaped.txt",
+                "../escape.txt",
+            ]
+            with patch(
+                "mission_control.workspace.prepare_isolated_workspace",
+                return_value=prep,
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
+
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.FAILED)
+            self.assertEqual(
+                updated.error,
+                "Declared file deliverable outside workspace: "
+                "/tmp/not-in-workspace.txt",
+            )
+            mock_persist.assert_not_called()
+            assert updated.result is not None
+            assert updated.result.deliverables is not None
+            self.assertFalse(updated.result.deliverables.passed)
+            self.assertEqual(
+                updated.result.deliverables.outside_workspace,
+                [
+                    "/tmp/not-in-workspace.txt",
+                    "~/escaped.txt",
+                    "../escape.txt",
+                ],
+            )
+            assert updated.result.persistence is not None
+            self.assertFalse(updated.result.persistence.attempted)
             mock_cleanup.assert_called_once_with(prep.workspace_path)
         finally:
             cleanup_workspace(prep.workspace_path)
@@ -1285,6 +1359,66 @@ class TestPersistenceHandoff(unittest.TestCase):
             updated.commit_sha,
         )
         self.assertIn("agent_workspace", seen)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    def test_cross_repository_name_writes_stay_in_isolated_workspace(
+        self,
+        _mock_cleanup,
+    ) -> None:
+        """repository.name selects clone URL; agent edits stay in isolated path."""
+        other = GitRepoFixture()
+        seen: dict[str, str] = {}
+        try:
+            os.environ[REPOSITORY_URL_MAP_ENV] = json.dumps(
+                {"nhpcorp35/mission-control": str(other.bare_remote)}
+            )
+            os.environ["MISSION_CONTROL_REPOSITORY_URL"] = str(
+                self.fixture.bare_remote
+            )
+            mission = other.mission(persistence_mode="commit")
+            mission["repository"]["name"] = "nhpcorp35/mission-control"
+            mission["deliverables"] = ["agent_created.txt"]
+
+            with patch(
+                "mission_control.workspace.execute_cursor_agent",
+                side_effect=self._fake_agent_write(seen),
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
+
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.COMPLETED, updated.error)
+            self.assertIsNotNone(updated.commit_sha)
+            assert updated.result is not None
+            self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+            assert updated.result.persistence is not None
+            self.assertTrue(updated.result.persistence.ok)
+            self.assertEqual(updated.result.persistence.mode, "commit")
+            self.assertFalse(updated.result.persistence.pushed)
+
+            agent_ws = Path(seen["agent_workspace"])
+            self.assertTrue((agent_ws / "agent_created.txt").is_file())
+            self.assertEqual(
+                get_origin_url(str(agent_ws)),
+                str(other.bare_remote),
+            )
+            # Must not land in the legacy Legal AI source tree.
+            self.assertFalse(
+                (self.fixture.source_repo / "agent_created.txt").exists()
+            )
+            # Isolated checkout is not either fixture's source path.
+            self.assertNotEqual(
+                os.path.realpath(agent_ws),
+                os.path.realpath(self.fixture.source_repo),
+            )
+            self.assertNotEqual(
+                os.path.realpath(agent_ws),
+                os.path.realpath(other.source_repo),
+            )
+        finally:
+            os.environ.pop(REPOSITORY_URL_MAP_ENV, None)
+            other.cleanup()
 
     @patch("mission_control.workspace.cleanup_workspace")
     def test_approved_push_handoff_records_pushed_true(

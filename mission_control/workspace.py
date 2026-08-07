@@ -780,16 +780,26 @@ def verify_declared_file_deliverables(
 
     Runs after successful agent execution and before platform persistence.
     Only file deliverables (explicit ``file:`` / ``kind: file`` entries, or
-    bare strings that pass :func:`looks_like_file_path_deliverable`) that
-    resolve safely inside the workspace are checked. Missing files produce:
+    bare strings that pass :func:`looks_like_file_path_deliverable`) are
+    considered. Paths that resolve safely inside the workspace must exist as
+    regular files. Absolute, home (``~``), or ``..``-escaping paths are
+    recorded without reading outside the workspace and fail closed:
+
+    ``Declared file deliverable outside workspace: <path>``
+
+    Missing in-workspace files produce:
 
     ``Missing declared file deliverable: <path>``
 
-    Empty deliverable lists, non-list values, descriptive (non-file) items,
-    and unsafe/escaping paths do not fail this gate; unsafe paths are skipped
-    rather than inspected outside the workspace.
+    Empty deliverable lists, non-list values, and descriptive (non-file)
+    items do not fail this gate.
     """
     evidence = collect_deliverable_evidence(mission, workspace_path)
+    if evidence.outside_workspace:
+        return (
+            "Declared file deliverable outside workspace: "
+            f"{evidence.outside_workspace[0]}"
+        )
     if evidence.missing:
         return f"Missing declared file deliverable: {evidence.missing[0]}"
     return None
@@ -807,16 +817,20 @@ def collect_deliverable_evidence(
             passed=True,
             checked_paths=[],
             missing=[],
+            outside_workspace=[],
         )
 
     checked_paths: list[str] = []
     missing: list[str] = []
+    outside_workspace: list[str] = []
     for item in deliverables:
         path = file_path_from_deliverable(item)
         if path is None:
             continue
         target = resolve_safe_workspace_path(workspace_path, path)
         if target is None:
+            # Absolute/home/escaping: record without reading outside workspace.
+            outside_workspace.append(path)
             continue
         checked_paths.append(path)
         if not target.is_file():
@@ -824,9 +838,10 @@ def collect_deliverable_evidence(
 
     return DeliverableEvidence(
         verified=True,
-        passed=len(missing) == 0,
+        passed=len(missing) == 0 and len(outside_workspace) == 0,
         checked_paths=checked_paths,
         missing=missing,
+        outside_workspace=outside_workspace,
     )
 
 
@@ -984,16 +999,23 @@ def execute_registered_run(
             workspace_path,
         )
         structured.deliverables = deliverable_evidence
-        if deliverable_evidence.missing:
+        deliverable_error: str | None = None
+        if deliverable_evidence.outside_workspace:
+            deliverable_error = (
+                "Declared file deliverable outside workspace: "
+                f"{deliverable_evidence.outside_workspace[0]}"
+            )
+        elif deliverable_evidence.missing:
+            deliverable_error = (
+                "Missing declared file deliverable: "
+                f"{deliverable_evidence.missing[0]}"
+            )
+        if deliverable_error is not None:
             append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
             structured.persistence = build_persistence_evidence(
                 mission,
                 attempted=False,
                 ok=None,
-            )
-            deliverable_error = (
-                "Missing declared file deliverable: "
-                f"{deliverable_evidence.missing[0]}"
             )
             # Agent completed; documentation status uses files_changed.
             _attach_documentation(handling_completed=True)
