@@ -912,17 +912,28 @@ class TestCommandRunner(unittest.TestCase):
         self.assertEqual(result.error_code, "PATH_OUTSIDE_ALLOWED_ROOTS")
 
     def test_case00_b2_q1_unapproved_env_names_rejected(self) -> None:
-        """Single-shot accepts OPENAI_TIMEOUT_SECONDS; unrelated names stay rejected."""
+        """Single-shot accepts timeout env names; unrelated names stay rejected."""
         with patch.dict(
             os.environ,
-            {"OPENAI_TIMEOUT_SECONDS": "90"},
+            {
+                "OPENAI_TIMEOUT_SECONDS": "90",
+                "LEGALAI_MODEL_TIMEOUT_SECONDS": "45",
+            },
             clear=False,
         ):
             env = build_command_env(
                 ["OPENAI_TIMEOUT_SECONDS"],
                 script=ALLOWED_CASE00_B2_Q1_SCRIPT,
             )
-        self.assertEqual(env.get("OPENAI_TIMEOUT_SECONDS"), "90")
+            self.assertEqual(env.get("OPENAI_TIMEOUT_SECONDS"), "90")
+
+            legalai_env = build_command_env(
+                ["LEGALAI_MODEL_TIMEOUT_SECONDS"],
+                script=ALLOWED_CASE00_B2_Q1_SCRIPT,
+            )
+        self.assertEqual(
+            legalai_env.get("LEGALAI_MODEL_TIMEOUT_SECONDS"), "45"
+        )
 
         with self.assertRaises(CommandRunnerError) as ctx:
             build_command_env(
