@@ -15,6 +15,7 @@ from mission_control.command_runner import (
     ALLOWED_REBUILD_SCRIPT,
     ALLOWED_SCRIPT,
     AUTHORIZATION_ACK,
+    AUTHORIZATION_CONFIRMED_FLAG,
     AUTHORIZATION_FLAG,
     CommandRunnerError,
     GENERATION_ONLY_FLAG,
@@ -150,7 +151,8 @@ parser.add_argument("--question-id", required=True)
 parser.add_argument("--required-commit", required=True)
 parser.add_argument("--candidate-output-root", type=Path, required=True)
 parser.add_argument(
-    "{AUTHORIZATION_FLAG}",
+    "{AUTHORIZATION_CONFIRMED_FLAG}",
+    action="store_true",
     required=True,
 )
 parser.add_argument("{GENERATION_ONLY_FLAG}", action="store_true", required=True)
@@ -265,9 +267,9 @@ raise SystemExit(0)
         *,
         case_root: str = "data/case-00-triborough",
         candidate_output_root: str = "out/case00-b2-q1",
-        auth: str = AUTHORIZATION_ACK,
         question_id: str = "Q1",
         include_generation_only: bool = True,
+        include_authorization_confirmed: bool = True,
         required_commit: str | None = None,
     ) -> list[str]:
         argv = [
@@ -281,9 +283,9 @@ raise SystemExit(0)
             required_commit or self.commit_sha,
             "--candidate-output-root",
             candidate_output_root,
-            AUTHORIZATION_FLAG,
-            auth,
         ]
+        if include_authorization_confirmed:
+            argv.append(AUTHORIZATION_CONFIRMED_FLAG)
         if include_generation_only:
             argv.append(GENERATION_ONLY_FLAG)
         return argv
@@ -734,7 +736,8 @@ class TestCommandRunner(unittest.TestCase):
         self.assertEqual(resolved[0], "python3")
         self.assertTrue(resolved[1].endswith(ALLOWED_CASE00_B2_Q1_SCRIPT))
         self.assertIn(GENERATION_ONLY_FLAG, resolved)
-        self.assertIn(AUTHORIZATION_FLAG, resolved)
+        self.assertIn(AUTHORIZATION_CONFIRMED_FLAG, resolved)
+        self.assertNotIn(AUTHORIZATION_FLAG, resolved)
         self.assertIsNotNone(out)
 
         env_names = [
@@ -768,7 +771,8 @@ class TestCommandRunner(unittest.TestCase):
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.exit_code, 0)
         self.assertIn(ALLOWED_CASE00_B2_Q1_SCRIPT, result.argv)
-        self.assertIn(REDACTED, result.argv)
+        self.assertIn(AUTHORIZATION_CONFIRMED_FLAG, result.argv)
+        self.assertNotIn(AUTHORIZATION_FLAG, result.argv)
         self.assertNotIn(AUTHORIZATION_ACK, result.argv)
         self.assertIn('"question_id": "Q1"', result.stdout)
 
@@ -795,9 +799,9 @@ class TestCommandRunner(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "INVALID_ARGV")
 
-    def test_case00_b2_q1_wrong_authorization_rejected(self) -> None:
-        """Wrong authorization acknowledgement is rejected at allowlist time."""
-        argv = self.fixture.case00_b2_q1_argv(auth="not-the-required-acknowledgement")
+    def test_case00_b2_q1_missing_authorization_confirmed_rejected(self) -> None:
+        """Single-shot allowlist requires --authorization-confirmed."""
+        argv = self.fixture.case00_b2_q1_argv(include_authorization_confirmed=False)
         with self.assertRaises(CommandRunnerError) as ctx:
             validate_and_build_argv(
                 argv,
@@ -806,6 +810,30 @@ class TestCommandRunner(unittest.TestCase):
                 mounted=[self.fixture.mount_root],
             )
         self.assertEqual(ctx.exception.code, "INVALID_ARGV")
+        self.assertIn(AUTHORIZATION_CONFIRMED_FLAG, str(ctx.exception))
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="nhpcorp35/legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_ARGV")
+
+    def test_case00_b2_q1_old_authorization_token_flag_rejected(self) -> None:
+        """Wrapper policy rejects the generator's token-bearing authorization flag."""
+        argv = self.fixture.case00_b2_q1_argv()
+        argv.extend([AUTHORIZATION_FLAG, AUTHORIZATION_ACK])
+        with self.assertRaises(CommandRunnerError) as ctx:
+            validate_and_build_argv(
+                argv,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(ctx.exception.code, "FLAG_NOT_ALLOWLISTED")
         self.assertIn(AUTHORIZATION_FLAG, str(ctx.exception))
 
         result = run_repository_command(
@@ -816,8 +844,8 @@ class TestCommandRunner(unittest.TestCase):
             )
         )
         self.assertFalse(result.ok)
-        self.assertEqual(result.error_code, "INVALID_ARGV")
-        self.assertNotIn("not-the-required-acknowledgement", result.argv)
+        self.assertEqual(result.error_code, "FLAG_NOT_ALLOWLISTED")
+        self.assertNotIn(AUTHORIZATION_ACK, result.argv)
 
     def test_case00_b2_q1_unknown_flag_rejected(self) -> None:
         """Flags outside the single-shot allowlist remain rejected."""

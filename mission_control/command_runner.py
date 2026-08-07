@@ -50,9 +50,13 @@ ALLOWED_REPOSITORY_ALIASES: dict[str, str] = {
 # scripts/generate_attorney_feedback_candidate.py (not approximate aliases).
 AUTHORIZATION_FLAG = "--authorize-private-evidence-transmission"
 GENERATION_ONLY_FLAG = "--generation-only"
-# Same acknowledgement required by generate_attorney_feedback_candidate.py /
-# scripts/run_case00_b2_q1.py (not approximate aliases).
+# Same acknowledgement required by generate_attorney_feedback_candidate.py
+# (not approximate aliases). The Case-00 B2 Q1 wrapper uses a separate
+# no-value confirmation flag instead of this token-bearing authorization.
 AUTHORIZATION_ACK = "I_AUTHORIZE_PRIVATE_EVIDENCE_TRANSMISSION_TO_MODEL_PROVIDER"
+# Verified against scripts/run_case00_b2_q1.py on LegalAI main: required
+# boolean confirmation (no value), distinct from AUTHORIZATION_FLAG.
+AUTHORIZATION_CONFIRMED_FLAG = "--authorization-confirmed"
 
 # Shell metacharacters / chaining / redirection / expansion markers.
 _SHELL_META_RE = re.compile(r"""[|;&><`$(){}]|&&|\|\||>>|<<|\n|\r""")
@@ -207,12 +211,11 @@ _CASE00_B2_Q1_POLICY = _ScriptPolicy(
             "--question-id",
             "--required-commit",
             "--candidate-output-root",
-            AUTHORIZATION_FLAG,
         }
     ),
-    flags_no_value=frozenset({GENERATION_ONLY_FLAG}),
+    flags_no_value=frozenset({GENERATION_ONLY_FLAG, AUTHORIZATION_CONFIRMED_FLAG}),
     path_flags=frozenset({"--case-root", "--candidate-output-root"}),
-    sensitive_flags=frozenset({AUTHORIZATION_FLAG}),
+    sensitive_flags=frozenset(),
     env_allowlist=_BASE_ENV_ALLOWLIST | _CASE00_B2_Q1_ENV_ALLOWLIST,
     workspace_local_paths_only=True,
     required_flags=frozenset(
@@ -221,11 +224,10 @@ _CASE00_B2_Q1_POLICY = _ScriptPolicy(
             "--question-id",
             "--required-commit",
             "--candidate-output-root",
-            AUTHORIZATION_FLAG,
+            AUTHORIZATION_CONFIRMED_FLAG,
             GENERATION_ONLY_FLAG,
         }
     ),
-    exact_flag_values=frozenset({(AUTHORIZATION_FLAG, AUTHORIZATION_ACK)}),
     flag_value_patterns=(
         ("--question-id", _SAFE_IDENTIFIER_RE),
         ("--required-commit", _GIT_REF_SAFE_RE),
