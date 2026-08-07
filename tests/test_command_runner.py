@@ -12,12 +12,16 @@ from unittest.mock import patch
 
 from mission_control.command_runner import (
     ALLOWED_SCRIPT,
+    AUTHORIZATION_FLAG,
+    CommandRunnerError,
+    GENERATION_ONLY_FLAG,
     REDACTED,
     REPOSITORY_URL_MAP_ENV,
     RepositoryCommandSpec,
     build_command_env,
     redact_argv,
     run_repository_command,
+    validate_and_build_argv,
 )
 from mission_control.workspace import prepare_ephemeral_checkout
 
@@ -57,7 +61,7 @@ class CommandRepoFixture:
         script_dir.mkdir()
         script_path = script_dir / "generate_attorney_feedback_candidate.py"
         script_path.write_text(
-            '''#!/usr/bin/env python3
+            f'''#!/usr/bin/env python3
 import argparse
 import json
 import os
@@ -71,10 +75,10 @@ parser.add_argument("--question-id", required=True)
 parser.add_argument("--required-commit", required=True)
 parser.add_argument("--candidate-output-root", type=Path, required=True)
 parser.add_argument(
-    "--authorize-private-evidence-transmission",
+    "{AUTHORIZATION_FLAG}",
     required=True,
 )
-parser.add_argument("--generation-only", action="store_true", required=True)
+parser.add_argument("{GENERATION_ONLY_FLAG}", action="store_true", required=True)
 args = parser.parse_args()
 
 # Test-only probe: sleep so the command runner timeout path can be exercised
@@ -85,14 +89,14 @@ if args.question_id == "__TIMEOUT_PROBE__":
 out = Path(args.candidate_output_root)
 out.mkdir(parents=True, exist_ok=True)
 artifact = out / "candidate.json"
-payload = {
+payload = {{
     "question_id": args.question_id,
     "required_commit": args.required_commit,
     "marker_env": os.environ.get("PYTHONUNBUFFERED"),
     "secret_env_present": "OPENAI_API_KEY" in os.environ,
-}
+}}
 artifact.write_text(json.dumps(payload), encoding="utf-8")
-print(f"wrote:{artifact}")
+print(f"wrote:{{artifact}}")
 raise SystemExit(0)
 ''',
             encoding="utf-8",
@@ -159,9 +163,9 @@ raise SystemExit(0)
             self.commit_sha,
             "--candidate-output-root",
             out,
-            "--authorize-private-evidence-transmission",
+            AUTHORIZATION_FLAG,
             auth,
-            "--generation-only",
+            GENERATION_ONLY_FLAG,
         ]
 
 
@@ -233,7 +237,7 @@ class TestCommandRunner(unittest.TestCase):
         argv = [
             "python3",
             "../etc/passwd",
-            "--generation-only",
+            GENERATION_ONLY_FLAG,
         ]
         result = run_repository_command(
             RepositoryCommandSpec(
@@ -247,6 +251,45 @@ class TestCommandRunner(unittest.TestCase):
             result.error_code,
             {"PATH_TRAVERSAL", "SCRIPT_NOT_ALLOWLISTED"},
         )
+
+    def test_authorization_and_generation_only_flags_accepted(self) -> None:
+        """Approved LegalAI safety/generation flags pass argv validation."""
+        argv = self.fixture.allowlisted_argv()
+        self.assertIn(AUTHORIZATION_FLAG, argv)
+        self.assertIn(GENERATION_ONLY_FLAG, argv)
+        workspace = self.fixture.source_repo
+        resolved, _cwd, _out = validate_and_build_argv(
+            argv,
+            workspace=workspace,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertIn(AUTHORIZATION_FLAG, resolved)
+        self.assertIn(GENERATION_ONLY_FLAG, resolved)
+
+    def test_unknown_flag_rejected(self) -> None:
+        """Flags outside the generator allowlist remain rejected."""
+        argv = self.fixture.allowlisted_argv()
+        argv.append("--not-an-allowlisted-flag")
+        with self.assertRaises(CommandRunnerError) as ctx:
+            validate_and_build_argv(
+                argv,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(ctx.exception.code, "FLAG_NOT_ALLOWLISTED")
+
+        # End-to-end runner path also rejects unknown flags.
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "FLAG_NOT_ALLOWLISTED")
 
     def test_timeout(self) -> None:
         result = run_repository_command(

@@ -39,6 +39,12 @@ ALLOWED_REPOSITORY_ALIASES: dict[str, str] = {
     "legal-ai": "nhpcorp35/legal-ai",
 }
 
+# Exact LegalAI CLI spellings for the authorized attorney benchmark (Q1)
+# safety acknowledgement and generation-only mode. Verified against
+# scripts/generate_attorney_feedback_candidate.py (not approximate aliases).
+AUTHORIZATION_FLAG = "--authorize-private-evidence-transmission"
+GENERATION_ONLY_FLAG = "--generation-only"
+
 # Flags accepted for the allowlisted generation CLI.
 _FLAGS_WITH_VALUE = frozenset(
     {
@@ -46,12 +52,12 @@ _FLAGS_WITH_VALUE = frozenset(
         "--question-id",
         "--required-commit",
         "--candidate-output-root",
-        "--authorize-private-evidence-transmission",
+        AUTHORIZATION_FLAG,
         "--repo-root",
         "--inventory-path",
     }
 )
-_FLAGS_NO_VALUE = frozenset({"--generation-only", "--help"})
+_FLAGS_NO_VALUE = frozenset({GENERATION_ONLY_FLAG, "--help"})
 _PATH_FLAGS = frozenset(
     {
         "--case-root",
@@ -62,7 +68,7 @@ _PATH_FLAGS = frozenset(
 )
 _SENSITIVE_FLAGS = frozenset(
     {
-        "--authorize-private-evidence-transmission",
+        AUTHORIZATION_FLAG,
     }
 )
 
