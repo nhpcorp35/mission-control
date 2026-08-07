@@ -2445,6 +2445,73 @@ class CitationValidationImprovementTests(unittest.TestCase):
             )
         )
 
+    def test_case00_short_ocr_word_fractures_survive(self):
+        """Case-00 style OCR splits (P2–P6 / P16 class) must still verify."""
+        page = (
+            "3. That at all times herein mentioned, the following named "
+            "persons ar e individ uals residing in the State of New York. "
+            "4. Tribor ough Construction Services, Inc. seeks rec ission of "
+            "the policy of insurance."
+        )
+        self.assertTrue(
+            de.excerpt_occurs_on_page("are individuals", page)
+        )
+        self.assertTrue(
+            de.excerpt_occurs_on_page("individ uals residing", page)
+        )
+        self.assertTrue(
+            de.excerpt_occurs_on_page(
+                "Triborough Construction Services, Inc.",
+                page,
+            )
+        )
+        self.assertTrue(
+            de.excerpt_occurs_on_page("rescission of the policy", page)
+        )
+        self.assertTrue(
+            de.excerpt_occurs_on_page("recission of the policy", page)
+        )
+        # Fractured needle against clean haystack.
+        self.assertTrue(
+            de.excerpt_occurs_on_page(
+                "ar e individ uals",
+                "persons are individuals residing in the State of New York.",
+            )
+        )
+
+    def test_intervening_pleading_paragraph_numbers_tolerated(self):
+        excerpt = (
+            "Plaintiff Alpha Carrier LP is a domestic corporation. "
+            "Defendant Beta Depot Inc. is a notice defendant."
+        )
+        page = (
+            "1. Plaintiff Alpha Carrier LP is a domestic corporation. "
+            "2. Defendant Beta Depot Inc. is a notice defendant."
+        )
+        self.assertTrue(de.excerpt_occurs_on_page(excerpt, page))
+        self.assertTrue(
+            de.excerpt_occurs_on_page(
+                "Alpha Carrier LP is a domestic corporation. "
+                "Beta Depot Inc. is a notice defendant.",
+                "79. Alpha Carrier LP is a domestic corporation. "
+                "80. Beta Depot Inc. is a notice defendant.",
+            )
+        )
+
+    def test_punctuation_whitespace_tolerant_matching(self):
+        self.assertTrue(
+            de.excerpt_occurs_on_page(
+                "Alpha Carrier LP, is a domestic corporation",
+                "Alpha Carrier LP is a domestic corporation.",
+            )
+        )
+        self.assertTrue(
+            de.excerpt_occurs_on_page(
+                "principal place of business located at 10 Harbor Way",
+                "principal place of business, located at 10 Harbor Way,",
+            )
+        )
+
     def test_ellipsis_segments_validate_independently(self):
         page = (
             "Plaintiff Alpha Carrier LP is a domestic corporation. "
@@ -2467,6 +2534,20 @@ class CitationValidationImprovementTests(unittest.TestCase):
             )
         )
 
+    def test_ellipsis_multiparty_with_paragraph_numbers(self):
+        page = (
+            "1. Plaintiff Alpha Carrier LP is a domestic corporation. "
+            "2. Defendant Beta Depot Inc. is a notice defendant. "
+            "3. Defendant Oakline Carrier LP is a resident of New York."
+        )
+        self.assertTrue(
+            de.excerpt_occurs_on_page(
+                "Alpha Carrier LP is a domestic corporation ... "
+                "Oakline Carrier LP is a resident of New York",
+                page,
+            )
+        )
+
     def test_unsupported_segments_still_fail(self):
         page = "Defendant Beta Depot Inc. is a notice defendant."
         self.assertFalse(
@@ -2478,6 +2559,38 @@ class CitationValidationImprovementTests(unittest.TestCase):
         self.assertFalse(
             de.excerpt_occurs_on_page(
                 "entirely absent quotation",
+                page,
+            )
+        )
+
+    def test_ocr_tolerant_negative_controls_still_reject_unrelated_text(self):
+        page = (
+            "1. Plaintiff Alpha Carrier LP is a domestic corporation. "
+            "2. Defendant Beta Depot Inc. is a notice defendant. "
+            "Persons ar e individ uals. Tribor ough Construction Services."
+        )
+        self.assertFalse(
+            de.excerpt_occurs_on_page(
+                "Omega Freight LLC is a foreign partnership authorized in Ohio",
+                page,
+            )
+        )
+        self.assertFalse(
+            de.excerpt_occurs_on_page(
+                "Triborough Bridge and Tunnel Authority is plaintiff",
+                page,
+            )
+        )
+        self.assertFalse(
+            de.excerpt_occurs_on_page(
+                "rescission of the reinsurance treaty",
+                page,
+            )
+        )
+        self.assertFalse(
+            de.excerpt_occurs_on_page(
+                "Alpha Carrier LP is a domestic corporation ... "
+                "Omega Freight LLC maintains a PPB in Cleveland",
                 page,
             )
         )
@@ -2812,6 +2925,194 @@ class PartyRoleDraftingCompletenessTests(unittest.TestCase):
         self.assertTrue(result["audit"].get("missing_party_role_attributes"))
         self.assertEqual(result["proposed_answer"], "")
         self.assertEqual(result["propositions"], [])
+
+    def test_post_validation_completeness_fails_after_mass_excerpt_mismatch(self):
+        """Reproduce 18 props / 6 retained / 12 excerpt_mismatch false PASS.
+
+        Pre-validation draft looks complete and high-confidence, but citation
+        validation strips most party-role propositions. Completeness must be
+        recomputed against retained verified propositions and must not remain
+        READY/PASS with the stripped claims still in prose.
+        """
+        page_text = (
+            "PARTIES\n"
+            "1. Plaintiff Cedar Ridge Logistics LLC is a domestic corporation "
+            "authorized to do business in this state.\n"
+            "2. Cedar Ridge Logistics LLC maintained a principal place of business "
+            "located at 10 Harbor Way, Albany, NY 12207.\n"
+            "3. Defendant Pine Harbor Depot Inc. is a notice defendant.\n"
+            "4. Pine Harbor Depot Inc. is a limited liability company.\n"
+            "5. Defendant Oakline Carrier LP is a resident of the State of New York "
+            "residing in Erie County.\n"
+            "6. Defendant Riverbend Supply Co. is a domestic corporation.\n"
+            "7. Riverbend Supply Co. maintained a principal place of business "
+            "located at 1 Main St, Buffalo, NY.\n"
+            "8. Defendant Summit Freight Inc. is a domestic corporation.\n"
+            "9. Summit Freight Inc. maintained a principal place of business "
+            "located at 2 Pine Rd, Rochester, NY.\n"
+            "10. Defendant Harborview Logistics LLC is a limited liability company.\n"
+            "11. Harborview Logistics LLC maintained a principal place of business "
+            "located at 3 Dock Ave, Syracuse, NY.\n"
+        )
+        hit = {
+            "result_id": "cret-nyscef-910-page-0001",
+            "page_id": "nyscef-910-page-0001",
+            "nyscef_document_number": 910,
+            "pdf_page": 1,
+            "source_filename": "nyscef_doc_no_910_complaint.pdf",
+            "document_type": "complaint",
+            "excerpt": page_text,
+            "page_text": page_text,
+            "classifications": ["party_identity"],
+            "assertion_kind": "party_allegation",
+            "score": 10.0,
+        }
+        retrieval = {
+            "query": self.party_question,
+            "results": [hit],
+        }
+        packet = de.build_evidence_packet(self.party_question, retrieval)
+        expected = de.extract_party_role_expected_attributes(packet)
+        self.assertGreaterEqual(len(expected), 6)
+
+        # Six verified excerpts that actually appear on the page (narrow support).
+        retained_specs = [
+            (
+                "P01",
+                "Cedar Ridge Logistics LLC is plaintiff.",
+                "Plaintiff Cedar Ridge Logistics LLC is a domestic corporation",
+            ),
+            (
+                "P02",
+                "Cedar Ridge Logistics LLC has a PPB in Albany.",
+                "principal place of business located at 10 Harbor Way, Albany, NY 12207",
+            ),
+            (
+                "P03",
+                "Pine Harbor Depot Inc. is a notice defendant.",
+                "Defendant Pine Harbor Depot Inc. is a notice defendant",
+            ),
+            (
+                "P04",
+                "Pine Harbor Depot Inc. is a limited liability company.",
+                "Pine Harbor Depot Inc. is a limited liability company",
+            ),
+            (
+                "P05",
+                "Oakline Carrier LP is a New York resident.",
+                "Defendant Oakline Carrier LP is a resident of the State of New York",
+            ),
+            (
+                "P06",
+                "Riverbend Supply Co. is a domestic corporation.",
+                "Defendant Riverbend Supply Co. is a domestic corporation",
+            ),
+        ]
+        # Twelve propositions with invented excerpts → excerpt_mismatch removals.
+        mismatch_specs = []
+        for i in range(7, 19):
+            mismatch_specs.append(
+                (
+                    f"P{i:02d}",
+                    f"Unsupported party-role claim number {i}.",
+                    (
+                        f"Completely invented excerpt {i} about Omega Freight "
+                        f"LLC foreign partnership in Cleveland Ohio"
+                    ),
+                )
+            )
+        self.assertEqual(len(retained_specs) + len(mismatch_specs), 18)
+
+        complete_looking_answer = (
+            "Plaintiff Cedar Ridge Logistics LLC is a domestic corporation with "
+            "principal place of business located at 10 Harbor Way, Albany, NY 12207. "
+            "Defendant Pine Harbor Depot Inc. is a notice defendant and a limited "
+            "liability company. Defendant Oakline Carrier LP is a resident of the "
+            "State of New York residing in Erie County. Defendant Riverbend Supply "
+            "Co. is a domestic corporation with principal place of business located "
+            "at 1 Main St, Buffalo, NY. Defendant Summit Freight Inc. is a domestic "
+            "corporation with principal place of business located at 2 Pine Rd, "
+            "Rochester, NY. Defendant Harborview Logistics LLC is a limited "
+            "liability company with principal place of business located at 3 Dock "
+            "Ave, Syracuse, NY."
+        )
+
+        def _payload():
+            propositions = []
+            for prop_id, text, excerpt in retained_specs + mismatch_specs:
+                propositions.append(
+                    {
+                        "proposition_id": prop_id,
+                        "text": text,
+                        "classification": "party_allegation",
+                        "nyscef_document_number": 910,
+                        "page_id": hit["page_id"],
+                        "pdf_page": 1,
+                        "source_excerpt": excerpt,
+                        "confidence": 0.92,
+                        "rationale": "Party-role pleading allegation.",
+                        "polarity": "supporting",
+                    }
+                )
+            return {
+                "proposed_answer": complete_looking_answer,
+                "propositions": propositions,
+                "supporting_evidence": [],
+                "contrary_evidence": [],
+                "unresolved_questions": [],
+                "documents_pages_reviewed": [],
+                "confidence": 0.92,
+                "attorney_review": {
+                    "requires_attorney_review": True,
+                    "review_notes": "Appears complete before citation validation.",
+                    "legal_conclusions_labeled": True,
+                    "coverage_conclusion": None,
+                },
+                "review_scope": {
+                    "completeness": "complete",
+                    "qualification": "Model claimed full roster.",
+                },
+            }
+
+        calls = []
+
+        def _model(_system, user_prompt):
+            calls.append(user_prompt)
+            # Repair still returns the same citation-broken complete-looking draft.
+            return _payload()
+
+        result = de.answer_attorney_record_question(
+            self.party_question,
+            retrieval,
+            model_call=_model,
+        )
+
+        removed = result["audit"].get("removed_propositions") or []
+        mismatch_removed = [
+            item
+            for item in removed
+            if item.get("removal_reason") == "excerpt_mismatch"
+        ]
+        kept_ids = {p["proposition_id"] for p in result.get("propositions") or []}
+
+        self.assertEqual(len(mismatch_removed), 12)
+        self.assertEqual(len(kept_ids), 6)
+        self.assertTrue(kept_ids <= {spec[0] for spec in retained_specs})
+        self.assertEqual(result["status"], de.STATUS_NOT_READY)
+        self.assertTrue(result["audit"].get("party_role_completeness_failed"))
+        self.assertTrue(result["audit"].get("missing_party_role_attributes"))
+        self.assertLessEqual(result.get("confidence") or 0.0, 0.0)
+        # Final prose must not retain the pre-validation complete roster claim.
+        answer = (result.get("proposed_answer") or "").lower()
+        self.assertNotIn("summit freight", answer)
+        self.assertNotIn("harborview logistics", answer)
+        self.assertNotEqual(
+            (result.get("review_scope") or {}).get("completeness"),
+            "complete",
+        )
+        # Bounded repair was invoked after post-validation gap detection.
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(result["audit"].get("party_role_repair_attempted"))
 
     def test_non_party_questions_skip_instruction_and_repair(self):
         motion_hit = {

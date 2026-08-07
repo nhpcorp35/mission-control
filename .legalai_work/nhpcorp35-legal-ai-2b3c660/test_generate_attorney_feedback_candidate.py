@@ -54,10 +54,10 @@ def _synthetic_case(root: Path) -> None:
             1,
             (
                 "PARTIES\n"
-                "Cedar Ridge Logistics LLC is a domestic corporation duly "
-                "authorized to do business in this state and is the plaintiff.\n"
-                "Meadow Bridge Repair Inc. is a domestic corporation with its "
-                "principal place of business in Albany and is a defendant.\n"
+                "1. Plaintiff Cedar Ridge Logistics LLC is a domestic corporation "
+                "duly authorized to do business in this state.\n"
+                "2. Defendant Meadow Bridge Repair Inc. is a domestic corporation "
+                "with its principal place of business in Albany.\n"
             ),
             nyscef,
         ),
@@ -156,7 +156,11 @@ def _complete_payload_from_prompt(user_prompt: str) -> dict:
     expected = de.extract_party_role_expected_attributes(packet)
     bits = []
     for party in expected:
-        bit = f"{party.get('procedural_role')} {party.get('identity')}"
+        identity = party.get("identity")
+        if not identity:
+            continue
+        role = party.get("procedural_role")
+        bit = f"{role} {identity}".strip() if role else str(identity)
         if party.get("entity_type"):
             bit += f" is a {party['entity_type']}"
         if party.get("residence_or_ppb"):
@@ -165,6 +169,10 @@ def _complete_payload_from_prompt(user_prompt: str) -> dict:
             bit += f" ({party['pleaded_role_basis']})"
         bits.append(bit + ".")
     answer = " ".join(bits) or "Parties are identified in the record."
+    page_text = hit.get("page_text") or hit.get("excerpt") or ""
+    grounded_excerpt = "Cedar Ridge Logistics LLC is a domestic corporation"
+    if page_text and not de.excerpt_occurs_on_page(grounded_excerpt, page_text):
+        grounded_excerpt = (page_text.strip().split("\n") or [""])[0][:120]
     return {
         "proposed_answer": answer,
         "propositions": [
@@ -175,7 +183,7 @@ def _complete_payload_from_prompt(user_prompt: str) -> dict:
                 "nyscef_document_number": hit.get("nyscef_document_number") or 101,
                 "page_id": hit.get("page_id") or "nyscef-101-page-0001",
                 "pdf_page": hit.get("pdf_page") or 1,
-                "source_excerpt": "Cedar Ridge Logistics LLC is a domestic corporation",
+                "source_excerpt": grounded_excerpt,
                 "confidence": 0.9,
                 "rationale": "Party roster from pleading.",
                 "polarity": "supporting",

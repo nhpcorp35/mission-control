@@ -806,11 +806,13 @@ def normalize_whitespace(value: Any) -> str:
 _OCR_CITATION_JOIN_WORDS = frozenset(
     {
         "additional",
+        "are",
         "association",
         "authorized",
         "business",
         "companies",
         "company",
+        "construction",
         "corporation",
         "corporations",
         "declaration",
@@ -833,15 +835,32 @@ _OCR_CITATION_JOIN_WORDS = frozenset(
         "plaintiff",
         "plaintiffs",
         "principal",
+        "recission",
+        "rescission",
         "resident",
         "residents",
         "residing",
         "residence",
+        "services",
+        "triborough",
+        "tribrough",
         "underwriters",
     }
 )
 
 _ELLIPSIS_SPLIT_RE = re.compile(r"(?:\.{3}|…|\[\s*\.\.\.\s*\])")
+
+# Pleading paragraph markers that may sit between excerpt sentences on-page
+# (e.g. ``corporation. 5. Defendant`` vs excerpt ``corporation. Defendant``).
+_PLEADING_PARA_MARKER_RE = re.compile(
+    r"(?:(?<=^)|(?<=[\s]))(?:\d{1,3})\.(?=\s|$)"
+)
+
+# Compact-form legal spelling variants tolerated only during citation compare.
+_CITATION_COMPACT_VARIANTS = (
+    ("rescission", "recission"),
+    ("recission", "rescission"),
+)
 
 
 # Legal-entity suffixes commonly fractured by OCR inside party identities.
@@ -1043,6 +1062,95 @@ def normalize_citation_text(value: Any) -> str:
     return heal_ocr_intra_word_spaces(normalize_whitespace(value)).lower()
 
 
+def _strip_pleading_paragraph_markers(text: str) -> str:
+    """Remove intervening ``N.`` pleading markers for citation compare only."""
+    if not text:
+        return ""
+    return normalize_whitespace(_PLEADING_PARA_MARKER_RE.sub(" ", text))
+
+
+def _citation_alnum_tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def _citation_compact_alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _citation_compact_forms(text: str) -> List[str]:
+    """Compact alnum forms including targeted legal spelling variants."""
+    base = _citation_compact_alnum(text)
+    if not base:
+        return []
+    forms = {base}
+    for left, right in _CITATION_COMPACT_VARIANTS:
+        if left in base:
+            forms.add(base.replace(left, right))
+    return list(forms)
+
+
+def _flexible_citation_token_pattern(token: str) -> str:
+    """Allow OCR spaces / punctuation between letters of one token."""
+    chars = [re.escape(ch) for ch in (token or "").lower() if ch.isalnum()]
+    if not chars:
+        return ""
+    return r"[^\w]*".join(chars)
+
+
+def _punct_ocr_tolerant_citation_occurs(needle: str, hay: str) -> bool:
+    """
+    Match a citation needle against page text with punctuation / whitespace
+    tolerance, short OCR letter fractures, and intervening pleading paragraph
+    numbers. Token sequence must remain contiguous (no skipped words).
+    """
+    needle_norm = normalize_citation_text(needle) or normalize_whitespace(needle).lower()
+    hay_norm = normalize_citation_text(hay) or normalize_whitespace(hay).lower()
+    if not needle_norm or not hay_norm:
+        return False
+
+    # Compact compare (punctuation/whitespace insensitive) with spelling variants.
+    hay_compacts = set()
+    for form in (
+        hay_norm,
+        _strip_pleading_paragraph_markers(hay_norm),
+        normalize_whitespace(hay).lower(),
+    ):
+        hay_compacts.update(_citation_compact_forms(form))
+    for needle_form in (
+        needle_norm,
+        normalize_whitespace(needle).lower(),
+    ):
+        for compact in _citation_compact_forms(needle_form):
+            if compact and any(compact in hay_c for hay_c in hay_compacts):
+                return True
+
+    tokens = _citation_alnum_tokens(needle_norm)
+    if not tokens:
+        return False
+    # Mirror substantive-segment guard: reject ultra-short single tokens.
+    if len(tokens) == 1 and len(tokens[0]) < 4:
+        return False
+
+    token_patterns = [
+        _flexible_citation_token_pattern(tok) for tok in tokens
+    ]
+    token_patterns = [p for p in token_patterns if p]
+    if not token_patterns:
+        return False
+
+    # Between tokens: non-alnum runs and/or pleading ``N.`` markers only.
+    sep = r"(?:[^\w]+|\d{1,3}\.)*"
+    body = sep.join(token_patterns)
+    pattern = re.compile(rf"(?<![a-z0-9]){body}(?![a-z0-9])", re.I)
+    hay_candidates = (
+        hay_norm,
+        _strip_pleading_paragraph_markers(hay_norm),
+        normalize_whitespace(hay).lower(),
+        _strip_pleading_paragraph_markers(normalize_whitespace(hay).lower()),
+    )
+    return any(pattern.search(candidate) for candidate in hay_candidates if candidate)
+
+
 def _substantive_citation_segment(segment: str) -> bool:
     tokens = re.findall(r"[A-Za-z0-9]+", segment or "")
     if not tokens:
@@ -1059,7 +1167,13 @@ def _citation_segment_occurs(segment: str, hay_raw: str, hay_ocr: str) -> bool:
     if needle in hay_raw:
         return True
     needle_ocr = normalize_citation_text(needle)
-    return bool(needle_ocr and needle_ocr in hay_ocr)
+    if needle_ocr and needle_ocr in hay_ocr:
+        return True
+    if _punct_ocr_tolerant_citation_occurs(needle, hay_raw):
+        return True
+    if hay_ocr and _punct_ocr_tolerant_citation_occurs(needle, hay_ocr):
+        return True
+    return False
 
 
 def excerpt_occurs_on_page(excerpt: Any, page_text: Any) -> bool:
@@ -1067,7 +1181,9 @@ def excerpt_occurs_on_page(excerpt: Any, page_text: Any) -> bool:
     True when a cited excerpt is supported by page text.
 
     Accepts whitespace-normalized contiguous matches, OCR-healed word matches,
-    and ellipsis-separated quotations when every substantive segment is
+    punctuation-tolerant matches, short OCR letter fractures, intervening
+    pleading paragraph numbers between excerpt sentences, and
+    ellipsis-separated quotations when every substantive segment is
     independently supported. Unsupported segments fail the whole quotation.
     """
     needle = normalize_whitespace(excerpt)
@@ -1080,6 +1196,9 @@ def excerpt_occurs_on_page(excerpt: Any, page_text: Any) -> bool:
     hay_ocr = normalize_citation_text(hay)
     needle_ocr = normalize_citation_text(needle)
     if needle_ocr and needle_ocr in hay_ocr:
+        return True
+
+    if _punct_ocr_tolerant_citation_occurs(needle, hay):
         return True
 
     if _ELLIPSIS_SPLIT_RE.search(needle):
@@ -3399,6 +3518,102 @@ def _party_role_completeness_failure(
     return result
 
 
+def _draft_text_from_retained_party_role_propositions(propositions: Sequence[dict]) -> str:
+    """Build completeness-check text from retained verified propositions only."""
+    parts: List[str] = []
+    for prop in propositions or []:
+        if not isinstance(prop, dict):
+            continue
+        parts.append(str(prop.get("text") or ""))
+        parts.append(str(prop.get("source_excerpt") or prop.get("excerpt") or ""))
+    return "\n".join(parts)
+
+
+def _scrub_party_role_answer_to_retained_propositions(validated: dict) -> dict:
+    """
+    Drop unverified party-role prose after citation validation removals.
+
+    Completeness and confidence must reflect surviving verified propositions,
+    not the pre-validation draft that still contains stripped claims.
+    """
+    removed = validated.get("audit", {}).get("removed_propositions") or []
+    if not removed:
+        return validated
+
+    kept = [
+        prop
+        for prop in (validated.get("propositions") or [])
+        if isinstance(prop, dict)
+    ]
+    if kept:
+        rewritten = " ".join(
+            normalize_whitespace(prop.get("text"))
+            for prop in kept
+            if normalize_whitespace(prop.get("text"))
+        )
+        validated["proposed_answer"] = rewritten or (
+            "No validated propositions remained after citation review; "
+            "see unresolved questions and audit."
+        )
+        confidences = [
+            _coerce_confidence(prop.get("confidence"), 0.0) for prop in kept
+        ]
+        if confidences:
+            validated["confidence"] = min(
+                _coerce_confidence(validated.get("confidence"), 0.0) or 0.0,
+                round(sum(confidences) / len(confidences), 6),
+            )
+    else:
+        validated["proposed_answer"] = (
+            "No validated propositions remained after citation review; "
+            "see unresolved questions and audit."
+        )
+        validated["confidence"] = 0.0
+        validated["status"] = STATUS_NOT_READY
+
+    review_scope = validated.get("review_scope")
+    if isinstance(review_scope, dict):
+        review_scope = dict(review_scope)
+        review_scope["completeness"] = "not_established"
+        review_scope["qualification"] = normalize_whitespace(
+            review_scope.get("qualification")
+        ) or (
+            "Findings are limited to surviving citation-validated propositions; "
+            "completeness is not established beyond that scope."
+        )
+        validated["review_scope"] = review_scope
+
+    notes = validated.setdefault("audit", {}).setdefault("notes", [])
+    notes.append(
+        "Proposed answer scrubbed to retained citation-validated propositions "
+        "after unsupported propositions were removed."
+    )
+    return validated
+
+
+def find_missing_party_role_attributes_from_retained(
+    validated: dict,
+    expected_parties: Sequence[dict],
+) -> List[dict]:
+    """
+    Recompute party-role completeness against retained verified propositions.
+
+    Ignores pre-validation proposed_answer prose that may still recite stripped
+    party-role claims.
+    """
+    retained_draft = _draft_text_from_retained_party_role_propositions(
+        validated.get("propositions") or []
+    )
+    # Evaluate missing attributes against retained proposition text only.
+    return find_missing_party_role_attributes(
+        {
+            "proposed_answer": retained_draft,
+            "propositions": validated.get("propositions") or [],
+        },
+        expected_parties,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -4002,6 +4217,9 @@ def answer_attorney_record_question(
 
     Party-and-role questions receive a final completeness instruction and, when
     evidence-supported attributes are omitted, exactly one bounded repair retry.
+    After citation validation removes unsupported propositions, completeness is
+    recomputed against retained verified propositions so stripped party-role
+    claims cannot leave a false PASS / high-confidence answer.
     """
     question_text = normalize_whitespace(question)
     retrieval = retrieval or {"query": question_text, "results": []}
@@ -4052,6 +4270,7 @@ def answer_attorney_record_question(
         return result
 
     repair_attempted = False
+    expected: List[dict] = []
     if party_role_intent:
         expected = extract_party_role_expected_attributes(evidence_packet)
         missing = find_missing_party_role_attributes(raw, expected)
@@ -4091,8 +4310,95 @@ def answer_attorney_record_question(
     validated["audit"]["provider_available"] = True
     validated["evidence_packet_hit_count"] = evidence_packet["retrieval_hit_count"]
     if party_role_intent:
+        # After citation validation strips unsupported propositions, recompute
+        # completeness against retained verified support only. A draft must not
+        # remain completeness PASS / high-confidence when core party-role claims
+        # were removed. When nothing was removed, pre-validation completeness
+        # already governs.
+        removed = validated.get("audit", {}).get("removed_propositions") or []
+        missing_retained: List[dict] = []
+        if removed:
+            validated = _scrub_party_role_answer_to_retained_propositions(validated)
+            missing_retained = find_missing_party_role_attributes_from_retained(
+                validated, expected
+            )
+        if missing_retained:
+            if not repair_attempted:
+                repair_attempted = True
+                repair_prompt = build_party_role_repair_prompt(
+                    question=question_text,
+                    evidence_packet=evidence_packet,
+                    current_draft=validated,
+                    missing_attributes=missing_retained,
+                )
+                try:
+                    raw = provider(active_system, repair_prompt)
+                    provider_calls = 2
+                except Exception as exc:  # noqa: BLE001
+                    return _party_role_completeness_failure(
+                        question=question_text,
+                        retrieval=retrieval,
+                        missing_attributes=missing_retained,
+                        provider_error=f"{type(exc).__name__}: {exc}",
+                    )
+                validated = validate_attorney_qa_response(
+                    raw,
+                    question=question_text,
+                    retrieval=retrieval,
+                    documents=documents,
+                    case_map=case_map,
+                )
+                validated["audit"]["provider_available"] = True
+                validated["evidence_packet_hit_count"] = evidence_packet[
+                    "retrieval_hit_count"
+                ]
+                removed_after = (
+                    validated.get("audit", {}).get("removed_propositions") or []
+                )
+                if removed_after:
+                    validated = _scrub_party_role_answer_to_retained_propositions(
+                        validated
+                    )
+                    missing_retained = (
+                        find_missing_party_role_attributes_from_retained(
+                            validated, expected
+                        )
+                    )
+                else:
+                    missing_retained = find_missing_party_role_attributes(
+                        validated, expected
+                    )
+            if missing_retained:
+                failure = _party_role_completeness_failure(
+                    question=question_text,
+                    retrieval=retrieval,
+                    missing_attributes=missing_retained,
+                )
+                # Preserve citation-audit detail from the validated attempt.
+                failure["audit"]["removed_propositions"] = list(
+                    validated.get("audit", {}).get("removed_propositions") or []
+                )
+                failure["audit"]["rejection_reasons"] = list(
+                    validated.get("audit", {}).get("rejection_reasons") or []
+                )
+                failure["audit"]["party_role_provider_calls"] = max(
+                    provider_calls, 2 if repair_attempted else provider_calls
+                )
+                failure["propositions"] = list(validated.get("propositions") or [])
+                failure["proposed_answer"] = validated.get("proposed_answer") or ""
+                failure["confidence"] = min(
+                    _coerce_confidence(validated.get("confidence"), 0.0),
+                    0.0,
+                )
+                failure["evidence_packet_hit_count"] = evidence_packet[
+                    "retrieval_hit_count"
+                ]
+                return failure
         validated["audit"]["party_role_provider_calls"] = provider_calls
         validated["audit"]["party_role_repair_attempted"] = repair_attempted
+        validated["audit"]["party_role_post_validation_completeness"] = bool(
+            removed
+        )
     return validated
 
 
