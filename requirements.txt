@@ -6,3 +6,4 @@ httpx
 pypdf
 pytesseract
 pdf2image
+boto3
