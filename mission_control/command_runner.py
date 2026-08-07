@@ -30,9 +30,11 @@ DEFAULT_TIMEOUT_SECONDS = 300.0
 MAX_TIMEOUT_SECONDS = 3600.0
 MIN_TIMEOUT_SECONDS = 0.1
 
-# Initial allowlist: LegalAI generation CLI only.
+# Allowlist: LegalAI generation CLI + Case-00 derived rebuild CLI.
 ALLOWED_EXECUTABLE = "python3"
 ALLOWED_SCRIPT = "scripts/generate_attorney_feedback_candidate.py"
+ALLOWED_REBUILD_SCRIPT = "scripts/rebuild_case00_derived.py"
+ALLOWED_SCRIPTS = frozenset({ALLOWED_SCRIPT, ALLOWED_REBUILD_SCRIPT})
 
 ALLOWED_REPOSITORY_ALIASES: dict[str, str] = {
     "nhpcorp35/legal-ai": "nhpcorp35/legal-ai",
@@ -44,33 +46,6 @@ ALLOWED_REPOSITORY_ALIASES: dict[str, str] = {
 # scripts/generate_attorney_feedback_candidate.py (not approximate aliases).
 AUTHORIZATION_FLAG = "--authorize-private-evidence-transmission"
 GENERATION_ONLY_FLAG = "--generation-only"
-
-# Flags accepted for the allowlisted generation CLI.
-_FLAGS_WITH_VALUE = frozenset(
-    {
-        "--case-root",
-        "--question-id",
-        "--required-commit",
-        "--candidate-output-root",
-        AUTHORIZATION_FLAG,
-        "--repo-root",
-        "--inventory-path",
-    }
-)
-_FLAGS_NO_VALUE = frozenset({GENERATION_ONLY_FLAG, "--help"})
-_PATH_FLAGS = frozenset(
-    {
-        "--case-root",
-        "--candidate-output-root",
-        "--repo-root",
-        "--inventory-path",
-    }
-)
-_SENSITIVE_FLAGS = frozenset(
-    {
-        AUTHORIZATION_FLAG,
-    }
-)
 
 # Shell metacharacters / chaining / redirection / expansion markers.
 _SHELL_META_RE = re.compile(r"""[|;&><`$(){}]|&&|\|\||>>|<<|\n|\r""")
@@ -124,7 +99,82 @@ _GENERATION_ENV_ALLOWLIST = frozenset(
     }
 )
 
-PLATFORM_ENV_NAME_ALLOWLIST = _BASE_ENV_ALLOWLIST | _GENERATION_ENV_ALLOWLIST
+# Case-00 rebuild script may forward only these B2 credential names.
+_REBUILD_ENV_ALLOWLIST = frozenset(
+    {
+        "B2_KEY_ID",
+        "B2_APPLICATION_KEY",
+        "B2_BUCKET",
+        "B2_ENDPOINT",
+        "B2_REGION",
+    }
+)
+
+PLATFORM_ENV_NAME_ALLOWLIST = (
+    _BASE_ENV_ALLOWLIST | _GENERATION_ENV_ALLOWLIST | _REBUILD_ENV_ALLOWLIST
+)
+
+
+@dataclass(frozen=True)
+class _ScriptPolicy:
+    """Per-script argv / env allowlist for repository commands."""
+
+    script: str
+    flags_with_value: frozenset[str]
+    flags_no_value: frozenset[str]
+    path_flags: frozenset[str]
+    sensitive_flags: frozenset[str]
+    env_allowlist: frozenset[str]
+    workspace_local_paths_only: bool = False
+    mutually_exclusive_flag_groups: tuple[frozenset[str], ...] = ()
+
+
+_GENERATION_POLICY = _ScriptPolicy(
+    script=ALLOWED_SCRIPT,
+    flags_with_value=frozenset(
+        {
+            "--case-root",
+            "--question-id",
+            "--required-commit",
+            "--candidate-output-root",
+            AUTHORIZATION_FLAG,
+            "--repo-root",
+            "--inventory-path",
+        }
+    ),
+    flags_no_value=frozenset({GENERATION_ONLY_FLAG, "--help"}),
+    path_flags=frozenset(
+        {
+            "--case-root",
+            "--candidate-output-root",
+            "--repo-root",
+            "--inventory-path",
+        }
+    ),
+    sensitive_flags=frozenset({AUTHORIZATION_FLAG}),
+    env_allowlist=_BASE_ENV_ALLOWLIST | _GENERATION_ENV_ALLOWLIST,
+    workspace_local_paths_only=False,
+)
+
+_REBUILD_POLICY = _ScriptPolicy(
+    script=ALLOWED_REBUILD_SCRIPT,
+    flags_with_value=frozenset({"--case-root", "--source-dir"}),
+    flags_no_value=frozenset({"--b2-prefix", "--validate-only"}),
+    path_flags=frozenset({"--case-root", "--source-dir"}),
+    sensitive_flags=frozenset(),
+    env_allowlist=_BASE_ENV_ALLOWLIST | _REBUILD_ENV_ALLOWLIST,
+    workspace_local_paths_only=True,
+    mutually_exclusive_flag_groups=(frozenset({"--source-dir", "--b2-prefix"}),),
+)
+
+_SCRIPT_POLICIES: dict[str, _ScriptPolicy] = {
+    ALLOWED_SCRIPT: _GENERATION_POLICY,
+    ALLOWED_REBUILD_SCRIPT: _REBUILD_POLICY,
+}
+
+_SENSITIVE_FLAGS = frozenset().union(
+    *(policy.sensitive_flags for policy in _SCRIPT_POLICIES.values())
+)
 
 MOUNTED_PATHS_ENV = "MISSION_CONTROL_MOUNTED_PATHS"
 REPOSITORY_URL_MAP_ENV = "MISSION_CONTROL_REPOSITORY_URL_MAP"
@@ -360,6 +410,36 @@ def _resolve_allowed_path(
     return resolved
 
 
+def _resolve_workspace_local_path(
+    path_text: str,
+    *,
+    workspace: Path,
+    cwd: Path,
+) -> Path:
+    """Resolve a path that must stay repository/workspace-local (no absolutes)."""
+    _reject_shell_token(path_text, role="path argument")
+
+    raw = Path(path_text).expanduser()
+    if raw.is_absolute() or path_text.startswith(("/", "~")):
+        raise CommandRunnerError(
+            "Absolute path rejected for path-valued argument",
+            code="PATH_OUTSIDE_ALLOWED_ROOTS",
+        )
+    normalized = _normalize_repo_relative(path_text)
+    if normalized is None:
+        raise CommandRunnerError(
+            "Path traversal rejected",
+            code="PATH_TRAVERSAL",
+        )
+    resolved = (cwd / Path(path_text)).resolve()
+    if not _is_under_root(resolved, workspace.resolve()):
+        raise CommandRunnerError(
+            "Path is outside the repository workspace",
+            code="PATH_OUTSIDE_ALLOWED_ROOTS",
+        )
+    return resolved
+
+
 def validate_and_build_argv(
     argv: list[str],
     *,
@@ -387,12 +467,15 @@ def validate_and_build_argv(
         )
     if len(argv) < 2:
         raise CommandRunnerError(
-            f"argv must include {ALLOWED_SCRIPT!r}",
+            "argv must include an allowlisted script path",
             code="SCRIPT_NOT_ALLOWLISTED",
         )
 
     script_normalized = _normalize_repo_relative(argv[1])
-    if script_normalized != ALLOWED_SCRIPT:
+    policy = (
+        _SCRIPT_POLICIES.get(script_normalized) if script_normalized is not None else None
+    )
+    if policy is None:
         if script_normalized is None and (
             ".." in Path(argv[1]).parts or argv[1].startswith(("/", "~"))
         ):
@@ -400,16 +483,17 @@ def validate_and_build_argv(
                 "Path traversal rejected",
                 code="PATH_TRAVERSAL",
             )
+        allowed_list = ", ".join(sorted(ALLOWED_SCRIPTS))
         raise CommandRunnerError(
             f"Script not allowlisted: {argv[1]!r} "
-            f"(only {ALLOWED_SCRIPT!r} is permitted)",
+            f"(only {allowed_list} are permitted)",
             code="SCRIPT_NOT_ALLOWLISTED",
         )
 
-    script_path = resolve_safe_workspace_path(str(workspace), ALLOWED_SCRIPT)
+    script_path = resolve_safe_workspace_path(str(workspace), policy.script)
     if script_path is None or not script_path.is_file():
         raise CommandRunnerError(
-            f"Allowlisted script missing from checkout: {ALLOWED_SCRIPT}",
+            f"Allowlisted script missing from checkout: {policy.script}",
             code="SCRIPT_MISSING",
         )
 
@@ -442,28 +526,38 @@ def validate_and_build_argv(
     mounts = mounted if mounted is not None else mounted_artifact_paths()
     resolved: list[str] = [ALLOWED_EXECUTABLE, str(script_path)]
     candidate_output: Path | None = None
+    seen_flags: set[str] = set()
 
     i = 2
     while i < len(argv):
         token = argv[i]
-        if token in _FLAGS_NO_VALUE:
+        if token in policy.flags_no_value:
+            seen_flags.add(token)
             resolved.append(token)
             i += 1
             continue
-        if token in _FLAGS_WITH_VALUE:
+        if token in policy.flags_with_value:
             if i + 1 >= len(argv):
                 raise CommandRunnerError(
                     f"Flag {token} requires a value",
                     code="INVALID_ARGV",
                 )
             value = argv[i + 1]
-            if token in _PATH_FLAGS:
-                path_resolved = _resolve_allowed_path(
-                    value,
-                    workspace=workspace,
-                    cwd=cwd_path,
-                    mounted=mounts,
-                )
+            seen_flags.add(token)
+            if token in policy.path_flags:
+                if policy.workspace_local_paths_only:
+                    path_resolved = _resolve_workspace_local_path(
+                        value,
+                        workspace=workspace,
+                        cwd=cwd_path,
+                    )
+                else:
+                    path_resolved = _resolve_allowed_path(
+                        value,
+                        workspace=workspace,
+                        cwd=cwd_path,
+                        mounted=mounts,
+                    )
                 resolved.extend([token, str(path_resolved)])
                 if token == "--candidate-output-root":
                     candidate_output = path_resolved
@@ -473,23 +567,31 @@ def validate_and_build_argv(
             continue
         if token.startswith("--") and "=" in token:
             flag, _, value = token.partition("=")
-            if flag in _FLAGS_NO_VALUE:
+            if flag in policy.flags_no_value:
                 raise CommandRunnerError(
                     f"Flag {flag} does not take a value",
                     code="INVALID_ARGV",
                 )
-            if flag not in _FLAGS_WITH_VALUE:
+            if flag not in policy.flags_with_value:
                 raise CommandRunnerError(
                     f"Flag not allowlisted: {flag!r}",
                     code="FLAG_NOT_ALLOWLISTED",
                 )
-            if flag in _PATH_FLAGS:
-                path_resolved = _resolve_allowed_path(
-                    value,
-                    workspace=workspace,
-                    cwd=cwd_path,
-                    mounted=mounts,
-                )
+            seen_flags.add(flag)
+            if flag in policy.path_flags:
+                if policy.workspace_local_paths_only:
+                    path_resolved = _resolve_workspace_local_path(
+                        value,
+                        workspace=workspace,
+                        cwd=cwd_path,
+                    )
+                else:
+                    path_resolved = _resolve_allowed_path(
+                        value,
+                        workspace=workspace,
+                        cwd=cwd_path,
+                        mounted=mounts,
+                    )
                 resolved.append(f"{flag}={path_resolved}")
                 if flag == "--candidate-output-root":
                     candidate_output = path_resolved
@@ -502,16 +604,39 @@ def validate_and_build_argv(
             code="FLAG_NOT_ALLOWLISTED",
         )
 
+    for group in policy.mutually_exclusive_flag_groups:
+        present = group & seen_flags
+        if len(present) > 1:
+            names = ", ".join(sorted(present))
+            raise CommandRunnerError(
+                f"Mutually exclusive flags combined: {names}",
+                code="INVALID_ARGV",
+            )
+
     return resolved, cwd_path, candidate_output
 
 
-def build_command_env(allowed_env_names: list[str]) -> dict[str, str]:
+def build_command_env(
+    allowed_env_names: list[str],
+    *,
+    script: str | None = None,
+) -> dict[str, str]:
     """Build a subprocess env from an explicit name allowlist (values not logged)."""
     if any(not isinstance(name, str) or not name for name in allowed_env_names):
         raise CommandRunnerError(
             "allowed_env_names entries must be non-empty strings",
             code="INVALID_ENV_ALLOWLIST",
         )
+    if script is None:
+        name_allowlist = PLATFORM_ENV_NAME_ALLOWLIST
+    else:
+        policy = _SCRIPT_POLICIES.get(script)
+        if policy is None:
+            raise CommandRunnerError(
+                f"Script not allowlisted: {script!r}",
+                code="SCRIPT_NOT_ALLOWLISTED",
+            )
+        name_allowlist = policy.env_allowlist
     for name in allowed_env_names:
         _reject_shell_token(name, role="env name")
         if name in _BLOCKED_ENV_NAMES:
@@ -519,7 +644,7 @@ def build_command_env(allowed_env_names: list[str]) -> dict[str, str]:
                 f"Environment variable name not permitted: {name!r}",
                 code="ENV_NAME_NOT_ALLOWLISTED",
             )
-        if name not in PLATFORM_ENV_NAME_ALLOWLIST:
+        if name not in name_allowlist:
             raise CommandRunnerError(
                 f"Environment variable name not allowlisted: {name!r}",
                 code="ENV_NAME_NOT_ALLOWLISTED",
@@ -665,10 +790,13 @@ def run_repository_command(
         )
         redacted = redact_argv(resolved_argv)
         # Keep script path as the allowlisted relative form in evidence.
+        script_name = _normalize_repo_relative(spec.argv[1]) if len(spec.argv) > 1 else None
+        if script_name is None or script_name not in _SCRIPT_POLICIES:
+            script_name = ALLOWED_SCRIPT
         if len(redacted) >= 2:
-            redacted[1] = ALLOWED_SCRIPT
+            redacted[1] = script_name
 
-        env = build_command_env(list(spec.allowed_env_names))
+        env = build_command_env(list(spec.allowed_env_names), script=script_name)
 
         logger.info(
             (

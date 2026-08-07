@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mission_control.command_runner import (
+    ALLOWED_REBUILD_SCRIPT,
     ALLOWED_SCRIPT,
     AUTHORIZATION_FLAG,
     CommandRunnerError,
@@ -101,10 +102,48 @@ raise SystemExit(0)
 ''',
             encoding="utf-8",
         )
+        rebuild_path = script_dir / "rebuild_case00_derived.py"
+        rebuild_path.write_text(
+            '''#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--case-root", required=True)
+parser.add_argument("--source-dir", default=None)
+parser.add_argument("--b2-prefix", nargs="?", const="DEFAULT", default=None)
+parser.add_argument("--validate-only", action="store_true")
+args = parser.parse_args()
+if args.validate_only:
+    mode = "validate-only"
+elif args.b2_prefix is not None:
+    mode = "b2"
+else:
+    mode = "local"
+payload = {
+    "ok": True,
+    "mode": mode,
+    "case_root": args.case_root,
+    "source_dir": args.source_dir,
+    "b2_env_present": "B2_KEY_ID" in os.environ,
+}
+print(json.dumps(payload))
+raise SystemExit(0)
+''',
+            encoding="utf-8",
+        )
         (self.source_repo / "README.md").write_text("legal-ai fixture\n", encoding="utf-8")
         case_root = self.source_repo / "data" / "case"
         case_root.mkdir(parents=True)
         (case_root / "placeholder.txt").write_text("case\n", encoding="utf-8")
+        case00_root = self.source_repo / "data" / "case-00-triborough"
+        case00_root.mkdir(parents=True)
+        (case00_root / "placeholder.txt").write_text("case00\n", encoding="utf-8")
+        source_dir = case00_root / "source-pdfs"
+        source_dir.mkdir(parents=True)
+        (source_dir / "doc.pdf").write_text("%PDF-1.4\n", encoding="utf-8")
 
         _run_git(["-C", str(self.source_repo), "add", "-A"])
         _run_git(["-C", str(self.source_repo), "commit", "-m", "init"])
@@ -166,6 +205,19 @@ raise SystemExit(0)
             AUTHORIZATION_FLAG,
             auth,
             GENERATION_ONLY_FLAG,
+        ]
+
+    def rebuild_argv(
+        self,
+        *extra: str,
+        case_root: str = "data/case-00-triborough",
+    ) -> list[str]:
+        return [
+            "python3",
+            ALLOWED_REBUILD_SCRIPT,
+            "--case-root",
+            case_root,
+            *extra,
         ]
 
 
@@ -419,6 +471,188 @@ class TestCommandRunner(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "SHELL_METACHARACTERS")
+
+    def test_rebuild_b2_invocation_accepted(self) -> None:
+        """Case-00 B2 rebuild argv + approved B2 env names are accepted."""
+        argv = self.fixture.rebuild_argv("--b2-prefix")
+        resolved, _cwd, _out = validate_and_build_argv(
+            argv,
+            workspace=self.fixture.source_repo,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertEqual(resolved[0], "python3")
+        self.assertTrue(resolved[1].endswith(ALLOWED_REBUILD_SCRIPT))
+        self.assertIn("--b2-prefix", resolved)
+        self.assertNotIn("--source-dir", resolved)
+
+        b2_names = [
+            "B2_KEY_ID",
+            "B2_APPLICATION_KEY",
+            "B2_BUCKET",
+            "B2_ENDPOINT",
+            "B2_REGION",
+        ]
+        with patch.dict(
+            os.environ,
+            {name: f"test-{name}" for name in b2_names},
+            clear=False,
+        ):
+            env = build_command_env(b2_names, script=ALLOWED_REBUILD_SCRIPT)
+            self.assertEqual(env.get("B2_KEY_ID"), "test-B2_KEY_ID")
+            result = run_repository_command(
+                RepositoryCommandSpec(
+                    repository="nhpcorp35/legal-ai",
+                    ref=self.fixture.commit_sha,
+                    argv=argv,
+                    allowed_env_names=b2_names,
+                )
+            )
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn(ALLOWED_REBUILD_SCRIPT, result.argv)
+        self.assertIn('"mode": "b2"', result.stdout)
+
+    def test_rebuild_local_source_invocation_accepted(self) -> None:
+        """Local --source-dir rebuild stays workspace-local and executes."""
+        argv = self.fixture.rebuild_argv(
+            "--source-dir",
+            "data/case-00-triborough/source-pdfs",
+        )
+        resolved, _cwd, _out = validate_and_build_argv(
+            argv,
+            workspace=self.fixture.source_repo,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertIn("--source-dir", resolved)
+        self.assertNotIn("--b2-prefix", resolved)
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="nhpcorp35/legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertIn('"mode": "local"', result.stdout)
+
+    def test_rebuild_validate_only_accepted(self) -> None:
+        """--validate-only with workspace-local --case-root is accepted."""
+        argv = self.fixture.rebuild_argv("--validate-only")
+        resolved, _cwd, _out = validate_and_build_argv(
+            argv,
+            workspace=self.fixture.source_repo,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertIn("--validate-only", resolved)
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertIn('"mode": "validate-only"', result.stdout)
+
+    def test_rebuild_unknown_flag_rejected(self) -> None:
+        """Rebuild allowlist rejects flags outside the Case-00 safe set."""
+        argv = self.fixture.rebuild_argv(
+            "--validate-only",
+            "--inventory-path",
+            "data/case-00-triborough/nyscef_filing_inventory.json",
+        )
+        with self.assertRaises(CommandRunnerError) as ctx:
+            validate_and_build_argv(
+                argv,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(ctx.exception.code, "FLAG_NOT_ALLOWLISTED")
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "FLAG_NOT_ALLOWLISTED")
+
+    def test_rebuild_path_escape_and_absolute_rejected(self) -> None:
+        """Rebuild path args reject absolute paths and workspace escapes."""
+        absolute = self.fixture.rebuild_argv(
+            "--source-dir",
+            str(self.fixture.mount_root / "outside"),
+        )
+        with self.assertRaises(CommandRunnerError) as abs_ctx:
+            validate_and_build_argv(
+                absolute,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(abs_ctx.exception.code, "PATH_OUTSIDE_ALLOWED_ROOTS")
+
+        escape = [
+            "python3",
+            ALLOWED_REBUILD_SCRIPT,
+            "--case-root",
+            "../outside-case",
+            "--validate-only",
+        ]
+        with self.assertRaises(CommandRunnerError) as esc_ctx:
+            validate_and_build_argv(
+                escape,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(esc_ctx.exception.code, "PATH_TRAVERSAL")
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=absolute,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATH_OUTSIDE_ALLOWED_ROOTS")
+
+    def test_rebuild_unapproved_env_names_rejected(self) -> None:
+        """Rebuild script accepts only B2 env names, not generation secrets."""
+        with self.assertRaises(CommandRunnerError) as ctx:
+            build_command_env(
+                ["OPENAI_API_KEY"],
+                script=ALLOWED_REBUILD_SCRIPT,
+            )
+        self.assertEqual(ctx.exception.code, "ENV_NAME_NOT_ALLOWLISTED")
+        self.assertIn("not allowlisted", str(ctx.exception))
+
+        with self.assertRaises(CommandRunnerError) as ctx:
+            build_command_env(
+                ["NOT_A_REAL_ENV_NAME"],
+                script=ALLOWED_REBUILD_SCRIPT,
+            )
+        self.assertEqual(ctx.exception.code, "ENV_NAME_NOT_ALLOWLISTED")
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=self.fixture.rebuild_argv("--b2-prefix"),
+                allowed_env_names=["OPENAI_API_KEY"],
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "ENV_NAME_NOT_ALLOWLISTED")
 
 
 class TestRepositoryCommandApi(unittest.TestCase):
