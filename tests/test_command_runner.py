@@ -11,8 +11,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mission_control.command_runner import (
+    ALLOWED_CASE00_B2_Q1_SCRIPT,
     ALLOWED_REBUILD_SCRIPT,
     ALLOWED_SCRIPT,
+    AUTHORIZATION_ACK,
     AUTHORIZATION_FLAG,
     CommandRunnerError,
     GENERATION_ONLY_FLAG,
@@ -134,6 +136,44 @@ raise SystemExit(0)
 ''',
             encoding="utf-8",
         )
+        case00_b2_q1_path = script_dir / "run_case00_b2_q1.py"
+        case00_b2_q1_path.write_text(
+            f'''#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--case-root", type=Path, required=True)
+parser.add_argument("--question-id", required=True)
+parser.add_argument("--required-commit", required=True)
+parser.add_argument("--candidate-output-root", type=Path, required=True)
+parser.add_argument(
+    "{AUTHORIZATION_FLAG}",
+    required=True,
+)
+parser.add_argument("{GENERATION_ONLY_FLAG}", action="store_true", required=True)
+args = parser.parse_args()
+
+out = Path(args.candidate_output_root)
+out.mkdir(parents=True, exist_ok=True)
+artifact = out / "case00_b2_q1.json"
+payload = {{
+    "ok": True,
+    "question_id": args.question_id,
+    "required_commit": args.required_commit,
+    "case_root": str(args.case_root),
+    "b2_env_present": "B2_KEY_ID" in os.environ,
+    "openai_env_present": "OPENAI_API_KEY" in os.environ,
+    "openai_model": os.environ.get("OPENAI_MODEL"),
+}}
+artifact.write_text(json.dumps(payload), encoding="utf-8")
+print(json.dumps(payload))
+raise SystemExit(0)
+''',
+            encoding="utf-8",
+        )
         (self.source_repo / "README.md").write_text("legal-ai fixture\n", encoding="utf-8")
         case_root = self.source_repo / "data" / "case"
         case_root.mkdir(parents=True)
@@ -187,7 +227,7 @@ raise SystemExit(0)
         self,
         *,
         candidate_output_root: str | None = None,
-        auth: str = "I_AUTHORIZE_PRIVATE_EVIDENCE_TRANSMISSION_TO_MODEL_PROVIDER",
+        auth: str = AUTHORIZATION_ACK,
         question_id: str = "Q1",
     ) -> list[str]:
         out = candidate_output_root or str(self.artifacts_root / "out")
@@ -219,6 +259,34 @@ raise SystemExit(0)
             case_root,
             *extra,
         ]
+
+    def case00_b2_q1_argv(
+        self,
+        *,
+        case_root: str = "data/case-00-triborough",
+        candidate_output_root: str = "out/case00-b2-q1",
+        auth: str = AUTHORIZATION_ACK,
+        question_id: str = "Q1",
+        include_generation_only: bool = True,
+        required_commit: str | None = None,
+    ) -> list[str]:
+        argv = [
+            "python3",
+            ALLOWED_CASE00_B2_Q1_SCRIPT,
+            "--case-root",
+            case_root,
+            "--question-id",
+            question_id,
+            "--required-commit",
+            required_commit or self.commit_sha,
+            "--candidate-output-root",
+            candidate_output_root,
+            AUTHORIZATION_FLAG,
+            auth,
+        ]
+        if include_generation_only:
+            argv.append(GENERATION_ONLY_FLAG)
+        return argv
 
 
 class TestCommandRunner(unittest.TestCase):
@@ -392,7 +460,7 @@ class TestCommandRunner(unittest.TestCase):
         self.assertEqual(result.error_code, "ENV_NAME_NOT_ALLOWLISTED")
 
     def test_redaction(self) -> None:
-        secret = "I_AUTHORIZE_PRIVATE_EVIDENCE_TRANSMISSION_TO_MODEL_PROVIDER"
+        secret = AUTHORIZATION_ACK
         argv = self.fixture.allowlisted_argv(auth=secret)
         redacted = redact_argv(argv)
         self.assertIn(REDACTED, redacted)
@@ -649,6 +717,188 @@ class TestCommandRunner(unittest.TestCase):
                 ref=self.fixture.commit_sha,
                 argv=self.fixture.rebuild_argv("--b2-prefix"),
                 allowed_env_names=["OPENAI_API_KEY"],
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "ENV_NAME_NOT_ALLOWLISTED")
+
+    def test_case00_b2_q1_single_shot_accepted(self) -> None:
+        """Case-00 B2 Q1 single-shot argv + composed env names are accepted."""
+        argv = self.fixture.case00_b2_q1_argv()
+        resolved, _cwd, out = validate_and_build_argv(
+            argv,
+            workspace=self.fixture.source_repo,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertEqual(resolved[0], "python3")
+        self.assertTrue(resolved[1].endswith(ALLOWED_CASE00_B2_Q1_SCRIPT))
+        self.assertIn(GENERATION_ONLY_FLAG, resolved)
+        self.assertIn(AUTHORIZATION_FLAG, resolved)
+        self.assertIsNotNone(out)
+
+        env_names = [
+            "B2_KEY_ID",
+            "B2_APPLICATION_KEY",
+            "B2_BUCKET",
+            "B2_ENDPOINT",
+            "B2_REGION",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+        ]
+        with patch.dict(
+            os.environ,
+            {
+                **{name: f"test-{name}" for name in env_names if name != "OPENAI_MODEL"},
+                "OPENAI_MODEL": "gpt-test",
+            },
+            clear=False,
+        ):
+            env = build_command_env(env_names, script=ALLOWED_CASE00_B2_Q1_SCRIPT)
+            self.assertEqual(env.get("B2_KEY_ID"), "test-B2_KEY_ID")
+            self.assertEqual(env.get("OPENAI_MODEL"), "gpt-test")
+            result = run_repository_command(
+                RepositoryCommandSpec(
+                    repository="nhpcorp35/legal-ai",
+                    ref=self.fixture.commit_sha,
+                    argv=argv,
+                    allowed_env_names=env_names,
+                )
+            )
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn(ALLOWED_CASE00_B2_Q1_SCRIPT, result.argv)
+        self.assertIn(REDACTED, result.argv)
+        self.assertNotIn(AUTHORIZATION_ACK, result.argv)
+        self.assertIn('"question_id": "Q1"', result.stdout)
+
+    def test_case00_b2_q1_missing_generation_only_rejected(self) -> None:
+        """Single-shot allowlist requires --generation-only."""
+        argv = self.fixture.case00_b2_q1_argv(include_generation_only=False)
+        with self.assertRaises(CommandRunnerError) as ctx:
+            validate_and_build_argv(
+                argv,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(ctx.exception.code, "INVALID_ARGV")
+        self.assertIn(GENERATION_ONLY_FLAG, str(ctx.exception))
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="nhpcorp35/legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_ARGV")
+
+    def test_case00_b2_q1_wrong_authorization_rejected(self) -> None:
+        """Wrong authorization acknowledgement is rejected at allowlist time."""
+        argv = self.fixture.case00_b2_q1_argv(auth="not-the-required-acknowledgement")
+        with self.assertRaises(CommandRunnerError) as ctx:
+            validate_and_build_argv(
+                argv,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(ctx.exception.code, "INVALID_ARGV")
+        self.assertIn(AUTHORIZATION_FLAG, str(ctx.exception))
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_ARGV")
+        self.assertNotIn("not-the-required-acknowledgement", result.argv)
+
+    def test_case00_b2_q1_unknown_flag_rejected(self) -> None:
+        """Flags outside the single-shot allowlist remain rejected."""
+        argv = self.fixture.case00_b2_q1_argv()
+        argv.extend(["--b2-prefix", "case-00"])
+        with self.assertRaises(CommandRunnerError) as ctx:
+            validate_and_build_argv(
+                argv,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(ctx.exception.code, "FLAG_NOT_ALLOWLISTED")
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "FLAG_NOT_ALLOWLISTED")
+
+    def test_case00_b2_q1_path_escape_and_absolute_rejected(self) -> None:
+        """Single-shot path args reject absolute paths and workspace escapes."""
+        absolute = self.fixture.case00_b2_q1_argv(
+            candidate_output_root=str(self.fixture.mount_root / "outside"),
+        )
+        with self.assertRaises(CommandRunnerError) as abs_ctx:
+            validate_and_build_argv(
+                absolute,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(abs_ctx.exception.code, "PATH_OUTSIDE_ALLOWED_ROOTS")
+
+        escape = self.fixture.case00_b2_q1_argv(case_root="../outside-case")
+        with self.assertRaises(CommandRunnerError) as esc_ctx:
+            validate_and_build_argv(
+                escape,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(esc_ctx.exception.code, "PATH_TRAVERSAL")
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=absolute,
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATH_OUTSIDE_ALLOWED_ROOTS")
+
+    def test_case00_b2_q1_unapproved_env_names_rejected(self) -> None:
+        """Single-shot accepts only B2 + OpenAI env names, not extras."""
+        with self.assertRaises(CommandRunnerError) as ctx:
+            build_command_env(
+                ["ANTHROPIC_API_KEY"],
+                script=ALLOWED_CASE00_B2_Q1_SCRIPT,
+            )
+        self.assertEqual(ctx.exception.code, "ENV_NAME_NOT_ALLOWLISTED")
+        self.assertIn("not allowlisted", str(ctx.exception))
+
+        with self.assertRaises(CommandRunnerError) as ctx:
+            build_command_env(
+                ["NOT_A_REAL_ENV_NAME"],
+                script=ALLOWED_CASE00_B2_Q1_SCRIPT,
+            )
+        self.assertEqual(ctx.exception.code, "ENV_NAME_NOT_ALLOWLISTED")
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=self.fixture.case00_b2_q1_argv(),
+                allowed_env_names=["ANTHROPIC_API_KEY"],
             )
         )
         self.assertFalse(result.ok)

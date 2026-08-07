@@ -30,11 +30,15 @@ DEFAULT_TIMEOUT_SECONDS = 300.0
 MAX_TIMEOUT_SECONDS = 3600.0
 MIN_TIMEOUT_SECONDS = 0.1
 
-# Allowlist: LegalAI generation CLI + Case-00 derived rebuild CLI.
+# Allowlist: LegalAI generation CLI + Case-00 derived rebuild CLI +
+# Case-00 B2 Q1 single-shot (rebuild + generate) CLI.
 ALLOWED_EXECUTABLE = "python3"
 ALLOWED_SCRIPT = "scripts/generate_attorney_feedback_candidate.py"
 ALLOWED_REBUILD_SCRIPT = "scripts/rebuild_case00_derived.py"
-ALLOWED_SCRIPTS = frozenset({ALLOWED_SCRIPT, ALLOWED_REBUILD_SCRIPT})
+ALLOWED_CASE00_B2_Q1_SCRIPT = "scripts/run_case00_b2_q1.py"
+ALLOWED_SCRIPTS = frozenset(
+    {ALLOWED_SCRIPT, ALLOWED_REBUILD_SCRIPT, ALLOWED_CASE00_B2_Q1_SCRIPT}
+)
 
 ALLOWED_REPOSITORY_ALIASES: dict[str, str] = {
     "nhpcorp35/legal-ai": "nhpcorp35/legal-ai",
@@ -46,12 +50,21 @@ ALLOWED_REPOSITORY_ALIASES: dict[str, str] = {
 # scripts/generate_attorney_feedback_candidate.py (not approximate aliases).
 AUTHORIZATION_FLAG = "--authorize-private-evidence-transmission"
 GENERATION_ONLY_FLAG = "--generation-only"
+# Same acknowledgement required by generate_attorney_feedback_candidate.py /
+# scripts/run_case00_b2_q1.py (not approximate aliases).
+AUTHORIZATION_ACK = "I_AUTHORIZE_PRIVATE_EVIDENCE_TRANSMISSION_TO_MODEL_PROVIDER"
 
 # Shell metacharacters / chaining / redirection / expansion markers.
 _SHELL_META_RE = re.compile(r"""[|;&><`$(){}]|&&|\|\||>>|<<|\n|\r""")
 
 # Full SHA for exact checkout verification.
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# Safe question / identifier tokens for Case-00 single-shot argv values.
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+# Git SHA or ref-safe tokens (no traversal / shell / weird punctuation).
+_GIT_REF_SAFE_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 
 # Env names that must never be forwarded into the command process.
 _BLOCKED_ENV_NAMES = frozenset(
@@ -110,8 +123,24 @@ _REBUILD_ENV_ALLOWLIST = frozenset(
     }
 )
 
+# Case-00 B2 Q1 single-shot: B2 rebuild creds + OpenAI generation only.
+_CASE00_B2_Q1_ENV_ALLOWLIST = frozenset(
+    {
+        "B2_KEY_ID",
+        "B2_APPLICATION_KEY",
+        "B2_BUCKET",
+        "B2_ENDPOINT",
+        "B2_REGION",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+    }
+)
+
 PLATFORM_ENV_NAME_ALLOWLIST = (
-    _BASE_ENV_ALLOWLIST | _GENERATION_ENV_ALLOWLIST | _REBUILD_ENV_ALLOWLIST
+    _BASE_ENV_ALLOWLIST
+    | _GENERATION_ENV_ALLOWLIST
+    | _REBUILD_ENV_ALLOWLIST
+    | _CASE00_B2_Q1_ENV_ALLOWLIST
 )
 
 
@@ -127,6 +156,9 @@ class _ScriptPolicy:
     env_allowlist: frozenset[str]
     workspace_local_paths_only: bool = False
     mutually_exclusive_flag_groups: tuple[frozenset[str], ...] = ()
+    required_flags: frozenset[str] = frozenset()
+    exact_flag_values: frozenset[tuple[str, str]] = frozenset()
+    flag_value_patterns: tuple[tuple[str, re.Pattern[str]], ...] = ()
 
 
 _GENERATION_POLICY = _ScriptPolicy(
@@ -167,9 +199,43 @@ _REBUILD_POLICY = _ScriptPolicy(
     mutually_exclusive_flag_groups=(frozenset({"--source-dir", "--b2-prefix"}),),
 )
 
+_CASE00_B2_Q1_POLICY = _ScriptPolicy(
+    script=ALLOWED_CASE00_B2_Q1_SCRIPT,
+    flags_with_value=frozenset(
+        {
+            "--case-root",
+            "--question-id",
+            "--required-commit",
+            "--candidate-output-root",
+            AUTHORIZATION_FLAG,
+        }
+    ),
+    flags_no_value=frozenset({GENERATION_ONLY_FLAG}),
+    path_flags=frozenset({"--case-root", "--candidate-output-root"}),
+    sensitive_flags=frozenset({AUTHORIZATION_FLAG}),
+    env_allowlist=_BASE_ENV_ALLOWLIST | _CASE00_B2_Q1_ENV_ALLOWLIST,
+    workspace_local_paths_only=True,
+    required_flags=frozenset(
+        {
+            "--case-root",
+            "--question-id",
+            "--required-commit",
+            "--candidate-output-root",
+            AUTHORIZATION_FLAG,
+            GENERATION_ONLY_FLAG,
+        }
+    ),
+    exact_flag_values=frozenset({(AUTHORIZATION_FLAG, AUTHORIZATION_ACK)}),
+    flag_value_patterns=(
+        ("--question-id", _SAFE_IDENTIFIER_RE),
+        ("--required-commit", _GIT_REF_SAFE_RE),
+    ),
+)
+
 _SCRIPT_POLICIES: dict[str, _ScriptPolicy] = {
     ALLOWED_SCRIPT: _GENERATION_POLICY,
     ALLOWED_REBUILD_SCRIPT: _REBUILD_POLICY,
+    ALLOWED_CASE00_B2_Q1_SCRIPT: _CASE00_B2_Q1_POLICY,
 }
 
 _SENSITIVE_FLAGS = frozenset().union(
@@ -527,6 +593,27 @@ def validate_and_build_argv(
     resolved: list[str] = [ALLOWED_EXECUTABLE, str(script_path)]
     candidate_output: Path | None = None
     seen_flags: set[str] = set()
+    pattern_by_flag = dict(policy.flag_value_patterns)
+    exact_by_flag = dict(policy.exact_flag_values)
+
+    def _validate_non_path_value(flag: str, value: str) -> None:
+        expected = exact_by_flag.get(flag)
+        if expected is not None and value != expected:
+            if flag in policy.sensitive_flags:
+                raise CommandRunnerError(
+                    f"Invalid value for {flag}",
+                    code="INVALID_ARGV",
+                )
+            raise CommandRunnerError(
+                f"Invalid value for {flag}: {value!r}",
+                code="INVALID_ARGV",
+            )
+        pattern = pattern_by_flag.get(flag)
+        if pattern is not None and pattern.fullmatch(value) is None:
+            raise CommandRunnerError(
+                f"Invalid value for {flag}: {value!r}",
+                code="INVALID_ARGV",
+            )
 
     i = 2
     while i < len(argv):
@@ -562,6 +649,7 @@ def validate_and_build_argv(
                 if token == "--candidate-output-root":
                     candidate_output = path_resolved
             else:
+                _validate_non_path_value(token, value)
                 resolved.extend([token, value])
             i += 2
             continue
@@ -596,12 +684,21 @@ def validate_and_build_argv(
                 if flag == "--candidate-output-root":
                     candidate_output = path_resolved
             else:
+                _validate_non_path_value(flag, value)
                 resolved.append(token)
             i += 1
             continue
         raise CommandRunnerError(
             f"Flag or argument not allowlisted: {token!r}",
             code="FLAG_NOT_ALLOWLISTED",
+        )
+
+    missing = policy.required_flags - seen_flags
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise CommandRunnerError(
+            f"Required flag(s) missing: {names}",
+            code="INVALID_ARGV",
         )
 
     for group in policy.mutually_exclusive_flag_groups:
