@@ -10,9 +10,12 @@ from typing import Any
 
 import boto3
 import httpx
+from cryptography.fernet import Fernet
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
+from key_value.aio.stores.redis import RedisStore
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -34,6 +37,13 @@ auth_provider = GitHubProvider(
     client_secret=os.environ["GITHUB_OAUTH_CLIENT_SECRET"],
     base_url=PUBLIC_URL,
     jwt_signing_key=os.environ.get("JWT_SIGNING_KEY"),
+    client_storage=FernetEncryptionWrapper(
+        key_value=RedisStore(
+            host=os.environ["REDIS_HOST"],
+            port=int(os.environ.get("REDIS_PORT", "6379")),
+        ),
+        fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"].encode()),
+    ),
 )
 
 mcp = FastMCP(
