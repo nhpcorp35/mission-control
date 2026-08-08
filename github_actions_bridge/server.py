@@ -23,6 +23,8 @@ from starlette.responses import JSONResponse
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "nhpcorp35/legal-ai")
 WORKFLOW = os.environ.get("GITHUB_WORKFLOW", "hal-bridge-proof.yml")
 WORKFLOW_BRANCH = os.environ.get("GITHUB_WORKFLOW_BRANCH", "agent/hal-bridge-proof-workflow")
+CASE00_WORKFLOW = os.environ.get("GITHUB_CASE00_WORKFLOW", "hal-case00-q1.yml")
+CASE00_WORKFLOW_BRANCH = os.environ.get("GITHUB_CASE00_WORKFLOW_BRANCH", "main")
 B2_BUCKET = os.environ.get("B2_BUCKET", "legalai-corpus")
 B2_PREFIX = os.environ.get("B2_PROOF_PREFIX", "Benchmarks/Bridge-Proof")
 PUBLIC_URL = os.environ.get(
@@ -52,7 +54,9 @@ mcp = FastMCP(
         "Dispatch and observe the bounded LegalAI proof workflow. Use submit_run, "
         "then get_run. Use cancel_run for a deliberate long run. After a successful "
         "run, use get_artifacts to copy the harmless proof JSON to B2, verify it, "
-        "and retrieve the durable object key."
+        "and retrieve the durable object key. The separate Case-00 Q1 tools "
+        "dispatch the bounded generation-only workflow, require explicit private-evidence "
+        "authorization, and return only B2-verified candidate artifact metadata."
     ),
     auth=auth_provider,
 )
@@ -103,6 +107,19 @@ async def _resolve_run(mission_id: str) -> dict[str, Any] | None:
         params={"event": "workflow_dispatch", "per_page": 50},
     )
     marker = f"hal-proof-{mission_id}"
+    for run in response.json().get("workflow_runs", []):
+        if marker in (run.get("display_title") or ""):
+            return run
+    return None
+
+
+async def _resolve_case00_run(mission_id: str) -> dict[str, Any] | None:
+    response = await _github(
+        "GET",
+        f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/runs",
+        params={"event": "workflow_dispatch", "per_page": 50},
+    )
+    marker = f"hal-case00-q1-{mission_id}"
     for run in response.json().get("workflow_runs", []):
         if marker in (run.get("display_title") or ""):
             return run
@@ -173,6 +190,65 @@ async def cancel_run(mission_id: str) -> dict[str, Any]:
     return {"ok": True, "mission_id": mission_id, "run_id": run["id"], "status": "cancellation_requested"}
 
 
+@mcp.tool()
+async def submit_case00_q1(
+    ref: str, authorization_confirmed: bool, mission_id: str | None = None
+) -> dict[str, Any]:
+    """Dispatch generation-only Case-00 Q1 at an exact commit SHA."""
+    _require_allowed_user()
+    if not authorization_confirmed:
+        raise ValueError(
+            "authorization_confirmed must be true before private evidence is sent"
+        )
+    normalized_ref = ref.strip().lower()
+    if len(normalized_ref) != 40 or any(ch not in "0123456789abcdef" for ch in normalized_ref):
+        raise ValueError("ref must be an exact 40-character lowercase commit SHA")
+    mission_id = mission_id or str(uuid.uuid4())
+    await _github(
+        "POST",
+        f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/dispatches",
+        json={
+            "ref": CASE00_WORKFLOW_BRANCH,
+            "inputs": {
+                "mission_id": mission_id,
+                "legalai_ref": normalized_ref,
+                "authorization_confirmed": "true",
+            },
+        },
+    )
+    return {
+        "ok": True,
+        "mission_id": mission_id,
+        "status": "dispatched",
+        "repository": REPOSITORY,
+        "requested_ref": normalized_ref,
+        "workflow": CASE00_WORKFLOW,
+    }
+
+
+@mcp.tool()
+async def get_case00_q1_run(mission_id: str) -> dict[str, Any]:
+    """Return the current GitHub status for a Case-00 Q1 run."""
+    _require_allowed_user()
+    return _run_result(mission_id, await _resolve_case00_run(mission_id))
+
+
+@mcp.tool()
+async def cancel_case00_q1_run(mission_id: str) -> dict[str, Any]:
+    """Cancel the Case-00 Q1 GitHub Actions run correlated with mission_id."""
+    _require_allowed_user()
+    run = await _resolve_case00_run(mission_id)
+    if run is None:
+        return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
+    await _github("POST", f"/repos/{REPOSITORY}/actions/runs/{run['id']}/cancel")
+    return {
+        "ok": True,
+        "mission_id": mission_id,
+        "run_id": run["id"],
+        "status": "cancellation_requested",
+    }
+
+
 def _b2_client():
     endpoint = os.environ["B2_ENDPOINT"].rstrip("/")
     return boto3.client(
@@ -225,6 +301,79 @@ async def get_artifacts(mission_id: str) -> dict[str, Any]:
         "verified": True,
         "content_length": verified["ContentLength"],
         "etag": verified.get("ETag", "").strip('"'),
+    }
+
+
+@mcp.tool()
+async def get_case00_q1_artifacts(mission_id: str) -> dict[str, Any]:
+    """Return and independently HEAD-verify the four durable Case-00 Q1 B2 objects."""
+    _require_allowed_user()
+    run = await _resolve_case00_run(mission_id)
+    if run is None:
+        return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        return {
+            "ok": False,
+            "mission_id": mission_id,
+            "error": "run_not_successful",
+            "status": run.get("status"),
+            "conclusion": run.get("conclusion"),
+        }
+
+    listing = await _github(
+        "GET", f"/repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts"
+    )
+    artifact_name = f"hal-case00-q1-{mission_id}"
+    artifact = next(
+        (a for a in listing.json().get("artifacts", []) if a.get("name") == artifact_name),
+        None,
+    )
+    if artifact is None:
+        return {"ok": False, "mission_id": mission_id, "error": "artifact_not_found"}
+
+    archive = await _github(
+        "GET", f"/repos/{REPOSITORY}/actions/artifacts/{artifact['id']}/zip"
+    )
+    with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
+        payload = json.loads(bundle.read("case00-q1-result.json"))
+
+    durable = payload.get("durable_artifacts") or {}
+    objects = durable.get("objects") or []
+    if not payload.get("ok") or len(objects) != 4:
+        return {
+            "ok": False,
+            "mission_id": mission_id,
+            "error": "durable_result_incomplete",
+        }
+
+    client = _b2_client()
+    verified_objects = []
+    for item in objects:
+        key = item.get("object_key")
+        if not isinstance(key, str) or not key.startswith(
+            "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/candidate-answers/"
+        ):
+            raise ValueError("artifact object key escaped the canonical Case-00 prefix")
+        head = client.head_object(Bucket=durable["bucket"], Key=key)
+        if head.get("ContentLength") != item.get("size"):
+            raise ValueError(f"B2 size mismatch for {key}")
+        verified_objects.append(
+            {
+                "filename": item.get("filename"),
+                "object_key": key,
+                "size": head.get("ContentLength"),
+                "etag": (head.get("ETag") or "").strip('"'),
+            }
+        )
+
+    return {
+        "ok": True,
+        "mission_id": mission_id,
+        "run_id": run["id"],
+        "verified": True,
+        "b2_bucket": durable["bucket"],
+        "object_keys": [item["object_key"] for item in verified_objects],
+        "objects": verified_objects,
     }
 
 
