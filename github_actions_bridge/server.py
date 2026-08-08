@@ -64,8 +64,11 @@ async def _github(method: str, path: str, **kwargs: Any) -> httpx.Response:
             detail = response.json().get("message", response.text[:500])
         except (ValueError, AttributeError):
             detail = response.text[:500]
+        accepted = response.headers.get("x-accepted-github-permissions", "unknown")
+        scopes = response.headers.get("x-oauth-scopes", "not-reported")
         raise RuntimeError(
-            f"GitHub API {response.status_code} for {method} {path}: {detail}"
+            f"GitHub API {response.status_code} for {method} {path}: {detail}; "
+            f"accepted_permissions={accepted}; token_scopes={scopes}"
         ) from exc
     return response
 
