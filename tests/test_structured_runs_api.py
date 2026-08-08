@@ -454,6 +454,36 @@ class TestStructuredRunsApi(unittest.TestCase):
             "Missing bearer token",
         )
 
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_explicit_legal_ai_repository_fields_map_into_mission_yaml(
+        self,
+        _mock_preflight,
+    ) -> None:
+        """MCP/API structured fields must become repository.* in Mission Spec."""
+        with patch.object(
+            api_module,
+            "_accept_async_run",
+            wraps=api_module._accept_async_run,
+        ) as accept_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    repository_name="nhpcorp35/legal-ai",
+                    repository_path=".",
+                    base_branch="main",
+                    persistence_mode="none",
+                    create_files=False,
+                    modify_files=False,
+                ),
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        accept_mock.assert_called_once()
+        mission_yaml = accept_mock.call_args.args[0]
+        self.assertIn("name: nhpcorp35/legal-ai", mission_yaml)
+        self.assertIn("path: .", mission_yaml)
+        self.assertIn("base_branch: main", mission_yaml)
+        self.assertNotIn("name: Mission-Control", mission_yaml)
+
 
 if __name__ == "__main__":
     unittest.main()

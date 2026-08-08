@@ -440,13 +440,24 @@ Limitations:
 
 For **`POST /runs`** (async execute):
 
-1. Clone `MISSION_CONTROL_REPOSITORY_URL` at `repository.base_branch` into a
-   temporary directory (`mission-control-run-*`).
-2. Rewrite `repository.path` for that run to the temp workspace.
+1. Resolve the clone URL from `repository.name` (optional
+   `MISSION_CONTROL_REPOSITORY_URL_MAP`, Mission Control aliases → Mission
+   Control, Legal AI aliases → Legal AI / `MISSION_CONTROL_LEGAL_AI_REPOSITORY_URL`,
+   explicit `owner/repo` → `https://github.com/owner/repo.git`, else legacy
+   `MISSION_CONTROL_REPOSITORY_URL`). Clone that remote at
+   `repository.base_branch` into a temporary directory
+   (`mission-control-run-*`). Fail closed before execution when clone fails or
+   workspace origin does not match the selected repository.
+2. Rewrite `repository.path` for that run to the temp checkout (`.` → repo
+   root; relative subdirectories must resolve inside the checkout). Absolute
+   submit-time validation paths bind the agent to checkout root.
 3. Execute the agent there.
 4. Verify declared file deliverables exist as regular files in that
-   workspace (fail the run before persistence if any are missing).
-5. Apply platform persistence for that workspace.
+   workspace (fail the run before persistence if any are missing). Reject
+   `.legalai_work/` nesting that would legitimize the wrong repository.
+5. Apply platform persistence for that workspace only after origin/target
+   identity matches `repository.name` (fail closed on mismatch; never report
+   persistence success for a different remote).
 6. Always attempt `cleanup_workspace` (delete the temp directory) in `finally`.
 
 Consequences:

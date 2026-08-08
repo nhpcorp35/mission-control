@@ -51,18 +51,36 @@ PLATFORM_PUSH_APPROVAL_REQUIRED = (
 REPOSITORY_URL_MAP_ENV = "MISSION_CONTROL_REPOSITORY_URL_MAP"
 # Optional override when repository.name selects Mission Control itself.
 SELF_REPOSITORY_URL_ENV = "MISSION_CONTROL_SELF_REPOSITORY_URL"
+# Optional override when repository.name selects Legal AI.
+LEGAL_AI_REPOSITORY_URL_ENV = "MISSION_CONTROL_LEGAL_AI_REPOSITORY_URL"
 DEFAULT_MISSION_CONTROL_CLONE_URL = (
     "https://github.com/nhpcorp35/mission-control.git"
 )
+DEFAULT_LEGAL_AI_CLONE_URL = "https://github.com/nhpcorp35/legal-ai.git"
 
 # Names that must clone Mission Control rather than the legacy single-repo
-# MISSION_CONTROL_REPOSITORY_URL (commonly pointed at Legal AI).
+# MISSION_CONTROL_REPOSITORY_URL.
 _MISSION_CONTROL_REPOSITORY_NAMES = frozenset(
     {
         "mission-control",
         "nhpcorp35/mission-control",
     }
 )
+
+# Explicit Legal AI identities — never fall back to Mission Control's clone URL.
+_LEGAL_AI_REPOSITORY_NAMES = frozenset(
+    {
+        "legal-ai",
+        "nhpcorp35/legal-ai",
+    }
+)
+
+# Nested checkout directory agents previously used inside Mission Control.
+# Changes under this path must not legitimize wrong-repo persistence.
+NESTED_LEGALAI_WORK_DIR = ".legalai_work"
+
+REPOSITORY_ORIGIN_MISMATCH_PREFIX = "REPOSITORY_ORIGIN_MISMATCH:"
+NESTED_WORKSPACE_CONTAMINATION_PREFIX = "NESTED_WORKSPACE_CONTAMINATION:"
 
 
 @dataclass(frozen=True)
@@ -190,14 +208,173 @@ def _is_mission_control_repository_name(name: str) -> bool:
     }
 
 
+def _is_legal_ai_repository_name(name: str) -> bool:
+    """Return whether ``name`` selects the Legal AI GitHub repository."""
+    if not name:
+        return False
+    return name.casefold() in {
+        alias.casefold() for alias in _LEGAL_AI_REPOSITORY_NAMES
+    }
+
+
+def _looks_like_github_owner_repo(name: str) -> bool:
+    """Return whether ``name`` looks like an explicit ``owner/repo`` identity."""
+    if not name or " " in name or name.count("/") != 1:
+        return False
+    owner, repo = name.split("/", 1)
+    if not owner or not repo:
+        return False
+    if owner.startswith(".") or repo.startswith("."):
+        return False
+    return True
+
+
+def normalize_remote_url_identity(url: str) -> str:
+    """Normalize a Git remote URL for origin/target comparison.
+
+    HTTPS, SSH, and local/file remotes compare as the same repository when they
+    refer to the same host/owner/repo (case-insensitive) or the same realpath.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+
+    # Local / file remotes: compare canonical paths.
+    if raw.startswith("file://"):
+        path = raw[len("file://") :]
+        if path.startswith("//"):
+            # file://localhost/path or file:///path
+            without_host = path.split("/", 2)
+            if len(without_host) == 3:
+                path = "/" + without_host[2]
+            else:
+                path = path.lstrip("/")
+        return os.path.realpath(path)
+    if "://" not in raw and not raw.startswith("git@"):
+        return os.path.realpath(raw)
+
+    normalized = raw
+    if normalized.startswith("git@"):
+        # git@host:owner/repo.git → host/owner/repo
+        try:
+            host_and_path = normalized[len("git@") :]
+            host, path = host_and_path.split(":", 1)
+            normalized = f"{host}/{path}"
+        except ValueError:
+            normalized = normalized[len("git@") :]
+    else:
+        # https://host/owner/repo.git (optionally with userinfo)
+        without_scheme = normalized.split("://", 1)[1]
+        if "@" in without_scheme.split("/", 1)[0]:
+            without_scheme = without_scheme.split("@", 1)[1]
+        normalized = without_scheme
+
+    normalized = normalized.rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[: -len(".git")]
+    return normalized.casefold()
+
+
+def verify_workspace_origin_matches_mission(
+    mission: dict,
+    workspace_path: str,
+) -> str | None:
+    """Return an error when workspace origin is not the mission target remote.
+
+    Fail closed before mutation/persistence so Mission Control never reports
+    persistence success against a different repository than ``repository.name``.
+    """
+    expected_url, url_error = resolve_mission_clone_url(mission)
+    if url_error is not None or not expected_url:
+        return url_error or (
+            f"{REPOSITORY_ORIGIN_MISMATCH_PREFIX} cannot resolve expected "
+            "clone URL for repository.name"
+        )
+
+    actual_url = get_origin_url(workspace_path)
+    if not actual_url:
+        name = _repository_name(mission) or "<unknown>"
+        return (
+            f"{REPOSITORY_ORIGIN_MISMATCH_PREFIX} workspace origin is missing "
+            f"for repository.name={name!r}; expected {expected_url}"
+        )
+
+    expected_id = normalize_remote_url_identity(expected_url)
+    actual_id = normalize_remote_url_identity(actual_url)
+    if expected_id and actual_id and expected_id == actual_id:
+        return None
+
+    name = _repository_name(mission) or "<unknown>"
+    return (
+        f"{REPOSITORY_ORIGIN_MISMATCH_PREFIX} repository.name={name!r} "
+        f"expected origin {expected_url} but workspace origin is {actual_url}"
+    )
+
+
+def resolve_agent_workspace_path(
+    checkout_root: str,
+    repository_path: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve the agent ``--workspace`` directory inside ``checkout_root``.
+
+    ``repository.name`` selects which repository to clone. ``repository.path``
+    may select a subdirectory only inside that checkout; ``'.'`` (and absolute
+    submit-time host paths used for validation) mean the repository root.
+    """
+    root = os.path.realpath(checkout_root)
+    if not repository_path or not str(repository_path).strip():
+        return root, None
+
+    requested = str(repository_path).strip()
+    if requested in {".", "./"}:
+        return root, None
+
+    # Absolute paths are submit-time validation roots on the API host, not
+    # clone-relative locations. Isolated runs bind the agent to checkout root.
+    if os.path.isabs(requested) or requested.startswith("~"):
+        return root, None
+
+    resolved = resolve_safe_workspace_path(root, requested)
+    if resolved is None:
+        return None, (
+            "repository.path must be '.' or a relative subdirectory inside "
+            f"the selected repository checkout (got {requested!r})"
+        )
+    if not resolved.is_dir():
+        return None, (
+            "repository.path subdirectory does not exist inside checkout: "
+            f"{requested}"
+        )
+    return str(resolved), None
+
+
+def nested_workspace_contamination_error(paths: list[str]) -> str | None:
+    """Reject ``.legalai_work`` nesting that must not satisfy deliverables."""
+    for raw in paths:
+        if not isinstance(raw, str) or not raw:
+            continue
+        parts = Path(raw).parts
+        if NESTED_LEGALAI_WORK_DIR in parts:
+            return (
+                f"{NESTED_WORKSPACE_CONTAMINATION_PREFIX} path {raw!r} is under "
+                f"{NESTED_LEGALAI_WORK_DIR}/ and cannot legitimize persistence "
+                "for the selected repository"
+            )
+    return None
+
+
 def resolve_mission_clone_url(mission: dict) -> tuple[str | None, str | None]:
     """Return ``(clone_url, error)`` for the mission's isolated workspace.
 
     Persistence inspects the clone prepared here. If that clone is a different
     repository than the one identified by ``repository.name``, the coding agent
-    may modify the intended repo while platform persistence sees an empty tree
-    ("no repository changes"). Resolve the clone URL from ``repository.name``
-    (and optional URL map) so agent and persistence share one checkout.
+    may modify the intended repo while platform persistence pushes elsewhere.
+    Resolve the clone URL from ``repository.name`` (and optional URL map) so
+    agent and persistence share one checkout of the selected remote.
+
+    Explicit Legal AI / ``owner/repo`` names never fall back silently to
+    Mission Control. Missions that omit optional fields still default to
+    Mission Control via the structured builder's ``Mission-Control`` name.
     """
     name = _repository_name(mission)
     name_key = name.casefold()
@@ -229,8 +406,22 @@ def resolve_mission_clone_url(mission: dict) -> tuple[str | None, str | None]:
         self_url = os.environ.get(SELF_REPOSITORY_URL_ENV, "").strip()
         return (self_url or DEFAULT_MISSION_CONTROL_CLONE_URL), None
 
+    if _is_legal_ai_repository_name(name):
+        legal_url = os.environ.get(LEGAL_AI_REPOSITORY_URL_ENV, "").strip()
+        return (legal_url or DEFAULT_LEGAL_AI_CLONE_URL), None
+
+    # Explicit owner/repo clone identity: do not reuse the legacy single-repo
+    # MISSION_CONTROL_REPOSITORY_URL (often Mission Control or Legal AI).
+    if _looks_like_github_owner_repo(name):
+        return f"https://github.com/{name}.git", None
+
     repository_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL", "").strip()
     if not repository_url:
+        if name:
+            return None, (
+                f"Cannot resolve clone URL for repository.name={name!r}. "
+                f"Set {REPOSITORY_URL_MAP_ENV} or MISSION_CONTROL_REPOSITORY_URL."
+            )
         return None, (
             "MISSION_CONTROL_REPOSITORY_URL is not configured. "
             "Set it to the Git clone URL for the repository."
@@ -242,6 +433,7 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
     """Clone the mission's target repository into a temporary workspace."""
     repository = mission["repository"]
     base_branch = repository["base_branch"]
+    repo_name = _repository_name(mission) or "<unknown>"
     repository_url, url_error = resolve_mission_clone_url(mission)
 
     if url_error is not None or not repository_url:
@@ -256,28 +448,44 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
 
     workspace_path = tempfile.mkdtemp(prefix="mission-control-run-")
 
+    # Prefer GitHub HTTPS auth when available so private allowed repositories
+    # can clone; missing token is fine for local/file remotes in tests.
+    clone_env, _auth_error = _github_push_environment()
     clone = _run_git(
         [
             "clone",
             "--branch",
-            base_branch,
+            str(base_branch),
             "--single-branch",
             repository_url,
             workspace_path,
-        ]
+        ],
+        env=clone_env,
     )
     if clone.returncode != 0:
         _safe_cleanup(workspace_path)
         message = clone.stderr.strip() or clone.stdout.strip()
         if not message:
             message = f"git clone failed with code {clone.returncode}"
-        return WorkspacePrepResult(ok=False, error=message)
+        return WorkspacePrepResult(
+            ok=False,
+            error=(
+                f"Failed to clone repository.name={repo_name!r} "
+                f"at ref {base_branch!r} from {repository_url}: {message}"
+            ),
+        )
 
     # Canonicalize so agent --workspace / cwd and persistence git -C agree
     # even when /tmp (or the mkdtemp path) involves symlinks.
+    real_workspace = os.path.realpath(workspace_path)
+    mismatch = verify_workspace_origin_matches_mission(mission, real_workspace)
+    if mismatch is not None:
+        _safe_cleanup(real_workspace)
+        return WorkspacePrepResult(ok=False, error=mismatch)
+
     return WorkspacePrepResult(
         ok=True,
-        workspace_path=os.path.realpath(workspace_path),
+        workspace_path=real_workspace,
     )
 
 
@@ -481,6 +689,15 @@ def persist_workspace_changes(
                 mode="push",
                 pushed=False,
             )
+
+    mismatch = verify_workspace_origin_matches_mission(mission, workspace_path)
+    if mismatch is not None:
+        return PersistenceResult(
+            ok=False,
+            error=mismatch,
+            mode=mode,
+            pushed=False,
+        )
 
     status = _git_status_porcelain(workspace_path)
     if status.returncode != 0:
@@ -942,10 +1159,40 @@ def execute_registered_run(
         workspace_path = os.path.realpath(prep.workspace_path)
         assert workspace_path is not None
 
+        # repository.path from the mission selects a subdirectory inside the
+        # checkout ('.' → repository root). Git persistence always uses the
+        # clone top-level so nested paths cannot retarget origin.
+        requested_path = mission.get("repository", {}).get("path")
+        agent_workspace, path_error = resolve_agent_workspace_path(
+            workspace_path,
+            requested_path if isinstance(requested_path, str) else ".",
+        )
+        if path_error is not None or not agent_workspace:
+            append_warning(structured, WARNING_PREP_FAILED)
+            append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
+            structured.deliverables = DeliverableEvidence(
+                verified=False,
+                passed=None,
+            )
+            _attach_documentation(handling_completed=False)
+            finalize_structured_summary(structured, error=path_error)
+            registry.store_result(
+                run_id,
+                error=path_error,
+                result=structured,
+            )
+            registry.update_status(run_id, RunStatus.FAILED)
+            return
+
         isolated_mission = copy.deepcopy(mission)
         isolated_mission["repository"] = {
             **mission["repository"],
-            "path": workspace_path,
+            "path": agent_workspace,
         }
 
         execution_result = execute_cursor_agent(
@@ -959,6 +1206,34 @@ def execute_registered_run(
         structured.files_changed = changed_files
         if files_warning is not None:
             append_warning(structured, files_warning)
+
+        contamination = nested_workspace_contamination_error(changed_files)
+        if contamination is not None and execution_result.ok:
+            append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+            structured.deliverables = DeliverableEvidence(
+                verified=False,
+                passed=False,
+                checked_paths=[],
+                missing=[],
+                outside_workspace=[],
+            )
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
+            _attach_documentation(handling_completed=False)
+            finalize_structured_summary(structured, error=contamination)
+            registry.store_result(
+                run_id,
+                stdout=execution_result.stdout,
+                stderr=execution_result.stderr,
+                error=contamination,
+                return_code=execution_result.return_code,
+                result=structured,
+            )
+            registry.update_status(run_id, RunStatus.FAILED)
+            return
 
         if not execution_result.ok:
             append_warning(structured, WARNING_DELIVERABLES_NOT_CHECKED)
@@ -1000,7 +1275,14 @@ def execute_registered_run(
         )
         structured.deliverables = deliverable_evidence
         deliverable_error: str | None = None
-        if deliverable_evidence.outside_workspace:
+        contamination = nested_workspace_contamination_error(
+            list(deliverable_evidence.checked_paths)
+            + list(deliverable_evidence.missing)
+            + list(deliverable_evidence.outside_workspace)
+        )
+        if contamination is not None:
+            deliverable_error = contamination
+        elif deliverable_evidence.outside_workspace:
             deliverable_error = (
                 "Declared file deliverable outside workspace: "
                 f"{deliverable_evidence.outside_workspace[0]}"

@@ -15,8 +15,12 @@ from mission_control.executor import ExecutionResult
 from mission_control.run_registry import RunRegistry, RunStatus
 from mission_control.validator import validate_mission_for_execute
 from mission_control.workspace import (
+    DEFAULT_LEGAL_AI_CLONE_URL,
     DEFAULT_MISSION_CONTROL_CLONE_URL,
+    LEGAL_AI_REPOSITORY_URL_ENV,
+    NESTED_WORKSPACE_CONTAMINATION_PREFIX,
     PLATFORM_PUSH_APPROVAL_REQUIRED,
+    REPOSITORY_ORIGIN_MISMATCH_PREFIX,
     REPOSITORY_URL_MAP_ENV,
     SELF_REPOSITORY_URL_ENV,
     PersistenceResult,
@@ -29,12 +33,16 @@ from mission_control.workspace import (
     get_origin_url,
     is_platform_push_authorized,
     looks_like_file_path_deliverable,
+    nested_workspace_contamination_error,
+    normalize_remote_url_identity,
     persist_workspace_changes,
     prepare_isolated_workspace,
     require_platform_push_approval,
+    resolve_agent_workspace_path,
     resolve_mission_clone_url,
     resolve_safe_workspace_deliverable,
     verify_declared_file_deliverables,
+    verify_workspace_origin_matches_mission,
 )
 
 
@@ -543,6 +551,9 @@ class TestWorkspacePersistence(unittest.TestCase):
                 stderr="commit failed",
             )
             with patch(
+                "mission_control.workspace.verify_workspace_origin_matches_mission",
+                return_value=None,
+            ), patch(
                 "mission_control.workspace._run_git",
                 side_effect=[status, add, commit],
             ):
@@ -587,6 +598,9 @@ class TestWorkspacePersistence(unittest.TestCase):
                 stderr="push rejected",
             )
             with patch(
+                "mission_control.workspace.verify_workspace_origin_matches_mission",
+                return_value=None,
+            ), patch(
                 "mission_control.workspace._run_git",
                 side_effect=[status, add, commit, push],
             ):
@@ -1219,11 +1233,14 @@ class TestMissionCloneUrlResolution(unittest.TestCase):
         self._previous_repo_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL")
         self._previous_map = os.environ.get(REPOSITORY_URL_MAP_ENV)
         self._previous_self = os.environ.get(SELF_REPOSITORY_URL_ENV)
+        self._previous_legal = os.environ.get(LEGAL_AI_REPOSITORY_URL_ENV)
+        # Simulate production where the legacy env points at Mission Control.
         os.environ["MISSION_CONTROL_REPOSITORY_URL"] = (
-            "https://github.com/nhpcorp35/legal-ai.git"
+            "https://github.com/nhpcorp35/Mission-Control.git"
         )
         os.environ.pop(REPOSITORY_URL_MAP_ENV, None)
         os.environ.pop(SELF_REPOSITORY_URL_ENV, None)
+        os.environ.pop(LEGAL_AI_REPOSITORY_URL_ENV, None)
 
     def tearDown(self) -> None:
         if self._previous_repo_url is None:
@@ -1238,6 +1255,10 @@ class TestMissionCloneUrlResolution(unittest.TestCase):
             os.environ.pop(SELF_REPOSITORY_URL_ENV, None)
         else:
             os.environ[SELF_REPOSITORY_URL_ENV] = self._previous_self
+        if self._previous_legal is None:
+            os.environ.pop(LEGAL_AI_REPOSITORY_URL_ENV, None)
+        else:
+            os.environ[LEGAL_AI_REPOSITORY_URL_ENV] = self._previous_legal
 
     def test_mission_control_name_does_not_use_legal_ai_env_url(self) -> None:
         mission = {
@@ -1264,10 +1285,33 @@ class TestMissionCloneUrlResolution(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(url, DEFAULT_MISSION_CONTROL_CLONE_URL)
 
-    def test_legal_ai_name_uses_legacy_env_url(self) -> None:
+    def test_legal_ai_name_does_not_use_mission_control_env_url(self) -> None:
+        """Explicit LegalAI must not silently clone Mission-Control."""
         mission = {
             "repository": {
                 "name": "nhpcorp35/legal-ai",
+                "path": ".",
+                "base_branch": "main",
+            }
+        }
+        url, error = resolve_mission_clone_url(mission)
+        self.assertIsNone(error)
+        self.assertEqual(url, DEFAULT_LEGAL_AI_CLONE_URL)
+        self.assertNotIn("mission-control", (url or "").casefold())
+        self.assertNotEqual(
+            normalize_remote_url_identity(url or ""),
+            normalize_remote_url_identity(
+                os.environ["MISSION_CONTROL_REPOSITORY_URL"]
+            ),
+        )
+
+    def test_legal_ai_short_alias_uses_dedicated_url(self) -> None:
+        os.environ[LEGAL_AI_REPOSITORY_URL_ENV] = (
+            "https://github.com/nhpcorp35/legal-ai.git"
+        )
+        mission = {
+            "repository": {
+                "name": "legal-ai",
                 "path": ".",
                 "base_branch": "main",
             }
@@ -1524,6 +1568,245 @@ class TestPersistenceHandoff(unittest.TestCase):
                 cleanup_workspace(prep.workspace_path)
         finally:
             other.cleanup()
+
+
+class TestExplicitLegalAiRepositoryRouting(unittest.TestCase):
+    """Structured LegalAI missions must check out legal-ai, not Mission-Control."""
+
+    def setUp(self) -> None:
+        self.mc = GitRepoFixture()
+        self.legal = GitRepoFixture()
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        self.registry = RunRegistry(self._db_path)
+        self._previous_map = os.environ.get(REPOSITORY_URL_MAP_ENV)
+        # Legacy env points at Mission Control — the production footgun.
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = str(self.mc.bare_remote)
+        os.environ[REPOSITORY_URL_MAP_ENV] = json.dumps(
+            {
+                "nhpcorp35/legal-ai": str(self.legal.bare_remote),
+                "legal-ai": str(self.legal.bare_remote),
+                "nhpcorp35/mission-control": str(self.mc.bare_remote),
+                "Mission-Control": str(self.mc.bare_remote),
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.registry.close()
+        os.unlink(self._db_path)
+        if self._previous_map is None:
+            os.environ.pop(REPOSITORY_URL_MAP_ENV, None)
+        else:
+            os.environ[REPOSITORY_URL_MAP_ENV] = self._previous_map
+        self.legal.cleanup()
+        self.mc.cleanup()
+
+    def _legal_mission(self, *, persistence_mode: str = "commit") -> dict:
+        return {
+            "mission_id": "2026-08-08-legalai-routing",
+            "repository": {
+                "name": "nhpcorp35/legal-ai",
+                "path": ".",
+                "base_branch": "main",
+            },
+            "permissions": {"push": False},
+            "persistence": {"mode": persistence_mode},
+            "approval": {"platform_push_approved": True},
+            "deliverables": ["agent_created.txt"],
+        }
+
+    def test_prepare_clones_legal_ai_not_mission_control(self) -> None:
+        mission = self._legal_mission()
+        prep = prepare_isolated_workspace(mission)
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            origin = get_origin_url(prep.workspace_path)
+            self.assertEqual(origin, str(self.legal.bare_remote))
+            self.assertNotEqual(
+                normalize_remote_url_identity(origin or ""),
+                normalize_remote_url_identity(str(self.mc.bare_remote)),
+            )
+            agent_ws, path_error = resolve_agent_workspace_path(
+                prep.workspace_path,
+                ".",
+            )
+            self.assertIsNone(path_error)
+            self.assertEqual(agent_ws, prep.workspace_path)
+            branch = _run_git(
+                ["-C", prep.workspace_path, "rev-parse", "--abbrev-ref", "HEAD"]
+            ).stdout.strip()
+            self.assertEqual(branch, "main")
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    def test_execute_binds_agent_to_legal_ai_checkout_root(
+        self,
+        _mock_cleanup,
+    ) -> None:
+        seen: dict[str, str] = {}
+        mission = self._legal_mission()
+
+        def fake_agent(mission_arg: dict, run_id: str | None = None) -> ExecutionResult:
+            workspace = mission_arg["repository"]["path"]
+            seen["agent_workspace"] = os.path.realpath(workspace)
+            seen["origin"] = get_origin_url(workspace) or ""
+            (Path(workspace) / "agent_created.txt").write_text(
+                "legal\n",
+                encoding="utf-8",
+            )
+            return ExecutionResult(
+                ok=True,
+                stdout="agent done\n",
+                return_code=0,
+                command=["cursor-agent", "--workspace", workspace],
+            )
+
+        with patch(
+            "mission_control.workspace.execute_cursor_agent",
+            side_effect=fake_agent,
+        ):
+            record = self.registry.create_run()
+            execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        self.assertEqual(updated.status, RunStatus.COMPLETED, updated.error)
+        self.assertEqual(
+            normalize_remote_url_identity(seen["origin"]),
+            normalize_remote_url_identity(str(self.legal.bare_remote)),
+        )
+        self.assertNotEqual(
+            normalize_remote_url_identity(seen["origin"]),
+            normalize_remote_url_identity(str(self.mc.bare_remote)),
+        )
+        assert updated.result is not None
+        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+        self.assertFalse(
+            any(
+                ".legalai_work" in path
+                for path in updated.result.files_changed
+            )
+        )
+
+    def test_origin_mismatch_fails_closed_before_persist(self) -> None:
+        mission = self._legal_mission(persistence_mode="commit")
+        prep = prepare_isolated_workspace(mission)
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            # Simulate the regression: workspace origin retargeted to MC.
+            configure_workspace_origin(
+                prep.workspace_path,
+                str(self.mc.bare_remote),
+            )
+            mismatch = verify_workspace_origin_matches_mission(
+                mission,
+                prep.workspace_path,
+            )
+            self.assertIsNotNone(mismatch)
+            assert mismatch is not None
+            self.assertTrue(
+                mismatch.startswith(REPOSITORY_ORIGIN_MISMATCH_PREFIX),
+                mismatch,
+            )
+
+            (Path(prep.workspace_path) / "nested.txt").write_text(
+                "should not commit\n",
+                encoding="utf-8",
+            )
+            result = persist_workspace_changes(
+                "run-mismatch",
+                mission,
+                prep.workspace_path,
+            )
+            self.assertFalse(result.ok)
+            self.assertTrue(
+                (result.error or "").startswith(REPOSITORY_ORIGIN_MISMATCH_PREFIX),
+                result.error,
+            )
+            self.assertIsNone(result.commit_sha)
+            legal_head = _run_git(
+                [
+                    "--git-dir",
+                    str(self.legal.bare_remote),
+                    "rev-parse",
+                    "main",
+                ]
+            ).stdout.strip()
+            workspace_head = _run_git(
+                ["-C", prep.workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            self.assertEqual(workspace_head, legal_head)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    @patch("mission_control.workspace.cleanup_workspace")
+    def test_nested_legalai_work_changes_cannot_persist_to_mission_control(
+        self,
+        _mock_cleanup,
+    ) -> None:
+        """Edits under .legalai_work must not legitimize MC persistence."""
+        mission = {
+            "mission_id": "2026-08-08-nested-contamination",
+            "repository": {
+                "name": "nhpcorp35/mission-control",
+                "path": ".",
+                "base_branch": "main",
+            },
+            "permissions": {"push": False},
+            "persistence": {"mode": "commit"},
+            "deliverables": [
+                ".legalai_work/nhpcorp35-legal-ai-2b3c660/created.txt",
+            ],
+        }
+
+        def fake_agent(mission_arg: dict, run_id: str | None = None) -> ExecutionResult:
+            workspace = mission_arg["repository"]["path"]
+            nested = (
+                Path(workspace)
+                / ".legalai_work"
+                / "nhpcorp35-legal-ai-2b3c660"
+                / "created.txt"
+            )
+            nested.parent.mkdir(parents=True, exist_ok=True)
+            nested.write_text("nested legalai\n", encoding="utf-8")
+            return ExecutionResult(
+                ok=True,
+                stdout="agent done\n",
+                return_code=0,
+                command=["cursor-agent", "--workspace", workspace],
+            )
+
+        with patch(
+            "mission_control.workspace.execute_cursor_agent",
+            side_effect=fake_agent,
+        ):
+            record = self.registry.create_run()
+            execute_registered_run(record.run_id, mission, self.registry)
+
+        updated = self.registry.get_run(record.run_id)
+        assert updated is not None
+        self.assertEqual(updated.status, RunStatus.FAILED)
+        self.assertTrue(
+            (updated.error or "").startswith(NESTED_WORKSPACE_CONTAMINATION_PREFIX),
+            updated.error,
+        )
+        self.assertIsNone(updated.commit_sha)
+        assert updated.result is not None
+        assert updated.result.persistence is not None
+        self.assertFalse(updated.result.persistence.attempted)
+
+    def test_nested_contamination_helper_detects_legalai_work(self) -> None:
+        error = nested_workspace_contamination_error(
+            [".legalai_work/nhpcorp35-legal-ai-2b3c660/foo.py"]
+        )
+        self.assertIsNotNone(error)
+        self.assertTrue(
+            (error or "").startswith(NESTED_WORKSPACE_CONTAMINATION_PREFIX)
+        )
+        self.assertIsNone(nested_workspace_contamination_error(["app/api.py"]))
 
 
 if __name__ == "__main__":

@@ -198,6 +198,34 @@ class TestSubmitStructuredRunClient(unittest.IsolatedAsyncioTestCase):
         payload = request.await_args.kwargs["json"]
         self.assertEqual(payload["persistence_mode"], "none")
 
+    async def test_client_maps_legal_ai_repository_routing_fields(self) -> None:
+        """MCP structured wrapper must forward LegalAI routing fields unchanged."""
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value={"run_id": "r-legal", "status": "queued"}),
+        ) as request:
+            await self.client.submit_structured_run(
+                mission_id="2026-08-08-legalai",
+                title="LegalAI routing",
+                instructions="Fix LegalAI",
+                deliverables=["summary"],
+                create_files=True,
+                modify_files=True,
+                persistence_mode="commit",
+                repository_name="nhpcorp35/legal-ai",
+                repository_path=".",
+                base_branch="main",
+            )
+        request.assert_awaited_once()
+        self.assertEqual(request.await_args.args[0], "POST")
+        self.assertEqual(request.await_args.args[1], "/runs/structured")
+        payload = request.await_args.kwargs["json"]
+        self.assertEqual(payload["repository_name"], "nhpcorp35/legal-ai")
+        self.assertEqual(payload["repository_path"], ".")
+        self.assertEqual(payload["base_branch"], "main")
+        self.assertEqual(payload["persistence_mode"], "commit")
+
 
 class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -519,6 +547,7 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
                 "get_run",
                 "wait_for_run",
                 "submit_and_wait",
+                "run_repository_command",
             ],
         )
 

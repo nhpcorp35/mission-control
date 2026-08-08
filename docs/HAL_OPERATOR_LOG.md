@@ -1,5 +1,36 @@
 # HAL Operator Log
 
+## 2026-08-08 — Explicit repository routing (LegalAI vs Mission Control)
+
+### Objective
+
+Structured missions that set `repository_name=nhpcorp35/legal-ai` (path `.`,
+branch `main`) were still preparing a Mission Control checkout. Agents edited
+nested `.legalai_work/*` trees and platform persistence could push to
+`nhpcorp35/mission-control` while reporting success.
+
+### Root cause
+
+`resolve_mission_clone_url` treated every non–Mission-Control `repository.name`
+as the legacy single-repo `MISSION_CONTROL_REPOSITORY_URL`. After Mission
+Control self-routing landed, that env commonly pointed at Mission Control, so
+explicit LegalAI missions silently cloned the wrong remote.
+
+### Implementation
+
+- `mission_control/workspace.py`: Legal AI aliases and explicit `owner/repo`
+  names resolve to their own clone URLs (map / `MISSION_CONTROL_LEGAL_AI_REPOSITORY_URL`
+  / GitHub default) and never fall back to Mission Control. Prep and
+  persistence fail closed on origin/target mismatch; `.legalai_work` nesting
+  cannot legitimize persistence; agent workspace honors `.` as checkout root.
+- Regression coverage in workspace, structured API, mission builder, and MCP
+  structured client field mapping.
+
+### Next Objective
+
+Confirm Railway redeploy; LegalAI structured missions must clone
+`nhpcorp35/legal-ai` and never persist nested LegalAI edits into Mission Control.
+
 ## 2026-08-05 — Workspace persistence handoff (repository.name → clone URL)
 
 ### Objective

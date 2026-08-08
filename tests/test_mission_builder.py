@@ -221,6 +221,42 @@ class TestMissionBuilder(unittest.TestCase):
         )
         self.assertEqual(spec["persistence"]["mode"], "push")
 
+    def test_legal_ai_structured_fields_map_to_repository_block(self) -> None:
+        """Exact MCP structured wrapper field mapping for LegalAI missions."""
+        spec = build_mission_spec(
+            mission_id="2026-08-08-legalai",
+            title="LegalAI routing",
+            instructions="Implement LegalAI change.",
+            deliverables=["summary"],
+            create_files=True,
+            modify_files=True,
+            persistence_mode="commit",
+            repository_name="nhpcorp35/legal-ai",
+            repository_path=".",
+            base_branch="main",
+        )
+        self.assertEqual(spec["repository"]["name"], "nhpcorp35/legal-ai")
+        self.assertEqual(spec["repository"]["path"], ".")
+        self.assertEqual(spec["repository"]["base_branch"], "main")
+        yaml_text = render_mission_yaml(
+            mission_id="2026-08-08-legalai",
+            title="LegalAI routing",
+            instructions="Implement LegalAI change.",
+            deliverables=["summary"],
+            create_files=True,
+            modify_files=True,
+            persistence_mode="commit",
+            repository_name="nhpcorp35/legal-ai",
+            repository_path=".",
+            base_branch="main",
+        )
+        result, loaded = load_mission_yaml(yaml_text)
+        self.assertTrue(result.ok, result.error)
+        assert loaded is not None
+        self.assertEqual(loaded["repository"]["name"], "nhpcorp35/legal-ai")
+        self.assertEqual(loaded["repository"]["path"], ".")
+        self.assertEqual(loaded["repository"]["base_branch"], "main")
+
 
 if __name__ == "__main__":
     unittest.main()
