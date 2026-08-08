@@ -14,8 +14,10 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 
@@ -24,6 +26,7 @@ WORKFLOW = os.environ.get("GITHUB_WORKFLOW", "hal-bridge-proof.yml")
 WORKFLOW_BRANCH = os.environ.get("GITHUB_WORKFLOW_BRANCH", "agent/hal-bridge-proof-workflow")
 B2_BUCKET = os.environ.get("B2_BUCKET", "legalai-corpus")
 B2_PREFIX = os.environ.get("B2_PROOF_PREFIX", "Benchmarks/Bridge-Proof")
+BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "")
 GITHUB_API = "https://api.github.com"
 
 mcp = FastMCP(
@@ -190,6 +193,17 @@ async def health(_request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "service": "hal-github-actions-bridge", "time": int(time.time())})
 
 
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> Response:
+        if request.url.path == "/health":
+            return await call_next(request)
+        if not BRIDGE_API_KEY:
+            return JSONResponse({"error": "bridge_auth_not_configured"}, status_code=503)
+        if request.headers.get("authorization") != f"Bearer {BRIDGE_API_KEY}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
 def create_http_app() -> Starlette:
     streamable_app = mcp.streamable_http_app()
     routes = [Route("/health", health), *streamable_app.routes]
@@ -199,7 +213,11 @@ def create_http_app() -> Starlette:
         async with mcp.session_manager.run():
             yield
 
-    return Starlette(routes=routes, lifespan=lifespan)
+    return Starlette(
+        routes=routes,
+        lifespan=lifespan,
+        middleware=[Middleware(BearerAuthMiddleware)],
+    )
 
 
 def main() -> None:
@@ -208,4 +226,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
