@@ -6,19 +6,15 @@ import os
 import time
 import uuid
 import zipfile
-from contextlib import asynccontextmanager
 from typing import Any
 
 import boto3
 import httpx
-import uvicorn
-from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.github import GitHubProvider
+from fastmcp.server.dependencies import get_access_token
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.responses import JSONResponse
 
 
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "nhpcorp35/legal-ai")
@@ -26,8 +22,19 @@ WORKFLOW = os.environ.get("GITHUB_WORKFLOW", "hal-bridge-proof.yml")
 WORKFLOW_BRANCH = os.environ.get("GITHUB_WORKFLOW_BRANCH", "agent/hal-bridge-proof-workflow")
 B2_BUCKET = os.environ.get("B2_BUCKET", "legalai-corpus")
 B2_PREFIX = os.environ.get("B2_PROOF_PREFIX", "Benchmarks/Bridge-Proof")
-BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "")
+PUBLIC_URL = os.environ.get(
+    "BRIDGE_PUBLIC_URL",
+    "https://hal-github-actions-bridge-production.up.railway.app",
+).rstrip("/")
+ALLOWED_GITHUB_LOGIN = os.environ.get("ALLOWED_GITHUB_LOGIN", "nhpcorp35")
 GITHUB_API = "https://api.github.com"
+
+auth_provider = GitHubProvider(
+    client_id=os.environ["GITHUB_OAUTH_CLIENT_ID"],
+    client_secret=os.environ["GITHUB_OAUTH_CLIENT_SECRET"],
+    base_url=PUBLIC_URL,
+    jwt_signing_key=os.environ.get("JWT_SIGNING_KEY"),
+)
 
 mcp = FastMCP(
     "HAL GitHub Actions Bridge",
@@ -37,10 +44,16 @@ mcp = FastMCP(
         "run, use get_artifacts to copy the harmless proof JSON to B2, verify it, "
         "and retrieve the durable object key."
     ),
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", "8000")),
-    json_response=True,
+    auth=auth_provider,
 )
+
+
+def _require_allowed_user() -> str:
+    token = get_access_token()
+    login = token.claims.get("login") if token is not None else None
+    if login != ALLOWED_GITHUB_LOGIN:
+        raise PermissionError("authenticated GitHub user is not authorized")
+    return str(login)
 
 
 def _github_headers() -> dict[str, str]:
@@ -105,6 +118,7 @@ async def submit_run(
     ref: str = "main", sleep_seconds: int = 0, mission_id: str | None = None
 ) -> dict[str, Any]:
     """Dispatch the bounded LegalAI proof workflow and return its correlation ID."""
+    _require_allowed_user()
     if sleep_seconds < 0 or sleep_seconds > 300:
         raise ValueError("sleep_seconds must be between 0 and 300")
     mission_id = mission_id or str(uuid.uuid4())
@@ -132,12 +146,14 @@ async def submit_run(
 @mcp.tool()
 async def get_run(mission_id: str) -> dict[str, Any]:
     """Return GitHub's current status, conclusion, and exact checked-out SHA."""
+    _require_allowed_user()
     return _run_result(mission_id, await _resolve_run(mission_id))
 
 
 @mcp.tool()
 async def cancel_run(mission_id: str) -> dict[str, Any]:
     """Cancel the GitHub Actions run correlated with mission_id."""
+    _require_allowed_user()
     run = await _resolve_run(mission_id)
     if run is None:
         return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
@@ -161,6 +177,7 @@ def _b2_client():
 @mcp.tool()
 async def get_artifacts(mission_id: str) -> dict[str, Any]:
     """Publish the proof JSON to B2, verify it, and return the durable object key."""
+    _require_allowed_user()
     run = await _resolve_run(mission_id)
     if run is None:
         return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
@@ -201,39 +218,17 @@ async def get_artifacts(mission_id: str) -> dict[str, Any]:
     }
 
 
+@mcp.custom_route("/health", methods=["GET"])
 async def health(_request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "service": "hal-github-actions-bridge", "time": int(time.time())})
 
 
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next) -> Response:
-        if request.url.path == "/health":
-            return await call_next(request)
-        if not BRIDGE_API_KEY:
-            return JSONResponse({"error": "bridge_auth_not_configured"}, status_code=503)
-        if request.headers.get("authorization") != f"Bearer {BRIDGE_API_KEY}":
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
-def create_http_app() -> Starlette:
-    streamable_app = mcp.streamable_http_app()
-    routes = [Route("/health", health), *streamable_app.routes]
-
-    @asynccontextmanager
-    async def lifespan(_app: Starlette):
-        async with mcp.session_manager.run():
-            yield
-
-    return Starlette(
-        routes=routes,
-        lifespan=lifespan,
-        middleware=[Middleware(BearerAuthMiddleware)],
-    )
-
-
 def main() -> None:
-    uvicorn.run(create_http_app(), host=mcp.settings.host, port=mcp.settings.port)
+    mcp.run(
+        transport="http",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
+    )
 
 
 if __name__ == "__main__":
