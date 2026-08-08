@@ -57,7 +57,16 @@ async def _github(method: str, path: str, **kwargs: Any) -> httpx.Response:
         response = await client.request(
             method, f"{GITHUB_API}{path}", headers=_github_headers(), **kwargs
         )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        try:
+            detail = response.json().get("message", response.text[:500])
+        except (ValueError, AttributeError):
+            detail = response.text[:500]
+        raise RuntimeError(
+            f"GitHub API {response.status_code} for {method} {path}: {detail}"
+        ) from exc
     return response
 
 
