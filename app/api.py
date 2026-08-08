@@ -377,7 +377,14 @@ class RepositoryCommandResponse(BaseModel):
     stderr: str = ""
     exit_code: int | None = None
     elapsed_seconds: float = 0.0
-    artifact_paths: list[str] = Field(default_factory=list)
+    artifact_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ephemeral local files under --candidate-output-root when present. "
+            "Not durable proof; Case-00 durable candidate keys come from "
+            "verified B2 upload reported in wrapper stdout (durable_artifacts)."
+        ),
+    )
     persistence: RepositoryCommandPersistenceModel
     error: str | None = None
     error_code: str | None = None
@@ -1112,9 +1119,11 @@ def retry_run_endpoint(
     description=(
         "Clone an allowlisted repository at the requested branch/commit, "
         "execute argv directly without a shell, and return stdout/stderr. "
-        "Initial allowlist: python3 scripts/generate_attorney_feedback_candidate.py. "
-        "Persistence is always none (never commits or pushes). Sensitive argv "
-        "values are redacted in the response."
+        "Allowlist includes LegalAI generation, Case-00 rebuild, and "
+        "Case-00 B2 Q1 scripts. Persistence is always none (never commits "
+        "or pushes). Sensitive argv values are redacted in the response. "
+        "artifact_paths are ephemeral local files only; durable Case-00 "
+        "candidate keys come from verified B2 upload in wrapper stdout."
     ),
     response_model=RepositoryCommandResponse,
 )

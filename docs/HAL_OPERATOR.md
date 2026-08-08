@@ -10,6 +10,11 @@ claims against repository state, and submits corrective follow-up missions.
 - For async Mission Control runs, prefer `summary`, `result.persistence`, and
   `commit_sha` over agent `stdout` when judging persistence: platform
   persistence runs after the agent completes.
+- For `POST /repository-commands` / MCP `run_repository_command`, persistence is
+  always `none`. Executor `artifact_paths` under `--candidate-output-root` are
+  ephemeral local scratch only. Durable Case-00 candidate handoff is the
+  wrapper's verified B2 `durable_artifacts` / object keys in command stdout —
+  not those local paths.
 - Significant claims must be independently verified through tests, source
   inspection, repository state, or equivalent direct evidence.
 

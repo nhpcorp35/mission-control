@@ -57,6 +57,15 @@ AUTHORIZATION_ACK = "I_AUTHORIZE_PRIVATE_EVIDENCE_TRANSMISSION_TO_MODEL_PROVIDER
 # Verified against scripts/run_case00_b2_q1.py on LegalAI main: required
 # boolean confirmation (no value), distinct from AUTHORIZATION_FLAG.
 AUTHORIZATION_CONFIRMED_FLAG = "--authorization-confirmed"
+# Optional durable upload prefix for Case-00 B2 Q1 (LegalAI commit
+# 76668ecee38b39747e4af9d995dc8c1989c4e9fe). Non-secret B2 object-prefix
+# string — not a local filesystem path. When omitted, the wrapper keeps its
+# argparse canonical default (LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX).
+CANDIDATE_B2_PREFIX_FLAG = "--candidate-b2-prefix"
+LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX = (
+    "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/"
+    "candidate-answers/"
+)
 
 # Shell metacharacters / chaining / redirection / expansion markers.
 _SHELL_META_RE = re.compile(r"""[|;&><`$(){}]|&&|\|\||>>|<<|\n|\r""")
@@ -165,6 +174,8 @@ class _ScriptPolicy:
     required_flags: frozenset[str] = frozenset()
     exact_flag_values: frozenset[tuple[str, str]] = frozenset()
     flag_value_patterns: tuple[tuple[str, re.Pattern[str]], ...] = ()
+    # Non-path B2 object-prefix flags (validated separately from path_flags).
+    object_prefix_flags: frozenset[str] = frozenset()
 
 
 _GENERATION_POLICY = _ScriptPolicy(
@@ -213,6 +224,7 @@ _CASE00_B2_Q1_POLICY = _ScriptPolicy(
             "--question-id",
             "--required-commit",
             "--candidate-output-root",
+            CANDIDATE_B2_PREFIX_FLAG,
         }
     ),
     flags_no_value=frozenset({GENERATION_ONLY_FLAG, AUTHORIZATION_CONFIRMED_FLAG}),
@@ -234,6 +246,7 @@ _CASE00_B2_Q1_POLICY = _ScriptPolicy(
         ("--question-id", _SAFE_IDENTIFIER_RE),
         ("--required-commit", _GIT_REF_SAFE_RE),
     ),
+    object_prefix_flags=frozenset({CANDIDATE_B2_PREFIX_FLAG}),
 )
 
 _SCRIPT_POLICIES: dict[str, _ScriptPolicy] = {
@@ -399,6 +412,54 @@ def _reject_shell_token(token: str, *, role: str) -> None:
         raise CommandRunnerError(
             f"Rejected shell metacharacters in {role}",
             code="SHELL_METACHARACTERS",
+        )
+
+
+def _validate_b2_object_prefix(value: str, *, flag: str) -> None:
+    """Validate a non-secret B2 object-prefix string (not a local path).
+
+    Conservative checks: non-empty, no NUL, no leading slash / home marker,
+    no empty or traversal segments (``.`` / ``..``), no backslashes, and no
+    shell metacharacters. Mission Control does not treat this as a filesystem
+    path and does not resolve it against the checkout.
+    """
+    if not isinstance(value, str) or value == "":
+        raise CommandRunnerError(
+            f"Invalid value for {flag}: empty prefix",
+            code="INVALID_ARGV",
+        )
+    if "\x00" in value:
+        raise CommandRunnerError(
+            f"Invalid value for {flag}: NUL byte",
+            code="INVALID_ARGV",
+        )
+    if value.startswith("/") or value.startswith("~"):
+        raise CommandRunnerError(
+            f"Invalid value for {flag}: must not start with '/' or '~'",
+            code="INVALID_ARGV",
+        )
+    if "\\" in value:
+        raise CommandRunnerError(
+            f"Invalid value for {flag}: backslash not allowed",
+            code="INVALID_ARGV",
+        )
+    if _contains_shell_metacharacters(value):
+        raise CommandRunnerError(
+            f"Rejected shell metacharacters in {flag} value",
+            code="SHELL_METACHARACTERS",
+        )
+    parts = value.split("/")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if not parts or any(part == "" for part in parts):
+        raise CommandRunnerError(
+            f"Invalid value for {flag}: empty path segment",
+            code="INVALID_ARGV",
+        )
+    if any(part in (".", "..") for part in parts):
+        raise CommandRunnerError(
+            f"Invalid value for {flag}: path traversal segments rejected",
+            code="INVALID_ARGV",
         )
 
 
@@ -599,8 +660,12 @@ def validate_and_build_argv(
     seen_flags: set[str] = set()
     pattern_by_flag = dict(policy.flag_value_patterns)
     exact_by_flag = dict(policy.exact_flag_values)
+    object_prefix_flags = policy.object_prefix_flags
 
     def _validate_non_path_value(flag: str, value: str) -> None:
+        if flag in object_prefix_flags:
+            _validate_b2_object_prefix(value, flag=flag)
+            return
         expected = exact_by_flag.get(flag)
         if expected is not None and value != expected:
             if flag in policy.sensitive_flags:

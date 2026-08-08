@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from typing import Any
@@ -854,6 +855,95 @@ class TestSubmitAndWaitMcpTool(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["run_id"], "run-saw-t")
         self.assertTrue(result["wait_expired"])
+
+
+class TestMcpRunRepositoryCommandDurablePrefix(unittest.IsolatedAsyncioTestCase):
+    """MCP wrapper forwards Case-00 durable prefix argv; secrets stay client-side."""
+
+    async def test_mcp_run_repository_command_forwards_candidate_b2_prefix(
+        self,
+    ) -> None:
+        canonical = (
+            "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/"
+            "candidate-answers/"
+        )
+        argv = [
+            "python3",
+            "scripts/run_case00_b2_q1.py",
+            "--case-root",
+            "data/case-00-triborough",
+            "--question-id",
+            "Q1",
+            "--required-commit",
+            "a" * 40,
+            "--candidate-output-root",
+            "out/case00-b2-q1",
+            "--candidate-b2-prefix",
+            canonical,
+            "--authorization-confirmed",
+            "--generation-only",
+        ]
+        api_payload = {
+            "ok": True,
+            "run_id": "repo-cmd-1",
+            "checkout_commit": "a" * 40,
+            "argv": list(argv),
+            "stdout": json.dumps(
+                {
+                    "ok": True,
+                    "durable_artifacts": {
+                        "prefix": canonical,
+                        "object_keys": [canonical + "q1/Q1_candidate_answer.json"],
+                    },
+                }
+            ),
+            "stderr": "",
+            "exit_code": 0,
+            "elapsed_seconds": 1.2,
+            "artifact_paths": ["/tmp/ephemeral/case00_b2_q1.json"],
+            "persistence": {
+                "mode": "none",
+                "attempted": False,
+                "ok": True,
+                "commit_sha": None,
+                "pushed": False,
+            },
+            "error": None,
+            "error_code": None,
+        }
+        with patch.object(
+            mcp_server.client,
+            "run_repository_command",
+            new=AsyncMock(return_value=api_payload),
+        ) as mocked:
+            result = await mcp_server.run_repository_command(
+                repository="nhpcorp35/legal-ai",
+                ref="a" * 40,
+                argv=argv,
+                working_directory=".",
+                timeout_seconds=30.0,
+                allowed_env_names=["B2_KEY_ID", "B2_APPLICATION_KEY", "OPENAI_API_KEY"],
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["persistence"]["mode"], "none")
+        self.assertFalse(result["persistence"]["attempted"])
+        self.assertIn("--candidate-b2-prefix", result["argv"])
+        self.assertIn(canonical, result["argv"])
+        self.assertIn("durable_artifacts", result["stdout"])
+        # Local artifact_paths remain ephemeral; durable proof is wrapper JSON.
+        self.assertTrue(result["artifact_paths"])
+        mocked.assert_awaited_once()
+        kwargs = mocked.await_args.kwargs
+        self.assertEqual(kwargs["argv"], argv)
+        self.assertEqual(
+            kwargs["allowed_env_names"],
+            ["B2_KEY_ID", "B2_APPLICATION_KEY", "OPENAI_API_KEY"],
+        )
+        # Wrapper must not invent or echo credential values.
+        rendered = json.dumps(result)
+        self.assertNotIn("B2_APPLICATION_KEY=", rendered)
+        self.assertNotIn("sk-", rendered)
 
 
 if __name__ == "__main__":

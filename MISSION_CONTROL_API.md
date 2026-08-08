@@ -500,7 +500,20 @@ Requires authentication.
 
 Execute one allowlisted repository command in an ephemeral checkout. argv is launched directly (`shell=False`) — no shell interpolation. Persistence is always `none` (this path never stages, commits, or pushes).
 
-Initial allowlist: `python3` + `scripts/generate_attorney_feedback_candidate.py` with explicit generation CLI flags only.
+Allowlisted scripts (per-script argv/env policy):
+
+- `python3` + `scripts/generate_attorney_feedback_candidate.py`
+- `python3` + `scripts/rebuild_case00_derived.py`
+- `python3` + `scripts/run_case00_b2_q1.py` (Case-00 B2 rebuild + Q1 generation)
+
+For `scripts/run_case00_b2_q1.py`, optional `--candidate-b2-prefix` is a
+non-secret B2 **object-prefix** string (not a local filesystem path). When the
+flag is omitted, LegalAI's wrapper keeps its canonical durable default under
+`Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/candidate-answers/`.
+Durable candidate success is the wrapper's verified `durable_artifacts` / B2
+object keys (and nonzero wrapper failures remain failures). Executor
+`artifact_paths` under `--candidate-output-root` are ephemeral local scratch
+only and are **not** durable proof.
 
 **Request body** `application/json`
 
@@ -524,7 +537,7 @@ Initial allowlist: `python3` + `scripts/generate_attorney_feedback_candidate.py`
 | `stdout` / `stderr` | string | Captured process output |
 | `exit_code` | integer or null | Process exit code (`null` on timeout) |
 | `elapsed_seconds` | number | Wall time |
-| `artifact_paths` | string[] | Files under `--candidate-output-root` when present |
+| `artifact_paths` | string[] | Ephemeral local files under `--candidate-output-root` when present. Not durable proof — Case-00 durable candidate keys come from verified B2 upload in wrapper stdout (`durable_artifacts`) |
 | `persistence` | object | Always `{mode: "none", attempted: false, ...}` |
 | `error` / `error_code` | string or null | Rejection or failure detail |
 

@@ -17,8 +17,10 @@ from mission_control.command_runner import (
     AUTHORIZATION_ACK,
     AUTHORIZATION_CONFIRMED_FLAG,
     AUTHORIZATION_FLAG,
+    CANDIDATE_B2_PREFIX_FLAG,
     CommandRunnerError,
     GENERATION_ONLY_FLAG,
+    LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX,
     REDACTED,
     REPOSITORY_URL_MAP_ENV,
     RepositoryCommandSpec,
@@ -151,6 +153,10 @@ parser.add_argument("--question-id", required=True)
 parser.add_argument("--required-commit", required=True)
 parser.add_argument("--candidate-output-root", type=Path, required=True)
 parser.add_argument(
+    "{CANDIDATE_B2_PREFIX_FLAG}",
+    default="{LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX}",
+)
+parser.add_argument(
     "{AUTHORIZATION_CONFIRMED_FLAG}",
     action="store_true",
     required=True,
@@ -166,9 +172,18 @@ payload = {{
     "question_id": args.question_id,
     "required_commit": args.required_commit,
     "case_root": str(args.case_root),
+    "candidate_b2_prefix": args.candidate_b2_prefix,
     "b2_env_present": "B2_KEY_ID" in os.environ,
     "openai_env_present": "OPENAI_API_KEY" in os.environ,
     "openai_model": os.environ.get("OPENAI_MODEL"),
+    # Fixture echoes presence only — never credential values.
+    "durable_artifacts": {{
+        "prefix": args.candidate_b2_prefix,
+        "object_keys": [
+            args.candidate_b2_prefix.rstrip("/")
+            + "/q1-candidate-fixture/Q1_candidate_answer.json"
+        ],
+    }},
 }}
 artifact.write_text(json.dumps(payload), encoding="utf-8")
 print(json.dumps(payload))
@@ -271,6 +286,7 @@ raise SystemExit(0)
         include_generation_only: bool = True,
         include_authorization_confirmed: bool = True,
         required_commit: str | None = None,
+        candidate_b2_prefix: str | None = None,
     ) -> list[str]:
         argv = [
             "python3",
@@ -284,6 +300,8 @@ raise SystemExit(0)
             "--candidate-output-root",
             candidate_output_root,
         ]
+        if candidate_b2_prefix is not None:
+            argv.extend([CANDIDATE_B2_PREFIX_FLAG, candidate_b2_prefix])
         if include_authorization_confirmed:
             argv.append(AUTHORIZATION_CONFIRMED_FLAG)
         if include_generation_only:
@@ -961,11 +979,201 @@ class TestCommandRunner(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "ENV_NAME_NOT_ALLOWLISTED")
 
+    def test_case00_b2_q1_candidate_b2_prefix_accepted(self) -> None:
+        """Exact LegalAI Q1 argv with --candidate-b2-prefix is allowlisted."""
+        argv = self.fixture.case00_b2_q1_argv(
+            candidate_b2_prefix=LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX,
+        )
+        self.assertIn(CANDIDATE_B2_PREFIX_FLAG, argv)
+        self.assertIn(LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX, argv)
+
+        resolved, _cwd, out = validate_and_build_argv(
+            argv,
+            workspace=self.fixture.source_repo,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertIn(CANDIDATE_B2_PREFIX_FLAG, resolved)
+        flag_idx = resolved.index(CANDIDATE_B2_PREFIX_FLAG)
+        self.assertEqual(resolved[flag_idx + 1], LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX)
+        # Prefix is not treated as a local path (value unchanged / unresolved).
+        self.assertEqual(resolved[flag_idx + 1], argv[argv.index(CANDIDATE_B2_PREFIX_FLAG) + 1])
+        self.assertIsNotNone(out)
+
+        env_names = [
+            "B2_KEY_ID",
+            "B2_APPLICATION_KEY",
+            "B2_BUCKET",
+            "B2_ENDPOINT",
+            "B2_REGION",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+        ]
+        secret_values = {
+            "B2_KEY_ID": "b2-key-id-secret-value",
+            "B2_APPLICATION_KEY": "b2-app-key-secret-value",
+            "B2_BUCKET": "legalai-corpus",
+            "B2_ENDPOINT": "https://s3.us-east-005.backblazeb2.com",
+            "B2_REGION": "us-east-005",
+            "OPENAI_API_KEY": "sk-openai-secret-value",
+            "OPENAI_MODEL": "gpt-test",
+        }
+        with patch.dict(os.environ, secret_values, clear=False):
+            result = run_repository_command(
+                RepositoryCommandSpec(
+                    repository="nhpcorp35/legal-ai",
+                    ref=self.fixture.commit_sha,
+                    argv=argv,
+                    allowed_env_names=env_names,
+                )
+            )
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn(CANDIDATE_B2_PREFIX_FLAG, result.argv)
+        self.assertIn(LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX, result.argv)
+        self.assertIn(LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX, result.stdout)
+        self.assertEqual(result.persistence["mode"], "none")
+        self.assertFalse(result.persistence["attempted"])
+        # B2 / model secrets must never appear in returned evidence.
+        for secret in (
+            "b2-key-id-secret-value",
+            "b2-app-key-secret-value",
+            "sk-openai-secret-value",
+        ):
+            self.assertNotIn(secret, result.argv)
+            self.assertNotIn(secret, result.stdout)
+            self.assertNotIn(secret, result.stderr)
+            self.assertNotIn(secret, result.error or "")
+        # Local artifact_paths are ephemeral evidence only — not durable B2 proof.
+        self.assertTrue(result.artifact_paths)
+        self.assertTrue(
+            any(path.endswith("case00_b2_q1.json") for path in result.artifact_paths)
+        )
+        self.assertIn("durable_artifacts", result.stdout)
+
+    def test_case00_b2_q1_candidate_b2_prefix_omitted_uses_wrapper_default(
+        self,
+    ) -> None:
+        """Omitting --candidate-b2-prefix keeps LegalAI's canonical default."""
+        argv = self.fixture.case00_b2_q1_argv()
+        self.assertNotIn(CANDIDATE_B2_PREFIX_FLAG, argv)
+
+        resolved, _cwd, _out = validate_and_build_argv(
+            argv,
+            workspace=self.fixture.source_repo,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertNotIn(CANDIDATE_B2_PREFIX_FLAG, resolved)
+
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="nhpcorp35/legal-ai",
+                ref=self.fixture.commit_sha,
+                argv=argv,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertNotIn(CANDIDATE_B2_PREFIX_FLAG, result.argv)
+        self.assertIn(
+            f'"candidate_b2_prefix": "{LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX}"',
+            result.stdout,
+        )
+        self.assertEqual(result.persistence["mode"], "none")
+        self.assertFalse(result.persistence["attempted"])
+
+    def test_case00_b2_q1_unsafe_candidate_b2_prefix_rejected(self) -> None:
+        """Unsafe B2 object-prefix values are rejected before execution."""
+        unsafe = [
+            ("../escape/", "INVALID_ARGV"),
+            ("Benchmarks/../other/", "INVALID_ARGV"),
+            ("/tmp/case00-runs", "INVALID_ARGV"),
+            ("~/Benchmarks/", "INVALID_ARGV"),
+            ("prefix|rm", "SHELL_METACHARACTERS"),
+            ("a/./b/", "INVALID_ARGV"),
+            ("Benchmarks//gap/", "INVALID_ARGV"),
+            (r"Benchmarks\Case-00", "SHELL_METACHARACTERS"),
+        ]
+        for bad, expected_code in unsafe:
+            with self.subTest(bad=bad):
+                argv = self.fixture.case00_b2_q1_argv(candidate_b2_prefix=bad)
+                with self.assertRaises(CommandRunnerError) as ctx:
+                    validate_and_build_argv(
+                        argv,
+                        workspace=self.fixture.source_repo,
+                        working_directory=".",
+                        mounted=[self.fixture.mount_root],
+                    )
+                self.assertEqual(ctx.exception.code, expected_code)
+
+                result = run_repository_command(
+                    RepositoryCommandSpec(
+                        repository="legal-ai",
+                        ref=self.fixture.commit_sha,
+                        argv=argv,
+                    )
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error_code, expected_code)
+                self.assertEqual(result.persistence["mode"], "none")
+
+        # Empty prefix token is rejected as an empty argv entry.
+        empty_argv = self.fixture.case00_b2_q1_argv(candidate_b2_prefix="x")
+        idx = empty_argv.index(CANDIDATE_B2_PREFIX_FLAG)
+        empty_argv[idx + 1] = ""
+        with self.assertRaises(CommandRunnerError) as empty_ctx:
+            validate_and_build_argv(
+                empty_argv,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertIn(empty_ctx.exception.code, {"INVALID_ARGV", "SHELL_METACHARACTERS"})
+
+    def test_case00_b2_q1_prefix_does_not_weaken_auth_or_ref_gates(self) -> None:
+        """Prefix support does not bypass authorization or checkout/ref gates."""
+        missing_auth = self.fixture.case00_b2_q1_argv(
+            candidate_b2_prefix=LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX,
+            include_authorization_confirmed=False,
+        )
+        with self.assertRaises(CommandRunnerError) as auth_ctx:
+            validate_and_build_argv(
+                missing_auth,
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(auth_ctx.exception.code, "INVALID_ARGV")
+        self.assertIn(AUTHORIZATION_CONFIRMED_FLAG, str(auth_ctx.exception))
+
+        wrong_sha = "a" * 40
+        self.assertNotEqual(wrong_sha, self.fixture.commit_sha)
+        result = run_repository_command(
+            RepositoryCommandSpec(
+                repository="nhpcorp35/legal-ai",
+                ref=wrong_sha,
+                argv=self.fixture.case00_b2_q1_argv(
+                    candidate_b2_prefix=LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX,
+                    required_commit=wrong_sha,
+                ),
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "CHECKOUT_FAILED")
+
 
 class TestRepositoryCommandApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls._previous_api_key = os.environ.get("MISSION_CONTROL_API_KEY")
         os.environ["MISSION_CONTROL_API_KEY"] = "test-command-runner-key"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._previous_api_key is None:
+            os.environ.pop("MISSION_CONTROL_API_KEY", None)
+        else:
+            os.environ["MISSION_CONTROL_API_KEY"] = cls._previous_api_key
 
     def setUp(self) -> None:
         self.fixture = CommandRepoFixture()
@@ -1004,6 +1212,62 @@ class TestRepositoryCommandApi(unittest.TestCase):
         self.assertEqual(body["persistence"]["mode"], "none")
         self.assertTrue(body["run_id"])
         self.assertIn(REDACTED, body["argv"])
+
+    def test_api_case00_b2_q1_candidate_b2_prefix(self) -> None:
+        """API accepts durable prefix argv; secrets stay out of the response."""
+        secret_env = {
+            "B2_KEY_ID": "api-b2-key-id-secret",
+            "B2_APPLICATION_KEY": "api-b2-app-key-secret",
+            "B2_BUCKET": "legalai-corpus",
+            "B2_ENDPOINT": "https://s3.example.test",
+            "B2_REGION": "us-east-005",
+            "OPENAI_API_KEY": "api-openai-secret",
+            "OPENAI_MODEL": "gpt-test",
+        }
+        argv = self.fixture.case00_b2_q1_argv(
+            candidate_b2_prefix=LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX,
+        )
+        with patch.dict(os.environ, secret_env, clear=False):
+            response = self.client.post(
+                "/repository-commands",
+                headers={"Authorization": "Bearer test-command-runner-key"},
+                json={
+                    "repository": "nhpcorp35/legal-ai",
+                    "ref": self.fixture.commit_sha,
+                    "argv": argv,
+                    "working_directory": ".",
+                    "timeout_seconds": 30,
+                    "allowed_env_names": list(secret_env.keys()),
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(body["persistence"]["mode"], "none")
+        self.assertFalse(body["persistence"]["attempted"])
+        self.assertIn(CANDIDATE_B2_PREFIX_FLAG, body["argv"])
+        self.assertIn(LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX, body["argv"])
+        for secret in (
+            "api-b2-key-id-secret",
+            "api-b2-app-key-secret",
+            "api-openai-secret",
+        ):
+            self.assertNotIn(secret, json.dumps(body))
+        # Ephemeral local paths are reported; they are not durable B2 proof.
+        self.assertTrue(body["artifact_paths"])
+
+    def test_api_rejects_unauthenticated_repository_commands(self) -> None:
+        response = self.client.post(
+            "/repository-commands",
+            json={
+                "repository": "nhpcorp35/legal-ai",
+                "ref": self.fixture.commit_sha,
+                "argv": self.fixture.case00_b2_q1_argv(
+                    candidate_b2_prefix=LEGALAI_DEFAULT_CANDIDATE_B2_PREFIX,
+                ),
+            },
+        )
+        self.assertIn(response.status_code, {401, 403})
 
 
 if __name__ == "__main__":

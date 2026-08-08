@@ -248,11 +248,14 @@ async def run_repository_command(
     """Run one allowlisted repository command in an ephemeral checkout.
 
     Structured alternative to free-form mission YAML for LegalAI generation
-    CLI execution. argv is executed directly (no shell). Initial allowlist:
-    python3 scripts/generate_attorney_feedback_candidate.py with explicit
-    arguments. Persistence is always none. Sensitive argv values are
+    CLI execution. argv is executed directly (no shell). Allowlist includes
+    generate_attorney_feedback_candidate, rebuild_case00_derived, and
+    run_case00_b2_q1 (optional --candidate-b2-prefix is a B2 object prefix,
+    not a local path). Persistence is always none. Sensitive argv values are
     redacted. Returns run_id, checkout_commit, argv, stdout, stderr,
-    exit_code, elapsed_seconds, artifact_paths, and persistence.
+    exit_code, elapsed_seconds, artifact_paths (ephemeral local files only;
+    durable Case-00 candidate keys are verified B2 uploads in stdout), and
+    persistence.
     """
     try:
         if not repository.strip():
