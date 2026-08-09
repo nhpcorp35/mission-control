@@ -19,6 +19,8 @@ from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from storage_policy import build_attorney_review_archive, inventory_prefix
+
 
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "nhpcorp35/legal-ai")
 WORKFLOW = os.environ.get("GITHUB_WORKFLOW", "hal-bridge-proof.yml")
@@ -68,7 +70,9 @@ mcp = FastMCP(
         "dispatch the bounded generation-only workflow, require explicit private-evidence "
         "authorization, and return only B2-verified candidate artifact metadata. "
         "Use get_case_artifact to read one allowlisted, mission-correlated artifact "
-        "after a successful run."
+        "after a successful run. Case-00 storage tools expose allowlisted inventory "
+        "metadata and archive a fixed attorney-feedback package under the canonical "
+        "B2 prefix."
     ),
     auth=auth_provider,
 )
@@ -270,6 +274,90 @@ def _b2_client():
         aws_access_key_id=os.environ["B2_KEY_ID"],
         aws_secret_access_key=os.environ["B2_APPLICATION_KEY"],
     )
+
+
+@mcp.tool()
+async def list_case00_storage(
+    category: Literal[
+        "all", "source", "questions", "candidate_answers", "attorney_reviews"
+    ] = "all",
+    max_keys: int = 200,
+) -> dict[str, Any]:
+    """List allowlisted Case-00 B2 object metadata under a canonical prefix."""
+    _require_allowed_user()
+    if max_keys < 1 or max_keys > 200:
+        raise ValueError("max_keys must be between 1 and 200")
+    prefix = inventory_prefix(category)
+    response = _b2_client().list_objects_v2(
+        Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=max_keys
+    )
+    objects = [
+        {
+            "object_key": item["Key"],
+            "size": item["Size"],
+            "etag": (item.get("ETag") or "").strip('"'),
+            "last_modified": item["LastModified"].isoformat(),
+        }
+        for item in response.get("Contents", [])
+    ]
+    return {
+        "ok": True,
+        "b2_bucket": B2_BUCKET,
+        "category": category,
+        "prefix": prefix,
+        "objects": objects,
+        "count": len(objects),
+        "truncated": bool(response.get("IsTruncated")),
+    }
+
+
+@mcp.tool()
+async def archive_case00_attorney_feedback(
+    evaluation_date: str,
+    original_packet_md: str,
+    feedback_email_md: str,
+    structured_evaluation_json: str,
+) -> dict[str, Any]:
+    """Archive and HEAD-verify one fixed Case-00 attorney-feedback package in B2."""
+    archived_by = _require_allowed_user()
+    archive_id, items = build_attorney_review_archive(
+        evaluation_date=evaluation_date,
+        original_packet_md=original_packet_md,
+        feedback_email_md=feedback_email_md,
+        structured_evaluation_json=structured_evaluation_json,
+        archived_by=archived_by,
+    )
+    client = _b2_client()
+    verified_objects = []
+    for item in items:
+        client.put_object(
+            Bucket=B2_BUCKET,
+            Key=item["object_key"],
+            Body=item["payload"],
+            ContentType=item["content_type"],
+            Metadata={"sha256": item["sha256"]},
+        )
+        head = client.head_object(Bucket=B2_BUCKET, Key=item["object_key"])
+        if head.get("ContentLength") != len(item["payload"]):
+            raise ValueError(f"B2 size mismatch for {item['object_key']}")
+        if (head.get("Metadata") or {}).get("sha256") != item["sha256"]:
+            raise ValueError(f"B2 SHA-256 metadata mismatch for {item['object_key']}")
+        verified_objects.append(
+            {
+                "filename": item["filename"],
+                "object_key": item["object_key"],
+                "size": head["ContentLength"],
+                "etag": (head.get("ETag") or "").strip('"'),
+                "sha256": item["sha256"],
+            }
+        )
+    return {
+        "ok": True,
+        "verified": True,
+        "archive_id": archive_id,
+        "b2_bucket": B2_BUCKET,
+        "objects": verified_objects,
+    }
 
 
 @mcp.tool()
