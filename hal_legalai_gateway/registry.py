@@ -7,10 +7,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from hal_legalai_gateway.forwarding import ToolBinding
+
 REGISTRY_FILENAME = "registry.json"
 REQUIRED_NAMESPACES = frozenset({"case", "storage", "mission"})
 REQUIRED_SERVICES = frozenset(
     {"bridge", "storage", "mission_control", "artifacts"}
+)
+REQUIRED_GATEWAY_TOOLS = frozenset(
+    {
+        "case.get_artifact",
+        "storage.archive_feedback",
+        "storage.archive_review_packet",
+        "storage.verify_archive",
+        "mission.submit",
+        "mission.status",
+    }
 )
 
 
@@ -49,18 +61,22 @@ class ToolRoute:
 
 @dataclass(frozen=True)
 class GatewayRegistry:
-    """Validated Phase 1 gateway registry."""
+    """Validated gateway registry (Phase 2 namespaced tool surface)."""
 
     version: int
     description: str
     services: dict[str, DownstreamService]
     namespaces: dict[str, NamespaceMapping]
     tool_routes: tuple[ToolRoute, ...]
+    tool_bindings: tuple[ToolBinding, ...]
 
     def service_keys(self) -> tuple[str, ...]:
         return tuple(sorted(self.services))
 
     def namespace_for_tool(self, tool: str) -> str | None:
+        for binding in self.tool_bindings:
+            if binding.gateway_tool == tool:
+                return binding.namespace
         for route in self.tool_routes:
             if route.tool == tool:
                 return route.namespace
@@ -70,12 +86,21 @@ class GatewayRegistry:
         return None
 
     def downstream_for_tool(self, tool: str) -> str | None:
+        for binding in self.tool_bindings:
+            if binding.gateway_tool == tool:
+                return binding.downstream_service
         for route in self.tool_routes:
             if route.tool == tool:
                 return route.downstream_service
         for mapping in self.namespaces.values():
             if tool in mapping.tools:
                 return mapping.downstream_service
+        return None
+
+    def downstream_tool_for_gateway_tool(self, tool: str) -> str | None:
+        for binding in self.tool_bindings:
+            if binding.gateway_tool == tool:
+                return binding.downstream_tool
         return None
 
     def as_public_dict(self) -> dict[str, Any]:
@@ -110,6 +135,16 @@ class GatewayRegistry:
                     "notes": route.notes,
                 }
                 for route in self.tool_routes
+            ],
+            "tool_bindings": [
+                {
+                    "tool": binding.gateway_tool,
+                    "namespace": binding.namespace,
+                    "downstream_service": binding.downstream_service,
+                    "downstream_tool": binding.downstream_tool,
+                    "notes": binding.notes,
+                }
+                for binding in self.tool_bindings
             ],
         }
 
@@ -269,12 +304,54 @@ def parse_registry(document: dict[str, Any]) -> GatewayRegistry:
             )
         )
 
+    bindings_raw = document.get("tool_bindings") or []
+    if not isinstance(bindings_raw, list):
+        raise RuntimeError("registry.tool_bindings must be an array when present")
+
+    tool_bindings: list[ToolBinding] = []
+    for index, raw in enumerate(bindings_raw):
+        context = f"tool_bindings[{index}]"
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"{context} must be an object")
+        namespace = _require_str(raw, "namespace", context=context)
+        if namespace not in namespaces:
+            raise RuntimeError(
+                f"{context}.namespace '{namespace}' is not defined"
+            )
+        downstream = _require_str(raw, "downstream_service", context=context)
+        if downstream not in services:
+            raise RuntimeError(
+                f"{context}.downstream_service '{downstream}' is not defined"
+            )
+        tool_bindings.append(
+            ToolBinding(
+                gateway_tool=_require_str(raw, "tool", context=context),
+                namespace=namespace,
+                downstream_service=downstream,
+                downstream_tool=_require_str(
+                    raw, "downstream_tool", context=context
+                ),
+                notes=str(raw.get("notes") or ""),
+                description=str(raw.get("description") or ""),
+            )
+        )
+
+    if tool_bindings:
+        present = {binding.gateway_tool for binding in tool_bindings}
+        missing_required = REQUIRED_GATEWAY_TOOLS - present
+        if missing_required:
+            raise RuntimeError(
+                "registry.tool_bindings missing required gateway tools: "
+                + ", ".join(sorted(missing_required))
+            )
+
     return GatewayRegistry(
         version=version,
         description=str(description or ""),
         services=services,
         namespaces=namespaces,
         tool_routes=tuple(tool_routes),
+        tool_bindings=tuple(tool_bindings),
     )
 
 

@@ -1,4 +1,4 @@
-"""Focused tests for HAL LegalAI Gateway Phase 1."""
+"""Focused tests for HAL LegalAI Gateway Phase 2 (MCP routing)."""
 
 from __future__ import annotations
 
@@ -13,21 +13,40 @@ import httpx
 from fastapi.testclient import TestClient
 
 from hal_legalai_gateway import config as gateway_config
+from hal_legalai_gateway.auth import (
+    DOWNSTREAM_AUTHORIZATION_HEADER,
+    extract_downstream_authorization,
+)
 from hal_legalai_gateway.config import (
     DEFAULT_HEALTH_TIMEOUT_SECONDS,
     load_settings,
     validate_http_base_url,
 )
-from hal_legalai_gateway.health import (
+from hal_legalai_gateway.forwarding import (
+    STAGE_AUTH,
     STAGE_CONNECT,
-    STAGE_HTTP,
     STAGE_TIMEOUT,
+    STAGE_TOOL,
+    STAGE_UNCONFIGURED,
+    ToolBinding,
+    forward_mcp_tool,
+    mcp_endpoint_url,
+)
+from hal_legalai_gateway.health import (
+    STAGE_CONNECT as HEALTH_STAGE_CONNECT,
+    STAGE_HTTP,
     STATUS_HEALTHY,
     STATUS_UNHEALTHY,
     aggregate_health,
     probe_downstream,
 )
+from hal_legalai_gateway.mcp_server import (
+    DEFAULT_TOOL_BINDINGS,
+    create_mcp_server,
+    list_registered_tool_names,
+)
 from hal_legalai_gateway.registry import (
+    REQUIRED_GATEWAY_TOOLS,
     REQUIRED_NAMESPACES,
     REQUIRED_SERVICES,
     load_registry,
@@ -36,10 +55,12 @@ from hal_legalai_gateway.registry import (
 from hal_legalai_gateway.request_context import (
     CORRELATION_ID_HEADER,
     REQUEST_ID_HEADER,
+    bind_request_ids,
     get_correlation_id,
     get_request_id,
+    reset_request_ids,
 )
-from hal_legalai_gateway.server import app, reset_settings_for_tests
+from hal_legalai_gateway.server import create_app, reset_settings_for_tests
 
 REGISTRY_PATH = (
     Path(__file__).resolve().parent.parent
@@ -47,11 +68,16 @@ REGISTRY_PATH = (
     / "registry.json"
 )
 
+REQUIRED_SECRETS = {
+    "GATEWAY_API_KEY": "test-gateway-api-key",
+    "GATEWAY_BRIDGE_AUTHORIZATION": "Bearer test-bridge-token",
+}
+
 
 class RegistryTests(unittest.TestCase):
     def test_bundled_registry_loads_and_has_required_namespaces(self) -> None:
         registry = load_registry(REGISTRY_PATH)
-        self.assertEqual(registry.version, 1)
+        self.assertEqual(registry.version, 2)
         self.assertEqual(REQUIRED_NAMESPACES, set(registry.namespaces))
         self.assertEqual(REQUIRED_SERVICES, set(registry.services))
         self.assertEqual(registry.namespaces["case"].downstream_service, "bridge")
@@ -61,20 +87,44 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(
             registry.namespaces["mission"].downstream_service, "mission_control"
         )
-        self.assertIn("submit_case00_q1", registry.namespaces["case"].tools)
+        self.assertIn("case.submit_case00_q1", registry.namespaces["case"].tools)
         self.assertIn(
-            "list_case00_storage", registry.namespaces["storage"].tools
+            "storage.list_inventory", registry.namespaces["storage"].tools
         )
-        self.assertIn("submit_run", registry.namespaces["mission"].tools)
+        self.assertIn("mission.submit", registry.namespaces["mission"].tools)
+        present = {binding.gateway_tool for binding in registry.tool_bindings}
+        self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(present))
 
-    def test_tool_routes_point_artifacts_independently(self) -> None:
+    def test_tool_routes_and_bindings_point_artifacts_independently(self) -> None:
         registry = load_registry(REGISTRY_PATH)
         self.assertEqual(
-            registry.downstream_for_tool("get_case_artifact"), "artifacts"
+            registry.downstream_for_tool("case.get_artifact"), "artifacts"
         )
-        self.assertEqual(registry.downstream_for_tool("get_artifacts"), "artifacts")
         self.assertEqual(
-            registry.downstream_for_tool("submit_case00_q1"), "bridge"
+            registry.downstream_for_tool("case.get_artifacts"), "artifacts"
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("case.get_artifact"),
+            "get_case_artifact",
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("storage.verify_archive"),
+            "list_case00_storage",
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("storage.archive_feedback"),
+            "archive_case00_attorney_feedback",
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("mission.submit"),
+            "submit_run",
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("mission.status"),
+            "get_run",
+        )
+        self.assertEqual(
+            registry.downstream_for_tool("case.submit_case00_q1"), "bridge"
         )
 
     def test_parse_registry_rejects_missing_namespace(self) -> None:
@@ -91,6 +141,17 @@ class RegistryTests(unittest.TestCase):
             parse_registry(document)
         self.assertIn("missing", str(ctx.exception))
 
+    def test_parse_registry_rejects_missing_required_gateway_tools(self) -> None:
+        document = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        document["tool_bindings"] = [
+            binding
+            for binding in document["tool_bindings"]
+            if binding["tool"] != "case.get_artifact"
+        ]
+        with self.assertRaises(RuntimeError) as ctx:
+            parse_registry(document)
+        self.assertIn("case.get_artifact", str(ctx.exception))
+
 
 class ConfigTests(unittest.TestCase):
     def test_validate_http_base_url_accepts_https(self) -> None:
@@ -105,8 +166,11 @@ class ConfigTests(unittest.TestCase):
 
     def test_load_settings_uses_env_overrides_and_sha(self) -> None:
         env = {
+            **REQUIRED_SECRETS,
             "RAILWAY_GIT_COMMIT_SHA": "abc123deadbeef",
             "GATEWAY_HEALTH_TIMEOUT_SECONDS": "2.5",
+            "GATEWAY_CONNECT_TIMEOUT_SECONDS": "1.5",
+            "GATEWAY_READ_TIMEOUT_SECONDS": "12",
             "GATEWAY_BRIDGE_URL": "https://bridge.example",
             "GATEWAY_STORAGE_URL": "https://storage.example",
             "GATEWAY_MISSION_CONTROL_URL": "https://mission.example",
@@ -115,6 +179,9 @@ class ConfigTests(unittest.TestCase):
         settings = load_settings(environ=env, registry=load_registry(REGISTRY_PATH))
         self.assertEqual(settings.deployed_commit_sha, "abc123deadbeef")
         self.assertEqual(settings.health_timeout_seconds, 2.5)
+        self.assertEqual(settings.connect_timeout_seconds, 1.5)
+        self.assertEqual(settings.read_timeout_seconds, 12.0)
+        self.assertEqual(settings.gateway_api_key, "test-gateway-api-key")
         by_key = {item.key: item for item in settings.downstreams}
         self.assertEqual(by_key["bridge"].base_url, "https://bridge.example")
         self.assertEqual(
@@ -131,13 +198,33 @@ class ConfigTests(unittest.TestCase):
     def test_load_settings_rejects_invalid_timeout(self) -> None:
         with self.assertRaises(RuntimeError):
             load_settings(
-                environ={"GATEWAY_HEALTH_TIMEOUT_SECONDS": "0"},
+                environ={
+                    **REQUIRED_SECRETS,
+                    "GATEWAY_HEALTH_TIMEOUT_SECONDS": "0",
+                },
                 registry=load_registry(REGISTRY_PATH),
             )
 
+    def test_load_settings_fail_closed_without_api_key(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            load_settings(
+                environ={"GATEWAY_BRIDGE_AUTHORIZATION": "Bearer x"},
+                registry=load_registry(REGISTRY_PATH),
+            )
+        self.assertIn("GATEWAY_API_KEY", str(ctx.exception))
+
+    def test_load_settings_fail_closed_without_bridge_authorization(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            load_settings(
+                environ={"GATEWAY_API_KEY": "k"},
+                registry=load_registry(REGISTRY_PATH),
+            )
+        self.assertIn("GATEWAY_BRIDGE_AUTHORIZATION", str(ctx.exception))
+
     def test_default_timeout_when_unset(self) -> None:
         settings = load_settings(
-            environ={}, registry=load_registry(REGISTRY_PATH)
+            environ=dict(REQUIRED_SECRETS),
+            registry=load_registry(REGISTRY_PATH),
         )
         self.assertEqual(
             settings.health_timeout_seconds, DEFAULT_HEALTH_TIMEOUT_SECONDS
@@ -148,9 +235,267 @@ class ConfigTests(unittest.TestCase):
         )
 
 
+class AuthForwardingTests(unittest.TestCase):
+    def test_prefer_caller_downstream_authorization(self) -> None:
+        headers = {
+            DOWNSTREAM_AUTHORIZATION_HEADER: "Bearer caller-bridge-token",
+        }
+        resolved = extract_downstream_authorization(
+            headers, service_authorization="Bearer service-token"
+        )
+        self.assertEqual(resolved, "Bearer caller-bridge-token")
+
+    def test_falls_back_to_service_authorization(self) -> None:
+        resolved = extract_downstream_authorization(
+            {}, service_authorization="service-token"
+        )
+        self.assertEqual(resolved, "Bearer service-token")
+
+    def test_mcp_endpoint_url_join(self) -> None:
+        self.assertEqual(
+            mcp_endpoint_url("https://bridge.example", "/mcp"),
+            "https://bridge.example/mcp",
+        )
+        self.assertEqual(
+            mcp_endpoint_url("https://bridge.example/mcp", "/mcp"),
+            "https://bridge.example/mcp",
+        )
+
+
+class ForwardingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.binding = ToolBinding(
+            gateway_tool="case.get_artifact",
+            namespace="case",
+            downstream_service="artifacts",
+            downstream_tool="get_case_artifact",
+        )
+        self.tokens = bind_request_ids(
+            request_id="req-forward-1", correlation_id="corr-forward-1"
+        )
+
+    def tearDown(self) -> None:
+        reset_request_ids(self.tokens)
+
+    def test_unconfigured_stage(self) -> None:
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1", "filename": "Q1_candidate_answer.md"},
+                base_url=None,
+                authorization="Bearer t",
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_UNCONFIGURED)
+        self.assertEqual(payload["request_id"], "req-forward-1")
+        self.assertEqual(payload["correlation_id"], "corr-forward-1")
+        self.assertEqual(payload["downstream_tool"], "get_case_artifact")
+
+    def test_auth_stage_when_authorization_missing(self) -> None:
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1"},
+                base_url="https://artifacts.example",
+                authorization=None,
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                require_authorization=True,
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_AUTH)
+
+    def test_timeout_failure_stage(self) -> None:
+        class BoomClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, *args, **kwargs):
+                raise httpx.ReadTimeout("slow")
+
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1"},
+                base_url="https://artifacts.example",
+                authorization="Bearer t",
+                connect_timeout_seconds=0.2,
+                read_timeout_seconds=0.2,
+                client_factory=BoomClient,
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_TIMEOUT)
+        self.assertIsInstance(payload["duration_ms"], float)
+        self.assertNotIn("Bearer", json.dumps(payload))
+
+    def test_connect_failure_stage_isolated(self) -> None:
+        class BoomClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, *args, **kwargs):
+                raise httpx.ConnectError("refused")
+
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1"},
+                base_url="https://artifacts.example",
+                authorization="Bearer t",
+                connect_timeout_seconds=0.2,
+                read_timeout_seconds=0.2,
+                client_factory=BoomClient,
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_CONNECT)
+
+    def test_tool_error_stage(self) -> None:
+        class FakeResult:
+            is_error = True
+            data = None
+
+        class OkClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, arguments, raise_on_error=False):
+                self.name = name
+                self.arguments = arguments
+                return FakeResult()
+
+        client = OkClient()
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1"},
+                base_url="https://artifacts.example",
+                authorization="Bearer t",
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                client_factory=lambda: client,
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_TOOL)
+        self.assertEqual(client.name, "get_case_artifact")
+
+    def test_success_metadata_envelope(self) -> None:
+        class FakeResult:
+            is_error = False
+            data = {"ok": True, "verified": True}
+
+        class OkClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, arguments, raise_on_error=False):
+                return FakeResult()
+
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1"},
+                base_url="https://artifacts.example",
+                authorization="Bearer t",
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                client_factory=OkClient,
+            )
+        )
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["failure_stage"])
+        self.assertEqual(payload["gateway_tool"], "case.get_artifact")
+        self.assertEqual(payload["downstream_service"], "artifacts")
+        self.assertEqual(payload["result"]["verified"], True)
+
+    def test_isolation_one_failure_does_not_affect_other_binding(self) -> None:
+        """Two sequential forwards: mission failure must not alter case success."""
+
+        class FlakyFactory:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                outer = self
+
+                class Client:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, *args):
+                        return False
+
+                    async def call_tool(self, name, arguments, raise_on_error=False):
+                        if name == "submit_run":
+                            raise httpx.ConnectError("mission down")
+
+                        class Ok:
+                            is_error = False
+                            data = {"ok": True, "name": name}
+
+                        return Ok()
+
+                return Client()
+
+        factory = FlakyFactory()
+        mission_binding = ToolBinding(
+            gateway_tool="mission.submit",
+            namespace="mission",
+            downstream_service="mission_control",
+            downstream_tool="submit_run",
+        )
+        failed = asyncio.run(
+            forward_mcp_tool(
+                binding=mission_binding,
+                arguments={"mission_yaml": "id: x"},
+                base_url="https://mission.example",
+                authorization=None,
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                require_authorization=False,
+                client_factory=factory,
+            )
+        )
+        ok = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1"},
+                base_url="https://artifacts.example",
+                authorization="Bearer t",
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                client_factory=factory,
+            )
+        )
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["failure_stage"], STAGE_CONNECT)
+        self.assertTrue(ok["ok"])
+        self.assertEqual(ok["downstream_tool"], "get_case_artifact")
+
+
 class HealthIsolationTests(unittest.TestCase):
     def _settings(self, **url_map: str):
         env = {
+            **REQUIRED_SECRETS,
             "RAILWAY_GIT_COMMIT_SHA": "sha-for-health-tests",
             "GATEWAY_HEALTH_TIMEOUT_SECONDS": "1",
         }
@@ -177,7 +522,7 @@ class HealthIsolationTests(unittest.TestCase):
 
         result = asyncio.run(_run())
         self.assertEqual(result["status"], STATUS_UNHEALTHY)
-        self.assertEqual(result["failure_stage"], STAGE_TIMEOUT)
+        self.assertEqual(result["failure_stage"], "timeout")
         self.assertIsInstance(result["latency_ms"], float)
 
     def test_aggregate_isolates_single_downstream_failure(self) -> None:
@@ -189,12 +534,10 @@ class HealthIsolationTests(unittest.TestCase):
         )
 
         async def _run_direct() -> dict:
-            results = {}
-
             async def fake_probe(downstream, timeout_seconds, client=None):
                 key = downstream.key
                 if key == "mission_control":
-                    results[key] = {
+                    return {
                         "key": key,
                         "service_id": downstream.service_id,
                         "display_name": downstream.display_name,
@@ -203,12 +546,12 @@ class HealthIsolationTests(unittest.TestCase):
                         "base_url_env": downstream.base_url_env,
                         "status": STATUS_UNHEALTHY,
                         "latency_ms": 3.0,
-                        "failure_stage": STAGE_CONNECT,
+                        "failure_stage": HEALTH_STAGE_CONNECT,
                         "http_status": None,
                         "error": "connection refused",
                     }
-                elif key == "storage":
-                    results[key] = {
+                if key == "storage":
+                    return {
                         "key": key,
                         "service_id": downstream.service_id,
                         "display_name": downstream.display_name,
@@ -221,58 +564,71 @@ class HealthIsolationTests(unittest.TestCase):
                         "http_status": 503,
                         "error": "health endpoint returned HTTP 503",
                     }
-                else:
-                    results[key] = {
-                        "key": key,
-                        "service_id": downstream.service_id,
-                        "display_name": downstream.display_name,
-                        "base_url": downstream.base_url,
-                        "health_url": downstream.health_url,
-                        "base_url_env": downstream.base_url_env,
-                        "status": STATUS_HEALTHY,
-                        "latency_ms": 1.0,
-                        "failure_stage": None,
-                        "http_status": 200,
-                        "error": None,
-                    }
-                return results[key]
+                return {
+                    "key": key,
+                    "service_id": downstream.service_id,
+                    "display_name": downstream.display_name,
+                    "base_url": downstream.base_url,
+                    "health_url": downstream.health_url,
+                    "base_url_env": downstream.base_url_env,
+                    "status": STATUS_HEALTHY,
+                    "latency_ms": 1.0,
+                    "failure_stage": None,
+                    "http_status": 200,
+                    "error": None,
+                }
 
             with mock.patch(
                 "hal_legalai_gateway.health.probe_downstream",
                 side_effect=fake_probe,
             ):
-                return await aggregate_health(settings)
+                return await aggregate_health(
+                    settings,
+                    registered_tools=["case.get_artifact", "mission.submit"],
+                )
 
         payload = asyncio.run(_run_direct())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["phase"], 2)
         self.assertEqual(payload["deployed_commit_sha"], "sha-for-health-tests")
         self.assertEqual(
-            payload["downstream"]["bridge"]["status"], STATUS_HEALTHY
-        )
-        self.assertEqual(
-            payload["downstream"]["artifacts"]["status"], STATUS_HEALTHY
-        )
-        self.assertEqual(
-            payload["downstream"]["mission_control"]["failure_stage"],
-            STAGE_CONNECT,
-        )
-        self.assertEqual(
-            payload["downstream"]["storage"]["failure_stage"], STAGE_HTTP
+            payload["registered_tools"],
+            ["case.get_artifact", "mission.submit"],
         )
         self.assertTrue(payload["capabilities"]["case"]["available"])
         self.assertFalse(payload["capabilities"]["storage"]["available"])
         self.assertFalse(payload["capabilities"]["mission"]["available"])
-        # Case remains available even though mission/storage failed.
-        self.assertNotEqual(
-            payload["capabilities"]["case"]["available"],
-            payload["capabilities"]["mission"]["available"],
+
+
+class McpRegistrationTests(unittest.TestCase):
+    def test_default_bindings_include_settled_minimum(self) -> None:
+        names = {binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS}
+        self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(names))
+
+    def test_create_mcp_server_registers_exact_names(self) -> None:
+        settings = load_settings(
+            environ={
+                **REQUIRED_SECRETS,
+                "GATEWAY_BRIDGE_URL": "https://bridge.example",
+                "GATEWAY_STORAGE_URL": "https://storage.example",
+                "GATEWAY_MISSION_CONTROL_URL": "https://mission.example",
+                "GATEWAY_ARTIFACTS_URL": "https://artifacts.example",
+            },
+            registry=load_registry(REGISTRY_PATH),
         )
+        mcp = create_mcp_server(settings)
+        names = asyncio.run(list_registered_tool_names(mcp))
+        for required in REQUIRED_GATEWAY_TOOLS:
+            self.assertIn(required, names)
+        self.assertIn("case.submit_case00_q1", names)
+        self.assertIn("storage.archive_review_packet", names)
 
 
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.env = {
+            **REQUIRED_SECRETS,
             "RAILWAY_GIT_COMMIT_SHA": "deadbeefcafebabe0123456789abcdef01234567",
             "GATEWAY_HEALTH_TIMEOUT_SECONDS": "1",
             "GATEWAY_BRIDGE_URL": "https://bridge.example",
@@ -304,8 +660,8 @@ class ApiTests(unittest.TestCase):
         )
         self._probe_patch.start()
         reset_settings_for_tests()
-        # Context manager runs FastAPI lifespan (settings load).
-        self._client_cm = TestClient(app)
+        self._app = create_app()
+        self._client_cm = TestClient(self._app)
         self.client = self._client_cm.__enter__()
 
     def tearDown(self) -> None:
@@ -314,22 +670,20 @@ class ApiTests(unittest.TestCase):
         self._env_patch.stop()
         reset_settings_for_tests()
 
-    def test_health_reports_commit_sha_and_downstream_map(self) -> None:
+    def test_health_reports_commit_sha_tools_and_downstream_map(self) -> None:
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["service"], "hal-legalai-gateway")
+        self.assertEqual(payload["phase"], 2)
         self.assertEqual(
             payload["deployed_commit_sha"],
             "deadbeefcafebabe0123456789abcdef01234567",
         )
         self.assertIn("bridge", payload["downstream"])
-        self.assertIn("storage", payload["downstream"])
-        self.assertIn("mission_control", payload["downstream"])
-        self.assertIn("artifacts", payload["downstream"])
-        self.assertIn("case", payload["capabilities"])
-        self.assertIn("storage", payload["capabilities"])
-        self.assertIn("mission", payload["capabilities"])
+        self.assertIn("case.get_artifact", payload["registered_tools"])
+        self.assertIn("mission.submit", payload["registered_tools"])
+        self.assertIn("storage.verify_archive", payload["registered_tools"])
         self.assertTrue(response.headers.get(REQUEST_ID_HEADER))
         self.assertTrue(response.headers.get(CORRELATION_ID_HEADER))
 
@@ -350,7 +704,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["request_id"], "req-fixed-1")
         self.assertEqual(payload["correlation_id"], "corr-fixed-1")
 
-    def test_registry_endpoint_exposes_namespaces(self) -> None:
+    def test_registry_endpoint_exposes_namespaces_and_bindings(self) -> None:
         response = self.client.get("/registry")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -359,6 +713,35 @@ class ApiTests(unittest.TestCase):
             payload["resolved_downstreams"]["bridge"]["base_url"],
             "https://bridge.example",
         )
+        tools = {item["tool"] for item in payload["tool_bindings"]}
+        self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(tools))
+
+    def test_mcp_requires_authorization(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+        self.assertIn(response.status_code, {401, 403})
+
+    def test_mcp_accepts_gateway_api_key(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {REQUIRED_SECRETS['GATEWAY_API_KEY']}",
+            },
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            }},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload.get("jsonrpc"), "2.0")
+        self.assertIn("result", payload)
 
 
 class RequestContextUnitTests(unittest.TestCase):

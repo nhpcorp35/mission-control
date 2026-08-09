@@ -161,7 +161,11 @@ def _body_preview(body: Any) -> Any:
     return {"type": type(body).__name__}
 
 
-async def aggregate_health(settings: GatewaySettings) -> dict[str, Any]:
+async def aggregate_health(
+    settings: GatewaySettings,
+    *,
+    registered_tools: list[str] | None = None,
+) -> dict[str, Any]:
     """Check every configured downstream independently.
 
     One failure never prevents other probes from completing. Namespace
@@ -233,14 +237,19 @@ async def aggregate_health(settings: GatewaySettings) -> dict[str, Any]:
     ]
     gateway_status = "ok" if not unhealthy else "degraded"
 
+    tools = list(registered_tools) if registered_tools is not None else []
     return {
         "ok": True,
         "status": gateway_status,
         "service": "hal-legalai-gateway",
+        "phase": 2,
         "deployed_commit_sha": settings.deployed_commit_sha,
+        "registered_tools": tools,
         "request_id": get_request_id(),
         "correlation_id": get_correlation_id(),
         "health_timeout_seconds": timeout,
+        "connect_timeout_seconds": settings.connect_timeout_seconds,
+        "read_timeout_seconds": settings.read_timeout_seconds,
         "downstream": {item["key"]: item for item in results},
         "capabilities": capabilities,
     }

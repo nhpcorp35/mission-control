@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "HAL LegalAI Gateway Phase 1 service/tool registry. Maps stable logical namespaces to independently deployable downstream services.",
+  "version": 2,
+  "description": "HAL LegalAI Gateway Phase 2 service/tool registry. Maps stable namespaced gateway tools to independently deployable downstream MCP services.",
   "services": {
     "bridge": {
       "service_id": "hal-github-actions-bridge",
@@ -8,7 +8,7 @@
       "base_url_env": "GATEWAY_BRIDGE_URL",
       "health_path": "/health",
       "default_base_url": "https://hal-github-actions-bridge-production.up.railway.app",
-      "notes": "Case-facing MCP tools and proof workflow dispatch. Remains separately deployable."
+      "notes": "Case-facing MCP tools and proof workflow dispatch. Remains separately deployable. MCP auth is GitHub OAuth — not compatible with GATEWAY_API_KEY; use X-Downstream-Authorization or GATEWAY_BRIDGE_AUTHORIZATION."
     },
     "storage": {
       "service_id": "hal-storage",
@@ -24,7 +24,7 @@
       "base_url_env": "GATEWAY_MISSION_CONTROL_URL",
       "health_path": "/health",
       "default_base_url": "https://mission-control-production-76ff.up.railway.app",
-      "notes": "Mission validation, execution orchestration, and run persistence."
+      "notes": "Must point at the Mission Control MCP Streamable HTTP base (SERVICE_MODE=mcp). MCP tools use server-side MISSION_CONTROL_API_KEY; gateway write access is gated by GATEWAY_API_KEY."
     },
     "artifacts": {
       "service_id": "hal-artifact-retrieval",
@@ -40,48 +40,148 @@
       "description": "LegalAI case workflow tools (Case-00 Q1 and related).",
       "downstream_service": "bridge",
       "tools": [
-        "submit_case00_q1",
-        "get_case00_q1_run",
-        "cancel_case00_q1_run",
-        "get_case00_q1_artifacts",
-        "get_case_artifact"
+        "case.submit_case00_q1",
+        "case.get_case00_q1_run",
+        "case.cancel_case00_q1_run",
+        "case.get_case00_q1_artifacts",
+        "case.get_artifact",
+        "case.get_artifacts"
       ]
     },
     "storage": {
       "description": "Bounded Case-00 storage inventory and archive tools.",
       "downstream_service": "storage",
       "tools": [
-        "list_case00_storage",
-        "archive_case00_attorney_feedback",
-        "archive_case00_review_packet"
+        "storage.list_inventory",
+        "storage.archive_feedback",
+        "storage.archive_review_packet",
+        "storage.verify_archive"
       ]
     },
     "mission": {
       "description": "Mission Control run submission and observation tools.",
       "downstream_service": "mission_control",
       "tools": [
-        "submit_run",
-        "submit_structured_run",
-        "get_run",
-        "wait_for_run",
-        "submit_and_wait",
-        "run_repository_command",
-        "cancel_run"
+        "mission.submit",
+        "mission.submit_structured",
+        "mission.status",
+        "mission.wait",
+        "mission.submit_and_wait",
+        "mission.run_repository_command"
       ]
     }
   },
   "tool_routes": [
     {
-      "tool": "get_artifacts",
+      "tool": "case.get_artifacts",
       "namespace": "case",
       "downstream_service": "artifacts",
       "notes": "Proof artifact copy/verify path; routed to the artifact retrieval downstream."
     },
     {
-      "tool": "get_case_artifact",
+      "tool": "case.get_artifact",
       "namespace": "case",
       "downstream_service": "artifacts",
       "notes": "Allowlisted case artifact read; independently health-checked via artifacts service."
+    }
+  ],
+  "tool_bindings": [
+    {
+      "tool": "case.submit_case00_q1",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "submit_case00_q1"
+    },
+    {
+      "tool": "case.get_case00_q1_run",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "get_case00_q1_run"
+    },
+    {
+      "tool": "case.cancel_case00_q1_run",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "cancel_case00_q1_run"
+    },
+    {
+      "tool": "case.get_case00_q1_artifacts",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "get_case00_q1_artifacts"
+    },
+    {
+      "tool": "case.get_artifact",
+      "namespace": "case",
+      "downstream_service": "artifacts",
+      "downstream_tool": "get_case_artifact"
+    },
+    {
+      "tool": "case.get_artifacts",
+      "namespace": "case",
+      "downstream_service": "artifacts",
+      "downstream_tool": "get_artifacts"
+    },
+    {
+      "tool": "storage.list_inventory",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "list_case00_storage"
+    },
+    {
+      "tool": "storage.archive_feedback",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "archive_case00_attorney_feedback"
+    },
+    {
+      "tool": "storage.archive_review_packet",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "archive_case00_review_packet"
+    },
+    {
+      "tool": "storage.verify_archive",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "list_case00_storage",
+      "notes": "Closest truthful inventory verification mapping (no separate verify_archive downstream tool)."
+    },
+    {
+      "tool": "mission.submit",
+      "namespace": "mission",
+      "downstream_service": "mission_control",
+      "downstream_tool": "submit_run"
+    },
+    {
+      "tool": "mission.submit_structured",
+      "namespace": "mission",
+      "downstream_service": "mission_control",
+      "downstream_tool": "submit_structured_run"
+    },
+    {
+      "tool": "mission.status",
+      "namespace": "mission",
+      "downstream_service": "mission_control",
+      "downstream_tool": "get_run"
+    },
+    {
+      "tool": "mission.wait",
+      "namespace": "mission",
+      "downstream_service": "mission_control",
+      "downstream_tool": "wait_for_run"
+    },
+    {
+      "tool": "mission.submit_and_wait",
+      "namespace": "mission",
+      "downstream_service": "mission_control",
+      "downstream_tool": "submit_and_wait"
+    },
+    {
+      "tool": "mission.run_repository_command",
+      "namespace": "mission",
+      "downstream_service": "mission_control",
+      "downstream_tool": "run_repository_command"
     }
   ]
 }

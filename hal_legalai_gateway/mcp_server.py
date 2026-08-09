@@ -1,0 +1,483 @@
+"""Authenticated FastMCP server with namespaced thin-forward tools."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Literal
+
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_request
+
+from hal_legalai_gateway.config import GatewaySettings
+from hal_legalai_gateway.forwarding import (
+    ToolBinding,
+    forward_mcp_tool,
+    resolve_authorization_for_service,
+)
+from hal_legalai_gateway.registry import GatewayRegistry
+
+logger = logging.getLogger(__name__)
+
+# Settled gateway surface (Phase 2). Downstream tool names stay on the services.
+DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
+    ToolBinding(
+        gateway_tool="case.submit_case00_q1",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="submit_case00_q1",
+        description="Dispatch generation-only Case-00 Q1 at an exact commit SHA.",
+    ),
+    ToolBinding(
+        gateway_tool="case.get_case00_q1_run",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="get_case00_q1_run",
+        description="Return the current GitHub status for a Case-00 Q1 run.",
+    ),
+    ToolBinding(
+        gateway_tool="case.cancel_case00_q1_run",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="cancel_case00_q1_run",
+        description="Cancel the Case-00 Q1 GitHub Actions run for mission_id.",
+    ),
+    ToolBinding(
+        gateway_tool="case.get_case00_q1_artifacts",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="get_case00_q1_artifacts",
+        description="HEAD-verify the four durable Case-00 Q1 B2 objects.",
+    ),
+    ToolBinding(
+        gateway_tool="case.get_artifact",
+        namespace="case",
+        downstream_service="artifacts",
+        downstream_tool="get_case_artifact",
+        description="Read one allowlisted B2 artifact for a successful case mission.",
+    ),
+    ToolBinding(
+        gateway_tool="case.get_artifacts",
+        namespace="case",
+        downstream_service="artifacts",
+        downstream_tool="get_artifacts",
+        description="Publish proof JSON to B2, verify it, and return the object key.",
+    ),
+    ToolBinding(
+        gateway_tool="storage.list_inventory",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="list_case00_storage",
+        description="List allowlisted Case-00 B2 object metadata under a canonical prefix.",
+    ),
+    ToolBinding(
+        gateway_tool="storage.archive_feedback",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="archive_case00_attorney_feedback",
+        description="Archive and HEAD-verify one Case-00 attorney-feedback package.",
+    ),
+    ToolBinding(
+        gateway_tool="storage.archive_review_packet",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="archive_case00_review_packet",
+        description="Archive and HEAD-verify one Case-00 attorney review-packet DOCX.",
+    ),
+    ToolBinding(
+        gateway_tool="storage.verify_archive",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="list_case00_storage",
+        description=(
+            "Closest truthful inventory verification mapping: list allowlisted "
+            "Case-00 storage object metadata (no separate verify_archive tool exists "
+            "downstream)."
+        ),
+        notes="Maps to list_case00_storage (inventory verification).",
+    ),
+    ToolBinding(
+        gateway_tool="mission.submit",
+        namespace="mission",
+        downstream_service="mission_control",
+        downstream_tool="submit_run",
+        description="Submit an exact Mission Control YAML document.",
+    ),
+    ToolBinding(
+        gateway_tool="mission.submit_structured",
+        namespace="mission",
+        downstream_service="mission_control",
+        downstream_tool="submit_structured_run",
+        description="Submit a mission via structured fields.",
+    ),
+    ToolBinding(
+        gateway_tool="mission.status",
+        namespace="mission",
+        downstream_service="mission_control",
+        downstream_tool="get_run",
+        description="Retrieve the current state of a Mission Control run.",
+    ),
+    ToolBinding(
+        gateway_tool="mission.wait",
+        namespace="mission",
+        downstream_service="mission_control",
+        downstream_tool="wait_for_run",
+        description="Wait for a Mission Control run to reach a terminal status.",
+    ),
+    ToolBinding(
+        gateway_tool="mission.submit_and_wait",
+        namespace="mission",
+        downstream_service="mission_control",
+        downstream_tool="submit_and_wait",
+        description="Submit exact mission YAML and wait for a terminal run state.",
+    ),
+    ToolBinding(
+        gateway_tool="mission.run_repository_command",
+        namespace="mission",
+        downstream_service="mission_control",
+        downstream_tool="run_repository_command",
+        description="Run an allowlisted repository command via Mission Control.",
+    ),
+)
+
+
+def bindings_from_registry(registry: GatewayRegistry) -> tuple[ToolBinding, ...]:
+    """Prefer registry tool_bindings when present; else built-in settled defaults."""
+    if registry.tool_bindings:
+        return registry.tool_bindings
+    return DEFAULT_TOOL_BINDINGS
+
+
+def _incoming_headers() -> Any:
+    try:
+        return get_http_request().headers
+    except RuntimeError:
+        return {}
+
+
+def create_mcp_server(settings: GatewaySettings) -> FastMCP:
+    """Build the gateway MCP server with thin forwarders.
+
+    Inbound Bearer auth is enforced by ``GatewayAPIKeyMiddleware`` on the parent
+    FastAPI app (not FastMCP OAuth middleware) so ``/mcp`` stays protected when
+    routes are composed into the gateway process.
+    """
+    mcp = FastMCP(
+        "HAL LegalAI Gateway",
+        instructions=(
+            "Thin authenticated router for LegalAI namespaces (case, storage, "
+            "mission). Tools forward to independently deployed Bridge, Storage, "
+            "artifact, and Mission Control MCP servers. No Case-00 generation, "
+            "archive mutation, or mission execution logic runs inside the gateway."
+        ),
+        auth=None,
+        mask_error_details=True,
+        stateless_http=True,
+        json_response=True,
+    )
+    bindings = bindings_from_registry(settings.registry)
+    register_forwarding_tools(mcp, settings, bindings)
+    return mcp
+
+
+def register_forwarding_tools(
+    mcp: FastMCP,
+    settings: GatewaySettings,
+    bindings: tuple[ToolBinding, ...],
+) -> None:
+    """Register one FastMCP tool per settled gateway binding."""
+    by_name = {binding.gateway_tool: binding for binding in bindings}
+
+    async def _forward(gateway_tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        binding = by_name[gateway_tool]
+        try:
+            downstream = settings.downstream_by_key(binding.downstream_service)
+        except KeyError:
+            return {
+                "ok": False,
+                "gateway_tool": gateway_tool,
+                "downstream_service": binding.downstream_service,
+                "downstream_tool": binding.downstream_tool,
+                "failure_stage": "unconfigured",
+                "duration_ms": 0.0,
+                "error": {
+                    "message": f"unknown downstream '{binding.downstream_service}'",
+                    "stage": "unconfigured",
+                },
+            }
+        require_auth = binding.downstream_service in {
+            "bridge",
+            "storage",
+            "artifacts",
+        }
+        authorization = resolve_authorization_for_service(
+            downstream_service=binding.downstream_service,
+            headers=_incoming_headers(),
+            bridge_authorization=settings.bridge_authorization,
+        )
+        return await forward_mcp_tool(
+            binding=binding,
+            arguments=arguments,
+            base_url=downstream.base_url,
+            authorization=authorization,
+            connect_timeout_seconds=settings.connect_timeout_seconds,
+            read_timeout_seconds=settings.read_timeout_seconds,
+            mcp_path=settings.mcp_path,
+            require_authorization=require_auth,
+        )
+
+    # --- case ---
+    @mcp.tool(name="case.submit_case00_q1", description=by_name["case.submit_case00_q1"].description)
+    async def case_submit_case00_q1(
+        ref: str,
+        authorization_confirmed: bool,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "ref": ref,
+            "authorization_confirmed": authorization_confirmed,
+        }
+        if mission_id is not None:
+            args["mission_id"] = mission_id
+        return await _forward("case.submit_case00_q1", args)
+
+    @mcp.tool(name="case.get_case00_q1_run", description=by_name["case.get_case00_q1_run"].description)
+    async def case_get_case00_q1_run(mission_id: str) -> dict[str, Any]:
+        return await _forward("case.get_case00_q1_run", {"mission_id": mission_id})
+
+    @mcp.tool(
+        name="case.cancel_case00_q1_run",
+        description=by_name["case.cancel_case00_q1_run"].description,
+    )
+    async def case_cancel_case00_q1_run(mission_id: str) -> dict[str, Any]:
+        return await _forward("case.cancel_case00_q1_run", {"mission_id": mission_id})
+
+    @mcp.tool(
+        name="case.get_case00_q1_artifacts",
+        description=by_name["case.get_case00_q1_artifacts"].description,
+    )
+    async def case_get_case00_q1_artifacts(mission_id: str) -> dict[str, Any]:
+        return await _forward("case.get_case00_q1_artifacts", {"mission_id": mission_id})
+
+    @mcp.tool(name="case.get_artifact", description=by_name["case.get_artifact"].description)
+    async def case_get_artifact(
+        mission_id: str,
+        filename: Literal[
+            "Q1_candidate_answer.json",
+            "Q1_candidate_answer.md",
+            "generation_manifest.json",
+            "model_input_audit.json",
+        ],
+    ) -> dict[str, Any]:
+        return await _forward(
+            "case.get_artifact",
+            {"mission_id": mission_id, "filename": filename},
+        )
+
+    @mcp.tool(name="case.get_artifacts", description=by_name["case.get_artifacts"].description)
+    async def case_get_artifacts(mission_id: str) -> dict[str, Any]:
+        return await _forward("case.get_artifacts", {"mission_id": mission_id})
+
+    # --- storage ---
+    @mcp.tool(
+        name="storage.list_inventory",
+        description=by_name["storage.list_inventory"].description,
+    )
+    async def storage_list_inventory(
+        category: Literal[
+            "all",
+            "source",
+            "questions",
+            "candidate_answers",
+            "attorney_reviews",
+            "attorney_review_packets",
+        ] = "all",
+        max_keys: int = 200,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.list_inventory",
+            {"category": category, "max_keys": max_keys},
+        )
+
+    @mcp.tool(
+        name="storage.archive_feedback",
+        description=by_name["storage.archive_feedback"].description,
+    )
+    async def storage_archive_feedback(
+        evaluation_date: str,
+        original_packet_md: str,
+        feedback_email_md: str,
+        structured_evaluation_json: str,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.archive_feedback",
+            {
+                "evaluation_date": evaluation_date,
+                "original_packet_md": original_packet_md,
+                "feedback_email_md": feedback_email_md,
+                "structured_evaluation_json": structured_evaluation_json,
+            },
+        )
+
+    @mcp.tool(
+        name="storage.archive_review_packet",
+        description=by_name["storage.archive_review_packet"].description,
+    )
+    async def storage_archive_review_packet(
+        docx_base64: str,
+        recipient: str,
+        question_id: str,
+        sent_at: str,
+        original_filename: str,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.archive_review_packet",
+            {
+                "docx_base64": docx_base64,
+                "recipient": recipient,
+                "question_id": question_id,
+                "sent_at": sent_at,
+                "original_filename": original_filename,
+            },
+        )
+
+    @mcp.tool(
+        name="storage.verify_archive",
+        description=by_name["storage.verify_archive"].description,
+    )
+    async def storage_verify_archive(
+        category: Literal[
+            "all",
+            "source",
+            "questions",
+            "candidate_answers",
+            "attorney_reviews",
+            "attorney_review_packets",
+        ] = "all",
+        max_keys: int = 200,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.verify_archive",
+            {"category": category, "max_keys": max_keys},
+        )
+
+    # --- mission ---
+    @mcp.tool(name="mission.submit", description=by_name["mission.submit"].description)
+    async def mission_submit(mission_yaml: str) -> dict[str, Any]:
+        return await _forward("mission.submit", {"mission_yaml": mission_yaml})
+
+    @mcp.tool(
+        name="mission.submit_structured",
+        description=by_name["mission.submit_structured"].description,
+    )
+    async def mission_submit_structured(
+        mission_id: str,
+        title: str,
+        instructions: str,
+        deliverables: list[str],
+        create_files: bool,
+        modify_files: bool,
+        persistence_mode: str | None = None,
+        repository_name: str = "Mission-Control",
+        repository_path: str = ".",
+        base_branch: str = "main",
+        run_commands: bool = True,
+        platform_push_approved: bool | None = None,
+        allow_automatic_platform_push: bool = False,
+        approval: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "mission_id": mission_id,
+            "title": title,
+            "instructions": instructions,
+            "deliverables": deliverables,
+            "create_files": create_files,
+            "modify_files": modify_files,
+            "repository_name": repository_name,
+            "repository_path": repository_path,
+            "base_branch": base_branch,
+            "run_commands": run_commands,
+            "allow_automatic_platform_push": allow_automatic_platform_push,
+        }
+        if persistence_mode is not None:
+            args["persistence_mode"] = persistence_mode
+        if platform_push_approved is not None:
+            args["platform_push_approved"] = platform_push_approved
+        if approval is not None:
+            args["approval"] = approval
+        return await _forward("mission.submit_structured", args)
+
+    @mcp.tool(name="mission.status", description=by_name["mission.status"].description)
+    async def mission_status(run_id: str) -> dict[str, Any]:
+        return await _forward("mission.status", {"run_id": run_id})
+
+    @mcp.tool(name="mission.wait", description=by_name["mission.wait"].description)
+    async def mission_wait(
+        run_id: str,
+        timeout_seconds: float = 20.0,
+        poll_interval_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "mission.wait",
+            {
+                "run_id": run_id,
+                "timeout_seconds": timeout_seconds,
+                "poll_interval_seconds": poll_interval_seconds,
+            },
+        )
+
+    @mcp.tool(
+        name="mission.submit_and_wait",
+        description=by_name["mission.submit_and_wait"].description,
+    )
+    async def mission_submit_and_wait(
+        mission_yaml: str,
+        timeout_seconds: float = 20.0,
+        poll_interval_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "mission.submit_and_wait",
+            {
+                "mission_yaml": mission_yaml,
+                "timeout_seconds": timeout_seconds,
+                "poll_interval_seconds": poll_interval_seconds,
+            },
+        )
+
+    @mcp.tool(
+        name="mission.run_repository_command",
+        description=by_name["mission.run_repository_command"].description,
+    )
+    async def mission_run_repository_command(
+        repository: str,
+        ref: str,
+        argv: list[str],
+        working_directory: str | None = None,
+        timeout_seconds: float | None = None,
+        allowed_env_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "repository": repository,
+            "ref": ref,
+            "argv": argv,
+        }
+        if working_directory is not None:
+            args["working_directory"] = working_directory
+        if timeout_seconds is not None:
+            args["timeout_seconds"] = timeout_seconds
+        if allowed_env_names is not None:
+            args["allowed_env_names"] = allowed_env_names
+        return await _forward("mission.run_repository_command", args)
+
+    logger.info(
+        "registered gateway MCP tools count=%s names=%s",
+        len(bindings),
+        ",".join(sorted(by_name)),
+    )
+
+
+async def list_registered_tool_names(mcp: FastMCP) -> list[str]:
+    """Exact sorted tool names from the running FastMCP instance."""
+    tools = await mcp.get_tools()
+    if isinstance(tools, dict):
+        return sorted(tools)
+    return sorted(str(item) for item in tools)
