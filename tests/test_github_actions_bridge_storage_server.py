@@ -11,7 +11,7 @@ from cryptography.fernet import Fernet
 from github_actions_bridge.storage_policy import CASE00_PREFIXES
 
 
-def _ensure_storage_server_env() -> None:
+def _ensure_bridge_env() -> None:
     os.environ.setdefault("GITHUB_OAUTH_CLIENT_ID", "test-client-id")
     os.environ.setdefault("GITHUB_OAUTH_CLIENT_SECRET", "test-client-secret")
     os.environ.setdefault("REDIS_HOST", "127.0.0.1")
@@ -19,7 +19,11 @@ def _ensure_storage_server_env() -> None:
     os.environ.setdefault(
         "STORAGE_ENCRYPTION_KEY", Fernet.generate_key().decode()
     )
-    os.environ.setdefault("JWT_SIGNING_KEY", "test-jwt-signing-key")
+    os.environ.setdefault("JWT_SIGNING_KEY", "test-jwt-signing-key-long-enough")
+    os.environ.setdefault(
+        "BRIDGE_PUBLIC_URL",
+        "https://hal-github-actions-bridge-production.up.railway.app",
+    )
     os.environ.setdefault("B2_ENDPOINT", "https://s3.example.test")
     os.environ.setdefault("B2_KEY_ID", "test-key-id")
     os.environ.setdefault("B2_APPLICATION_KEY", "test-app-key")
@@ -27,14 +31,52 @@ def _ensure_storage_server_env() -> None:
     os.environ.setdefault("ALLOWED_GITHUB_LOGIN", "nhpcorp35")
 
 
-_ensure_storage_server_env()
+_ensure_bridge_env()
 
+from github_actions_bridge import server  # noqa: E402
 from github_actions_bridge import storage_server  # noqa: E402
 
 
 class _FakeAccessToken:
     def __init__(self, login: str) -> None:
         self.claims = {"login": login}
+
+
+class BridgeRouteMountTests(unittest.TestCase):
+    def test_create_http_app_mounts_original_and_storage_mcp(self) -> None:
+        app = server.create_http_app()
+        paths = {getattr(route, "path", None) for route in app.routes}
+        self.assertIn("/mcp", paths)
+        self.assertIn("/storage/mcp", paths)
+        self.assertIn("/health", paths)
+        self.assertIn("/.well-known/oauth-protected-resource/mcp", paths)
+        self.assertIn(
+            "/.well-known/oauth-protected-resource/storage/mcp",
+            paths,
+        )
+        self.assertEqual(server.STORAGE_MCP_PATH, "/storage/mcp")
+        # Shared OAuth stays on the parent app (not under /storage).
+        self.assertIn("/authorize", paths)
+        self.assertIn("/auth/callback", paths)
+        self.assertNotIn("/storage/authorize", paths)
+
+    def test_original_mcp_exposes_exactly_nine_tools(self) -> None:
+        tool_names = sorted(server.mcp._tool_manager._tools.keys())
+        self.assertEqual(tool_names, sorted(server.EXPECTED_TOOL_NAMES))
+        self.assertEqual(len(tool_names), 9)
+        self.assertNotIn("list_case00_storage", tool_names)
+        self.assertNotIn("archive_case00_attorney_feedback", tool_names)
+
+    def test_storage_mcp_exposes_exactly_two_tools(self) -> None:
+        tool_names = sorted(storage_server.mcp._tool_manager._tools.keys())
+        self.assertEqual(
+            tool_names,
+            sorted(storage_server.EXPECTED_TOOL_NAMES),
+        )
+        self.assertEqual(
+            tool_names,
+            ["archive_case00_attorney_feedback", "list_case00_storage"],
+        )
 
 
 class StorageServerSurfaceTests(unittest.IsolatedAsyncioTestCase):
@@ -189,6 +231,21 @@ class StorageServerSurfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["service"], "hal-legalai-storage-bridge")
         self.assertIn("time", payload)
+
+    async def test_bridge_health_stays_compatible(self) -> None:
+        response = await server.health(MagicMock())
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["service"], "hal-github-actions-bridge")
+        self.assertIn("time", payload)
+
+    def test_storage_reuses_bridge_public_url_default(self) -> None:
+        self.assertEqual(storage_server.PUBLIC_URL, server.PUBLIC_URL)
+        self.assertTrue(
+            storage_server.PUBLIC_URL.endswith(
+                "hal-github-actions-bridge-production.up.railway.app"
+            )
+        )
 
 
 if __name__ == "__main__":

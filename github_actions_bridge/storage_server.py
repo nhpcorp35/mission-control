@@ -26,9 +26,10 @@ except ImportError:  # pragma: no cover - container flat layout
 B2_BUCKET = os.environ.get("B2_BUCKET", "legalai-corpus")
 PUBLIC_URL = os.environ.get(
     "BRIDGE_PUBLIC_URL",
-    "https://hal-legalai-storage-bridge-production.up.railway.app",
+    "https://hal-github-actions-bridge-production.up.railway.app",
 ).rstrip("/")
 ALLOWED_GITHUB_LOGIN = os.environ.get("ALLOWED_GITHUB_LOGIN", "nhpcorp35")
+STORAGE_MCP_PATH = "/storage/mcp"
 
 auth_provider = GitHubProvider(
     client_id=os.environ["GITHUB_OAUTH_CLIENT_ID"],
@@ -52,7 +53,9 @@ mcp = FastMCP(
         "archive_case00_attorney_feedback to store the fixed attorney-feedback "
         "package with a server-generated preservation manifest, then "
         "HEAD-verify size and SHA-256 metadata. Arbitrary bucket names and "
-        "object keys are not permitted."
+        "object keys are not permitted. When mounted on the GitHub Actions "
+        f"bridge, this surface is served at {STORAGE_MCP_PATH} on the same "
+        "BRIDGE_PUBLIC_URL / GitHub OAuth domain as /mcp."
     ),
     auth=auth_provider,
 )

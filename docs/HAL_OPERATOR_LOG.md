@@ -1,5 +1,95 @@
 # HAL Operator Log
 
+## 2026-08-09 — Mount Storage Bridge on Existing OAuth Domain
+
+### Objective
+
+Serve the dedicated Case-00 storage FastMCP surface from the existing
+`hal-github-actions-bridge` Railway service and GitHub OAuth domain so ChatGPT
+connectors do not need a second OAuth app or Railway hostname.
+
+### Implementation
+
+- `github_actions_bridge/server.py`: original MCP remains at `/mcp` with exactly
+  the nine workflow/artifact tools. Storage tools were removed from that
+  surface. `create_http_app()` runs one ASGI process that keeps shared GitHub
+  OAuth (`/authorize`, `/auth/callback`, …) on the parent app and mounts the
+  storage Streamable HTTP endpoint at `/storage/mcp` (plus
+  `/.well-known/oauth-protected-resource/storage/mcp`). `/health` still reports
+  `hal-github-actions-bridge`.
+- `github_actions_bridge/storage_server.py`: still the two-tool storage MCP
+  (`list_case00_storage`, `archive_case00_attorney_feedback`). Default
+  `BRIDGE_PUBLIC_URL` now matches the existing bridge domain. Standalone
+  `Dockerfile.storage` / `railway-storage.json` remain available as tested
+  artifacts but are not required for production.
+- `github_actions_bridge/Dockerfile`: copies `storage_server.py` so the single
+  production process can import and mount it.
+- `tests/test_github_actions_bridge_storage_server.py`: asserts route mounting
+  (`/mcp` + `/storage/mcp`), independent nine-tool vs two-tool surfaces, and
+  existing storage behavior/health checks.
+
+### ChatGPT connector handoff
+
+Use the **existing** bridge public origin (same GitHub OAuth client /
+`BRIDGE_PUBLIC_URL`):
+
+| Surface | Exact MCP URL |
+| --- | --- |
+| Original nine-tool bridge | `https://hal-github-actions-bridge-production.up.railway.app/mcp` |
+| Case-00 storage (two tools) | `https://hal-github-actions-bridge-production.up.railway.app/storage/mcp` |
+
+No new GitHub OAuth callback URL and no second Railway domain are required.
+Point storage connectors at `/storage/mcp`; leave workflow/dispatch connectors
+on `/mcp`.
+
+### Documentation
+
+Operator log updated for the mounted dual-endpoint handoff.
+`github_actions_bridge/README.md` still lists the tool inventory for this
+service; endpoint split is documented here (README was outside the mission
+deliverable file set).
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest \
+  tests.test_github_actions_bridge_storage_server \
+  tests.test_github_actions_bridge_storage \
+  -v
+# Ran 14 tests — OK
+```
+
+### Railway / deployment handoff
+
+Redeploy the **existing** `hal-github-actions-bridge` service only (same
+`Dockerfile` / `railway.json` entrypoint `python server.py`). Do not create a
+second Railway service for storage.
+
+Env unchanged in shape: continue using the bridge's
+`GITHUB_OAUTH_CLIENT_ID` / `SECRET`, Redis, encryption/JWT keys, and
+`BRIDGE_PUBLIC_URL=https://hal-github-actions-bridge-production.up.railway.app`
+plus existing B2 settings.
+
+Post-deploy checks:
+
+1. `GET {BRIDGE_PUBLIC_URL}/health` →
+   `{"ok": true, "service": "hal-github-actions-bridge", ...}`
+2. MCP at `/mcp` lists exactly the nine original tools (no storage tools)
+3. MCP at `/storage/mcp` lists exactly
+   `list_case00_storage` and `archive_case00_attorney_feedback`
+4. OAuth discovery for `/storage/mcp` advertises the same authorization server
+   as `/mcp`
+
+### Resulting commit
+
+Not committed / not pushed (mission constraints forbid git staging, commits,
+and pushes).
+
+### Next Objective
+
+Redeploy the existing bridge, attach ChatGPT storage connectors to
+`/storage/mcp`, and confirm workflow connectors on `/mcp` are unchanged.
+
 ## 2026-08-09 — Dedicated HAL LegalAI Storage Bridge
 
 ### Objective
