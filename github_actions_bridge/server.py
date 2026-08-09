@@ -30,6 +30,11 @@ from storage_policy import (
     inventory_prefix,
     map_archive_put_precondition_failure,
 )
+from service_auth import (
+    BRIDGE_SERVICE_TOKEN_ENV,
+    build_bridge_auth_provider,
+    is_service_access_token,
+)
 
 # Explicit deployment provenance only — never infer or fabricate a SHA.
 DEPLOYED_COMMIT_SHA_ENV = "RAILWAY_GIT_COMMIT_SHA"
@@ -110,18 +115,21 @@ CASE_ARTIFACT_LIMITS = {
     "model_input_audit.json": 100_000,
 }
 
-auth_provider = GitHubProvider(
-    client_id=os.environ["GITHUB_OAUTH_CLIENT_ID"],
-    client_secret=os.environ["GITHUB_OAUTH_CLIENT_SECRET"],
-    base_url=PUBLIC_URL,
-    jwt_signing_key=os.environ.get("JWT_SIGNING_KEY"),
-    client_storage=FernetEncryptionWrapper(
-        key_value=RedisStore(
-            host=os.environ["REDIS_HOST"],
-            port=int(os.environ.get("REDIS_PORT", "6379")),
+auth_provider = build_bridge_auth_provider(
+    GitHubProvider(
+        client_id=os.environ["GITHUB_OAUTH_CLIENT_ID"],
+        client_secret=os.environ["GITHUB_OAUTH_CLIENT_SECRET"],
+        base_url=PUBLIC_URL,
+        jwt_signing_key=os.environ.get("JWT_SIGNING_KEY"),
+        client_storage=FernetEncryptionWrapper(
+            key_value=RedisStore(
+                host=os.environ["REDIS_HOST"],
+                port=int(os.environ.get("REDIS_PORT", "6379")),
+            ),
+            fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"].encode()),
         ),
-        fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"].encode()),
     ),
+    service_token=os.environ.get(BRIDGE_SERVICE_TOKEN_ENV),
 )
 
 mcp = FastMCP(
@@ -145,6 +153,12 @@ mcp = FastMCP(
 
 def _require_allowed_user() -> str:
     token = get_access_token()
+    if is_service_access_token(token):
+        claims = token.claims if token is not None else {}
+        client_id = (claims or {}).get("client_id") or (
+            token.client_id if token is not None else "service"
+        )
+        return f"service:{client_id}"
     login = token.claims.get("login") if token is not None else None
     if login != ALLOWED_GITHUB_LOGIN:
         raise PermissionError("authenticated GitHub user is not authorized")

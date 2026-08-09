@@ -11,7 +11,10 @@ import httpx
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
-from hal_legalai_gateway.auth import extract_downstream_authorization
+from hal_legalai_gateway.auth import (
+    redact_secrets,
+    service_authorization_header,
+)
 from hal_legalai_gateway.request_context import get_correlation_id, get_request_id
 
 logger = logging.getLogger(__name__)
@@ -93,14 +96,27 @@ def _classify_transport_error(exc: BaseException) -> str:
     return STAGE_INTERNAL
 
 
-def _safe_error_message(exc: BaseException) -> str:
-    """Stringify an error without echoing Authorization / API key material."""
+def _safe_error_message(
+    exc: BaseException,
+    *,
+    extra_secrets: tuple[str, ...] = (),
+) -> str:
+    """Stringify an error without echoing Authorization / secret material."""
     text = str(exc) or exc.__class__.__name__
-    lowered = text.lower()
-    for needle in ("bearer ", "authorization", "api_key", "api-key", "client_secret"):
-        if needle in lowered:
+    redacted = redact_secrets(text, extra_secrets=extra_secrets)
+    lowered = redacted.lower()
+    for needle in (
+        "bearer ",
+        "authorization",
+        "api_key",
+        "api-key",
+        "client_secret",
+        "jwt_signing",
+        "storage_encryption",
+    ):
+        if needle in lowered and "[redacted]" not in lowered:
             return exc.__class__.__name__
-    return text[:500]
+    return redacted[:500]
 
 
 def mcp_endpoint_url(base_url: str, mcp_path: str = "/mcp") -> str:
@@ -142,6 +158,7 @@ async def forward_mcp_tool(
     mcp_path: str = "/mcp",
     require_authorization: bool = True,
     client_factory: Callable[[], Client] | None = None,
+    extra_secrets: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Call one downstream MCP tool and return a structured envelope.
 
@@ -193,8 +210,8 @@ async def forward_mcp_tool(
             failure_stage=STAGE_AUTH,
             error={
                 "message": (
-                    "downstream authorization missing: provide "
-                    "X-Downstream-Authorization or configure service credentials"
+                    "downstream authorization missing: configure "
+                    "GATEWAY_BRIDGE_AUTHORIZATION service credential"
                 ),
                 "stage": STAGE_AUTH,
             },
@@ -260,19 +277,20 @@ async def forward_mcp_tool(
             return _finish(ok=True, failure_stage=STAGE_OK, result=data)
     except Exception as exc:  # noqa: BLE001 — isolation boundary
         stage = _classify_transport_error(exc)
+        safe = _safe_error_message(exc, extra_secrets=extra_secrets)
         logger.warning(
             "forward failed gateway_tool=%s downstream=%s tool=%s stage=%s error=%s",
             binding.gateway_tool,
             binding.downstream_service,
             binding.downstream_tool,
             stage,
-            _safe_error_message(exc),
+            safe,
         )
         return _finish(
             ok=False,
             failure_stage=stage,
             error={
-                "message": _safe_error_message(exc),
+                "message": safe,
                 "stage": stage,
             },
         )
@@ -281,12 +299,13 @@ async def forward_mcp_tool(
 def resolve_authorization_for_service(
     *,
     downstream_service: str,
-    headers: Any,
     bridge_authorization: str | None,
 ) -> str | None:
-    """Bridge/storage/artifacts need auth; mission MCP is gateway-gated only."""
+    """Bridge/storage/artifacts use the dedicated service credential only.
+
+    Mission Control MCP is gateway-gated; its HTTP API key stays server-side.
+    Inbound GitHub OAuth session tokens are never forwarded.
+    """
     if downstream_service in {"bridge", "storage", "artifacts"}:
-        return extract_downstream_authorization(
-            headers, service_authorization=bridge_authorization
-        )
+        return service_authorization_header(bridge_authorization)
     return None

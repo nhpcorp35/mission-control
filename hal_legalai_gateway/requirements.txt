@@ -5,3 +5,5 @@ pydantic>=2,<3
 starlette>=0.38,<1
 mcp==1.29.0
 fastmcp>=2.11,<3
+cryptography>=42,<46
+redis>=5,<7

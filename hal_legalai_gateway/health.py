@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from hal_legalai_gateway.auth import redact_secrets
 from hal_legalai_gateway.config import GatewaySettings, ResolvedDownstream
 from hal_legalai_gateway.request_context import get_correlation_id, get_request_id
 
@@ -132,14 +133,17 @@ async def probe_downstream(
             "downstream health probe failed key=%s stage=%s error=%s",
             downstream.key,
             stage,
-            exc,
+            redact_secrets(str(exc) or exc.__class__.__name__),
         )
         base.update(
             {
                 "status": STATUS_UNHEALTHY,
                 "failure_stage": stage,
                 "latency_ms": latency_ms,
-                "error": str(exc) or exc.__class__.__name__,
+                "error": redact_secrets(
+                str(exc) or exc.__class__.__name__,
+                extra_secrets=(),
+            ),
             }
         )
         return base

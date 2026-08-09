@@ -9,13 +9,18 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from cryptography.fernet import Fernet
+
 import httpx
 from fastapi.testclient import TestClient
 
 from hal_legalai_gateway import config as gateway_config
 from hal_legalai_gateway.auth import (
-    DOWNSTREAM_AUTHORIZATION_HEADER,
-    extract_downstream_authorization,
+    FixedTokenAuthProvider,
+    ServiceTokenVerifier,
+    normalize_bearer_token,
+    redact_secrets,
+    service_authorization_header,
 )
 from hal_legalai_gateway.config import (
     DEFAULT_HEALTH_TIMEOUT_SECONDS,
@@ -31,6 +36,7 @@ from hal_legalai_gateway.forwarding import (
     ToolBinding,
     forward_mcp_tool,
     mcp_endpoint_url,
+    resolve_authorization_for_service,
 )
 from hal_legalai_gateway.health import (
     STAGE_CONNECT as HEALTH_STAGE_CONNECT,
@@ -68,10 +74,26 @@ REGISTRY_PATH = (
     / "registry.json"
 )
 
+TEST_STORAGE_ENCRYPTION_KEY = Fernet.generate_key().decode()
+TEST_GATEWAY_OAUTH_TOKEN = "test-gateway-oauth-token"
+TEST_BRIDGE_SERVICE_TOKEN = "test-bridge-service-token"
+
 REQUIRED_SECRETS = {
-    "GATEWAY_API_KEY": "test-gateway-api-key",
-    "GATEWAY_BRIDGE_AUTHORIZATION": "Bearer test-bridge-token",
+    "GITHUB_OAUTH_CLIENT_ID": "test-gateway-client-id",
+    "GITHUB_OAUTH_CLIENT_SECRET": "test-gateway-client-secret",
+    "GATEWAY_PUBLIC_URL": "https://gateway.example",
+    "JWT_SIGNING_KEY": "test-jwt-signing-key-for-gateway",
+    "REDIS_HOST": "127.0.0.1",
+    "STORAGE_ENCRYPTION_KEY": TEST_STORAGE_ENCRYPTION_KEY,
+    "GATEWAY_BRIDGE_AUTHORIZATION": f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+    "ALLOWED_GITHUB_LOGIN": "nhpcorp35",
 }
+
+def _test_inbound_auth() -> FixedTokenAuthProvider:
+    return FixedTokenAuthProvider(
+        TEST_GATEWAY_OAUTH_TOKEN,
+        claims={"login": "nhpcorp35"},
+    )
 
 
 class RegistryTests(unittest.TestCase):
@@ -181,7 +203,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.health_timeout_seconds, 2.5)
         self.assertEqual(settings.connect_timeout_seconds, 1.5)
         self.assertEqual(settings.read_timeout_seconds, 12.0)
-        self.assertEqual(settings.gateway_api_key, "test-gateway-api-key")
+        self.assertEqual(settings.github_oauth_client_id, "test-gateway-client-id")
+        self.assertEqual(
+            normalize_bearer_token(settings.bridge_authorization),
+            TEST_BRIDGE_SERVICE_TOKEN,
+        )
         by_key = {item.key: item for item in settings.downstreams}
         self.assertEqual(by_key["bridge"].base_url, "https://bridge.example")
         self.assertEqual(
@@ -205,21 +231,35 @@ class ConfigTests(unittest.TestCase):
                 registry=load_registry(REGISTRY_PATH),
             )
 
-    def test_load_settings_fail_closed_without_api_key(self) -> None:
+    def test_load_settings_fail_closed_without_github_oauth(self) -> None:
+        env = {**REQUIRED_SECRETS}
+        del env["GITHUB_OAUTH_CLIENT_ID"]
         with self.assertRaises(RuntimeError) as ctx:
             load_settings(
-                environ={"GATEWAY_BRIDGE_AUTHORIZATION": "Bearer x"},
+                environ=env,
                 registry=load_registry(REGISTRY_PATH),
             )
-        self.assertIn("GATEWAY_API_KEY", str(ctx.exception))
+        self.assertIn("GITHUB_OAUTH_CLIENT_ID", str(ctx.exception))
 
     def test_load_settings_fail_closed_without_bridge_authorization(self) -> None:
+        env = {**REQUIRED_SECRETS}
+        del env["GATEWAY_BRIDGE_AUTHORIZATION"]
         with self.assertRaises(RuntimeError) as ctx:
             load_settings(
-                environ={"GATEWAY_API_KEY": "k"},
+                environ=env,
                 registry=load_registry(REGISTRY_PATH),
             )
         self.assertIn("GATEWAY_BRIDGE_AUTHORIZATION", str(ctx.exception))
+
+    def test_load_settings_fail_closed_without_public_url(self) -> None:
+        env = {**REQUIRED_SECRETS}
+        del env["GATEWAY_PUBLIC_URL"]
+        with self.assertRaises(RuntimeError) as ctx:
+            load_settings(
+                environ=env,
+                registry=load_registry(REGISTRY_PATH),
+            )
+        self.assertIn("GATEWAY_PUBLIC_URL", str(ctx.exception))
 
     def test_default_timeout_when_unset(self) -> None:
         settings = load_settings(
@@ -236,20 +276,34 @@ class ConfigTests(unittest.TestCase):
 
 
 class AuthForwardingTests(unittest.TestCase):
-    def test_prefer_caller_downstream_authorization(self) -> None:
-        headers = {
-            DOWNSTREAM_AUTHORIZATION_HEADER: "Bearer caller-bridge-token",
-        }
-        resolved = extract_downstream_authorization(
-            headers, service_authorization="Bearer service-token"
+    def test_service_authorization_header_formats_bearer(self) -> None:
+        self.assertEqual(
+            service_authorization_header("service-token"),
+            "Bearer service-token",
         )
-        self.assertEqual(resolved, "Bearer caller-bridge-token")
+        self.assertEqual(
+            service_authorization_header("Bearer already"),
+            "Bearer already",
+        )
 
-    def test_falls_back_to_service_authorization(self) -> None:
-        resolved = extract_downstream_authorization(
-            {}, service_authorization="service-token"
+    def test_resolve_authorization_uses_service_credential_only(self) -> None:
+        resolved = resolve_authorization_for_service(
+            downstream_service="bridge",
+            bridge_authorization="Bearer service-token",
         )
         self.assertEqual(resolved, "Bearer service-token")
+        self.assertIsNone(
+            resolve_authorization_for_service(
+                downstream_service="mission_control",
+                bridge_authorization="Bearer service-token",
+            )
+        )
+
+    def test_redact_secrets_strips_bearer_material(self) -> None:
+        raw = "Authorization: Bearer super-secret-token failed"
+        redacted = redact_secrets(raw, extra_secrets=("super-secret-token",))
+        self.assertNotIn("super-secret-token", redacted)
+        self.assertIn("[REDACTED]", redacted)
 
     def test_mcp_endpoint_url_join(self) -> None:
         self.assertEqual(
@@ -617,7 +671,7 @@ class McpRegistrationTests(unittest.TestCase):
             },
             registry=load_registry(REGISTRY_PATH),
         )
-        mcp = create_mcp_server(settings)
+        mcp = create_mcp_server(settings, auth=_test_inbound_auth())
         names = asyncio.run(list_registered_tool_names(mcp))
         for required in REQUIRED_GATEWAY_TOOLS:
             self.assertIn(required, names)
@@ -660,7 +714,7 @@ class ApiTests(unittest.TestCase):
         )
         self._probe_patch.start()
         reset_settings_for_tests()
-        self._app = create_app()
+        self._app = create_app(auth_override=_test_inbound_auth())
         self._client_cm = TestClient(self._app)
         self.client = self._client_cm.__enter__()
 
@@ -724,13 +778,29 @@ class ApiTests(unittest.TestCase):
         )
         self.assertIn(response.status_code, {401, 403})
 
-    def test_mcp_accepts_gateway_api_key(self) -> None:
+    def test_mcp_rejects_invalid_token(self) -> None:
         response = self.client.post(
             "/mcp",
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
-                "Authorization": f"Bearer {REQUIRED_SECRETS['GATEWAY_API_KEY']}",
+                "Authorization": "Bearer definitely-not-valid",
+            },
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            }},
+        )
+        self.assertIn(response.status_code, {401, 403})
+
+    def test_mcp_accepts_authenticated_gateway_token(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {TEST_GATEWAY_OAUTH_TOKEN}",
             },
             json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                 "protocolVersion": "2024-11-05",
@@ -742,6 +812,39 @@ class ApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload.get("jsonrpc"), "2.0")
         self.assertIn("result", payload)
+
+    def test_health_reports_auth_mode_without_secrets(self) -> None:
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["auth"]["inbound"], "github_oauth")
+        self.assertEqual(payload["auth"]["downstream_bridge"], "service_credential")
+        blob = str(payload)
+        self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
+        self.assertNotIn(REQUIRED_SECRETS["GITHUB_OAUTH_CLIENT_SECRET"], blob)
+        self.assertNotIn(REQUIRED_SECRETS["JWT_SIGNING_KEY"], blob)
+
+
+class ServiceCredentialTests(unittest.TestCase):
+    def test_valid_service_token_verifies(self) -> None:
+        verifier = ServiceTokenVerifier(TEST_BRIDGE_SERVICE_TOKEN)
+
+        async def _run():
+            return await verifier.verify_token(TEST_BRIDGE_SERVICE_TOKEN)
+
+        token = __import__("asyncio").run(_run())
+        self.assertIsNotNone(token)
+        self.assertEqual(token.claims.get("token_use"), "service")
+        self.assertIsNone(token.expires_at)
+
+    def test_invalid_service_token_rejected(self) -> None:
+        verifier = ServiceTokenVerifier(TEST_BRIDGE_SERVICE_TOKEN)
+
+        async def _run():
+            return await verifier.verify_token("wrong-token")
+
+        token = __import__("asyncio").run(_run())
+        self.assertIsNone(token)
 
 
 class RequestContextUnitTests(unittest.TestCase):

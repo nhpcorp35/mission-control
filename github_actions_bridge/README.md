@@ -48,3 +48,14 @@ arbitrary bucket names or object keys. Private benchmark data and generated
 packet content are not stored in GitHub.
 
 Mission Control remains unchanged and is not used by this bridge.
+
+## Authentication
+
+**Direct clients (unchanged):** FastMCP `GitHubProvider` OAuth. Interactive
+ChatGPT / operator connections continue to use GitHub OAuth.
+
+**Gateway service-to-service (additive):** Set `BRIDGE_SERVICE_TOKEN` to a
+dedicated non-expiring secret. The Gateway's `GATEWAY_BRIDGE_AUTHORIZATION`
+must present the same value. This is **not** a copied user OAuth bearer and does
+not expire with a user session. When unset, Bridge behavior remains OAuth-only
+(compatible during cutover).

@@ -10,9 +10,14 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthProvider
+from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
+from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
+from starlette.authentication import AuthenticationBackend
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.requests import HTTPConnection
 
 from hal_legalai_gateway.config import GatewaySettings, load_settings
-from hal_legalai_gateway.auth import GatewayAPIKeyMiddleware
 from hal_legalai_gateway.health import aggregate_health
 from hal_legalai_gateway.mcp_server import (
     create_mcp_server,
@@ -31,6 +36,26 @@ _settings: GatewaySettings | None = None
 _mcp: FastMCP | None = None
 _registered_tools: list[str] = []
 _mcp_http_app: Any = None
+_auth_override: AuthProvider | None = None
+
+
+class _GatewayAuthBackend(AuthenticationBackend):
+    """Lazy Bearer backend so auth works after MCP routes are composed into FastAPI.
+
+    FastMCP wraps ``/mcp`` with ``RequireAuthMiddleware``, which expects
+    ``AuthenticationMiddleware`` to have populated ``scope["user"]``. Route
+    copying alone does not install that middleware on the parent app.
+    """
+
+    async def authenticate(self, conn: HTTPConnection):
+        provider = _auth_override
+        if provider is None and _mcp is not None:
+            provider = getattr(_mcp, "auth", None)
+        if provider is None:
+            return None
+        return await BearerAuthBackend(provider).authenticate(conn)
+
+
 
 
 def get_settings() -> GatewaySettings:
@@ -47,11 +72,12 @@ def get_mcp() -> FastMCP | None:
 
 def reset_settings_for_tests() -> None:
     """Clear cached settings / MCP state (test helper)."""
-    global _settings, _mcp, _registered_tools, _mcp_http_app
+    global _settings, _mcp, _registered_tools, _mcp_http_app, _auth_override
     _settings = None
     _mcp = None
     _registered_tools = []
     _mcp_http_app = None
+    _auth_override = None
 
 
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
@@ -71,16 +97,17 @@ def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
 async def lifespan(application: FastAPI):
     global _settings, _registered_tools, _mcp_http_app, _mcp
     configure_logging()
-    # Fail closed on missing GATEWAY_API_KEY / GATEWAY_BRIDGE_AUTHORIZATION.
+    # Fail closed on missing GitHub OAuth config / GATEWAY_BRIDGE_AUTHORIZATION.
     _settings = load_settings()
-    _mcp = create_mcp_server(_settings)
+    auth = _auth_override
+    _mcp = create_mcp_server(_settings, auth=auth)
     _mcp_http_app = _mcp.http_app(path="/mcp", transport="http")
     _attach_mcp_routes(application, _mcp_http_app)
     _registered_tools = await list_registered_tool_names(_mcp)
     logger.info(
         "HAL LegalAI Gateway starting phase=2 deployed_commit_sha=%s "
         "downstreams=%s registered_tools=%s health_timeout_seconds=%s "
-        "connect_timeout_seconds=%s read_timeout_seconds=%s",
+        "connect_timeout_seconds=%s read_timeout_seconds=%s inbound_auth=github_oauth",
         _settings.deployed_commit_sha,
         ",".join(item.key for item in _settings.downstreams),
         ",".join(_registered_tools),
@@ -97,23 +124,33 @@ async def lifespan(application: FastAPI):
     _mcp_http_app = None
 
 
-def create_app() -> FastAPI:
-    """Application factory used by uvicorn and tests."""
+def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
+    """Application factory used by uvicorn and tests.
+
+    ``auth_override`` is for tests only (inject a fixed token verifier). Production
+    always uses GitHub OAuth via settings.
+    """
+    global _auth_override
+    _auth_override = auth_override
+
     application = FastAPI(
         title="HAL LegalAI Gateway",
         description=(
             "Thin authenticated interface consolidation for LegalAI downstream "
             "MCP services. Phase 2 exposes namespaced case/storage/mission tools "
             "that forward to Bridge, Storage, artifact retrieval, and Mission "
-            "Control. Downstream business logic remains separately deployed."
+            "Control. Downstream business logic remains separately deployed. "
+            "Inbound /mcp uses GitHub OAuth for ChatGPT Business custom MCP."
         ),
         version="0.2.0",
         lifespan=lifespan,
     )
-    # Order: request IDs outermost, then MCP Bearer gate for /mcp only.
+    # Order: last added is outermost. Request IDs outer; auth populates scope
+    # for FastMCP RequireAuthMiddleware on /mcp; /health and /registry stay open.
+    application.add_middleware(AuthContextMiddleware)
     application.add_middleware(
-        GatewayAPIKeyMiddleware,
-        api_key_provider=lambda: get_settings().gateway_api_key,
+        AuthenticationMiddleware,
+        backend=_GatewayAuthBackend(),
     )
     application.add_middleware(RequestIdMiddleware)
 
@@ -132,6 +169,10 @@ def create_app() -> FastAPI:
                 "health": "/health",
                 "registry": "/registry",
                 "mcp": "/mcp",
+            },
+            "auth": {
+                "inbound": "github_oauth",
+                "downstream_bridge": "service_credential",
             },
             "registered_tools": list(_registered_tools),
         }
@@ -162,7 +203,7 @@ def create_app() -> FastAPI:
         Always returns HTTP 200 when the gateway process itself is up so a single
         unhealthy downstream cannot take the gateway (or unrelated capabilities)
         out of Railway rotation. Reports exact registered MCP tool names and the
-        Railway-provided commit SHA.
+        Railway-provided commit SHA. Never includes secrets.
         """
         settings = get_settings()
         tools = list(_registered_tools)
@@ -176,6 +217,10 @@ def create_app() -> FastAPI:
             request.state, "correlation_id", payload.get("correlation_id")
         )
         payload["deployed_commit_sha"] = settings.deployed_commit_sha
+        payload["auth"] = {
+            "inbound": "github_oauth",
+            "downstream_bridge": "service_credential",
+        }
         return JSONResponse(payload)
 
     return application

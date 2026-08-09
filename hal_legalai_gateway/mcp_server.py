@@ -6,8 +6,13 @@ import logging
 from typing import Any, Literal
 
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_http_request
+from fastmcp.server.auth import AuthProvider
+from fastmcp.server.dependencies import get_access_token
 
+from hal_legalai_gateway.auth import (
+    build_github_oauth_provider,
+    is_service_access_token,
+)
 from hal_legalai_gateway.config import GatewaySettings
 from hal_legalai_gateway.forwarding import (
     ToolBinding,
@@ -147,20 +152,46 @@ def bindings_from_registry(registry: GatewayRegistry) -> tuple[ToolBinding, ...]
     return DEFAULT_TOOL_BINDINGS
 
 
-def _incoming_headers() -> Any:
-    try:
-        return get_http_request().headers
-    except RuntimeError:
-        return {}
+def build_inbound_auth_provider(settings: GatewaySettings) -> AuthProvider:
+    """ChatGPT-compatible GitHub OAuth (same FastMCP pattern as the Bridge)."""
+    return build_github_oauth_provider(
+        client_id=settings.github_oauth_client_id,
+        client_secret=settings.github_oauth_client_secret,
+        public_url=settings.gateway_public_url,
+        jwt_signing_key=settings.jwt_signing_key,
+        redis_host=settings.redis_host,
+        redis_port=settings.redis_port,
+        storage_encryption_key=settings.storage_encryption_key,
+    )
 
 
-def create_mcp_server(settings: GatewaySettings) -> FastMCP:
+def _require_gateway_principal(settings: GatewaySettings) -> str | None:
+    """Return authorized GitHub login, or None when the caller is not allowed."""
+    token = get_access_token()
+    if token is None:
+        return None
+    if is_service_access_token(token):
+        # Inbound gateway auth is user GitHub OAuth only; service tokens are
+        # reserved for gateway→bridge and must not unlock the public /mcp surface.
+        return None
+    login = (token.claims or {}).get("login")
+    if login != settings.allowed_github_login:
+        return None
+    return str(login)
+
+
+def create_mcp_server(
+    settings: GatewaySettings,
+    *,
+    auth: AuthProvider | None = None,
+) -> FastMCP:
     """Build the gateway MCP server with thin forwarders.
 
-    Inbound Bearer auth is enforced by ``GatewayAPIKeyMiddleware`` on the parent
-    FastAPI app (not FastMCP OAuth middleware) so ``/mcp`` stays protected when
-    routes are composed into the gateway process.
+    Inbound auth is FastMCP ``GitHubProvider`` (ChatGPT Business custom MCP OAuth).
+    Downstream Bridge/Storage/Artifacts calls use the dedicated service credential
+    from settings — never the inbound OAuth session token.
     """
+    auth_provider = auth if auth is not None else build_inbound_auth_provider(settings)
     mcp = FastMCP(
         "HAL LegalAI Gateway",
         instructions=(
@@ -169,7 +200,7 @@ def create_mcp_server(settings: GatewaySettings) -> FastMCP:
             "artifact, and Mission Control MCP servers. No Case-00 generation, "
             "archive mutation, or mission execution logic runs inside the gateway."
         ),
-        auth=None,
+        auth=auth_provider,
         mask_error_details=True,
         stateless_http=True,
         json_response=True,
@@ -189,6 +220,19 @@ def register_forwarding_tools(
 
     async def _forward(gateway_tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         binding = by_name[gateway_tool]
+        if _require_gateway_principal(settings) is None:
+            return {
+                "ok": False,
+                "gateway_tool": gateway_tool,
+                "downstream_service": binding.downstream_service,
+                "downstream_tool": binding.downstream_tool,
+                "failure_stage": "auth",
+                "duration_ms": 0.0,
+                "error": {
+                    "message": "authenticated GitHub user is not authorized",
+                    "stage": "auth",
+                },
+            }
         try:
             downstream = settings.downstream_by_key(binding.downstream_service)
         except KeyError:
@@ -211,7 +255,6 @@ def register_forwarding_tools(
         }
         authorization = resolve_authorization_for_service(
             downstream_service=binding.downstream_service,
-            headers=_incoming_headers(),
             bridge_authorization=settings.bridge_authorization,
         )
         return await forward_mcp_tool(
@@ -223,6 +266,7 @@ def register_forwarding_tools(
             read_timeout_seconds=settings.read_timeout_seconds,
             mcp_path=settings.mcp_path,
             require_authorization=require_auth,
+            extra_secrets=settings.secret_values_for_redaction(),
         )
 
     # --- case ---

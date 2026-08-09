@@ -12,13 +12,13 @@ is copied into the gateway.
 
 | Surface | Purpose |
 | --- | --- |
-| `POST/GET /mcp` | Authenticated Streamable HTTP MCP endpoint (FastMCP) |
+| `POST/GET /mcp` | Authenticated Streamable HTTP MCP endpoint (FastMCP + GitHub OAuth) |
 | Namespaced tools | Settled `case.*`, `storage.*`, `mission.*` surface with thin forwarding |
 | `registry.json` | Machine-readable map of namespaces → downstream service IDs, URL env vars, health paths, and tool bindings |
 | `GET /registry` | Serve the registry plus resolved (non-secret) downstream URLs |
-| `GET /health` | Gateway liveness + **independent** downstream status; reports exact `RAILWAY_GIT_COMMIT_SHA` and **runtime registered tool names** |
+| `GET /health` | Gateway liveness + **independent** downstream status; reports exact `RAILWAY_GIT_COMMIT_SHA` and **runtime registered tool names** (no secrets) |
 | Request IDs | `X-Request-ID` / `X-Correlation-ID` middleware; every forwarded call returns correlation metadata |
-| Config validation | Fail closed on missing auth secrets, invalid timeouts, or non-http(s) URLs |
+| Config validation | Fail closed on missing OAuth/service secrets, invalid timeouts, or non-http(s) URLs |
 
 ## Settled tool surface (minimum)
 
@@ -38,25 +38,24 @@ Also exposed: Case-00 lifecycle (`case.submit_case00_q1`, `case.get_case00_q1_ru
 
 ## Authentication and forwarding
 
-**Inbound (required):** `Authorization: Bearer <GATEWAY_API_KEY>`
+**Inbound (required):** FastMCP `GitHubProvider` OAuth — the same ChatGPT Business
+custom MCP pattern as the Bridge. Write tools are never exposed unauthenticated.
+Missing GitHub OAuth configuration fails startup (fail closed). A static inbound
+`GATEWAY_API_KEY` is **not** used.
 
-Write tools are never exposed unauthenticated. Missing `GATEWAY_API_KEY` fails
-startup (fail closed).
-
-**Downstream Bridge / Storage / Artifacts:** GitHub OAuth on the Bridge MCP is
-**not compatible** with the gateway API key. After inbound auth succeeds, the
-gateway resolves Bridge-facing credentials as:
-
-1. Prefer caller `X-Downstream-Authorization` when present (validated caller
-   already holds a Bridge-compatible Bearer token), else
-2. Use service-to-service `GATEWAY_BRIDGE_AUTHORIZATION` (required at startup).
-
-Never forward the gateway API key to Bridge.
+**Downstream Bridge / Storage / Artifacts:** After inbound GitHub OAuth succeeds,
+the gateway authenticates to Bridge with a **dedicated non-expiring service
+credential** (`GATEWAY_BRIDGE_AUTHORIZATION`), which must match Bridge
+`BRIDGE_SERVICE_TOKEN`. The inbound user OAuth session token is **never**
+forwarded downstream (different audience; expires with the user session).
 
 **Downstream Mission Control:** The MCP connector authenticates to the Mission
 Control HTTP API with its own server-side `MISSION_CONTROL_API_KEY`. The gateway
-gates `mission.*` with `GATEWAY_API_KEY` only and does not put that Mission
+gates `mission.*` with inbound GitHub OAuth only and does not put that Mission
 Control key on the public wire.
+
+**Direct Bridge clients:** GitHub OAuth on the Bridge remains fully compatible
+during cutover. Service-token acceptance is additive via a composite verifier.
 
 ## Failure isolation and observability
 
@@ -70,6 +69,7 @@ Every forwarded call returns (and logs) at least:
 
 A failure in one namespace/tool does not cancel or poison other tools. Downstream
 health probes remain concurrent and independent (Phase 1 behavior preserved).
+Secrets are redacted from logs, error envelopes, and health payloads.
 
 ## Namespaces → downstreams
 
@@ -84,10 +84,19 @@ Streamable HTTP base (`SERVICE_MODE=mcp`), not only the REST API service.
 
 ## Configuration (Railway variables)
 
+### Gateway service
+
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `GATEWAY_API_KEY` | **yes** | — | Inbound Bearer for `/mcp` (fail closed) |
-| `GATEWAY_BRIDGE_AUTHORIZATION` | **yes** | — | Service-to-service Bearer for Bridge MCP (or rely on per-call `X-Downstream-Authorization`) |
+| `GITHUB_OAUTH_CLIENT_ID` | **yes** | — | Inbound GitHub OAuth client (ChatGPT custom MCP) |
+| `GITHUB_OAUTH_CLIENT_SECRET` | **yes** | — | Inbound GitHub OAuth secret (never log) |
+| `GATEWAY_PUBLIC_URL` | **yes** | — | Public `https://…` base URL for OAuth callbacks / metadata |
+| `JWT_SIGNING_KEY` | **yes** | — | FastMCP JWT signing key for inbound OAuth tokens |
+| `REDIS_HOST` | **yes** | — | Redis host for OAuth client storage (same pattern as Bridge) |
+| `REDIS_PORT` | no | `6379` | Redis port |
+| `STORAGE_ENCRYPTION_KEY` | **yes** | — | Fernet key for encrypted OAuth client storage |
+| `GATEWAY_BRIDGE_AUTHORIZATION` | **yes** | — | Dedicated service Bearer for Bridge/Storage/Artifacts; must match Bridge `BRIDGE_SERVICE_TOKEN`; **not** a user OAuth token |
+| `ALLOWED_GITHUB_LOGIN` | no | `nhpcorp35` | GitHub login allowed to invoke gateway tools |
 | `PORT` | no | `8080` | Listen port |
 | `RAILWAY_GIT_COMMIT_SHA` | no | `unknown` | Exact deployed SHA when Railway injects it |
 | `GATEWAY_HEALTH_TIMEOUT_SECONDS` | no | `5` | Per-probe timeout (`0.1`–`30`) |
@@ -99,6 +108,15 @@ Streamable HTTP base (`SERVICE_MODE=mcp`), not only the REST API service.
 | `GATEWAY_MISSION_CONTROL_URL` | no | production Mission Control URL | Absolute `http(s)` MCP base URL |
 | `GATEWAY_ARTIFACTS_URL` | no | same default as bridge | Independently replaceable |
 
+Retired: `GATEWAY_API_KEY` (static inbound key). Do not set it for ChatGPT Business OAuth.
+
+### Bridge service (cutover)
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `BRIDGE_SERVICE_TOKEN` | recommended for gateway | — | Non-expiring service credential accepted **in addition to** GitHub OAuth; value must match Gateway `GATEWAY_BRIDGE_AUTHORIZATION` (with or without `Bearer ` prefix) |
+| Existing GitHub OAuth / Redis / JWT vars | **yes** | — | Unchanged; direct Bridge OAuth clients keep working |
+
 ## Local run
 
 ```bash
@@ -107,8 +125,13 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cd ..
-export GATEWAY_API_KEY=dev-gateway-key
-export GATEWAY_BRIDGE_AUTHORIZATION='Bearer dev-bridge-token'
+export GITHUB_OAUTH_CLIENT_ID=...
+export GITHUB_OAUTH_CLIENT_SECRET=...
+export GATEWAY_PUBLIC_URL=http://localhost:8080
+export JWT_SIGNING_KEY=...
+export REDIS_HOST=127.0.0.1
+export STORAGE_ENCRYPTION_KEY=...   # Fernet key
+export GATEWAY_BRIDGE_AUTHORIZATION='Bearer dev-bridge-service-token'
 PYTHONPATH=. uvicorn hal_legalai_gateway.server:app --host 0.0.0.0 --port 8080
 ```
 
@@ -117,7 +140,7 @@ Smoke:
 ```bash
 curl -sS localhost:8080/health | python -m json.tool
 curl -sS localhost:8080/registry | python -m json.tool
-# MCP requires Authorization: Bearer $GATEWAY_API_KEY
+# MCP requires GitHub OAuth (ChatGPT custom MCP connection)
 ```
 
 ## Tests
@@ -125,7 +148,7 @@ curl -sS localhost:8080/registry | python -m json.tool
 From the repository root:
 
 ```bash
-python -m unittest tests.test_hal_legalai_gateway -v
+python -m unittest tests.test_hal_legalai_gateway tests.test_github_actions_bridge_service_auth -v
 ```
 
 ## Docker
@@ -134,7 +157,12 @@ python -m unittest tests.test_hal_legalai_gateway -v
 docker build -t hal-legalai-gateway ./hal_legalai_gateway
 docker run --rm -p 8080:8080 \
   -e RAILWAY_GIT_COMMIT_SHA="$(git rev-parse HEAD)" \
-  -e GATEWAY_API_KEY=... \
+  -e GITHUB_OAUTH_CLIENT_ID=... \
+  -e GITHUB_OAUTH_CLIENT_SECRET=... \
+  -e GATEWAY_PUBLIC_URL=https://... \
+  -e JWT_SIGNING_KEY=... \
+  -e REDIS_HOST=... \
+  -e STORAGE_ENCRYPTION_KEY=... \
   -e GATEWAY_BRIDGE_AUTHORIZATION=... \
   hal-legalai-gateway
 ```
@@ -148,12 +176,13 @@ This repository does **not** auto-create a new Railway service for the gateway.
 
 1. In the Railway project that hosts Mission Control / the bridge, **create a new service** (if not already present from Phase 1).
 2. Point the service root / watch path at `hal_legalai_gateway` (Dockerfile builder).
-3. Set **required** `GATEWAY_API_KEY` and `GATEWAY_BRIDGE_AUTHORIZATION`.
-4. Set `GATEWAY_*_URL` overrides as needed; ensure `GATEWAY_MISSION_CONTROL_URL` targets MCP mode.
-5. Confirm Railway injects `RAILWAY_GIT_COMMIT_SHA`.
-6. Expose public networking; health check path is `/health`.
-7. Verify `GET /health` shows `deployed_commit_sha`, `registered_tools` (exact runtime names), and independent `downstream.*` entries.
-8. Point ChatGPT / HAL MCP clients at `/mcp` with the gateway Bearer **only after** live verification. Do not retire existing plugins until that cutover is confirmed.
+3. Set **required** GitHub OAuth + Redis/JWT/Fernet vars and `GATEWAY_BRIDGE_AUTHORIZATION`.
+4. On the Bridge service, set matching `BRIDGE_SERVICE_TOKEN` (additive; keeps direct OAuth).
+5. Set `GATEWAY_*_URL` overrides as needed; ensure `GATEWAY_MISSION_CONTROL_URL` targets MCP mode.
+6. Confirm Railway injects `RAILWAY_GIT_COMMIT_SHA`.
+7. Expose public networking; health check path is `/health`.
+8. Verify `GET /health` shows `deployed_commit_sha`, `registered_tools`, `auth.inbound=github_oauth`, and independent `downstream.*` entries.
+9. Point ChatGPT Business custom MCP at the gateway `/mcp` OAuth URL **only after** live verification. Do not retire existing plugins until that cutover is confirmed. This change does not claim live cutover.
 
 ## Non-goals
 

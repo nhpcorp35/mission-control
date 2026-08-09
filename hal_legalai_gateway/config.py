@@ -6,6 +6,19 @@ import os
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from hal_legalai_gateway.auth import (
+    ALLOWED_GITHUB_LOGIN_ENV,
+    BRIDGE_AUTHORIZATION_ENV,
+    DEFAULT_ALLOWED_GITHUB_LOGIN,
+    GATEWAY_PUBLIC_URL_ENV,
+    GITHUB_OAUTH_CLIENT_ID_ENV,
+    GITHUB_OAUTH_CLIENT_SECRET_ENV,
+    JWT_SIGNING_KEY_ENV,
+    REDIS_HOST_ENV,
+    REDIS_PORT_ENV,
+    STORAGE_ENCRYPTION_KEY_ENV,
+    normalize_bearer_token,
+)
 from hal_legalai_gateway.registry import GatewayRegistry, load_registry
 
 DEPLOYED_COMMIT_SHA_ENV = "RAILWAY_GIT_COMMIT_SHA"
@@ -24,10 +37,9 @@ MAX_READ_TIMEOUT_SECONDS = 120.0
 CONNECT_TIMEOUT_ENV = "GATEWAY_CONNECT_TIMEOUT_SECONDS"
 READ_TIMEOUT_ENV = "GATEWAY_READ_TIMEOUT_SECONDS"
 
-GATEWAY_API_KEY_ENV = "GATEWAY_API_KEY"
-BRIDGE_AUTHORIZATION_ENV = "GATEWAY_BRIDGE_AUTHORIZATION"
 MCP_PATH_ENV = "GATEWAY_MCP_PATH"
 DEFAULT_MCP_PATH = "/mcp"
+DEFAULT_REDIS_PORT = 6379
 
 
 @dataclass(frozen=True)
@@ -53,8 +65,15 @@ class GatewaySettings:
     connect_timeout_seconds: float
     read_timeout_seconds: float
     deployed_commit_sha: str
-    gateway_api_key: str
+    github_oauth_client_id: str
+    github_oauth_client_secret: str
+    gateway_public_url: str
+    jwt_signing_key: str
+    redis_host: str
+    redis_port: int
+    storage_encryption_key: str
     bridge_authorization: str
+    allowed_github_login: str
     mcp_path: str
 
     def downstream_by_key(self, key: str) -> ResolvedDownstream:
@@ -62,6 +81,20 @@ class GatewaySettings:
             if item.key == key:
                 return item
         raise KeyError(key)
+
+    def secret_values_for_redaction(self) -> tuple[str, ...]:
+        """Return configured secrets that must never appear in logs/errors/health."""
+        return tuple(
+            value
+            for value in (
+                self.github_oauth_client_secret,
+                self.jwt_signing_key,
+                self.storage_encryption_key,
+                self.bridge_authorization,
+                normalize_bearer_token(self.bridge_authorization) or "",
+            )
+            if value
+        )
 
 
 def get_deployed_commit_sha() -> str:
@@ -163,6 +196,18 @@ def _parse_mcp_path(raw: str | None) -> str:
     return value.rstrip("/") or "/"
 
 
+def _parse_redis_port(raw: str | None) -> int:
+    if raw is None or not str(raw).strip():
+        return DEFAULT_REDIS_PORT
+    try:
+        port = int(str(raw).strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{REDIS_PORT_ENV} must be an integer") from exc
+    if port < 1 or port > 65535:
+        raise RuntimeError(f"{REDIS_PORT_ENV} must be between 1 and 65535")
+    return port
+
+
 def load_settings(
     *,
     environ: dict[str, str] | None = None,
@@ -170,10 +215,10 @@ def load_settings(
 ) -> GatewaySettings:
     """Load registry + env, validate, and resolve downstream URLs.
 
-    Fail closed when inbound API key or Bridge service authorization is missing.
-    Bridge GitHub OAuth is not compatible with GATEWAY_API_KEY, so explicit
-    GATEWAY_BRIDGE_AUTHORIZATION (or per-call X-Downstream-Authorization) is
-    required for case/storage/artifacts forwarding.
+    Fail closed when inbound GitHub OAuth configuration or the dedicated
+    Bridge service authorization is missing. ``GATEWAY_BRIDGE_AUTHORIZATION``
+    must be a non-expiring service credential that matches Bridge
+    ``BRIDGE_SERVICE_TOKEN`` — never a copied user OAuth bearer.
     """
     env = environ if environ is not None else dict(os.environ)
     loaded_registry = registry or load_registry()
@@ -197,8 +242,28 @@ def load_settings(
             f"{READ_TIMEOUT_ENV} must be >= {CONNECT_TIMEOUT_ENV}"
         )
 
-    gateway_api_key = _require_secret(env, GATEWAY_API_KEY_ENV)
+    github_oauth_client_id = _require_secret(env, GITHUB_OAUTH_CLIENT_ID_ENV)
+    github_oauth_client_secret = _require_secret(
+        env, GITHUB_OAUTH_CLIENT_SECRET_ENV
+    )
+    gateway_public_url = validate_http_base_url(
+        _require_secret(env, GATEWAY_PUBLIC_URL_ENV),
+        env_name=GATEWAY_PUBLIC_URL_ENV,
+    )
+    jwt_signing_key = _require_secret(env, JWT_SIGNING_KEY_ENV)
+    redis_host = _require_secret(env, REDIS_HOST_ENV)
+    redis_port = _parse_redis_port(env.get(REDIS_PORT_ENV))
+    storage_encryption_key = _require_secret(env, STORAGE_ENCRYPTION_KEY_ENV)
     bridge_authorization = _require_secret(env, BRIDGE_AUTHORIZATION_ENV)
+    if normalize_bearer_token(bridge_authorization) is None:
+        raise RuntimeError(
+            f"{BRIDGE_AUTHORIZATION_ENV} is required (fail-closed): "
+            "set a dedicated non-expiring service credential"
+        )
+    allowed_github_login = (
+        (env.get(ALLOWED_GITHUB_LOGIN_ENV) or "").strip()
+        or DEFAULT_ALLOWED_GITHUB_LOGIN
+    )
     mcp_path = _parse_mcp_path(env.get(MCP_PATH_ENV))
 
     downstreams: list[ResolvedDownstream] = []
@@ -237,7 +302,14 @@ def load_settings(
         connect_timeout_seconds=connect_timeout,
         read_timeout_seconds=read_timeout,
         deployed_commit_sha=deployed,
-        gateway_api_key=gateway_api_key,
+        github_oauth_client_id=github_oauth_client_id,
+        github_oauth_client_secret=github_oauth_client_secret,
+        gateway_public_url=gateway_public_url,
+        jwt_signing_key=jwt_signing_key,
+        redis_host=redis_host,
+        redis_port=redis_port,
+        storage_encryption_key=storage_encryption_key,
         bridge_authorization=bridge_authorization,
+        allowed_github_login=allowed_github_login,
         mcp_path=mcp_path,
     )
