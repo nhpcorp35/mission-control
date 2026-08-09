@@ -13,6 +13,8 @@ Supported two-surface design (no FastMCP 3 migration):
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import secrets
 from typing import Any
 
@@ -26,6 +28,8 @@ BRIDGE_SERVICE_TOKEN_ENV = "BRIDGE_SERVICE_TOKEN"
 DEFAULT_PUBLIC_MCP_PATH = "/mcp"
 DEFAULT_SERVICE_MCP_PATH = "/mcp/service"
 
+logger = logging.getLogger(__name__)
+
 
 def normalize_bearer_token(value: str | None) -> str | None:
     if value is None:
@@ -36,6 +40,36 @@ def normalize_bearer_token(value: str | None) -> str | None:
     if cleaned.lower().startswith("bearer "):
         cleaned = cleaned[7:].strip()
     return cleaned or None
+
+
+def token_fingerprint(value: str) -> str:
+    """Short SHA-256 fingerprint for diagnostics; never log raw token values."""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def _log_service_verify(
+    *,
+    accepted: bool,
+    missing_bearer: bool,
+    provided_len: int,
+    expected_len: int,
+    fingerprint_match: bool,
+    provided_fp: str | None = None,
+    expected_fp: str | None = None,
+) -> None:
+    """Secret-safe verifier boundary diagnostics (booleans/lengths/fingerprints)."""
+    logger.warning(
+        "service_token_verify accepted=%s missing_bearer=%s provided_len=%s "
+        "expected_len=%s fingerprint_match=%s provided_fp=%s expected_fp=%s",
+        accepted,
+        missing_bearer,
+        provided_len,
+        expected_len,
+        fingerprint_match,
+        provided_fp or "-",
+        expected_fp or "-",
+    )
 
 
 class ServiceTokenVerifier(TokenVerifier):
@@ -58,10 +92,30 @@ class ServiceTokenVerifier(TokenVerifier):
             raise ValueError("service token must be non-empty")
         self._expected = expected
         self._client_id = client_id
+        self._expected_fp = token_fingerprint(expected)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         provided = normalize_bearer_token(token)
-        if not provided or not secrets.compare_digest(provided, self._expected):
+        if not provided:
+            _log_service_verify(
+                accepted=False,
+                missing_bearer=True,
+                provided_len=0,
+                expected_len=len(self._expected),
+                fingerprint_match=False,
+                expected_fp=self._expected_fp,
+            )
+            return None
+        if not secrets.compare_digest(provided, self._expected):
+            _log_service_verify(
+                accepted=False,
+                missing_bearer=False,
+                provided_len=len(provided),
+                expected_len=len(self._expected),
+                fingerprint_match=False,
+                provided_fp=token_fingerprint(provided),
+                expected_fp=self._expected_fp,
+            )
             return None
         return AccessToken(
             token=provided,
@@ -82,6 +136,16 @@ class FailClosedTokenVerifier(TokenVerifier):
         super().__init__(required_scopes=None)
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        provided = normalize_bearer_token(token)
+        missing = not provided
+        _log_service_verify(
+            accepted=False,
+            missing_bearer=missing,
+            provided_len=0 if missing else len(provided or ""),
+            expected_len=0,
+            fingerprint_match=False,
+            provided_fp=None if missing else token_fingerprint(provided or ""),
+        )
         return None
 
 

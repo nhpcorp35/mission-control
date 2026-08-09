@@ -123,9 +123,13 @@ Retired: `GATEWAY_API_KEY` (static inbound key). Do not set it for ChatGPT Busin
 | Existing GitHub OAuth / Redis / JWT vars | **yes** | — | Unchanged; direct Bridge OAuth clients keep using public `/mcp` |
 
 **Verify after deploy:** Gateway health + a live `storage.list_inventory` call
-should reach Bridge `/mcp/service` with the service bearer. Public `/mcp` must
-still expose GitHub OAuth discovery. Missing/invalid service tokens must return
-401 on `/mcp/service` without leaking credentials.
+should reach Bridge `/mcp/service` with the service bearer delivered via FastMCP
+`StreamableHttpTransport(auth=<raw normalized token>)` (not a manual
+`Authorization` header). Public `/mcp` must still expose GitHub OAuth discovery.
+Missing/invalid service tokens must return 401 on `/mcp/service` without leaking
+credentials. Bridge verifier logs should show `missing_bearer` vs length/fingerprint
+mismatch only — never rotate synchronized credentials again solely because of a
+401 after both services already share the same value.
 
 ## Local run
 

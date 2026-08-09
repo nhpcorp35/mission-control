@@ -67,11 +67,20 @@ When `BRIDGE_SERVICE_TOKEN` is unset, `/mcp/service` rejects all credentials
 ### Railway / cutover verification
 
 1. Set `BRIDGE_SERVICE_TOKEN` on the Bridge service (same value as Gateway
-   `GATEWAY_BRIDGE_AUTHORIZATION`; no new secret type required).
+   `GATEWAY_BRIDGE_AUTHORIZATION`; no new secret type required). **Do not
+   rotate again** if both services were already redeployed with the same
+   synchronized 96-hex value — a 401 after that is a delivery bug, not
+   credential drift.
 2. Ensure Gateway `GATEWAY_MCP_PATH` is `/mcp/service` (the deterministic
    default) for Bridge / Storage / Artifacts forwarding.
-3. Confirm `GET /health` still works without auth.
-4. Confirm public OAuth clients still use `/mcp` only.
-5. Confirm Gateway `storage.list_inventory` succeeds through `/mcp/service`.
-6. Confirm missing/invalid service bearer returns HTTP 401 on `/mcp/service`.
-7. Confirm logs and error bodies never echo the service token.
+3. Confirm Gateway forwarding uses FastMCP `StreamableHttpTransport(auth=raw_token)`
+   (not a manually injected `Authorization` header). Inbound GitHub OAuth must
+   never be forwarded downstream.
+4. Confirm `GET /health` still works without auth.
+5. Confirm public OAuth clients still use `/mcp` only.
+6. Confirm Gateway `storage.list_inventory` succeeds through `/mcp/service`.
+7. Confirm missing/invalid service bearer returns HTTP 401 on `/mcp/service`.
+8. Confirm Bridge verifier logs distinguish `missing_bearer=True` vs mismatch
+   (`provided_len` / `expected_len` / short SHA fingerprint only — never raw
+   tokens).
+9. Confirm logs and error bodies never echo the service token.

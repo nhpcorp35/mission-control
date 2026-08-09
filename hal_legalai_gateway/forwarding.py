@@ -12,6 +12,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from hal_legalai_gateway.auth import (
+    normalize_bearer_token,
     redact_secrets,
     service_authorization_header,
 )
@@ -158,6 +159,7 @@ async def forward_mcp_tool(
     mcp_path: str = "/mcp/service",
     require_authorization: bool = True,
     client_factory: Callable[[], Client] | None = None,
+    httpx_client_factory: Callable[..., httpx.AsyncClient] | None = None,
     extra_secrets: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Call one downstream MCP tool and return a structured envelope.
@@ -165,6 +167,10 @@ async def forward_mcp_tool(
     Never raises across the isolation boundary — failures become ``ok=false``
     with an exact ``failure_stage``. Credentials and private payloads are not
     copied into error strings.
+
+    Service credentials are passed via StreamableHttpTransport ``auth=`` (raw
+    token → FastMCP BearerAuth). ``httpx_client_factory`` may be overridden in
+    tests (e.g. ASGI transport) without bypassing that auth path.
     """
     started = time.perf_counter()
     request_id = get_request_id()
@@ -217,15 +223,20 @@ async def forward_mcp_tool(
             },
         )
 
+    # Correlation headers only — never inject Authorization manually.
+    # FastMCP 2.x StreamableHttpTransport accepts auth=str → BearerAuth(raw
+    # token). Manual Authorization headers can be overwritten or doubled when
+    # get_http_headers() merges inbound user OAuth into the outbound client.
     headers: dict[str, str] = {
         "Accept": "application/json, text/event-stream",
     }
-    if authorization:
-        headers["Authorization"] = authorization
     if request_id:
         headers["X-Request-ID"] = request_id
     if correlation_id:
         headers["X-Correlation-ID"] = correlation_id
+
+    # Raw token only; BearerAuth prefixes "Bearer ". Never forward user OAuth.
+    service_token = normalize_bearer_token(authorization)
 
     url = mcp_endpoint_url(base_url, mcp_path)
 
@@ -233,13 +244,15 @@ async def forward_mcp_tool(
         if client_factory is not None:
             client = client_factory()
         else:
+            factory = httpx_client_factory or _httpx_factory(
+                connect_timeout=connect_timeout_seconds,
+                read_timeout=read_timeout_seconds,
+            )
             transport = StreamableHttpTransport(
                 url,
                 headers=headers,
-                httpx_client_factory=_httpx_factory(
-                    connect_timeout=connect_timeout_seconds,
-                    read_timeout=read_timeout_seconds,
-                ),
+                auth=service_token,
+                httpx_client_factory=factory,
             )
             client = Client(transport, timeout=read_timeout_seconds)
 

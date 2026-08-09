@@ -154,6 +154,38 @@ class ServiceAuthUnitTests(unittest.TestCase):
 
         self.assertIsNone(asyncio.run(_run()))
 
+    def test_verifier_diagnostics_distinguish_missing_vs_mismatch(self) -> None:
+        from github_actions_bridge.service_auth import token_fingerprint
+
+        verifier = ServiceTokenVerifier(SERVICE_TOKEN)
+        buffer = io.StringIO()
+        handler = logging.StreamHandler(buffer)
+        logger = logging.getLogger("github_actions_bridge.service_auth")
+        logger.addHandler(handler)
+        prev_level = logger.level
+        logger.setLevel(logging.WARNING)
+        try:
+
+            async def _missing():
+                return await verifier.verify_token("")
+
+            async def _mismatch():
+                return await verifier.verify_token("wrong-token-value")
+
+            self.assertIsNone(asyncio.run(_missing()))
+            self.assertIsNone(asyncio.run(_mismatch()))
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(prev_level)
+
+        logs = buffer.getvalue()
+        self.assertIn("missing_bearer=True", logs)
+        self.assertIn("missing_bearer=False", logs)
+        self.assertIn("fingerprint_match=False", logs)
+        self.assertIn(f"expected_fp={token_fingerprint(SERVICE_TOKEN)}", logs)
+        self.assertNotIn(SERVICE_TOKEN, logs)
+        self.assertNotIn("wrong-token-value", logs)
+
     def test_build_service_auth_fail_closed_when_unset(self) -> None:
         provider = build_service_auth_provider(None)
         self.assertIsInstance(provider, FailClosedTokenVerifier)
@@ -315,24 +347,132 @@ class BridgeServiceFailClosedTests(unittest.TestCase):
             self.assertEqual(init.status_code, 401)
 
 
+class StreamableHttpTransportServiceAuthIntegrationTests(unittest.TestCase):
+    """Production-path: real StreamableHttpTransport auth= against Bridge ASGI.
+
+    Proves matching service tokens succeed through initialize/list/call and
+    invalid/missing tokens fail with 401. Header-mock assertions alone are not
+    enough — this drives the FastMCP 2.x client transport end-to-end.
+    """
+
+    def _asgi_httpx_factory(self, app):
+        import httpx
+
+        def factory(**kwargs):
+            # Drop caller transport/base_url so ASGI wins.
+            kwargs.pop("transport", None)
+            kwargs.pop("base_url", None)
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                **kwargs,
+            )
+
+        return factory
+
+    def test_matching_token_initialize_list_call_via_transport_auth(self) -> None:
+        from fastmcp import Client
+        from fastmcp.client.transports import StreamableHttpTransport
+
+        app = _build_test_bridge_app()
+        # TestClient enters FastMCP/Starlette lifespan (session manager task group).
+        with TestClient(app):
+            transport = StreamableHttpTransport(
+                f"http://test{DEFAULT_SERVICE_MCP_PATH}",
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "X-Request-ID": "req-svc-auth-1",
+                    "X-Correlation-ID": "corr-svc-auth-1",
+                },
+                auth=SERVICE_TOKEN,  # raw token — BearerAuth prefixes Bearer
+                httpx_client_factory=self._asgi_httpx_factory(app),
+            )
+
+            async def _run():
+                async with Client(transport, timeout=10.0) as client:
+                    tools = await client.list_tools()
+                    names = [t.name for t in tools]
+                    result = await client.call_tool(
+                        "list_case00_storage",
+                        {"category": "all", "max_keys": 5},
+                        raise_on_error=True,
+                    )
+                    return names, result
+
+            names, result = asyncio.run(_run())
+        self.assertIn("list_case00_storage", names)
+        data = getattr(result, "data", None)
+        if data is None:
+            data = getattr(result, "structured_content", None)
+        self.assertIsNotNone(data)
+        self.assertTrue(data.get("ok"))
+        self.assertNotIn(SERVICE_TOKEN, str(data))
+
+    def test_invalid_token_rejected_via_transport_auth(self) -> None:
+        from fastmcp import Client
+        from fastmcp.client.transports import StreamableHttpTransport
+
+        app = _build_test_bridge_app()
+        with TestClient(app):
+            transport = StreamableHttpTransport(
+                f"http://test{DEFAULT_SERVICE_MCP_PATH}",
+                headers={"Accept": "application/json, text/event-stream"},
+                auth="definitely-not-the-service-token",
+                httpx_client_factory=self._asgi_httpx_factory(app),
+            )
+
+            async def _run():
+                async with Client(transport, timeout=10.0) as client:
+                    await client.list_tools()
+
+            with self.assertRaises(Exception) as ctx:
+                asyncio.run(_run())
+        text = str(ctx.exception).lower()
+        self.assertTrue(
+            "401" in text or "unauthorized" in text or "auth" in text,
+            msg=f"expected 401/auth failure, got: {ctx.exception!r}",
+        )
+        self.assertNotIn(SERVICE_TOKEN, str(ctx.exception))
+
+    def test_missing_token_rejected_via_transport(self) -> None:
+        from fastmcp import Client
+        from fastmcp.client.transports import StreamableHttpTransport
+
+        app = _build_test_bridge_app()
+        with TestClient(app):
+            transport = StreamableHttpTransport(
+                f"http://test{DEFAULT_SERVICE_MCP_PATH}",
+                headers={"Accept": "application/json, text/event-stream"},
+                auth=None,
+                httpx_client_factory=self._asgi_httpx_factory(app),
+            )
+
+            async def _run():
+                async with Client(transport, timeout=10.0) as client:
+                    await client.list_tools()
+
+            with self.assertRaises(Exception) as ctx:
+                asyncio.run(_run())
+        text = str(ctx.exception).lower()
+        self.assertTrue(
+            "401" in text or "unauthorized" in text or "auth" in text,
+            msg=f"expected 401/auth failure, got: {ctx.exception!r}",
+        )
+
+
 class GatewayStorageInventoryViaServicePathTests(unittest.TestCase):
     """Gateway storage.list_inventory must target the service-only MCP path."""
 
-    def test_forward_uses_service_path_and_succeeds(self) -> None:
+    def test_forward_uses_transport_auth_not_manual_authorization_header(self) -> None:
         from hal_legalai_gateway.forwarding import (
             ToolBinding,
             forward_mcp_tool,
             mcp_endpoint_url,
         )
         from github_actions_bridge.service_auth import DEFAULT_SERVICE_MCP_PATH
+        import httpx
 
         app = _build_test_bridge_app()
-        # Drive the ASGI app in-process via httpx ASGI transport through a
-        # real Streamable HTTP client against /mcp/service.
-        import httpx
-        from fastmcp import Client
-        from fastmcp.client.transports import StreamableHttpTransport
-
         binding = ToolBinding(
             gateway_tool="storage.list_inventory",
             namespace="storage",
@@ -340,28 +480,23 @@ class GatewayStorageInventoryViaServicePathTests(unittest.TestCase):
             downstream_tool="list_case00_storage",
         )
 
+        def asgi_factory(**kwargs):
+            kwargs.pop("transport", None)
+            kwargs.pop("base_url", None)
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                **kwargs,
+            )
+
         log_buffer = io.StringIO()
         handler = logging.StreamHandler(log_buffer)
         logger = logging.getLogger("hal_legalai_gateway.forwarding")
         logger.addHandler(handler)
         try:
-            with TestClient(app) as test_client:
-                # Use the in-process ASGI app: wrap TestClient transport.
-                def client_factory():
-                    transport = StreamableHttpTransport(
-                        f"http://test{DEFAULT_SERVICE_MCP_PATH}",
-                        headers={
-                            "Authorization": f"Bearer {SERVICE_TOKEN}",
-                            "Accept": "application/json, text/event-stream",
-                        },
-                        httpx_client_factory=lambda **kwargs: httpx.AsyncClient(
-                            transport=httpx.ASGITransport(app=app),
-                            base_url="http://test",
-                            **kwargs,
-                        ),
-                    )
-                    return Client(transport, timeout=10.0)
-
+            with TestClient(app):
+                # Production path: StreamableHttpTransport(auth=raw_token) inside
+                # forward_mcp_tool — no client_factory bypass, no manual Authorization.
                 result = asyncio.run(
                     forward_mcp_tool(
                         binding=binding,
@@ -371,11 +506,10 @@ class GatewayStorageInventoryViaServicePathTests(unittest.TestCase):
                         connect_timeout_seconds=2.0,
                         read_timeout_seconds=5.0,
                         mcp_path=DEFAULT_SERVICE_MCP_PATH,
-                        client_factory=client_factory,
+                        httpx_client_factory=asgi_factory,
                         extra_secrets=(SERVICE_TOKEN,),
                     )
                 )
-                _ = test_client  # keep pattern explicit
         finally:
             logger.removeHandler(handler)
 

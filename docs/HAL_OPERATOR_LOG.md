@@ -1,5 +1,63 @@
 # HAL Operator Log
 
+## 2026-08-09 — FastMCP Gateway→Bridge bearer delivery (`auth=`)
+
+### Objective
+
+Gateway→Bridge `POST /mcp/service` returned 401 after synchronized
+`GATEWAY_BRIDGE_AUTHORIZATION` / `BRIDGE_SERVICE_TOKEN` rotation (same 96-hex
+value on both services). Evidence: request IDs
+`98037d1d-a575-4cad-976b-99e309250fe1` and
+`cd343573-ec88-4725-8cfd-9af7b77c50be`. Live commit before fix:
+`5ecedd8aee4b5b7ee232799ffa63c10c81feedde`.
+
+### Root cause
+
+Gateway forwarding injected `Authorization` manually into
+`StreamableHttpTransport(headers=...)`. FastMCP 2.x merges inbound request
+headers (including user OAuth `authorization`) into the outbound client and
+supports `auth=` → `BearerAuth(raw_token)`. Manual header injection can be
+overwritten or mishandled; do not blame credential caching after a synchronized
+redeploy.
+
+### Implementation
+
+- `hal_legalai_gateway/forwarding.py`: pass raw normalized service token via
+  `StreamableHttpTransport(auth=...)`; keep `X-Request-ID` /
+  `X-Correlation-ID` (and Accept) only — never forward inbound user OAuth.
+- `github_actions_bridge/service_auth.py`: secret-safe verifier diagnostics
+  (`missing_bearer`, lengths, short SHA fingerprint).
+- Production-path integration tests drive real `StreamableHttpTransport` against
+  the composed Bridge ASGI app (matching token initialize/list/call; invalid /
+  missing → 401).
+
+### Tests executed (this mission; no-git constraints)
+
+```text
+PYTHONPATH=. python -m unittest \
+  tests.test_github_actions_bridge_service_auth \
+  tests.test_hal_legalai_gateway \
+  -v
+# Ran 62 tests — OK
+```
+
+Commit/push to `main` was **not** performed here (mission constraints forbid Git).
+Exact production SHA will be whatever lands on `main` after an operator push.
+
+### Deployment verification (after commit/push + Railway redeploy)
+
+1. Do **not** rotate service credentials again if both env vars already match.
+2. Confirm Gateway + Bridge redeploy to the fix SHA (`RAILWAY_GIT_COMMIT_SHA`).
+3. Call Gateway `storage.list_inventory` → Bridge `/mcp/service` must succeed.
+4. Missing/invalid bearer must still 401; verifier logs show `missing_bearer` vs
+   fingerprint mismatch without token values.
+5. Public `/mcp` GitHub OAuth discovery unchanged.
+
+### Next Objective
+
+Operator commit/push to `main` (blocked in this mission run by no-git
+constraints), then Railway redeploy and live `storage.list_inventory` check.
+
 ## 2026-08-08 — Explicit repository routing (LegalAI vs Mission Control)
 
 ### Objective
