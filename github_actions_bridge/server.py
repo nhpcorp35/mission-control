@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
 import time
 import uuid
 import zipfile
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 import boto3
 import httpx
@@ -29,6 +30,60 @@ from storage_policy import (
     inventory_prefix,
     map_archive_put_precondition_failure,
 )
+
+# Explicit deployment provenance only — never infer or fabricate a SHA.
+DEPLOYED_COMMIT_SHA_ENV = "RAILWAY_GIT_COMMIT_SHA"
+UNKNOWN_DEPLOYED_COMMIT_SHA = "unknown"
+
+# Minimum production tool set. Subset check stays tolerant of harmless additions.
+REQUIRED_PRODUCTION_TOOLS = frozenset(
+    {
+        "submit_run",
+        "get_run",
+        "cancel_run",
+        "get_artifacts",
+        "submit_case00_q1",
+        "get_case00_q1_run",
+        "cancel_case00_q1_run",
+        "get_case00_q1_artifacts",
+        "get_case_artifact",
+        "list_case00_storage",
+        "archive_case00_attorney_feedback",
+        "archive_case00_review_packet",
+    }
+)
+
+
+def get_deployed_commit_sha() -> str:
+    """Return the explicit deployment commit SHA, or a safe unknown fallback."""
+    value = (os.environ.get(DEPLOYED_COMMIT_SHA_ENV) or "").strip()
+    return value if value else UNKNOWN_DEPLOYED_COMMIT_SHA
+
+
+def missing_required_production_tools(registered: Iterable[str]) -> list[str]:
+    """Return sorted required tool names absent from the registered set."""
+    return sorted(REQUIRED_PRODUCTION_TOOLS - set(registered))
+
+
+async def list_registered_tool_names() -> list[str]:
+    """Exact sorted tool names from the running FastMCP instance (supported API)."""
+    tools = await mcp.get_tools()
+    return sorted(tools)
+
+
+def assert_required_production_tools(registered: Iterable[str]) -> None:
+    """Fail closed when any required production tool is missing."""
+    missing = missing_required_production_tools(registered)
+    if missing:
+        raise RuntimeError(
+            "HAL GitHub Actions Bridge refused to start: required production "
+            f"MCP tools are not registered: {', '.join(missing)}"
+        )
+
+
+async def validate_required_production_tools() -> None:
+    """Preflight: ensure required production tools are registered before serving."""
+    assert_required_production_tools(await list_registered_tool_names())
 
 
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "nhpcorp35/legal-ai")
@@ -722,10 +777,19 @@ async def get_case_artifact(
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request: Request) -> JSONResponse:
-    return JSONResponse({"ok": True, "service": "hal-github-actions-bridge", "time": int(time.time())})
+    return JSONResponse(
+        {
+            "ok": True,
+            "service": "hal-github-actions-bridge",
+            "deployed_commit_sha": get_deployed_commit_sha(),
+            "registered_tools": await list_registered_tool_names(),
+            "time": int(time.time()),
+        }
+    )
 
 
 def main() -> None:
+    asyncio.run(validate_required_production_tools())
     mcp.run(
         transport="http",
         host="0.0.0.0",

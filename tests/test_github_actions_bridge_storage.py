@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
+import os
+import sys
 import unittest
 import zipfile
+from pathlib import Path
+from unittest import mock
+
+from cryptography.fernet import Fernet
 
 from github_actions_bridge.storage_policy import (
     CASE00_PREFIXES,
@@ -20,6 +27,28 @@ from github_actions_bridge.storage_policy import (
     normalize_review_packet_recipient,
     validate_docx_bytes,
 )
+
+_BRIDGE_DIR = Path(__file__).resolve().parent.parent / "github_actions_bridge"
+_BRIDGE_SERVER_ENV = {
+    "GITHUB_OAUTH_CLIENT_ID": "test-client-id",
+    "GITHUB_OAUTH_CLIENT_SECRET": "test-client-secret",
+    "REDIS_HOST": "127.0.0.1",
+    "REDIS_PORT": "6379",
+    "STORAGE_ENCRYPTION_KEY": Fernet.generate_key().decode(),
+    "JWT_SIGNING_KEY": "test-jwt-signing-key-for-bridge",
+}
+
+
+def _import_bridge_server():
+    """Load server the same way the container does (sibling storage_policy import)."""
+    for key, value in _BRIDGE_SERVER_ENV.items():
+        os.environ.setdefault(key, value)
+    bridge_dir = str(_BRIDGE_DIR)
+    if bridge_dir not in sys.path:
+        sys.path.insert(0, bridge_dir)
+    import server as bridge_server
+
+    return bridge_server
 
 
 def _minimal_docx_bytes(*, document_xml: bool = True) -> bytes:
@@ -302,6 +331,92 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
                 http_status_code=500,
             )
         )
+
+
+class BridgeOperationalIntegrityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = _import_bridge_server()
+
+    def test_deployed_commit_sha_prefers_explicit_env(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {self.server.DEPLOYED_COMMIT_SHA_ENV: "abc123def456"},
+            clear=False,
+        ):
+            self.assertEqual(self.server.get_deployed_commit_sha(), "abc123def456")
+
+    def test_deployed_commit_sha_unknown_without_explicit_env(self) -> None:
+        env = os.environ.copy()
+        env.pop(self.server.DEPLOYED_COMMIT_SHA_ENV, None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                self.server.get_deployed_commit_sha(),
+                self.server.UNKNOWN_DEPLOYED_COMMIT_SHA,
+            )
+
+    def test_deployed_commit_sha_blank_env_is_unknown(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {self.server.DEPLOYED_COMMIT_SHA_ENV: "  "},
+            clear=False,
+        ):
+            self.assertEqual(
+                self.server.get_deployed_commit_sha(),
+                self.server.UNKNOWN_DEPLOYED_COMMIT_SHA,
+            )
+
+    def test_required_tools_include_archive_review_packet(self) -> None:
+        self.assertIn(
+            "archive_case00_review_packet",
+            self.server.REQUIRED_PRODUCTION_TOOLS,
+        )
+
+    def test_missing_required_tools_detection(self) -> None:
+        registered = set(self.server.REQUIRED_PRODUCTION_TOOLS) - {
+            "archive_case00_review_packet"
+        }
+        self.assertEqual(
+            self.server.missing_required_production_tools(registered),
+            ["archive_case00_review_packet"],
+        )
+        self.server.assert_required_production_tools(
+            self.server.REQUIRED_PRODUCTION_TOOLS | {"harmless_extra_tool"}
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self.server.assert_required_production_tools(registered)
+        self.assertIn("archive_case00_review_packet", str(ctx.exception))
+
+    def test_registered_tools_match_fastmcp_supported_api(self) -> None:
+        names = asyncio.run(self.server.list_registered_tool_names())
+        self.assertEqual(names, sorted(names))
+        self.assertTrue(
+            self.server.REQUIRED_PRODUCTION_TOOLS.issubset(names),
+            msg=f"missing={self.server.missing_required_production_tools(names)}",
+        )
+        asyncio.run(self.server.validate_required_production_tools())
+
+    def test_health_reports_commit_sha_and_sorted_tools(self) -> None:
+        expected_sha = "deadbeefcafebabe0123456789abcdef01234567"
+        with mock.patch.dict(
+            os.environ,
+            {self.server.DEPLOYED_COMMIT_SHA_ENV: expected_sha},
+            clear=False,
+        ):
+            response = asyncio.run(self.server.health(mock.Mock()))
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["service"], "hal-github-actions-bridge")
+        self.assertEqual(payload["deployed_commit_sha"], expected_sha)
+        self.assertEqual(
+            payload["registered_tools"],
+            sorted(payload["registered_tools"]),
+        )
+        self.assertTrue(
+            self.server.REQUIRED_PRODUCTION_TOOLS.issubset(
+                payload["registered_tools"]
+            )
+        )
+        self.assertIn("archive_case00_review_packet", payload["registered_tools"])
 
 
 if __name__ == "__main__":
