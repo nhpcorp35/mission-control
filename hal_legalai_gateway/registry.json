@@ -8,7 +8,7 @@
       "base_url_env": "GATEWAY_BRIDGE_URL",
       "health_path": "/health",
       "default_base_url": "https://hal-github-actions-bridge-production.up.railway.app",
-      "notes": "Case-facing MCP tools and proof workflow dispatch. Remains separately deployable. Direct clients use GitHub OAuth; Gateway uses dedicated BRIDGE_SERVICE_TOKEN via GATEWAY_BRIDGE_AUTHORIZATION (never a copied user OAuth bearer)."
+      "notes": "Case-facing MCP tools and proof workflow dispatch. Remains separately deployable. Direct clients use GitHub OAuth on /mcp; Gateway calls the service-only /mcp/service TokenVerifier path with BRIDGE_SERVICE_TOKEN via GATEWAY_BRIDGE_AUTHORIZATION (never a copied user OAuth bearer)."
     },
     "storage": {
       "service_id": "hal-storage",

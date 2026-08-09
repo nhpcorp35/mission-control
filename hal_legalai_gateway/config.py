@@ -38,7 +38,11 @@ CONNECT_TIMEOUT_ENV = "GATEWAY_CONNECT_TIMEOUT_SECONDS"
 READ_TIMEOUT_ENV = "GATEWAY_READ_TIMEOUT_SECONDS"
 
 MCP_PATH_ENV = "GATEWAY_MCP_PATH"
-DEFAULT_MCP_PATH = "/mcp"
+# Bridge/Storage/Artifacts use the service-only MCP path (TokenVerifier bearer).
+DEFAULT_MCP_PATH = "/mcp/service"
+# Mission Control MCP remains on the public Streamable HTTP path.
+DEFAULT_MISSION_CONTROL_MCP_PATH = "/mcp"
+MISSION_CONTROL_MCP_PATH_ENV = "GATEWAY_MISSION_CONTROL_MCP_PATH"
 DEFAULT_REDIS_PORT = 6379
 
 
@@ -75,12 +79,23 @@ class GatewaySettings:
     bridge_authorization: str
     allowed_github_login: str
     mcp_path: str
+    mission_control_mcp_path: str
 
     def downstream_by_key(self, key: str) -> ResolvedDownstream:
         for item in self.downstreams:
             if item.key == key:
                 return item
         raise KeyError(key)
+
+    def mcp_path_for_service(self, downstream_service: str) -> str:
+        """Return the Streamable HTTP path for a downstream service.
+
+        Bridge / Storage / Artifacts use the service-only TokenVerifier path.
+        Mission Control keeps its public ``/mcp`` path.
+        """
+        if downstream_service in {"bridge", "storage", "artifacts"}:
+            return self.mcp_path
+        return self.mission_control_mcp_path
 
     def secret_values_for_redaction(self) -> tuple[str, ...]:
         """Return configured secrets that must never appear in logs/errors/health."""
@@ -187,12 +202,12 @@ def _require_secret(env: dict[str, str], name: str) -> str:
     return value
 
 
-def _parse_mcp_path(raw: str | None) -> str:
-    value = (raw or "").strip() or DEFAULT_MCP_PATH
+def _parse_mcp_path(raw: str | None, *, env_name: str, default: str) -> str:
+    value = (raw or "").strip() or default
     if not value.startswith("/"):
-        raise RuntimeError(f"{MCP_PATH_ENV} must start with '/'")
+        raise RuntimeError(f"{env_name} must start with '/'")
     if "?" in value or "#" in value:
-        raise RuntimeError(f"{MCP_PATH_ENV} must not include query or fragment")
+        raise RuntimeError(f"{env_name} must not include query or fragment")
     return value.rstrip("/") or "/"
 
 
@@ -264,7 +279,16 @@ def load_settings(
         (env.get(ALLOWED_GITHUB_LOGIN_ENV) or "").strip()
         or DEFAULT_ALLOWED_GITHUB_LOGIN
     )
-    mcp_path = _parse_mcp_path(env.get(MCP_PATH_ENV))
+    mcp_path = _parse_mcp_path(
+        env.get(MCP_PATH_ENV),
+        env_name=MCP_PATH_ENV,
+        default=DEFAULT_MCP_PATH,
+    )
+    mission_control_mcp_path = _parse_mcp_path(
+        env.get(MISSION_CONTROL_MCP_PATH_ENV),
+        env_name=MISSION_CONTROL_MCP_PATH_ENV,
+        default=DEFAULT_MISSION_CONTROL_MCP_PATH,
+    )
 
     downstreams: list[ResolvedDownstream] = []
     for key in loaded_registry.service_keys():
@@ -312,4 +336,5 @@ def load_settings(
         bridge_authorization=bridge_authorization,
         allowed_github_login=allowed_github_login,
         mcp_path=mcp_path,
+        mission_control_mcp_path=mission_control_mcp_path,
     )

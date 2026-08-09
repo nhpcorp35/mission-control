@@ -49,13 +49,29 @@ packet content are not stored in GitHub.
 
 Mission Control remains unchanged and is not used by this bridge.
 
-## Authentication
+## Authentication (two MCP surfaces)
 
-**Direct clients (unchanged):** FastMCP `GitHubProvider` OAuth. Interactive
-ChatGPT / operator connections continue to use GitHub OAuth.
+| Path | Audience | Auth |
+| --- | --- | --- |
+| `POST/GET /mcp` | Direct ChatGPT / operator clients | FastMCP `GitHubProvider` OAuth (unchanged) |
+| `POST/GET /mcp/service` | HAL LegalAI Gateway only | `BRIDGE_SERVICE_TOKEN` via FastMCP 2.x `TokenVerifier` (static bearer). Fail closed. **No** GitHub OAuth discovery on this path. |
 
-**Gateway service-to-service (additive):** Set `BRIDGE_SERVICE_TOKEN` to a
-dedicated non-expiring secret. The Gateway's `GATEWAY_BRIDGE_AUTHORIZATION`
-must present the same value. This is **not** a copied user OAuth bearer and does
-not expire with a user session. When unset, Bridge behavior remains OAuth-only
-(compatible during cutover).
+Do **not** put a composite OAuth+service verifier on the public `/mcp` route.
+Gateway must call `/mcp/service` with `GATEWAY_BRIDGE_AUTHORIZATION` matching
+`BRIDGE_SERVICE_TOKEN` (with or without a `Bearer ` prefix). Inbound user OAuth
+session tokens must never be forwarded downstream.
+
+When `BRIDGE_SERVICE_TOKEN` is unset, `/mcp/service` rejects all credentials
+(fail closed). Public `/mcp` OAuth behavior is unchanged.
+
+### Railway / cutover verification
+
+1. Set `BRIDGE_SERVICE_TOKEN` on the Bridge service (same value as Gateway
+   `GATEWAY_BRIDGE_AUTHORIZATION`; no new secret type required).
+2. Ensure Gateway `GATEWAY_MCP_PATH` is `/mcp/service` (the deterministic
+   default) for Bridge / Storage / Artifacts forwarding.
+3. Confirm `GET /health` still works without auth.
+4. Confirm public OAuth clients still use `/mcp` only.
+5. Confirm Gateway `storage.list_inventory` succeeds through `/mcp/service`.
+6. Confirm missing/invalid service bearer returns HTTP 401 on `/mcp/service`.
+7. Confirm logs and error bodies never echo the service token.

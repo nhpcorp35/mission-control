@@ -46,16 +46,20 @@ Missing GitHub OAuth configuration fails startup (fail closed). A static inbound
 **Downstream Bridge / Storage / Artifacts:** After inbound GitHub OAuth succeeds,
 the gateway authenticates to Bridge with a **dedicated non-expiring service
 credential** (`GATEWAY_BRIDGE_AUTHORIZATION`), which must match Bridge
-`BRIDGE_SERVICE_TOKEN`. The inbound user OAuth session token is **never**
-forwarded downstream (different audience; expires with the user session).
+`BRIDGE_SERVICE_TOKEN`. Calls go to the Bridge **service-only** MCP path
+(`/mcp/service` by default via `GATEWAY_MCP_PATH`) protected by a FastMCP 2.x
+`TokenVerifier` — **not** the public GitHub OAuth `/mcp` surface. The inbound
+user OAuth session token is **never** forwarded downstream (different audience;
+expires with the user session).
 
 **Downstream Mission Control:** The MCP connector authenticates to the Mission
 Control HTTP API with its own server-side `MISSION_CONTROL_API_KEY`. The gateway
 gates `mission.*` with inbound GitHub OAuth only and does not put that Mission
-Control key on the public wire.
+Control key on the public wire. Mission Control MCP stays on `/mcp`
+(`GATEWAY_MISSION_CONTROL_MCP_PATH`, default `/mcp`).
 
-**Direct Bridge clients:** GitHub OAuth on the Bridge remains fully compatible
-during cutover. Service-token acceptance is additive via a composite verifier.
+**Direct Bridge clients:** GitHub OAuth on Bridge `/mcp` remains fully
+compatible. Gateway traffic must use `/mcp/service` only.
 
 ## Failure isolation and observability
 
@@ -102,7 +106,8 @@ Streamable HTTP base (`SERVICE_MODE=mcp`), not only the REST API service.
 | `GATEWAY_HEALTH_TIMEOUT_SECONDS` | no | `5` | Per-probe timeout (`0.1`–`30`) |
 | `GATEWAY_CONNECT_TIMEOUT_SECONDS` | no | `5` | Downstream MCP connect timeout (`0.1`–`30`) |
 | `GATEWAY_READ_TIMEOUT_SECONDS` | no | `30` | Downstream MCP read timeout (`0.1`–`120`, ≥ connect) |
-| `GATEWAY_MCP_PATH` | no | `/mcp` | Downstream Streamable HTTP path |
+| `GATEWAY_MCP_PATH` | no | `/mcp/service` | Bridge/Storage/Artifacts Streamable HTTP path (service-only TokenVerifier surface) |
+| `GATEWAY_MISSION_CONTROL_MCP_PATH` | no | `/mcp` | Mission Control Streamable HTTP path |
 | `GATEWAY_BRIDGE_URL` | no | production bridge URL from registry | Absolute `http(s)` base URL |
 | `GATEWAY_STORAGE_URL` | no | same default as bridge | Independently replaceable |
 | `GATEWAY_MISSION_CONTROL_URL` | no | production Mission Control URL | Absolute `http(s)` MCP base URL |
@@ -114,8 +119,13 @@ Retired: `GATEWAY_API_KEY` (static inbound key). Do not set it for ChatGPT Busin
 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `BRIDGE_SERVICE_TOKEN` | recommended for gateway | — | Non-expiring service credential accepted **in addition to** GitHub OAuth; value must match Gateway `GATEWAY_BRIDGE_AUTHORIZATION` (with or without `Bearer ` prefix) |
-| Existing GitHub OAuth / Redis / JWT vars | **yes** | — | Unchanged; direct Bridge OAuth clients keep working |
+| `BRIDGE_SERVICE_TOKEN` | recommended for gateway | — | Non-expiring service credential for **`/mcp/service` only**; value must match Gateway `GATEWAY_BRIDGE_AUTHORIZATION` (with or without `Bearer ` prefix) |
+| Existing GitHub OAuth / Redis / JWT vars | **yes** | — | Unchanged; direct Bridge OAuth clients keep using public `/mcp` |
+
+**Verify after deploy:** Gateway health + a live `storage.list_inventory` call
+should reach Bridge `/mcp/service` with the service bearer. Public `/mcp` must
+still expose GitHub OAuth discovery. Missing/invalid service tokens must return
+401 on `/mcp/service` without leaking credentials.
 
 ## Local run
 
@@ -177,8 +187,11 @@ This repository does **not** auto-create a new Railway service for the gateway.
 1. In the Railway project that hosts Mission Control / the bridge, **create a new service** (if not already present from Phase 1).
 2. Point the service root / watch path at `hal_legalai_gateway` (Dockerfile builder).
 3. Set **required** GitHub OAuth + Redis/JWT/Fernet vars and `GATEWAY_BRIDGE_AUTHORIZATION`.
-4. On the Bridge service, set matching `BRIDGE_SERVICE_TOKEN` (additive; keeps direct OAuth).
-5. Set `GATEWAY_*_URL` overrides as needed; ensure `GATEWAY_MISSION_CONTROL_URL` targets MCP mode.
+4. On the Bridge service, set matching `BRIDGE_SERVICE_TOKEN` (protects
+   `/mcp/service` only; public `/mcp` OAuth unchanged).
+5. Set `GATEWAY_*_URL` overrides as needed; ensure `GATEWAY_MISSION_CONTROL_URL`
+   targets MCP mode. Leave `GATEWAY_MCP_PATH` at `/mcp/service` unless
+   intentionally overriding the Bridge service path.
 6. Confirm Railway injects `RAILWAY_GIT_COMMIT_SHA`.
 7. Expose public networking; health check path is `/health`.
 8. Verify `GET /health` shows `deployed_commit_sha`, `registered_tools`, `auth.inbound=github_oauth`, and independent `downstream.*` entries.

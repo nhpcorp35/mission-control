@@ -119,7 +119,7 @@ def _safe_error_message(
     return redacted[:500]
 
 
-def mcp_endpoint_url(base_url: str, mcp_path: str = "/mcp") -> str:
+def mcp_endpoint_url(base_url: str, mcp_path: str = "/mcp/service") -> str:
     """Join downstream base URL with the Streamable HTTP MCP path."""
     root = base_url.rstrip("/")
     path = mcp_path if mcp_path.startswith("/") else f"/{mcp_path}"
@@ -155,7 +155,7 @@ async def forward_mcp_tool(
     authorization: str | None,
     connect_timeout_seconds: float,
     read_timeout_seconds: float,
-    mcp_path: str = "/mcp",
+    mcp_path: str = "/mcp/service",
     require_authorization: bool = True,
     client_factory: Callable[[], Client] | None = None,
     extra_secrets: tuple[str, ...] = (),

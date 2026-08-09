@@ -1,9 +1,14 @@
-"""Narrow service-to-service auth for Gateway → Bridge cutover.
+"""Bridge auth surfaces: public GitHub OAuth + service-only TokenVerifier MCP.
 
-Preserves direct GitHub OAuth for interactive Bridge clients while accepting a
-dedicated non-expiring ``BRIDGE_SERVICE_TOKEN`` (matched by the Gateway's
-``GATEWAY_BRIDGE_AUTHORIZATION``). User OAuth session tokens are not reused as
-generic downstream secrets.
+FastMCP 2.x does not reliably support a custom CompositeAuthProvider that mixes
+GitHub OAuth discovery with a static service bearer on the same ``/mcp`` route
+(OAuth ``required_scopes`` and discovery metadata break Gateway service calls).
+
+Supported two-surface design (no FastMCP 3 migration):
+
+* Public ``/mcp`` — GitHub OAuth only (unchanged ChatGPT / operator clients).
+* Service ``/mcp/service`` — ``BRIDGE_SERVICE_TOKEN`` via TokenVerifier / static
+  bearer only. Fail closed. No GitHub OAuth discovery on this path.
 """
 
 from __future__ import annotations
@@ -12,9 +17,14 @@ import secrets
 from typing import Any
 
 from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
+from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
+from starlette.authentication import AuthenticationBackend
+from starlette.requests import HTTPConnection
 
 SERVICE_CLIENT_ID = "hal-gateway-service"
 BRIDGE_SERVICE_TOKEN_ENV = "BRIDGE_SERVICE_TOKEN"
+DEFAULT_PUBLIC_MCP_PATH = "/mcp"
+DEFAULT_SERVICE_MCP_PATH = "/mcp/service"
 
 
 def normalize_bearer_token(value: str | None) -> str | None:
@@ -29,7 +39,11 @@ def normalize_bearer_token(value: str | None) -> str | None:
 
 
 class ServiceTokenVerifier(TokenVerifier):
-    """Constant-time verifier for a dedicated non-expiring service credential."""
+    """Constant-time verifier for a dedicated non-expiring service credential.
+
+    Supported FastMCP 2.x ``TokenVerifier`` (static bearer) auth provider — use
+    on the service-only MCP path, never composed into the public OAuth surface.
+    """
 
     def __init__(
         self,
@@ -61,41 +75,44 @@ class ServiceTokenVerifier(TokenVerifier):
         )
 
 
-class CompositeAuthProvider(AuthProvider):
-    """GitHub OAuth routes/discovery plus optional service-token verification."""
+class FailClosedTokenVerifier(TokenVerifier):
+    """Reject every bearer token (service surface when ``BRIDGE_SERVICE_TOKEN`` unset)."""
+
+    def __init__(self) -> None:
+        super().__init__(required_scopes=None)
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        return None
+
+
+class PathAwareBearerBackend(AuthenticationBackend):
+    """Route AuthenticationMiddleware to OAuth or service TokenVerifier by path.
+
+    The service MCP path never consults GitHub OAuth verification.
+    """
 
     def __init__(
         self,
+        *,
         oauth: AuthProvider,
-        *extra_verifiers: TokenVerifier,
+        service: TokenVerifier,
+        service_mcp_path: str = DEFAULT_SERVICE_MCP_PATH,
     ) -> None:
-        base_url = getattr(oauth, "base_url", None)
-        required_scopes = list(getattr(oauth, "required_scopes", None) or [])
-        super().__init__(base_url=base_url, required_scopes=required_scopes)
-        self._oauth = oauth
-        self._extra_verifiers = extra_verifiers
+        self._oauth_backend = BearerAuthBackend(oauth)
+        self._service_backend = BearerAuthBackend(service)
+        path = service_mcp_path if service_mcp_path.startswith("/") else f"/{service_mcp_path}"
+        self._service_mcp_path = path.rstrip("/") or DEFAULT_SERVICE_MCP_PATH
 
-    async def verify_token(self, token: str) -> AccessToken | None:
-        for verifier in self._extra_verifiers:
-            result = await verifier.verify_token(token)
-            if result is not None:
-                return result
-        return await self._oauth.verify_token(token)
+    def _is_service_path(self, path: str) -> bool:
+        return path == self._service_mcp_path or path.startswith(
+            f"{self._service_mcp_path}/"
+        )
 
-    def set_mcp_path(self, mcp_path: str | None) -> None:
-        super().set_mcp_path(mcp_path)
-        setter = getattr(self._oauth, "set_mcp_path", None)
-        if callable(setter):
-            setter(mcp_path)
-
-    def get_routes(self, mcp_path: str | None = None) -> list[Any]:
-        return self._oauth.get_routes(mcp_path=mcp_path)
-
-    def get_well_known_routes(self, mcp_path: str | None = None) -> list[Any]:
-        getter = getattr(self._oauth, "get_well_known_routes", None)
-        if callable(getter):
-            return getter(mcp_path=mcp_path)
-        return super().get_well_known_routes(mcp_path=mcp_path)
+    async def authenticate(self, conn: HTTPConnection) -> Any:
+        path = conn.scope.get("path") or ""
+        if self._is_service_path(path):
+            return await self._service_backend.authenticate(conn)
+        return await self._oauth_backend.authenticate(conn)
 
 
 def is_service_access_token(token: AccessToken | None) -> bool:
@@ -109,13 +126,85 @@ def is_service_access_token(token: AccessToken | None) -> bool:
     )
 
 
-def build_bridge_auth_provider(
-    oauth: AuthProvider,
-    *,
+def build_service_auth_provider(
     service_token: str | None,
-) -> AuthProvider:
-    """Compose GitHub OAuth with an optional dedicated service credential."""
+) -> TokenVerifier:
+    """Build the service-only MCP TokenVerifier (fail closed when unset)."""
     cleaned = normalize_bearer_token(service_token)
     if not cleaned:
-        return oauth
-    return CompositeAuthProvider(oauth, ServiceTokenVerifier(cleaned))
+        return FailClosedTokenVerifier()
+    return ServiceTokenVerifier(cleaned)
+
+
+def compose_dual_mcp_http_app(
+    mcp: Any,
+    *,
+    oauth_auth: AuthProvider,
+    service_auth: TokenVerifier,
+    public_mcp_path: str = DEFAULT_PUBLIC_MCP_PATH,
+    service_mcp_path: str = DEFAULT_SERVICE_MCP_PATH,
+    json_response: bool = False,
+) -> Any:
+    """Compose public OAuth ``/mcp`` and service-only TokenVerifier MCP apps.
+
+    OAuth discovery/routes stay on the public surface only. The service path is
+    protected solely by ``service_auth`` and never mounts GitHub OAuth metadata.
+    """
+    from contextlib import asynccontextmanager
+
+    from fastmcp.server.http import RequestContextMiddleware, create_streamable_http_app
+    from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.authentication import AuthenticationMiddleware
+
+    public_path = (
+        public_mcp_path if public_mcp_path.startswith("/") else f"/{public_mcp_path}"
+    )
+    service_path = (
+        service_mcp_path
+        if service_mcp_path.startswith("/")
+        else f"/{service_mcp_path}"
+    )
+    public_path = public_path.rstrip("/") or DEFAULT_PUBLIC_MCP_PATH
+    service_path = service_path.rstrip("/") or DEFAULT_SERVICE_MCP_PATH
+
+    public_http = create_streamable_http_app(
+        mcp,
+        public_path,
+        auth=oauth_auth,
+        json_response=json_response,
+    )
+    service_http = create_streamable_http_app(
+        mcp,
+        service_path,
+        auth=service_auth,
+        json_response=json_response,
+    )
+
+    routes = list(public_http.routes)
+    routes.extend(
+        route
+        for route in service_http.routes
+        if getattr(route, "path", None) == service_path
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
+        async with public_http.lifespan(app):
+            async with service_http.lifespan(app):
+                yield
+
+    middleware = [
+        Middleware(RequestContextMiddleware),
+        Middleware(
+            AuthenticationMiddleware,
+            backend=PathAwareBearerBackend(
+                oauth=oauth_auth,
+                service=service_auth,
+                service_mcp_path=service_path,
+            ),
+        ),
+        Middleware(AuthContextMiddleware),
+    ]
+    return Starlette(routes=routes, lifespan=lifespan, middleware=middleware)

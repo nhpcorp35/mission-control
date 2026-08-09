@@ -264,7 +264,7 @@ def register_forwarding_tools(
             authorization=authorization,
             connect_timeout_seconds=settings.connect_timeout_seconds,
             read_timeout_seconds=settings.read_timeout_seconds,
-            mcp_path=settings.mcp_path,
+            mcp_path=settings.mcp_path_for_service(binding.downstream_service),
             require_authorization=require_auth,
             extra_secrets=settings.secret_values_for_redaction(),
         )

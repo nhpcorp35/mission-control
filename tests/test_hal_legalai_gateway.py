@@ -220,6 +220,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             by_key["artifacts"].base_url, "https://artifacts.example"
         )
+        self.assertEqual(settings.mcp_path, "/mcp/service")
+        self.assertEqual(settings.mission_control_mcp_path, "/mcp")
+        self.assertEqual(settings.mcp_path_for_service("storage"), "/mcp/service")
+        self.assertEqual(
+            settings.mcp_path_for_service("mission_control"), "/mcp"
+        )
 
     def test_load_settings_rejects_invalid_timeout(self) -> None:
         with self.assertRaises(RuntimeError):
@@ -307,12 +313,16 @@ class AuthForwardingTests(unittest.TestCase):
 
     def test_mcp_endpoint_url_join(self) -> None:
         self.assertEqual(
-            mcp_endpoint_url("https://bridge.example", "/mcp"),
-            "https://bridge.example/mcp",
+            mcp_endpoint_url("https://bridge.example", "/mcp/service"),
+            "https://bridge.example/mcp/service",
         )
         self.assertEqual(
-            mcp_endpoint_url("https://bridge.example/mcp", "/mcp"),
-            "https://bridge.example/mcp",
+            mcp_endpoint_url("https://bridge.example/mcp/service", "/mcp/service"),
+            "https://bridge.example/mcp/service",
+        )
+        self.assertEqual(
+            mcp_endpoint_url("https://mission.example", "/mcp"),
+            "https://mission.example/mcp",
         )
 
 

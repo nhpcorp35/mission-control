@@ -32,7 +32,10 @@ from storage_policy import (
 )
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
-    build_bridge_auth_provider,
+    DEFAULT_PUBLIC_MCP_PATH,
+    DEFAULT_SERVICE_MCP_PATH,
+    build_service_auth_provider,
+    compose_dual_mcp_http_app,
     is_service_access_token,
 )
 
@@ -115,21 +118,20 @@ CASE_ARTIFACT_LIMITS = {
     "model_input_audit.json": 100_000,
 }
 
-auth_provider = build_bridge_auth_provider(
-    GitHubProvider(
-        client_id=os.environ["GITHUB_OAUTH_CLIENT_ID"],
-        client_secret=os.environ["GITHUB_OAUTH_CLIENT_SECRET"],
-        base_url=PUBLIC_URL,
-        jwt_signing_key=os.environ.get("JWT_SIGNING_KEY"),
-        client_storage=FernetEncryptionWrapper(
-            key_value=RedisStore(
-                host=os.environ["REDIS_HOST"],
-                port=int(os.environ.get("REDIS_PORT", "6379")),
-            ),
-            fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"].encode()),
+# Public /mcp surface: GitHub OAuth only (ChatGPT / operator clients).
+# Gateway uses the separate /mcp/service TokenVerifier surface — never composite.
+oauth_auth_provider = GitHubProvider(
+    client_id=os.environ["GITHUB_OAUTH_CLIENT_ID"],
+    client_secret=os.environ["GITHUB_OAUTH_CLIENT_SECRET"],
+    base_url=PUBLIC_URL,
+    jwt_signing_key=os.environ.get("JWT_SIGNING_KEY"),
+    client_storage=FernetEncryptionWrapper(
+        key_value=RedisStore(
+            host=os.environ["REDIS_HOST"],
+            port=int(os.environ.get("REDIS_PORT", "6379")),
         ),
+        fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"].encode()),
     ),
-    service_token=os.environ.get(BRIDGE_SERVICE_TOKEN_ENV),
 )
 
 mcp = FastMCP(
@@ -147,7 +149,7 @@ mcp = FastMCP(
         "review packet under canonical B2 prefixes without accepting bucket or key "
         "inputs."
     ),
-    auth=auth_provider,
+    auth=oauth_auth_provider,
 )
 
 
@@ -806,10 +808,44 @@ async def health(_request: Request) -> JSONResponse:
     )
 
 
+def create_http_app(
+    *,
+    oauth_auth: Any | None = None,
+    service_token: str | None = None,
+    public_mcp_path: str = DEFAULT_PUBLIC_MCP_PATH,
+    service_mcp_path: str = DEFAULT_SERVICE_MCP_PATH,
+    json_response: bool = False,
+) -> Any:
+    """ASGI app: public OAuth ``/mcp`` + service-only ``/mcp/service``.
+
+    ``oauth_auth`` is for tests (inject a fixed verifier). Production uses the
+    module GitHub OAuth provider. Service auth uses ``BRIDGE_SERVICE_TOKEN`` via
+    a FastMCP 2.x TokenVerifier and fails closed when unset.
+    """
+    oauth = oauth_auth if oauth_auth is not None else oauth_auth_provider
+    token = (
+        service_token
+        if service_token is not None
+        else os.environ.get(BRIDGE_SERVICE_TOKEN_ENV)
+    )
+    service_auth = build_service_auth_provider(token)
+    return compose_dual_mcp_http_app(
+        mcp,
+        oauth_auth=oauth,
+        service_auth=service_auth,
+        public_mcp_path=public_mcp_path,
+        service_mcp_path=service_mcp_path,
+        json_response=json_response,
+    )
+
+
 def main() -> None:
+    import uvicorn
+
     asyncio.run(validate_required_production_tools())
-    mcp.run(
-        transport="http",
+    app = create_http_app()
+    uvicorn.run(
+        app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "8000")),
     )
