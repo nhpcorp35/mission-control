@@ -35,6 +35,16 @@ PUBLIC_URL = os.environ.get(
 ).rstrip("/")
 ALLOWED_GITHUB_LOGIN = os.environ.get("ALLOWED_GITHUB_LOGIN", "nhpcorp35")
 GITHUB_API = "https://api.github.com"
+CASE_ARTIFACT_PREFIX = (
+    "Benchmarks/Case-00-Triborough/derived/"
+    "attorney-feedback-eval/candidate-answers/"
+)
+CASE_ARTIFACT_LIMITS = {
+    "Q1_candidate_answer.json": 1_000_000,
+    "Q1_candidate_answer.md": 100_000,
+    "generation_manifest.json": 100_000,
+    "model_input_audit.json": 100_000,
+}
 
 auth_provider = GitHubProvider(
     client_id=os.environ["GITHUB_OAUTH_CLIENT_ID"],
@@ -58,9 +68,11 @@ mcp = FastMCP(
         "run, use get_artifacts to copy the harmless proof JSON to B2, verify it, "
         "and retrieve the durable object key. The separate Case-00 Q1 tools "
         "dispatch the bounded generation-only workflow, require explicit private-evidence "
-        "authorization, and return only B2-verified candidate artifact metadata."
-        " Case-00 storage tools expose allowlisted inventory metadata and archive "
-        "a fixed attorney-feedback package under the canonical B2 prefix."
+        "authorization, and return only B2-verified candidate artifact metadata. "
+        "Use get_case_artifact to read one allowlisted, mission-correlated artifact "
+        "after a successful run. Case-00 storage tools expose allowlisted inventory "
+        "metadata and archive a fixed attorney-feedback package under the canonical "
+        "B2 prefix."
     ),
     auth=auth_provider,
 )
@@ -462,6 +474,137 @@ async def get_case00_q1_artifacts(mission_id: str) -> dict[str, Any]:
         "b2_bucket": durable["bucket"],
         "object_keys": [item["object_key"] for item in verified_objects],
         "objects": verified_objects,
+    }
+
+
+@mcp.tool()
+async def get_case_artifact(
+    mission_id: str,
+    filename: Literal[
+        "Q1_candidate_answer.json",
+        "Q1_candidate_answer.md",
+        "generation_manifest.json",
+        "model_input_audit.json",
+    ],
+) -> dict[str, Any]:
+    """Read one allowlisted B2 artifact correlated to a successful case mission."""
+    _require_allowed_user()
+    size_limit = CASE_ARTIFACT_LIMITS.get(filename)
+    if size_limit is None:
+        raise ValueError("filename is not an allowlisted case artifact")
+
+    run = await _resolve_case00_run(mission_id)
+    if run is None:
+        return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        return {
+            "ok": False,
+            "mission_id": mission_id,
+            "error": "run_not_successful",
+            "status": run.get("status"),
+            "conclusion": run.get("conclusion"),
+        }
+
+    listing = await _github(
+        "GET", f"/repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts"
+    )
+    artifact_name = f"hal-case00-q1-{mission_id}"
+    artifact = next(
+        (a for a in listing.json().get("artifacts", []) if a.get("name") == artifact_name),
+        None,
+    )
+    if artifact is None:
+        return {"ok": False, "mission_id": mission_id, "error": "artifact_not_found"}
+
+    archive = await _github(
+        "GET", f"/repos/{REPOSITORY}/actions/artifacts/{artifact['id']}/zip"
+    )
+    with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
+        payload = json.loads(bundle.read("case00-q1-result.json"))
+
+    durable = payload.get("durable_artifacts") or {}
+    objects = durable.get("objects") or []
+    if not payload.get("ok") or len(objects) != 4:
+        return {
+            "ok": False,
+            "mission_id": mission_id,
+            "error": "durable_result_incomplete",
+        }
+    if durable.get("bucket") != B2_BUCKET:
+        raise ValueError("artifact bucket did not match the configured private bucket")
+
+    item = next((entry for entry in objects if entry.get("filename") == filename), None)
+    if item is None:
+        return {
+            "ok": False,
+            "mission_id": mission_id,
+            "error": "filename_not_found",
+            "filename": filename,
+        }
+
+    key = item.get("object_key")
+    expected_size = item.get("size")
+    if (
+        not isinstance(key, str)
+        or not key.startswith(CASE_ARTIFACT_PREFIX)
+        or not key.endswith(f"/{filename}")
+    ):
+        raise ValueError("artifact object key escaped the canonical case prefix")
+    if not isinstance(expected_size, int) or expected_size < 0:
+        raise ValueError("artifact result contained an invalid size")
+    if expected_size > size_limit:
+        raise ValueError(f"artifact exceeds the {size_limit}-byte filename limit")
+
+    client = _b2_client()
+    head = client.head_object(Bucket=B2_BUCKET, Key=key)
+    actual_size = head.get("ContentLength")
+    if actual_size != expected_size:
+        raise ValueError(f"B2 size mismatch for {key}")
+    actual_etag = (head.get("ETag") or "").strip('"')
+    expected_etag = item.get("etag")
+    if expected_etag and actual_etag != expected_etag:
+        raise ValueError(f"B2 ETag mismatch for {key}")
+
+    response = client.get_object(Bucket=B2_BUCKET, Key=key)
+    stream = response["Body"]
+    try:
+        body = stream.read(size_limit + 1)
+    finally:
+        stream.close()
+    if len(body) != actual_size:
+        raise ValueError(f"B2 body size mismatch for {key}")
+    if len(body) > size_limit:
+        raise ValueError(f"artifact exceeds the {size_limit}-byte filename limit")
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("artifact content is not valid UTF-8") from exc
+
+    content: Any
+    content_type: str
+    if filename.endswith(".json"):
+        try:
+            content = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("artifact content is not valid JSON") from exc
+        content_type = "application/json"
+    else:
+        content = text
+        content_type = "text/markdown"
+
+    return {
+        "ok": True,
+        "mission_id": mission_id,
+        "run_id": run["id"],
+        "head_sha": run.get("head_sha"),
+        "verified": True,
+        "filename": filename,
+        "b2_bucket": B2_BUCKET,
+        "object_key": key,
+        "size": actual_size,
+        "etag": actual_etag,
+        "content_type": content_type,
+        "content": content,
     }
 
 
