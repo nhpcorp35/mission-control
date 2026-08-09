@@ -7,7 +7,6 @@ import unittest
 import zipfile
 
 from github_actions_bridge.storage_policy import (
-    ALLOWED_REVIEW_PACKET_RECIPIENTS,
     CASE00_PREFIXES,
     MAX_REVIEW_PACKET_BYTES,
     REVIEW_PACKET_MANIFEST_FILENAME,
@@ -59,7 +58,7 @@ def _review_packet_kwargs(**overrides: object) -> dict[str, object]:
     docx_bytes = _minimal_docx_bytes()
     values: dict[str, object] = {
         "docx_base64": base64.b64encode(docx_bytes).decode("ascii"),
-        "recipient": "johncuomo@gmail.com",
+        "recipient": "attorney@example.com",
         "question_id": "Q1",
         "sent_at": "2026-08-02T15:30:00Z",
         "original_filename": "Case00-Q1-Review-Packet.docx",
@@ -137,7 +136,7 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
         self.assertEqual(manifest_item["filename"], REVIEW_PACKET_MANIFEST_FILENAME)
         manifest = json.loads(manifest_item["payload"].decode("utf-8"))
         self.assertEqual(manifest["archive_id"], archive_id)
-        self.assertEqual(manifest["recipient"], "johncuomo@gmail.com")
+        self.assertEqual(manifest["recipient"], "attorney@example.com")
         self.assertEqual(manifest["question_id"], kwargs["question_id"])
         self.assertEqual(manifest["original_filename"], kwargs["original_filename"])
         self.assertNotIn("docx_base64", manifest)
@@ -196,32 +195,36 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
                 )
             )
 
-    def test_non_allowlisted_recipient_rejected(self) -> None:
-        self.assertEqual(
-            ALLOWED_REVIEW_PACKET_RECIPIENTS, frozenset({"johncuomo@gmail.com"})
-        )
+    def test_invalid_recipient_rejected(self) -> None:
         for recipient in (
-            "attorney@example.com",
-            "other@gmail.com",
             "not-an-email",
-            "johncuomo@gmail.com.evil.com",
+            "attorney@",
+            "@example.com",
+            "attorney@example",
+            "attorney example@example.com",
+            "a" * (129),
         ):
             with self.assertRaises(ValueError) as ctx:
                 build_review_packet_archive(
                     **_review_packet_kwargs(recipient=recipient)
                 )
-            self.assertIn("allowlisted", str(ctx.exception).lower())
+            message = str(ctx.exception).lower()
+            self.assertTrue(
+                "valid" in message or "exceeds" in message,
+                msg=message,
+            )
+            self.assertNotIn("allowlisted", message)
 
     def test_recipient_case_normalization(self) -> None:
         self.assertEqual(
-            normalize_review_packet_recipient("JohnCuomo@Gmail.com"),
-            "johncuomo@gmail.com",
+            normalize_review_packet_recipient("Attorney@Example.COM"),
+            "attorney@example.com",
         )
         lower_id, lower_items = build_review_packet_archive(
-            **_review_packet_kwargs(recipient="johncuomo@gmail.com")
+            **_review_packet_kwargs(recipient="attorney@example.com")
         )
         mixed_id, mixed_items = build_review_packet_archive(
-            **_review_packet_kwargs(recipient="JohnCuomo@Gmail.com")
+            **_review_packet_kwargs(recipient="Attorney@Example.COM")
         )
         self.assertEqual(lower_id, mixed_id)
         self.assertEqual(
@@ -229,7 +232,7 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
             [item["object_key"] for item in mixed_items],
         )
         manifest = json.loads(mixed_items[1]["payload"].decode("utf-8"))
-        self.assertEqual(manifest["recipient"], "johncuomo@gmail.com")
+        self.assertEqual(manifest["recipient"], "attorney@example.com")
 
     def test_metadata_validation_allowlists(self) -> None:
         with self.assertRaises(ValueError):

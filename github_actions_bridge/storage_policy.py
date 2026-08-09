@@ -49,10 +49,6 @@ MAX_RECIPIENT_CHARS = 128
 MAX_SENT_AT_CHARS = 40
 MAX_ORIGINAL_FILENAME_CHARS = 128
 ALLOWED_QUESTION_IDS = frozenset({"Q1", "Q2", "Q3", "Q4", "Q5"})
-# Bounded Case-00 review-packet recipient allowlist. Extend only by adding
-# exact case-normalized addresses to this frozenset — never free-form runtime
-# recipient configuration.
-ALLOWED_REVIEW_PACKET_RECIPIENTS = frozenset({"johncuomo@gmail.com"})
 ARCHIVE_PUT_IF_NONE_MATCH = "*"
 _ARCHIVE_PUT_PRECONDITION_CODES = frozenset(
     {"PreconditionFailed", "412", "ConditionNotMet"}
@@ -64,6 +60,13 @@ _SENT_AT_RE = re.compile(
 )
 _ORIGINAL_FILENAME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.docx$"
+)
+# Bounded syntactic email check for review-packet recipients. Authorization is
+# enforced by the authenticated MCP user boundary; this only validates shape and
+# length, then lowercases for deterministic archive IDs and manifests.
+_RECIPIENT_EMAIL_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?"
+    r"@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
 
 
@@ -178,14 +181,14 @@ def _parse_sent_at(sent_at: str) -> datetime:
 
 
 def normalize_review_packet_recipient(recipient: str) -> str:
-    """Return the case-normalized recipient if it is on the bounded allowlist."""
+    """Return a lowercased recipient when it is a bounded, syntactically valid email."""
     if not isinstance(recipient, str):
-        raise ValueError("recipient must be an allowlisted email address")
+        raise ValueError("recipient must be a valid email address")
     if len(recipient) > MAX_RECIPIENT_CHARS:
         raise ValueError(f"recipient exceeds {MAX_RECIPIENT_CHARS} characters")
     normalized = recipient.lower()
-    if normalized not in ALLOWED_REVIEW_PACKET_RECIPIENTS:
-        raise ValueError("recipient is not an allowlisted email address")
+    if not _RECIPIENT_EMAIL_RE.fullmatch(normalized):
+        raise ValueError("recipient is not a valid email address")
     return normalized
 
 

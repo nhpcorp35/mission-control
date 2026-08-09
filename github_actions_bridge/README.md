@@ -37,7 +37,8 @@ Case-00 prefixes (including `attorney_review_packets`) and caps each response at
 package, generates a preservation manifest server-side, stores the package
 beneath a deterministic Case-00 review prefix, and verifies every object by size
 and SHA-256 metadata. The review-packet tool accepts exact DOCX bytes as strict
-base64 plus allowlisted recipient, question_id, sent_at, and original filename
+base64 plus a bounded syntactically valid recipient email (normalized to
+lowercase), question_id, sent_at, and original filename
 metadata; validates ZIP/OOXML structure; stores the unchanged DOCX and a
 server-generated preservation manifest beneath
 `Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/attorney-review-packets/<archive_id>/`;
