@@ -1,7 +1,7 @@
 # HAL GitHub Actions bridge
 
 This isolated OAuth-protected service exposes the original four proof tools,
-four bounded LegalAI Case-00 Q1 tools, and two controlled Case-00 storage tools.
+four bounded LegalAI Case-00 Q1 tools, and three controlled Case-00 storage tools.
 
 Proof tools:
 
@@ -21,6 +21,7 @@ Case-00 storage tools:
 
 - `list_case00_storage`
 - `archive_case00_attorney_feedback`
+- `archive_case00_review_packet`
 
 The Case-00 path accepts only an exact 40-character commit SHA and requires
 explicit authorization before private evidence can be transmitted to the model
@@ -31,10 +32,18 @@ four objects pass B2 HEAD verification. The artifact retrieval tool independentl
 HEAD-verifies those objects before returning their keys.
 
 The storage inventory tool can list metadata only beneath named canonical
-Case-00 prefixes and caps each response at 200 objects. The attorney-feedback
-tool accepts only the fixed three-file review package, generates a preservation
-manifest server-side, stores the package beneath a deterministic Case-00 review
-prefix, and verifies every object by size and SHA-256 metadata. Neither tool
-permits arbitrary bucket names or object keys.
+Case-00 prefixes (including `attorney_review_packets`) and caps each response at
+200 objects. The attorney-feedback tool accepts only the fixed three-file review
+package, generates a preservation manifest server-side, stores the package
+beneath a deterministic Case-00 review prefix, and verifies every object by size
+and SHA-256 metadata. The review-packet tool accepts exact DOCX bytes as strict
+base64 plus allowlisted recipient, question_id, sent_at, and original filename
+metadata; validates ZIP/OOXML structure; stores the unchanged DOCX and a
+server-generated preservation manifest beneath
+`Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/attorney-review-packets/<archive_id>/`;
+rejects collisions instead of overwriting; and returns `verified: true` only
+after HEAD size and SHA-256 metadata checks. None of these tools permit
+arbitrary bucket names or object keys. Private benchmark data and generated
+packet content are not stored in GitHub.
 
 Mission Control remains unchanged and is not used by this bridge.

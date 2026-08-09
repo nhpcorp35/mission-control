@@ -19,7 +19,14 @@ from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from storage_policy import build_attorney_review_archive, inventory_prefix
+from botocore.exceptions import ClientError
+
+from storage_policy import (
+    assert_archive_objects_absent,
+    build_attorney_review_archive,
+    build_review_packet_archive,
+    inventory_prefix,
+)
 
 
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "nhpcorp35/legal-ai")
@@ -71,8 +78,9 @@ mcp = FastMCP(
         "authorization, and return only B2-verified candidate artifact metadata. "
         "Use get_case_artifact to read one allowlisted, mission-correlated artifact "
         "after a successful run. Case-00 storage tools expose allowlisted inventory "
-        "metadata and archive a fixed attorney-feedback package under the canonical "
-        "B2 prefix."
+        "metadata, archive a fixed attorney-feedback package, and archive one DOCX "
+        "review packet under canonical B2 prefixes without accepting bucket or key "
+        "inputs."
     ),
     auth=auth_provider,
 )
@@ -279,7 +287,12 @@ def _b2_client():
 @mcp.tool()
 async def list_case00_storage(
     category: Literal[
-        "all", "source", "questions", "candidate_answers", "attorney_reviews"
+        "all",
+        "source",
+        "questions",
+        "candidate_answers",
+        "attorney_reviews",
+        "attorney_review_packets",
     ] = "all",
     max_keys: int = 200,
 ) -> dict[str, Any]:
@@ -328,6 +341,72 @@ async def archive_case00_attorney_feedback(
         archived_by=archived_by,
     )
     client = _b2_client()
+    verified_objects = []
+    for item in items:
+        client.put_object(
+            Bucket=B2_BUCKET,
+            Key=item["object_key"],
+            Body=item["payload"],
+            ContentType=item["content_type"],
+            Metadata={"sha256": item["sha256"]},
+        )
+        head = client.head_object(Bucket=B2_BUCKET, Key=item["object_key"])
+        if head.get("ContentLength") != len(item["payload"]):
+            raise ValueError(f"B2 size mismatch for {item['object_key']}")
+        if (head.get("Metadata") or {}).get("sha256") != item["sha256"]:
+            raise ValueError(f"B2 SHA-256 metadata mismatch for {item['object_key']}")
+        verified_objects.append(
+            {
+                "filename": item["filename"],
+                "object_key": item["object_key"],
+                "size": head["ContentLength"],
+                "etag": (head.get("ETag") or "").strip('"'),
+                "sha256": item["sha256"],
+            }
+        )
+    return {
+        "ok": True,
+        "verified": True,
+        "archive_id": archive_id,
+        "b2_bucket": B2_BUCKET,
+        "objects": verified_objects,
+    }
+
+
+def _b2_object_exists(client: Any, object_key: str) -> bool:
+    try:
+        client.head_object(Bucket=B2_BUCKET, Key=object_key)
+    except ClientError as exc:
+        code = str((exc.response or {}).get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+    return True
+
+
+@mcp.tool()
+async def archive_case00_review_packet(
+    docx_base64: str,
+    recipient: str,
+    question_id: str,
+    sent_at: str,
+    original_filename: str,
+) -> dict[str, Any]:
+    """Archive and HEAD-verify one Case-00 attorney review-packet DOCX in B2."""
+    archived_by = _require_allowed_user()
+    archive_id, items = build_review_packet_archive(
+        docx_base64=docx_base64,
+        recipient=recipient,
+        question_id=question_id,
+        sent_at=sent_at,
+        original_filename=original_filename,
+        archived_by=archived_by,
+    )
+    client = _b2_client()
+    assert_archive_objects_absent(
+        items,
+        object_exists=lambda key: _b2_object_exists(client, key),
+    )
     verified_objects = []
     for item in items:
         client.put_object(
