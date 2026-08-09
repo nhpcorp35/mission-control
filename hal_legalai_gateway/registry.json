@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "description": "HAL LegalAI Gateway Phase 1 service/tool registry. Maps stable logical namespaces to independently deployable downstream services.",
+  "services": {
+    "bridge": {
+      "service_id": "hal-github-actions-bridge",
+      "display_name": "HAL GitHub Actions Bridge",
+      "base_url_env": "GATEWAY_BRIDGE_URL",
+      "health_path": "/health",
+      "default_base_url": "https://hal-github-actions-bridge-production.up.railway.app",
+      "notes": "Case-facing MCP tools and proof workflow dispatch. Remains separately deployable."
+    },
+    "storage": {
+      "service_id": "hal-storage",
+      "display_name": "HAL Storage",
+      "base_url_env": "GATEWAY_STORAGE_URL",
+      "health_path": "/health",
+      "default_base_url": "https://hal-github-actions-bridge-production.up.railway.app",
+      "notes": "Storage inventory/archive surface. URL defaults to the bridge today but is independently configurable so storage can be split without gateway code changes."
+    },
+    "mission_control": {
+      "service_id": "mission-control",
+      "display_name": "Mission Control",
+      "base_url_env": "GATEWAY_MISSION_CONTROL_URL",
+      "health_path": "/health",
+      "default_base_url": "https://mission-control-production-76ff.up.railway.app",
+      "notes": "Mission validation, execution orchestration, and run persistence."
+    },
+    "artifacts": {
+      "service_id": "hal-artifact-retrieval",
+      "display_name": "HAL Artifact Retrieval",
+      "base_url_env": "GATEWAY_ARTIFACTS_URL",
+      "health_path": "/health",
+      "default_base_url": "https://hal-github-actions-bridge-production.up.railway.app",
+      "notes": "Artifact retrieval surface. Independently configurable from case/storage so retrieval can move without disabling unrelated namespaces."
+    }
+  },
+  "namespaces": {
+    "case": {
+      "description": "LegalAI case workflow tools (Case-00 Q1 and related).",
+      "downstream_service": "bridge",
+      "tools": [
+        "submit_case00_q1",
+        "get_case00_q1_run",
+        "cancel_case00_q1_run",
+        "get_case00_q1_artifacts",
+        "get_case_artifact"
+      ]
+    },
+    "storage": {
+      "description": "Bounded Case-00 storage inventory and archive tools.",
+      "downstream_service": "storage",
+      "tools": [
+        "list_case00_storage",
+        "archive_case00_attorney_feedback",
+        "archive_case00_review_packet"
+      ]
+    },
+    "mission": {
+      "description": "Mission Control run submission and observation tools.",
+      "downstream_service": "mission_control",
+      "tools": [
+        "submit_run",
+        "submit_structured_run",
+        "get_run",
+        "wait_for_run",
+        "submit_and_wait",
+        "run_repository_command",
+        "cancel_run"
+      ]
+    }
+  },
+  "tool_routes": [
+    {
+      "tool": "get_artifacts",
+      "namespace": "case",
+      "downstream_service": "artifacts",
+      "notes": "Proof artifact copy/verify path; routed to the artifact retrieval downstream."
+    },
+    {
+      "tool": "get_case_artifact",
+      "namespace": "case",
+      "downstream_service": "artifacts",
+      "notes": "Allowlisted case artifact read; independently health-checked via artifacts service."
+    }
+  ]
+}
