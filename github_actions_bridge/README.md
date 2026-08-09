@@ -1,7 +1,7 @@
 # HAL GitHub Actions bridge
 
-This isolated OAuth-protected service exposes the original four proof tools and
-four bounded LegalAI Case-00 Q1 tools.
+This isolated OAuth-protected service exposes the original four proof tools,
+four bounded LegalAI Case-00 Q1 tools, and two controlled Case-00 storage tools.
 
 Proof tools:
 
@@ -17,6 +17,11 @@ Case-00 Q1 tools:
 - `cancel_case00_q1_run`
 - `get_case00_q1_artifacts`
 
+Case-00 storage tools:
+
+- `list_case00_storage`
+- `archive_case00_attorney_feedback`
+
 The Case-00 path accepts only an exact 40-character commit SHA and requires
 explicit authorization before private evidence can be transmitted to the model
 provider. The GitHub workflow is generation-only. It rebuilds permitted Case-00
@@ -24,5 +29,12 @@ inputs from B2, generates Q1 with the production path, uploads exactly four
 candidate artifacts under the canonical candidate prefix, and fails unless all
 four objects pass B2 HEAD verification. The artifact retrieval tool independently
 HEAD-verifies those objects before returning their keys.
+
+The storage inventory tool can list metadata only beneath named canonical
+Case-00 prefixes and caps each response at 200 objects. The attorney-feedback
+tool accepts only the fixed three-file review package, generates a preservation
+manifest server-side, stores the package beneath a deterministic Case-00 review
+prefix, and verifies every object by size and SHA-256 metadata. Neither tool
+permits arbitrary bucket names or object keys.
 
 Mission Control remains unchanged and is not used by this bridge.
