@@ -1,5 +1,85 @@
 # HAL Operator Log
 
+## 2026-08-09 — Dedicated HAL LegalAI Storage Bridge
+
+### Objective
+
+Ship a production-ready FastMCP service that exposes only canonical Case-00
+storage tools (`list_case00_storage`, `archive_case00_attorney_feedback`) so a
+new Railway service can deploy from `github_actions_bridge/` without changing
+the existing nine-tool GitHub Actions bridge.
+
+### Implementation
+
+- `github_actions_bridge/storage_server.py`: dedicated MCP server reusing
+  `storage_policy.py` (no policy duplication). Preserves GitHub OAuth +
+  `ALLOWED_GITHUB_LOGIN`, fixed B2 bucket/prefix inventory, server-generated
+  attorney-feedback manifest, object size checks, and SHA-256 metadata HEAD
+  verification. Health route reports `hal-legalai-storage-bridge`. Imports
+  resolve as `github_actions_bridge.storage_policy` in repo tests and as
+  flat `storage_policy` in the container.
+- `github_actions_bridge/Dockerfile.storage` and
+  `github_actions_bridge/railway-storage.json`: independent Dockerfile /
+  Railway config so a second service can deploy without touching the existing
+  `Dockerfile` / `railway.json` entrypoint.
+- `tests/test_github_actions_bridge_storage_server.py`: asserts exactly the
+  two intended tools and that list/archive behavior stays prefix-confined and
+  HEAD-verified.
+- Existing `github_actions_bridge/server.py` tool surface and behavior were
+  not modified.
+
+### Documentation
+
+Operator log updated for deploy handoff. `github_actions_bridge/README.md`
+still describes the combined bridge accurately and was left unchanged; the
+dedicated storage service is documented here as the deployable split.
+
+### Tests executed
+
+```text
+/app/.venv/bin/python -m unittest \
+  tests.test_github_actions_bridge_storage_server \
+  tests.test_github_actions_bridge_storage \
+  -v
+# Ran 9 tests — OK
+```
+
+### Railway / deployment handoff
+
+Create a **new** Railway service from the `github_actions_bridge` directory
+using `railway-storage.json` / `Dockerfile.storage` (do not retarget the
+existing bridge service).
+
+Required env (same auth/storage secrets pattern as the existing bridge):
+
+- `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`
+- `REDIS_HOST`, `REDIS_PORT` (default 6379)
+- `STORAGE_ENCRYPTION_KEY`, `JWT_SIGNING_KEY`
+- `BRIDGE_PUBLIC_URL` = public HTTPS origin of **this** storage service
+- `ALLOWED_GITHUB_LOGIN` (default `nhpcorp35`)
+- `B2_ENDPOINT`, `B2_KEY_ID`, `B2_APPLICATION_KEY`, `B2_BUCKET`
+  (default bucket `legalai-corpus`), optional `B2_REGION`
+- `PORT` provided by Railway
+
+Post-deploy checks:
+
+1. `GET {BRIDGE_PUBLIC_URL}/health` →
+   `{"ok": true, "service": "hal-legalai-storage-bridge", ...}`
+2. MCP discovery lists exactly
+   `list_case00_storage` and `archive_case00_attorney_feedback`
+3. Confirm the original bridge health still reports
+   `hal-github-actions-bridge` and still exposes its existing tool set
+
+### Resulting commit
+
+Not committed / not pushed (mission constraints forbid git staging, commits,
+and pushes).
+
+### Next Objective
+
+Deploy the new Railway storage service, point HAL storage clients at its MCP
+URL, and keep Case-00 workflow/dispatch traffic on the existing bridge.
+
 ## 2026-08-08 — Explicit repository routing (LegalAI vs Mission Control)
 
 ### Objective
