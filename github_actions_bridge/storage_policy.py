@@ -49,11 +49,16 @@ MAX_RECIPIENT_CHARS = 128
 MAX_SENT_AT_CHARS = 40
 MAX_ORIGINAL_FILENAME_CHARS = 128
 ALLOWED_QUESTION_IDS = frozenset({"Q1", "Q2", "Q3", "Q4", "Q5"})
+# Bounded Case-00 review-packet recipient allowlist. Extend only by adding
+# exact case-normalized addresses to this frozenset — never free-form runtime
+# recipient configuration.
+ALLOWED_REVIEW_PACKET_RECIPIENTS = frozenset({"johncuomo@gmail.com"})
+ARCHIVE_PUT_IF_NONE_MATCH = "*"
+_ARCHIVE_PUT_PRECONDITION_CODES = frozenset(
+    {"PreconditionFailed", "412", "ConditionNotMet"}
+)
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_RECIPIENT_RE = re.compile(
-    r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}$"
-)
 _SENT_AT_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -172,17 +177,26 @@ def _parse_sent_at(sent_at: str) -> datetime:
     return parsed
 
 
+def normalize_review_packet_recipient(recipient: str) -> str:
+    """Return the case-normalized recipient if it is on the bounded allowlist."""
+    if not isinstance(recipient, str):
+        raise ValueError("recipient must be an allowlisted email address")
+    if len(recipient) > MAX_RECIPIENT_CHARS:
+        raise ValueError(f"recipient exceeds {MAX_RECIPIENT_CHARS} characters")
+    normalized = recipient.lower()
+    if normalized not in ALLOWED_REVIEW_PACKET_RECIPIENTS:
+        raise ValueError("recipient is not an allowlisted email address")
+    return normalized
+
+
 def _validate_review_packet_metadata(
     *,
     recipient: str,
     question_id: str,
     sent_at: str,
     original_filename: str,
-) -> datetime:
-    if not isinstance(recipient, str) or not _RECIPIENT_RE.fullmatch(recipient):
-        raise ValueError("recipient must be an allowlisted email address")
-    if len(recipient) > MAX_RECIPIENT_CHARS:
-        raise ValueError(f"recipient exceeds {MAX_RECIPIENT_CHARS} characters")
+) -> tuple[str, datetime]:
+    normalized_recipient = normalize_review_packet_recipient(recipient)
     if question_id not in ALLOWED_QUESTION_IDS:
         raise ValueError("question_id is not in the Case-00 allowlist")
     sent_at_dt = _parse_sent_at(sent_at)
@@ -199,7 +213,7 @@ def _validate_review_packet_metadata(
             "original_filename must be a basename ending in .docx "
             "with allowlisted characters"
         )
-    return sent_at_dt
+    return normalized_recipient, sent_at_dt
 
 
 def decode_review_packet_docx_base64(docx_base64: str) -> bytes:
@@ -230,17 +244,33 @@ def validate_docx_bytes(payload: bytes) -> None:
                 raise ValueError("DOCX archive contains no entries")
             if "[Content_Types].xml" not in names:
                 raise ValueError("DOCX missing required [Content_Types].xml")
-            if not any(
-                name == "word/document.xml" or name.startswith("word/")
-                for name in names
-            ):
-                raise ValueError("DOCX missing required word/ OOXML parts")
+            if "word/document.xml" not in names:
+                raise ValueError("DOCX missing required word/document.xml")
             corrupt = bundle.testzip()
             if corrupt is not None:
                 raise ValueError(f"DOCX archive is corrupt at {corrupt}")
             bundle.read("[Content_Types].xml")
+            bundle.read("word/document.xml")
     except zipfile.BadZipFile as exc:
         raise ValueError("DOCX payload is not a valid ZIP/OOXML archive") from exc
+
+
+def archive_create_only_put_params() -> dict[str, str]:
+    """Extra PutObject parameters for create-only archive writes (B2/S3)."""
+    return {"IfNoneMatch": ARCHIVE_PUT_IF_NONE_MATCH}
+
+
+def map_archive_put_precondition_failure(
+    *,
+    object_key: str,
+    error_code: str,
+    http_status_code: int | None = None,
+) -> ValueError | None:
+    """Map conditional-put precondition failures to archive collision errors."""
+    code = str(error_code)
+    if code in _ARCHIVE_PUT_PRECONDITION_CODES or http_status_code == 412:
+        return ValueError(f"archive object already exists: {object_key}")
+    return None
 
 
 def assert_archive_objects_absent(
@@ -263,7 +293,7 @@ def build_review_packet_archive(
     original_filename: str,
     archived_by: str,
 ) -> tuple[str, list[dict[str, Any]]]:
-    sent_at_dt = _validate_review_packet_metadata(
+    normalized_recipient, sent_at_dt = _validate_review_packet_metadata(
         recipient=recipient,
         question_id=question_id,
         sent_at=sent_at,
@@ -273,7 +303,9 @@ def build_review_packet_archive(
     validate_docx_bytes(docx_bytes)
 
     material = (
-        f"{recipient}\0{question_id}\0{sent_at}\0{original_filename}\0".encode("utf-8")
+        f"{normalized_recipient}\0{question_id}\0{sent_at}\0{original_filename}\0".encode(
+            "utf-8"
+        )
         + docx_bytes
     )
     digest = hashlib.sha256(material).hexdigest()
@@ -287,7 +319,7 @@ def build_review_packet_archive(
         "schema_version": "1.0",
         "archive_id": archive_id,
         "case_id": "Case-00-Triborough",
-        "recipient": recipient,
+        "recipient": normalized_recipient,
         "question_id": question_id,
         "sent_at": sent_at,
         "original_filename": original_filename,

@@ -7,19 +7,23 @@ import unittest
 import zipfile
 
 from github_actions_bridge.storage_policy import (
+    ALLOWED_REVIEW_PACKET_RECIPIENTS,
     CASE00_PREFIXES,
     MAX_REVIEW_PACKET_BYTES,
     REVIEW_PACKET_MANIFEST_FILENAME,
+    archive_create_only_put_params,
     assert_archive_objects_absent,
     build_attorney_review_archive,
     build_review_packet_archive,
     decode_review_packet_docx_base64,
     inventory_prefix,
+    map_archive_put_precondition_failure,
+    normalize_review_packet_recipient,
     validate_docx_bytes,
 )
 
 
-def _minimal_docx_bytes() -> bytes:
+def _minimal_docx_bytes(*, document_xml: bool = True) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as bundle:
         bundle.writestr(
@@ -35,16 +39,19 @@ def _minimal_docx_bytes() -> bytes:
                 "</Types>"
             ),
         )
-        bundle.writestr(
-            "word/document.xml",
-            (
-                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
-                'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
-                "Case-00 review packet fixture"
-                "</w:t></w:r></w:p></w:body></w:document>"
-            ),
-        )
+        if document_xml:
+            bundle.writestr(
+                "word/document.xml",
+                (
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                    'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+                    "Case-00 review packet fixture"
+                    "</w:t></w:r></w:p></w:body></w:document>"
+                ),
+            )
+        else:
+            bundle.writestr("word/styles.xml", "<styles/>")
     return buffer.getvalue()
 
 
@@ -52,7 +59,7 @@ def _review_packet_kwargs(**overrides: object) -> dict[str, object]:
     docx_bytes = _minimal_docx_bytes()
     values: dict[str, object] = {
         "docx_base64": base64.b64encode(docx_bytes).decode("ascii"),
-        "recipient": "attorney@example.com",
+        "recipient": "johncuomo@gmail.com",
         "question_id": "Q1",
         "sent_at": "2026-08-02T15:30:00Z",
         "original_filename": "Case00-Q1-Review-Packet.docx",
@@ -130,7 +137,7 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
         self.assertEqual(manifest_item["filename"], REVIEW_PACKET_MANIFEST_FILENAME)
         manifest = json.loads(manifest_item["payload"].decode("utf-8"))
         self.assertEqual(manifest["archive_id"], archive_id)
-        self.assertEqual(manifest["recipient"], kwargs["recipient"])
+        self.assertEqual(manifest["recipient"], "johncuomo@gmail.com")
         self.assertEqual(manifest["question_id"], kwargs["question_id"])
         self.assertEqual(manifest["original_filename"], kwargs["original_filename"])
         self.assertNotIn("docx_base64", manifest)
@@ -177,9 +184,54 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
                 )
             )
 
-    def test_metadata_validation_allowlists(self) -> None:
+    def test_missing_word_document_xml_rejected(self) -> None:
+        payload = _minimal_docx_bytes(document_xml=False)
+        with self.assertRaises(ValueError) as ctx:
+            validate_docx_bytes(payload)
+        self.assertIn("word/document.xml", str(ctx.exception))
         with self.assertRaises(ValueError):
-            build_review_packet_archive(**_review_packet_kwargs(recipient="not-an-email"))
+            build_review_packet_archive(
+                **_review_packet_kwargs(
+                    docx_base64=base64.b64encode(payload).decode("ascii")
+                )
+            )
+
+    def test_non_allowlisted_recipient_rejected(self) -> None:
+        self.assertEqual(
+            ALLOWED_REVIEW_PACKET_RECIPIENTS, frozenset({"johncuomo@gmail.com"})
+        )
+        for recipient in (
+            "attorney@example.com",
+            "other@gmail.com",
+            "not-an-email",
+            "johncuomo@gmail.com.evil.com",
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                build_review_packet_archive(
+                    **_review_packet_kwargs(recipient=recipient)
+                )
+            self.assertIn("allowlisted", str(ctx.exception).lower())
+
+    def test_recipient_case_normalization(self) -> None:
+        self.assertEqual(
+            normalize_review_packet_recipient("JohnCuomo@Gmail.com"),
+            "johncuomo@gmail.com",
+        )
+        lower_id, lower_items = build_review_packet_archive(
+            **_review_packet_kwargs(recipient="johncuomo@gmail.com")
+        )
+        mixed_id, mixed_items = build_review_packet_archive(
+            **_review_packet_kwargs(recipient="JohnCuomo@Gmail.com")
+        )
+        self.assertEqual(lower_id, mixed_id)
+        self.assertEqual(
+            [item["object_key"] for item in lower_items],
+            [item["object_key"] for item in mixed_items],
+        )
+        manifest = json.loads(mixed_items[1]["payload"].decode("utf-8"))
+        self.assertEqual(manifest["recipient"], "johncuomo@gmail.com")
+
+    def test_metadata_validation_allowlists(self) -> None:
         with self.assertRaises(ValueError):
             build_review_packet_archive(**_review_packet_kwargs(question_id="Q99"))
         with self.assertRaises(ValueError):
@@ -213,6 +265,40 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
             assert_archive_objects_absent(
                 items, object_exists=lambda key: key in existing
             )
+        # Partial prior write (DOCX only) must fail closed on rerun.
+        with self.assertRaises(ValueError) as partial_ctx:
+            assert_archive_objects_absent(
+                items, object_exists=lambda key: key == items[0]["object_key"]
+            )
+        self.assertIn("already exists", str(partial_ctx.exception))
+
+    def test_atomic_conditional_put_params_and_precondition_errors(self) -> None:
+        self.assertEqual(
+            archive_create_only_put_params(),
+            {"IfNoneMatch": "*"},
+        )
+        key = "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/attorney-review-packets/packet-q1/x.docx"
+        for code, status in (
+            ("PreconditionFailed", 412),
+            ("412", None),
+            ("ConditionNotMet", 409),
+            ("AccessDenied", 412),
+        ):
+            mapped = map_archive_put_precondition_failure(
+                object_key=key,
+                error_code=code,
+                http_status_code=status,
+            )
+            self.assertIsInstance(mapped, ValueError)
+            self.assertIn("already exists", str(mapped))
+            self.assertIn(key, str(mapped))
+        self.assertIsNone(
+            map_archive_put_precondition_failure(
+                object_key=key,
+                error_code="InternalError",
+                http_status_code=500,
+            )
+        )
 
 
 if __name__ == "__main__":

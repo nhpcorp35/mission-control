@@ -22,10 +22,12 @@ from starlette.responses import JSONResponse
 from botocore.exceptions import ClientError
 
 from storage_policy import (
+    archive_create_only_put_params,
     assert_archive_objects_absent,
     build_attorney_review_archive,
     build_review_packet_archive,
     inventory_prefix,
+    map_archive_put_precondition_failure,
 )
 
 
@@ -384,6 +386,32 @@ def _b2_object_exists(client: Any, object_key: str) -> bool:
     return True
 
 
+def _put_archive_object_create_only(client: Any, item: dict[str, Any]) -> None:
+    """Create one archive object; never overwrite. Precondition failures are collisions."""
+    try:
+        client.put_object(
+            Bucket=B2_BUCKET,
+            Key=item["object_key"],
+            Body=item["payload"],
+            ContentType=item["content_type"],
+            Metadata={"sha256": item["sha256"]},
+            **archive_create_only_put_params(),
+        )
+    except ClientError as exc:
+        response = exc.response or {}
+        error = response.get("Error", {})
+        mapped = map_archive_put_precondition_failure(
+            object_key=item["object_key"],
+            error_code=str(error.get("Code", "")),
+            http_status_code=response.get("ResponseMetadata", {}).get(
+                "HTTPStatusCode"
+            ),
+        )
+        if mapped is not None:
+            raise mapped from exc
+        raise
+
+
 @mcp.tool()
 async def archive_case00_review_packet(
     docx_base64: str,
@@ -403,24 +431,27 @@ async def archive_case00_review_packet(
         archived_by=archived_by,
     )
     client = _b2_client()
+    # Defense in depth: reject known collisions before create-only puts.
     assert_archive_objects_absent(
         items,
         object_exists=lambda key: _b2_object_exists(client, key),
     )
     verified_objects = []
+    # DOCX first, manifest last. Any failure after a successful put leaves a
+    # partial archive; reruns fail closed via preflight + IfNoneMatch='*'.
     for item in items:
-        client.put_object(
-            Bucket=B2_BUCKET,
-            Key=item["object_key"],
-            Body=item["payload"],
-            ContentType=item["content_type"],
-            Metadata={"sha256": item["sha256"]},
-        )
+        _put_archive_object_create_only(client, item)
         head = client.head_object(Bucket=B2_BUCKET, Key=item["object_key"])
         if head.get("ContentLength") != len(item["payload"]):
-            raise ValueError(f"B2 size mismatch for {item['object_key']}")
+            raise ValueError(
+                f"B2 size mismatch for {item['object_key']} "
+                "(archive incomplete; rerun rejected until objects are absent)"
+            )
         if (head.get("Metadata") or {}).get("sha256") != item["sha256"]:
-            raise ValueError(f"B2 SHA-256 metadata mismatch for {item['object_key']}")
+            raise ValueError(
+                f"B2 SHA-256 metadata mismatch for {item['object_key']} "
+                "(archive incomplete; rerun rejected until objects are absent)"
+            )
         verified_objects.append(
             {
                 "filename": item["filename"],
@@ -430,6 +461,8 @@ async def archive_case00_review_packet(
                 "sha256": item["sha256"],
             }
         )
+    if len(verified_objects) != len(items):
+        raise ValueError("review packet archive incomplete; refusing verified result")
     return {
         "ok": True,
         "verified": True,
