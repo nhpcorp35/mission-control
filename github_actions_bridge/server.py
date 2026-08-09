@@ -442,7 +442,11 @@ def _b2_object_exists(client: Any, object_key: str) -> bool:
 
 
 def _put_archive_object_create_only(client: Any, item: dict[str, Any]) -> None:
-    """Create one archive object; never overwrite. Precondition failures are collisions."""
+    """Put one archive object with B2-compatible PutObject parameters.
+
+    Callers must run assert_archive_objects_absent first. B2 rejects
+    IfNoneMatch on PutObject, so collision fail-closed is the preflight.
+    """
     try:
         client.put_object(
             Bucket=B2_BUCKET,
@@ -486,14 +490,14 @@ async def archive_case00_review_packet(
         archived_by=archived_by,
     )
     client = _b2_client()
-    # Defense in depth: reject known collisions before create-only puts.
+    # Fail closed if any canonical target already exists; do not overwrite.
     assert_archive_objects_absent(
         items,
         object_exists=lambda key: _b2_object_exists(client, key),
     )
     verified_objects = []
     # DOCX first, manifest last. Any failure after a successful put leaves a
-    # partial archive; reruns fail closed via preflight + IfNoneMatch='*'.
+    # partial archive; reruns fail closed via the existing-object preflight.
     for item in items:
         _put_archive_object_create_only(client, item)
         head = client.head_object(Bucket=B2_BUCKET, Key=item["object_key"])

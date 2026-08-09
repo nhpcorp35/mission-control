@@ -49,7 +49,6 @@ MAX_RECIPIENT_CHARS = 128
 MAX_SENT_AT_CHARS = 40
 MAX_ORIGINAL_FILENAME_CHARS = 128
 ALLOWED_QUESTION_IDS = frozenset({"Q1", "Q2", "Q3", "Q4", "Q5"})
-ARCHIVE_PUT_IF_NONE_MATCH = "*"
 _ARCHIVE_PUT_PRECONDITION_CODES = frozenset(
     {"PreconditionFailed", "412", "ConditionNotMet"}
 )
@@ -259,8 +258,13 @@ def validate_docx_bytes(payload: bytes) -> None:
 
 
 def archive_create_only_put_params() -> dict[str, str]:
-    """Extra PutObject parameters for create-only archive writes (B2/S3)."""
-    return {"IfNoneMatch": ARCHIVE_PUT_IF_NONE_MATCH}
+    """Extra PutObject parameters for archive writes on B2's S3-compatible API.
+
+    Backblaze B2 rejects conditional headers such as IfNoneMatch on PutObject.
+    Collision protection is the explicit HEAD preflight
+    (assert_archive_objects_absent), not a conditional put.
+    """
+    return {}
 
 
 def map_archive_put_precondition_failure(
@@ -269,7 +273,7 @@ def map_archive_put_precondition_failure(
     error_code: str,
     http_status_code: int | None = None,
 ) -> ValueError | None:
-    """Map conditional-put precondition failures to archive collision errors."""
+    """Map unexpected PutObject precondition failures to archive collision errors."""
     code = str(error_code)
     if code in _ARCHIVE_PUT_PRECONDITION_CODES or http_status_code == 412:
         return ValueError(f"archive object already exists: {object_key}")

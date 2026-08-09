@@ -304,11 +304,125 @@ class Case00ReviewPacketArchiveTests(unittest.TestCase):
             )
         self.assertIn("already exists", str(partial_ctx.exception))
 
-    def test_atomic_conditional_put_params_and_precondition_errors(self) -> None:
-        self.assertEqual(
-            archive_create_only_put_params(),
-            {"IfNoneMatch": "*"},
+    def test_b2_put_params_omit_unsupported_conditional_headers(self) -> None:
+        params = archive_create_only_put_params()
+        self.assertEqual(params, {})
+        banned = {
+            "IfNoneMatch",
+            "IfMatch",
+            "IfModifiedSince",
+            "IfUnmodifiedSince",
+        }
+        self.assertTrue(banned.isdisjoint(params))
+        self.assertTrue(
+            banned.isdisjoint({str(key) for key in params}),
         )
+
+    def test_put_archive_object_does_not_send_if_none_match(self) -> None:
+        server = _import_bridge_server()
+        _, items = build_review_packet_archive(**_review_packet_kwargs())
+        item = items[0]
+        client = mock.Mock()
+        server._put_archive_object_create_only(client, item)
+        client.put_object.assert_called_once()
+        kwargs = client.put_object.call_args.kwargs
+        self.assertNotIn("IfNoneMatch", kwargs)
+        self.assertEqual(kwargs["Key"], item["object_key"])
+        self.assertEqual(kwargs["Body"], item["payload"])
+        self.assertEqual(kwargs["Metadata"], {"sha256": item["sha256"]})
+
+    def test_archive_review_packet_preflight_fails_closed_without_put(self) -> None:
+        server = _import_bridge_server()
+        build_kwargs = _review_packet_kwargs()
+        _, items = build_review_packet_archive(**build_kwargs)
+        existing_key = items[0]["object_key"]
+        tool_kwargs = {
+            key: value
+            for key, value in build_kwargs.items()
+            if key != "archived_by"
+        }
+        client = mock.Mock()
+        client.head_object.return_value = {
+            "ContentLength": 1,
+            "Metadata": {"sha256": "x"},
+        }
+        with mock.patch.object(server, "_require_allowed_user", return_value="tester"):
+            with mock.patch.object(server, "_b2_client", return_value=client):
+                with self.assertRaises(ValueError) as ctx:
+                    asyncio.run(
+                        server.archive_case00_review_packet.fn(**tool_kwargs)
+                    )
+        self.assertIn("already exists", str(ctx.exception))
+        self.assertIn(existing_key, str(ctx.exception))
+        client.put_object.assert_not_called()
+
+    def test_archive_review_packet_head_verifies_size_and_sha256(self) -> None:
+        server = _import_bridge_server()
+        build_kwargs = _review_packet_kwargs()
+        _, expected_items = build_review_packet_archive(
+            **{**build_kwargs, "archived_by": "tester"}
+        )
+        tool_kwargs = {
+            key: value
+            for key, value in build_kwargs.items()
+            if key != "archived_by"
+        }
+        client = mock.Mock()
+        written: dict[str, dict[str, object]] = {}
+
+        def _put_object(**kwargs: object) -> dict[str, object]:
+            key = str(kwargs["Key"])
+            self.assertNotIn("IfNoneMatch", kwargs)
+            body = kwargs["Body"]
+            assert isinstance(body, (bytes, bytearray))
+            metadata = kwargs["Metadata"]
+            assert isinstance(metadata, dict)
+            written[key] = {
+                "payload": bytes(body),
+                "sha256": metadata["sha256"],
+            }
+            return {}
+
+        def _head_object(*, Bucket: str, Key: str) -> dict[str, object]:
+            del Bucket
+            stored = written.get(Key)
+            if stored is None:
+                raise server.ClientError(
+                    {"Error": {"Code": "404", "Message": "Not Found"}},
+                    "HeadObject",
+                )
+            payload = stored["payload"]
+            assert isinstance(payload, bytes)
+            return {
+                "ContentLength": len(payload),
+                "ETag": '"etag-value"',
+                "Metadata": {"sha256": stored["sha256"]},
+            }
+
+        client.put_object.side_effect = _put_object
+        client.head_object.side_effect = _head_object
+        with mock.patch.object(server, "_require_allowed_user", return_value="tester"):
+            with mock.patch.object(server, "_b2_client", return_value=client):
+                result = asyncio.run(
+                    server.archive_case00_review_packet.fn(**tool_kwargs)
+                )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(len(result["objects"]), 2)
+        self.assertEqual(
+            [obj["object_key"] for obj in result["objects"]],
+            [item["object_key"] for item in expected_items],
+        )
+        self.assertEqual(
+            [call.kwargs["Key"] for call in client.put_object.call_args_list],
+            [item["object_key"] for item in expected_items],
+        )
+        for obj in result["objects"]:
+            stored = written[obj["object_key"]]
+            self.assertEqual(obj["size"], len(stored["payload"]))
+            self.assertEqual(obj["sha256"], stored["sha256"])
+
+    def test_precondition_failure_mapping_still_fail_closed(self) -> None:
         key = "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/attorney-review-packets/packet-q1/x.docx"
         for code, status in (
             ("PreconditionFailed", 412),
