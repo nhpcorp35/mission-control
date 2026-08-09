@@ -1,5 +1,54 @@
 # HAL Operator Log
 
+## 2026-08-09 — Unified Gateway cutover (primary) + rollback hold
+
+### Objective
+
+Record the verified live cutover state for **HAL LegalAI Gateway Unified** as
+the primary ChatGPT connection, with explicit rollback/removal criteria and
+tomorrow's acceptance workflow. Do **not** revise Question 1, contact John
+Cuomo, or send anything externally.
+
+### Verified state (2026-08-09)
+
+- **Primary ChatGPT connection:** HAL LegalAI Gateway Unified.
+- **Live Gateway/Bridge code SHA:**
+  `a7a9cad952844973c16c4fb937d7c84ad55dc87e`.
+- **Gateway→Bridge service auth:** dedicated `/mcp/service` surface; FastMCP
+  `StreamableHttpTransport(auth=…)` with synchronized dedicated service
+  credentials (`GATEWAY_BRIDGE_AUTHORIZATION` ↔ `BRIDGE_SERVICE_TOKEN`).
+  Inbound user OAuth is **never** forwarded.
+- **Mission namespace URL:** `GATEWAY_MISSION_CONTROL_URL` must target
+  `https://mission-control-mcp-production.up.railway.app` (Mission Control
+  **MCP**), **not** the Mission Control REST service.
+- **Storage packet:** `packet-q1-20260809-e88c963fdee4` contains
+  `LegalAI-Case00-Q1-Benchmark-Review-Packet.docx` (40,089 bytes) and
+  `review-packet-preservation-manifest.json` (615 bytes).
+- **Canonical private storage:** Backblaze B2 `legalai-corpus`. GitHub remains
+  code/docs only — no private benchmark artifacts or secrets in the repo.
+
+### Read-only Unified checks
+
+| Check | Result |
+| --- | --- |
+| `storage.verify_archive` | passed |
+| `mission.status` | passed after correcting `GATEWAY_MISSION_CONTROL_URL` to the MCP production base |
+| `case.get_artifact` | reached the artifacts service; returned expected `run_not_found` (test used a non-Case mission ID) |
+
+### Rollback / plugin removal criteria
+
+Keep legacy **Bridge**, **Storage**, **Mission Control test**, and older
+**Gateway** ChatGPT plugins installed but unused as rollback paths. **Do not
+remove** them until **one real end-to-end LegalAI workflow** succeeds using
+**only** HAL LegalAI Gateway Unified.
+
+### Next Objective (acceptance workflow)
+
+1. Retrieve a real Case-00 artifact with a **valid Case mission ID**.
+2. Submit and monitor a real Mission Control run via Unified Gateway.
+3. Verify resulting archive/inventory.
+4. Confirm request IDs and failure-stage reporting on the forwarded path.
+
 ## 2026-08-09 — FastMCP Gateway→Bridge bearer delivery (`auth=`)
 
 ### Objective

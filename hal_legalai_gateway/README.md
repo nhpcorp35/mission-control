@@ -84,7 +84,9 @@ Secrets are redacted from logs, error envelopes, and health payloads.
 | `mission` | `mission_control` | `GATEWAY_MISSION_CONTROL_URL` |
 
 `GATEWAY_MISSION_CONTROL_URL` must point at the Mission Control **MCP**
-Streamable HTTP base (`SERVICE_MODE=mcp`), not only the REST API service.
+Streamable HTTP base (`SERVICE_MODE=mcp`), not the Mission Control REST
+service. Production MCP base:
+`https://mission-control-mcp-production.up.railway.app`.
 
 ## Configuration (Railway variables)
 
@@ -110,7 +112,7 @@ Streamable HTTP base (`SERVICE_MODE=mcp`), not only the REST API service.
 | `GATEWAY_MISSION_CONTROL_MCP_PATH` | no | `/mcp` | Mission Control Streamable HTTP path |
 | `GATEWAY_BRIDGE_URL` | no | production bridge URL from registry | Absolute `http(s)` base URL |
 | `GATEWAY_STORAGE_URL` | no | same default as bridge | Independently replaceable |
-| `GATEWAY_MISSION_CONTROL_URL` | no | production Mission Control URL | Absolute `http(s)` MCP base URL |
+| `GATEWAY_MISSION_CONTROL_URL` | no | production Mission Control **MCP** URL | Absolute `http(s)` MCP base (`https://mission-control-mcp-production.up.railway.app`); **not** the REST service URL |
 | `GATEWAY_ARTIFACTS_URL` | no | same default as bridge | Independently replaceable |
 
 Retired: `GATEWAY_API_KEY` (static inbound key). Do not set it for ChatGPT Business OAuth.
@@ -193,17 +195,46 @@ This repository does **not** auto-create a new Railway service for the gateway.
 3. Set **required** GitHub OAuth + Redis/JWT/Fernet vars and `GATEWAY_BRIDGE_AUTHORIZATION`.
 4. On the Bridge service, set matching `BRIDGE_SERVICE_TOKEN` (protects
    `/mcp/service` only; public `/mcp` OAuth unchanged).
-5. Set `GATEWAY_*_URL` overrides as needed; ensure `GATEWAY_MISSION_CONTROL_URL`
-   targets MCP mode. Leave `GATEWAY_MCP_PATH` at `/mcp/service` unless
-   intentionally overriding the Bridge service path.
+5. Set `GATEWAY_*_URL` overrides as needed; set `GATEWAY_MISSION_CONTROL_URL` to
+   `https://mission-control-mcp-production.up.railway.app` (MCP, not REST).
+   Leave `GATEWAY_MCP_PATH` at `/mcp/service` unless intentionally overriding
+   the Bridge service path.
 6. Confirm Railway injects `RAILWAY_GIT_COMMIT_SHA`.
 7. Expose public networking; health check path is `/health`.
 8. Verify `GET /health` shows `deployed_commit_sha`, `registered_tools`, `auth.inbound=github_oauth`, and independent `downstream.*` entries.
-9. Point ChatGPT Business custom MCP at the gateway `/mcp` OAuth URL **only after** live verification. Do not retire existing plugins until that cutover is confirmed. This change does not claim live cutover.
+9. Point ChatGPT Business custom MCP at the gateway `/mcp` OAuth URL (HAL
+   LegalAI Gateway Unified). Keep legacy plugins installed but unused until
+   removal criteria below are met.
+
+## Live cutover status (verified 2026-08-09)
+
+**Primary ChatGPT connection:** HAL LegalAI Gateway Unified.
+
+| Fact | Value |
+| --- | --- |
+| Live Gateway/Bridge code SHA | `a7a9cad952844973c16c4fb937d7c84ad55dc87e` |
+| Bridge service path | `/mcp/service` via `StreamableHttpTransport(auth=…)` with synchronized `GATEWAY_BRIDGE_AUTHORIZATION` / `BRIDGE_SERVICE_TOKEN`; inbound user OAuth never forwarded |
+| Mission namespace | `GATEWAY_MISSION_CONTROL_URL=https://mission-control-mcp-production.up.railway.app` |
+| Verified storage packet | `packet-q1-20260809-e88c963fdee4` — `LegalAI-Case00-Q1-Benchmark-Review-Packet.docx` (40,089 bytes), `review-packet-preservation-manifest.json` (615 bytes) |
+| Private corpus | Backblaze B2 `legalai-corpus` (GitHub = code/docs only; no private artifacts/secrets) |
+
+**Read-only Unified checks:** `storage.verify_archive` passed; `mission.status`
+passed after MCP URL correction; `case.get_artifact` reached artifacts and
+returned expected `run_not_found` (non-Case mission ID used in the probe).
+
+**Rollback:** Keep legacy Bridge, Storage, Mission Control test, and older
+Gateway ChatGPT plugins installed but unused. **Do not remove** them until
+**one real end-to-end LegalAI workflow** succeeds using **only** HAL LegalAI
+Gateway Unified.
+
+**Acceptance (next):** real Case-00 artifact with a valid Case mission ID;
+submit/monitor a real Mission Control run; verify archive/inventory; confirm
+request IDs and failure-stage reporting. Do not revise Question 1, contact John
+Cuomo, or send anything externally.
 
 ## Non-goals
 
 - No Case-00 Q1 generation, private benchmark access, recipient-policy, or storage archive mutation inside the gateway
 - No replacement of Mission Control, bridge, or B2 business logic
 - No automatic Railway service creation from this repo alone
-- No retirement of existing ChatGPT / HAL plugins in this phase (cutover is operator-gated after live gateway verification)
+- No removal of legacy ChatGPT / HAL plugins until one real end-to-end LegalAI workflow succeeds on Unified alone (rollback hold)
