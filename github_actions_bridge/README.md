@@ -23,9 +23,19 @@ Case-00 storage tools:
 - `archive_case00_attorney_feedback`
 - `archive_case00_review_packet`
 
-The Case-00 path accepts only an exact 40-character commit SHA and requires
+The Case-00 path accepts the configured workflow branch alias (normally
+`main`) or an exact 40-character lowercase commit SHA, and requires
 explicit authorization before private evidence can be transmitted to the model
-provider. The GitHub workflow is generation-only. It rebuilds permitted Case-00
+provider. Branch aliases are resolved to HEAD of the configured
+`GITHUB_REPOSITORY` (the LegalAI workflow repository) via the GitHub API;
+explicit SHAs are preflight-checked in that same repository before
+`workflow_dispatch`. Arbitrary branches, tags, abbreviated SHAs, uppercase
+SHAs, and commits absent from LegalAI are rejected with structured
+`error_code` values (`ref_invalid`, `ref_not_in_repository`,
+`ref_resolution_failed`, `dispatch_failed`) and no workflow is created.
+Successful submits return `requested_ref`, `resolved_ref`, `repository`, and
+`workflow`. GitHub Actions always receives the verified immutable SHA. The
+GitHub workflow is generation-only. It rebuilds permitted Case-00
 inputs from B2, generates Q1 with the production path, uploads exactly four
 candidate artifacts under the canonical candidate prefix, and fails unless all
 four objects pass B2 HEAD verification. The artifact retrieval tool independently

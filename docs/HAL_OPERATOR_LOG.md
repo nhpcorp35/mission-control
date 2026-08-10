@@ -1,5 +1,55 @@
 # HAL Operator Log
 
+## 2026-08-10 — Case-00 ref alias resolution (LegalAI repository)
+
+### Objective
+
+Permanently fix Case-00 submission ref handling through HAL LegalAI Gateway
+Unified so `ref=main` resolves against the configured LegalAI workflow
+repository (`GITHUB_REPOSITORY`) and GitHub Actions always receives a verified
+immutable 40-character lowercase SHA. Do **not** run a real Case workflow, revise
+Question 1, contact anyone externally, or record private case content /
+credentials.
+
+### Change summary
+
+- Bridge `submit_case00_q1` accepts the configured workflow branch alias
+  (normally `main`) or an exact lowercase 40-character SHA.
+- Branch HEAD is resolved via GitHub API against configured LegalAI
+  `GITHUB_REPOSITORY` only (never the Bridge/Mission Control source repo).
+- Explicit SHAs are preflight-checked in that same repository before
+  `workflow_dispatch`; wrong-repo commits fail closed with
+  `ref_not_in_repository` and create no workflow.
+- Arbitrary branches, tags, abbreviated SHAs, uppercase SHAs, and malformed
+  refs fail with `ref_invalid` before dispatch.
+- GitHub API / dispatch failures return structured `ref_resolution_failed` /
+  `dispatch_failed` without credential or scope leakage.
+- Successful results include `requested_ref`, `resolved_ref`, `repository`,
+  and `workflow`.
+- Gateway forwarding preserves safe structured tool `error_code` / `message`
+  in its envelope instead of collapsing to only
+  "downstream tool returned an error".
+
+### Tests executed (this mission; no-git constraints)
+
+```text
+PYTHONPATH=. python -m unittest \
+  tests.test_github_actions_bridge_storage.Case00RefResolutionTests \
+  tests.test_hal_legalai_gateway.ForwardingTests \
+  tests.test_hal_legalai_gateway.GatewayBridgeCase00RefIntegrationTests \
+  -v
+# Ran 17 tests — OK
+```
+
+Commit/push to `main` was **not** performed here (mission constraints forbid
+Git). Platform persistence may land the changes after agent completion.
+
+### Next Objective
+
+Operate Case-00 submits with `main` or an exact LegalAI SHA through Unified;
+confirm Railway redeploy picks up Bridge + Gateway changes before the next
+live Case run.
+
 ## 2026-08-10 — Unified Case-00 acceptance + legacy plugin cleanup
 
 ### Objective

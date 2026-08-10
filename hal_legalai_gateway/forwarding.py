@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -118,6 +119,117 @@ def _safe_error_message(
         if needle in lowered and "[redacted]" not in lowered:
             return exc.__class__.__name__
     return redacted[:500]
+
+
+def _safe_text(value: str, *, extra_secrets: tuple[str, ...] = ()) -> str:
+    """Redact secrets from an untrusted text fragment for client envelopes."""
+    redacted = redact_secrets(value, extra_secrets=extra_secrets)
+    lowered = redacted.lower()
+    for needle in (
+        "bearer ",
+        "authorization",
+        "api_key",
+        "api-key",
+        "client_secret",
+        "jwt_signing",
+        "storage_encryption",
+        "github_token",
+        "gho_",
+        "ghp_",
+    ):
+        if needle in lowered and "[redacted]" not in lowered.lower():
+            return "downstream tool returned an error"
+    return redacted[:500]
+
+
+def _content_blocks_text(content: Any) -> str | None:
+    """Extract plain text from MCP content blocks when present."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, (list, tuple)):
+        return None
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def _extract_safe_tool_error(
+    raw: Any,
+    *,
+    extra_secrets: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Preserve safe structured downstream tool errors; never leak secrets.
+
+    Prefer ``structured_content`` with ``error_code`` / ``message``. Fall back
+    to JSON text content. Always redact. Never copy credentials or raw
+    exception dumps into the envelope.
+    """
+    error: dict[str, Any] = {
+        "message": "downstream tool returned an error",
+        "stage": STAGE_TOOL,
+    }
+
+    candidates: list[Any] = []
+    structured = getattr(raw, "structured_content", None)
+    if structured is not None:
+        candidates.append(structured)
+    data = getattr(raw, "data", None)
+    if data is not None:
+        candidates.append(data)
+
+    text = _content_blocks_text(getattr(raw, "content", None))
+    if text:
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                candidates.append(parsed)
+        # Non-JSON tool error text may still be a safe short message.
+        else:
+            error["message"] = _safe_text(stripped, extra_secrets=extra_secrets)
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        # Unwrap common {"result": {...}} envelopes without copying secrets.
+        payload = candidate
+        inner = candidate.get("result")
+        if isinstance(inner, dict) and (
+            "error_code" in inner or "message" in inner or "ok" in inner
+        ):
+            payload = inner
+        code = payload.get("error_code")
+        message = payload.get("message")
+        if isinstance(code, str) and code.strip():
+            safe_code = _safe_text(code.strip(), extra_secrets=extra_secrets)
+            # error_code must stay a short token; reject if redaction collapsed it.
+            if safe_code and "[" not in safe_code and " " not in safe_code:
+                error["error_code"] = safe_code[:128]
+        if isinstance(message, str) and message.strip():
+            error["message"] = _safe_text(
+                message.strip(), extra_secrets=extra_secrets
+            )
+        # Stop after the first structured payload that contributed fields.
+        if "error_code" in error or error["message"] != "downstream tool returned an error":
+            break
+
+    return error
 
 
 def mcp_endpoint_url(base_url: str, mcp_path: str = "/mcp/service") -> str:
@@ -263,19 +375,21 @@ async def forward_mcp_tool(
                 raise_on_error=False,
             )
             if getattr(raw, "is_error", False):
+                safe_error = _extract_safe_tool_error(
+                    raw, extra_secrets=extra_secrets
+                )
                 logger.warning(
-                    "downstream tool error gateway_tool=%s downstream=%s tool=%s",
+                    "downstream tool error gateway_tool=%s downstream=%s "
+                    "tool=%s error_code=%s",
                     binding.gateway_tool,
                     binding.downstream_service,
                     binding.downstream_tool,
+                    safe_error.get("error_code"),
                 )
                 return _finish(
                     ok=False,
                     failure_stage=STAGE_TOOL,
-                    error={
-                        "message": "downstream tool returned an error",
-                        "stage": STAGE_TOOL,
-                    },
+                    error=safe_error,
                 )
             data = getattr(raw, "data", None)
             if data is None:

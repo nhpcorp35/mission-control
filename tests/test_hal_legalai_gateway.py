@@ -458,6 +458,99 @@ class ForwardingTests(unittest.TestCase):
         self.assertEqual(payload["failure_stage"], STAGE_TOOL)
         self.assertEqual(client.name, "get_case_artifact")
 
+    def test_tool_error_preserves_safe_structured_details(self) -> None:
+        class FakeResult:
+            is_error = True
+            data = None
+            structured_content = {
+                "ok": False,
+                "error_code": "ref_not_in_repository",
+                "message": "commit deadbeef was not found in nhpcorp35/legal-ai",
+            }
+            content = [
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error_code": "ref_not_in_repository",
+                        "message": "commit deadbeef was not found in nhpcorp35/legal-ai",
+                    }
+                )
+            ]
+
+        class OkClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, arguments, raise_on_error=False):
+                return FakeResult()
+
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=ToolBinding(
+                    gateway_tool="case.submit_case00_q1",
+                    namespace="case",
+                    downstream_service="bridge",
+                    downstream_tool="submit_case00_q1",
+                ),
+                arguments={
+                    "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "authorization_confirmed": True,
+                },
+                base_url="https://bridge.example",
+                authorization="Bearer bridge-service-secret-token",
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                client_factory=OkClient,
+                extra_secrets=("bridge-service-secret-token",),
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_TOOL)
+        self.assertEqual(payload["error"]["error_code"], "ref_not_in_repository")
+        self.assertIn("nhpcorp35/legal-ai", payload["error"]["message"])
+        blob = json.dumps(payload)
+        self.assertNotIn("bridge-service-secret-token", blob)
+        self.assertNotIn("Bearer", blob)
+
+    def test_tool_error_redacts_secret_bearing_messages(self) -> None:
+        class FakeResult:
+            is_error = True
+            data = None
+            structured_content = {
+                "error_code": "dispatch_failed",
+                "message": "Authorization: Bearer super-secret-token exploded",
+            }
+            content = None
+
+        class OkClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, *args, **kwargs):
+                return FakeResult()
+
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=self.binding,
+                arguments={"mission_id": "m1"},
+                base_url="https://artifacts.example",
+                authorization="Bearer t",
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                client_factory=OkClient,
+                extra_secrets=("super-secret-token",),
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["error_code"], "dispatch_failed")
+        self.assertNotIn("super-secret-token", json.dumps(payload))
+
     def test_success_metadata_envelope(self) -> None:
         class FakeResult:
             is_error = False
@@ -855,6 +948,140 @@ class ServiceCredentialTests(unittest.TestCase):
 
         token = __import__("asyncio").run(_run())
         self.assertIsNone(token)
+
+
+class GatewayBridgeCase00RefIntegrationTests(unittest.TestCase):
+    """Gateway→Bridge submit with main resolves an immutable LegalAI SHA."""
+
+    LEGALAI_SHA = "49f6881c08e7e4fdf76d8500d52a27d057c0804b"
+
+    def test_gateway_main_submission_returns_resolved_immutable_sha(self) -> None:
+        import sys
+        from pathlib import Path
+
+        from cryptography.fernet import Fernet
+
+        bridge_dir = Path(__file__).resolve().parent.parent / "github_actions_bridge"
+        for key, value in {
+            "GITHUB_OAUTH_CLIENT_ID": "test-client-id",
+            "GITHUB_OAUTH_CLIENT_SECRET": "test-client-secret",
+            "REDIS_HOST": "127.0.0.1",
+            "REDIS_PORT": "6379",
+            "STORAGE_ENCRYPTION_KEY": Fernet.generate_key().decode(),
+            "JWT_SIGNING_KEY": "test-jwt-signing-key-for-bridge",
+            "GITHUB_TOKEN": "test-github-token-not-for-production",
+        }.items():
+            os.environ.setdefault(key, value)
+        if str(bridge_dir) not in sys.path:
+            sys.path.insert(0, str(bridge_dir))
+        import server as bridge_server
+
+        dispatches: list[dict] = []
+        orig_repo = bridge_server.REPOSITORY
+        orig_branch = bridge_server.CASE00_WORKFLOW_BRANCH
+        orig_workflow = bridge_server.CASE00_WORKFLOW
+        bridge_server.REPOSITORY = "nhpcorp35/legal-ai"
+        bridge_server.CASE00_WORKFLOW_BRANCH = "main"
+        bridge_server.CASE00_WORKFLOW = "hal-case00-q1.yml"
+
+        async def fake_github_json(method, path, **kwargs):
+            class Resp:
+                def __init__(self, status_code: int):
+                    self.status_code = status_code
+
+            if method == "GET" and path.endswith("/commits/main"):
+                return Resp(200), {"sha": self.LEGALAI_SHA}, None
+            if method == "POST" and path.endswith("/dispatches"):
+                dispatches.append(kwargs.get("json") or {})
+                return Resp(204), None, None
+            return Resp(500), {"message": "unexpected"}, None
+
+        class BridgeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, arguments, raise_on_error=False):
+                assert name == "submit_case00_q1"
+                from fastmcp.exceptions import ToolError
+
+                with mock.patch.object(
+                    bridge_server, "_require_allowed_user", return_value="service:gateway"
+                ), mock.patch.object(
+                    bridge_server, "_github_json", side_effect=fake_github_json
+                ):
+                    submit = getattr(
+                        bridge_server.submit_case00_q1,
+                        "fn",
+                        bridge_server.submit_case00_q1,
+                    )
+                    try:
+                        raw = await submit(**arguments)
+                    except ToolError as exc:
+                        payload = json.loads(str(exc))
+
+                        class ErrResult:
+                            is_error = True
+                            data = payload
+                            structured_content = payload
+                            content = [str(exc)]
+
+                        return ErrResult()
+
+                class Result:
+                    is_error = False
+                    data = raw
+                    structured_content = raw
+                    content = None
+
+                return Result()
+
+        binding = ToolBinding(
+            gateway_tool="case.submit_case00_q1",
+            namespace="case",
+            downstream_service="bridge",
+            downstream_tool="submit_case00_q1",
+        )
+        tokens = bind_request_ids(
+            request_id="req-case00-main", correlation_id="corr-case00-main"
+        )
+        try:
+            payload = asyncio.run(
+                forward_mcp_tool(
+                    binding=binding,
+                    arguments={
+                        "ref": "main",
+                        "authorization_confirmed": True,
+                        "mission_id": "mission-gateway-main",
+                    },
+                    base_url="https://bridge.example",
+                    authorization="Bearer bridge-service-token",
+                    connect_timeout_seconds=1.0,
+                    read_timeout_seconds=2.0,
+                    client_factory=BridgeClient,
+                    extra_secrets=("bridge-service-token", "test-github-token-not-for-production"),
+                )
+            )
+        finally:
+            reset_request_ids(tokens)
+            bridge_server.REPOSITORY = orig_repo
+            bridge_server.CASE00_WORKFLOW_BRANCH = orig_branch
+            bridge_server.CASE00_WORKFLOW = orig_workflow
+
+        self.assertTrue(payload["ok"], msg=payload)
+        self.assertIsNone(payload["failure_stage"])
+        result = payload["result"]
+        self.assertEqual(result["requested_ref"], "main")
+        self.assertEqual(result["resolved_ref"], self.LEGALAI_SHA)
+        self.assertEqual(result["repository"], "nhpcorp35/legal-ai")
+        self.assertEqual(result["workflow"], "hal-case00-q1.yml")
+        self.assertEqual(len(dispatches), 1)
+        self.assertEqual(dispatches[0]["inputs"]["legalai_ref"], self.LEGALAI_SHA)
+        blob = json.dumps(payload)
+        self.assertNotIn("bridge-service-token", blob)
+        self.assertNotIn("test-github-token-not-for-production", blob)
 
 
 class RequestContextUnitTests(unittest.TestCase):

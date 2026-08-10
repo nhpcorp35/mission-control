@@ -4,15 +4,17 @@ import asyncio
 import io
 import json
 import os
+import re
 import time
 import uuid
 import zipfile
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, NoReturn
 
 import boto3
 import httpx
 from cryptography.fernet import Fernet
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 from key_value.aio.stores.redis import RedisStore
@@ -38,6 +40,15 @@ from service_auth import (
     compose_dual_mcp_http_app,
     is_service_access_token,
 )
+
+# Exact immutable LegalAI commit SHA (lowercase hex only — no abbreviated / mixed case).
+_FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# Structured Case-00 ref / dispatch failures (safe for Gateway envelopes).
+ERROR_REF_INVALID = "ref_invalid"
+ERROR_REF_NOT_IN_REPOSITORY = "ref_not_in_repository"
+ERROR_REF_RESOLUTION_FAILED = "ref_resolution_failed"
+ERROR_DISPATCH_FAILED = "dispatch_failed"
 
 # Explicit deployment provenance only — never infer or fabricate a SHA.
 DEPLOYED_COMMIT_SHA_ENV = "RAILWAY_GIT_COMMIT_SHA"
@@ -197,6 +208,127 @@ async def _github(method: str, path: str, **kwargs: Any) -> httpx.Response:
     return response
 
 
+def raise_case00_structured_error(error_code: str, message: str) -> NoReturn:
+    """Raise a ToolError whose message is safe JSON for Gateway envelopes."""
+    payload = {
+        "ok": False,
+        "error_code": error_code,
+        "message": message,
+    }
+    raise ToolError(json.dumps(payload, separators=(",", ":")))
+
+
+def _is_exact_commit_sha(value: str) -> bool:
+    return bool(_FULL_COMMIT_SHA_RE.fullmatch(value))
+
+
+async def _github_json(
+    method: str, path: str, **kwargs: Any
+) -> tuple[httpx.Response | None, dict[str, Any] | None, str | None]:
+    """GitHub JSON helper that never echoes credentials or token scope headers.
+
+    Returns ``(response, json_body, transport_error_message)``. On transport
+    failure ``response`` is None. Callers map status codes to safe error_codes.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.request(
+                method, f"{GITHUB_API}{path}", headers=_github_headers(), **kwargs
+            )
+    except httpx.HTTPError as exc:
+        return None, None, exc.__class__.__name__
+    try:
+        body: dict[str, Any] | None
+        parsed = response.json()
+        body = parsed if isinstance(parsed, dict) else None
+    except (ValueError, TypeError):
+        body = None
+    return response, body, None
+
+
+async def resolve_case00_legalai_ref(ref: str) -> tuple[str, str]:
+    """Accept configured branch alias or exact SHA; resolve against GITHUB_REPOSITORY.
+
+    Returns ``(requested_ref, resolved_sha)``. Raises ``ToolError`` with safe
+    JSON ``error_code`` / ``message`` on validation or GitHub failures.
+    Does not consult the Bridge deployment/source repository — only
+    ``REPOSITORY`` (configured LegalAI workflow repository).
+    """
+    requested_ref = (ref or "").strip()
+    if not requested_ref:
+        raise_case00_structured_error(
+            ERROR_REF_INVALID,
+            "ref must be the configured workflow branch "
+            f"({CASE00_WORKFLOW_BRANCH}) or an exact 40-character lowercase commit SHA",
+        )
+
+    if requested_ref == CASE00_WORKFLOW_BRANCH:
+        path = f"/repos/{REPOSITORY}/commits/{CASE00_WORKFLOW_BRANCH}"
+        response, body, transport_error = await _github_json("GET", path)
+        if transport_error is not None:
+            raise_case00_structured_error(
+                ERROR_REF_RESOLUTION_FAILED,
+                "failed to resolve configured workflow branch HEAD from "
+                f"{REPOSITORY} ({transport_error})",
+            )
+        assert response is not None
+        if response.status_code == 404:
+            raise_case00_structured_error(
+                ERROR_REF_RESOLUTION_FAILED,
+                f"configured workflow branch {CASE00_WORKFLOW_BRANCH!r} was not "
+                f"found in {REPOSITORY}",
+            )
+        if response.status_code >= 400 or not isinstance(body, dict):
+            raise_case00_structured_error(
+                ERROR_REF_RESOLUTION_FAILED,
+                "failed to resolve configured workflow branch HEAD from "
+                f"{REPOSITORY} (HTTP {response.status_code})",
+            )
+        sha = body.get("sha")
+        if not isinstance(sha, str) or not _is_exact_commit_sha(sha.lower()):
+            raise_case00_structured_error(
+                ERROR_REF_RESOLUTION_FAILED,
+                "GitHub did not return an exact commit SHA for the configured "
+                f"workflow branch in {REPOSITORY}",
+            )
+        return requested_ref, sha.lower()
+
+    if _is_exact_commit_sha(requested_ref):
+        path = f"/repos/{REPOSITORY}/commits/{requested_ref}"
+        response, body, transport_error = await _github_json("GET", path)
+        if transport_error is not None:
+            raise_case00_structured_error(
+                ERROR_REF_RESOLUTION_FAILED,
+                "failed to verify commit in "
+                f"{REPOSITORY} ({transport_error})",
+            )
+        assert response is not None
+        if response.status_code == 404:
+            raise_case00_structured_error(
+                ERROR_REF_NOT_IN_REPOSITORY,
+                f"commit {requested_ref} was not found in {REPOSITORY}",
+            )
+        if response.status_code >= 400:
+            raise_case00_structured_error(
+                ERROR_REF_RESOLUTION_FAILED,
+                "failed to verify commit in "
+                f"{REPOSITORY} (HTTP {response.status_code})",
+            )
+        sha = (body or {}).get("sha") if isinstance(body, dict) else None
+        if isinstance(sha, str) and _is_exact_commit_sha(sha.lower()):
+            return requested_ref, sha.lower()
+        # Some GitHub responses omit body.sha on success; the requested SHA
+        # already passed format + existence (non-404) checks.
+        return requested_ref, requested_ref
+
+    raise_case00_structured_error(
+        ERROR_REF_INVALID,
+        "ref must be the configured workflow branch "
+        f"({CASE00_WORKFLOW_BRANCH}) or an exact 40-character lowercase commit SHA; "
+        "arbitrary branches, tags, abbreviated SHAs, and uppercase SHAs are rejected",
+    )
+
+
 async def _resolve_run(mission_id: str) -> dict[str, Any] | None:
     response = await _github(
         "GET",
@@ -291,34 +423,55 @@ async def cancel_run(mission_id: str) -> dict[str, Any]:
 async def submit_case00_q1(
     ref: str, authorization_confirmed: bool, mission_id: str | None = None
 ) -> dict[str, Any]:
-    """Dispatch generation-only Case-00 Q1 at an exact commit SHA."""
+    """Dispatch generation-only Case-00 Q1 at an immutable verified commit SHA.
+
+    ``ref`` may be the configured workflow branch (normally ``main``), which is
+    resolved to HEAD of the configured ``GITHUB_REPOSITORY`` (LegalAI), or an
+    exact lowercase 40-character commit SHA preflight-checked in that same
+    repository. GitHub Actions always receives the resolved SHA.
+    """
     _require_allowed_user()
     if not authorization_confirmed:
         raise ValueError(
             "authorization_confirmed must be true before private evidence is sent"
         )
-    normalized_ref = ref.strip().lower()
-    if len(normalized_ref) != 40 or any(ch not in "0123456789abcdef" for ch in normalized_ref):
-        raise ValueError("ref must be an exact 40-character lowercase commit SHA")
+    requested_ref, resolved_ref = await resolve_case00_legalai_ref(ref)
     mission_id = mission_id or str(uuid.uuid4())
-    await _github(
+    dispatch_path = (
+        f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/dispatches"
+    )
+    response, _body, transport_error = await _github_json(
         "POST",
-        f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/dispatches",
+        dispatch_path,
         json={
             "ref": CASE00_WORKFLOW_BRANCH,
             "inputs": {
                 "mission_id": mission_id,
-                "legalai_ref": normalized_ref,
+                "legalai_ref": resolved_ref,
                 "authorization_confirmed": "true",
             },
         },
     )
+    if transport_error is not None:
+        raise_case00_structured_error(
+            ERROR_DISPATCH_FAILED,
+            f"workflow dispatch failed for {CASE00_WORKFLOW} ({transport_error})",
+        )
+    assert response is not None
+    # workflow_dispatch accepted → 204 No Content
+    if response.status_code not in {201, 204}:
+        raise_case00_structured_error(
+            ERROR_DISPATCH_FAILED,
+            f"workflow dispatch failed for {CASE00_WORKFLOW} "
+            f"(HTTP {response.status_code})",
+        )
     return {
         "ok": True,
         "mission_id": mission_id,
         "status": "dispatched",
         "repository": REPOSITORY,
-        "requested_ref": normalized_ref,
+        "requested_ref": requested_ref,
+        "resolved_ref": resolved_ref,
         "workflow": CASE00_WORKFLOW,
     }
 

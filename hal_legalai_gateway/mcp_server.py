@@ -30,7 +30,13 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         namespace="case",
         downstream_service="bridge",
         downstream_tool="submit_case00_q1",
-        description="Dispatch generation-only Case-00 Q1 at an exact commit SHA.",
+        description=(
+            "Dispatch generation-only Case-00 Q1. Accepts the configured "
+            "workflow branch (normally main), resolved immutably to HEAD of "
+            "the LegalAI workflow repository, or an exact lowercase "
+            "40-character commit SHA preflight-checked in that repository. "
+            "GitHub Actions always receives the verified SHA."
+        ),
     ),
     ToolBinding(
         gateway_tool="case.get_case00_q1_run",

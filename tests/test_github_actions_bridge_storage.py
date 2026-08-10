@@ -533,5 +533,239 @@ class BridgeOperationalIntegrityTests(unittest.TestCase):
         self.assertIn("archive_case00_review_packet", payload["registered_tools"])
 
 
+class Case00RefResolutionTests(unittest.TestCase):
+    """Case-00 submit ref alias + SHA preflight against configured LegalAI repo."""
+
+    LEGALAI_SHA = "49f6881c08e7e4fdf76d8500d52a27d057c0804b"
+    WRONG_REPO_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = _import_bridge_server()
+
+    def setUp(self) -> None:
+        self.dispatches: list[dict] = []
+        self._orig_repo = self.server.REPOSITORY
+        self._orig_branch = self.server.CASE00_WORKFLOW_BRANCH
+        self._orig_workflow = self.server.CASE00_WORKFLOW
+        self.server.REPOSITORY = "nhpcorp35/legal-ai"
+        self.server.CASE00_WORKFLOW_BRANCH = "main"
+        self.server.CASE00_WORKFLOW = "hal-case00-q1.yml"
+
+    def tearDown(self) -> None:
+        self.server.REPOSITORY = self._orig_repo
+        self.server.CASE00_WORKFLOW_BRANCH = self._orig_branch
+        self.server.CASE00_WORKFLOW = self._orig_workflow
+
+    def _submit(self):
+        tool = self.server.submit_case00_q1
+        return getattr(tool, "fn", tool)
+
+    def _tool_error_payload(self, exc: Exception) -> dict:
+        from fastmcp.exceptions import ToolError
+
+        self.assertIsInstance(exc, ToolError)
+        payload = json.loads(str(exc))
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload.get("ok"), False)
+        return payload
+
+    def _patch_github_json(self, handler):
+        return mock.patch.object(self.server, "_github_json", side_effect=handler)
+
+    async def _fake_github_json(self, method, path, **kwargs):
+        class Resp:
+            def __init__(self, status_code: int):
+                self.status_code = status_code
+
+        if method == "GET" and path.endswith(f"/commits/{self.server.CASE00_WORKFLOW_BRANCH}"):
+            return Resp(200), {"sha": self.LEGALAI_SHA}, None
+        if method == "GET" and path.endswith(f"/commits/{self.LEGALAI_SHA}"):
+            return Resp(200), {"sha": self.LEGALAI_SHA}, None
+        if method == "GET" and path.endswith(f"/commits/{self.WRONG_REPO_SHA}"):
+            return Resp(404), {"message": "Not Found"}, None
+        if method == "POST" and path.endswith("/dispatches"):
+            self.dispatches.append({"path": path, "json": kwargs.get("json")})
+            return Resp(204), None, None
+        return Resp(500), {"message": "unexpected"}, None
+
+    def test_main_resolves_from_configured_legalai_repo_and_dispatches_sha(self) -> None:
+        submit = self._submit()
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    ref="main",
+                    authorization_confirmed=True,
+                    mission_id="mission-main-alias",
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["requested_ref"], "main")
+        self.assertEqual(result["resolved_ref"], self.LEGALAI_SHA)
+        self.assertEqual(result["repository"], "nhpcorp35/legal-ai")
+        self.assertEqual(result["workflow"], "hal-case00-q1.yml")
+        self.assertEqual(len(self.dispatches), 1)
+        payload = self.dispatches[0]["json"]
+        self.assertEqual(payload["ref"], "main")
+        self.assertEqual(payload["inputs"]["legalai_ref"], self.LEGALAI_SHA)
+        self.assertNotIn("GITHUB_TOKEN", json.dumps(result))
+        self.assertNotIn("bearer", json.dumps(result).lower())
+
+    def test_explicit_valid_sha_succeeds(self) -> None:
+        submit = self._submit()
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    ref=self.LEGALAI_SHA,
+                    authorization_confirmed=True,
+                    mission_id="mission-explicit-sha",
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["requested_ref"], self.LEGALAI_SHA)
+        self.assertEqual(result["resolved_ref"], self.LEGALAI_SHA)
+        self.assertEqual(len(self.dispatches), 1)
+        self.assertEqual(
+            self.dispatches[0]["json"]["inputs"]["legalai_ref"], self.LEGALAI_SHA
+        )
+
+    def test_wrong_repository_sha_fails_before_dispatch(self) -> None:
+        submit = self._submit()
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    ref=self.WRONG_REPO_SHA,
+                    authorization_confirmed=True,
+                    mission_id="mission-wrong-repo",
+                )
+
+        with self.assertRaises(Exception) as ctx:
+            asyncio.run(run())
+        result = self._tool_error_payload(ctx.exception)
+        self.assertEqual(result["error_code"], self.server.ERROR_REF_NOT_IN_REPOSITORY)
+        self.assertIn("nhpcorp35/legal-ai", result["message"])
+        self.assertEqual(self.dispatches, [])
+
+    def test_arbitrary_branch_tag_and_malformed_refs_fail_before_dispatch(self) -> None:
+        from fastmcp.exceptions import ToolError
+
+        submit = self._submit()
+        bad_refs = [
+            "develop",
+            "refs/tags/v1.0.0",
+            "v1.0.0",
+            "49f6881",  # abbreviated
+            self.LEGALAI_SHA.upper(),  # uppercase
+            "MAIN",
+            "not a ref",
+            "",
+            "g" * 40,  # non-hex
+        ]
+
+        async def run(ref: str):
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    ref=ref,
+                    authorization_confirmed=True,
+                    mission_id="mission-bad-ref",
+                )
+
+        for ref in bad_refs:
+            with self.assertRaises(ToolError) as ctx:
+                asyncio.run(run(ref))
+            result = self._tool_error_payload(ctx.exception)
+            self.assertEqual(
+                result["error_code"],
+                self.server.ERROR_REF_INVALID,
+                msg=f"ref={ref!r}",
+            )
+        self.assertEqual(self.dispatches, [])
+
+    def test_github_api_resolution_failure_is_structured(self) -> None:
+        submit = self._submit()
+
+        async def boom(method, path, **kwargs):
+            return None, None, "ConnectError"
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(boom):
+                return await submit(
+                    ref="main",
+                    authorization_confirmed=True,
+                    mission_id="mission-resolve-fail",
+                )
+
+        with self.assertRaises(Exception) as ctx:
+            asyncio.run(run())
+        result = self._tool_error_payload(ctx.exception)
+        self.assertEqual(result["error_code"], self.server.ERROR_REF_RESOLUTION_FAILED)
+        self.assertEqual(self.dispatches, [])
+        blob = json.dumps(result).lower()
+        self.assertNotIn("bearer", blob)
+        self.assertNotIn("github_token", blob)
+
+    def test_dispatch_failure_is_structured_and_redacted(self) -> None:
+        submit = self._submit()
+
+        async def handler(method, path, **kwargs):
+            class Resp:
+                def __init__(self, status_code: int):
+                    self.status_code = status_code
+
+            if method == "GET":
+                return Resp(200), {"sha": self.LEGALAI_SHA}, None
+            return Resp(403), {"message": "Resource not accessible by integration"}, None
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(handler):
+                return await submit(
+                    ref=self.LEGALAI_SHA,
+                    authorization_confirmed=True,
+                    mission_id="mission-dispatch-fail",
+                )
+
+        with self.assertRaises(Exception) as ctx:
+            asyncio.run(run())
+        result = self._tool_error_payload(ctx.exception)
+        self.assertEqual(result["error_code"], self.server.ERROR_DISPATCH_FAILED)
+        self.assertIn("HTTP 403", result["message"])
+        self.assertNotIn("token_scopes", result["message"])
+        self.assertNotIn("Bearer", json.dumps(result))
+
+    def test_authorization_confirmed_still_required(self) -> None:
+        submit = self._submit()
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    ref="main",
+                    authorization_confirmed=False,
+                )
+
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(run())
+        self.assertIn("authorization_confirmed", str(ctx.exception))
+        self.assertEqual(self.dispatches, [])
+
+
 if __name__ == "__main__":
     unittest.main()

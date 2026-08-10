@@ -220,9 +220,13 @@ This repository does **not** auto-create a new Railway service for the gateway.
 | Accepted candidate directory | `q1-candidate-20260810T153540Z` — four B2 objects (JSON/MD/manifest/audit; sizes in operator log) |
 | Private corpus | Backblaze B2 `legalai-corpus` (GitHub = code/docs only; no private artifacts/secrets) |
 
-**Enforcement observed:** `ref=main` rejected (exact lowercase 40-char SHA
-required; no workflow). Wrong-repo SHA failed at exact LegalAI checkout (run
-`31403783182`). Clean SHA run succeeded.
+**Case-00 ref handling:** `case.submit_case00_q1` accepts the configured
+workflow branch (normally `main`) or an exact lowercase 40-character SHA.
+`main` is resolved to HEAD of the configured LegalAI `GITHUB_REPOSITORY` and
+dispatched as that immutable SHA; explicit SHAs are preflight-checked in the
+same repository. Wrong-repo commits, tags, abbreviated/uppercase SHAs, and
+arbitrary branches fail closed before dispatch with structured `error_code`
+values preserved through the Gateway envelope.
 
 **Unified verification:** Retrieved/verified four candidate artifacts;
 `case.get_artifact` on `generation_manifest.json` → `verified=true`,
