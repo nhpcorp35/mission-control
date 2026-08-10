@@ -303,7 +303,10 @@ async def resolve_case00_legalai_ref(ref: str) -> tuple[str, str]:
                 f"{REPOSITORY} ({transport_error})",
             )
         assert response is not None
-        if response.status_code == 404:
+        # GitHub returns 404 or 422 for a well-formed SHA that is absent from
+        # the repository (or belongs to another repo). Both mean fail-closed
+        # before workflow_dispatch — not a transient resolution failure.
+        if response.status_code in (404, 422):
             raise_case00_structured_error(
                 ERROR_REF_NOT_IN_REPOSITORY,
                 f"commit {requested_ref} was not found in {REPOSITORY}",

@@ -1,5 +1,42 @@
 # HAL Operator Log
 
+## 2026-08-10 — Explicit SHA preflight: classify GitHub 422 as ref_not_in_repository
+
+### Objective
+
+Live Unified acceptance showed GitHub `GET .../commits/{sha}` returning HTTP
+422 for a valid-format 40-character SHA absent from `nhpcorp35/legal-ai`. The
+bridge blocked dispatch but returned `ref_resolution_failed`. Treat explicit-SHA
+lookup 404 **or** 422 as `ref_not_in_repository` with a safe message and no
+`workflow_dispatch`. Do not change branch-alias handling. Do not run a real Case
+workflow or record private artifacts/secrets.
+
+### Change summary
+
+- Explicit SHA preflight maps GitHub HTTP 404 and 422 to
+  `ref_not_in_repository` (same safe “not found in repository” message).
+- Other non-success commit-lookup statuses remain `ref_resolution_failed`.
+- Branch-alias resolution unchanged.
+- Focused tests cover absent-commit 404 and 422 and assert dispatch is not
+  called.
+
+### Tests executed (this mission; no-git constraints)
+
+```text
+PYTHONPATH=. python -m unittest \
+  tests.test_github_actions_bridge_storage.Case00RefResolutionTests \
+  -v
+# Ran 8 tests — OK
+```
+
+Commit/push to `main` was **not** performed here (mission constraints forbid
+Git). Platform persistence may land the changes after agent completion.
+
+### Next Objective
+
+Re-run Unified Case-00 submit with an absent/wrong-repo SHA and confirm the
+operator-facing code is `ref_not_in_repository` (not `ref_resolution_failed`).
+
 ## 2026-08-10 — Case-00 ref alias resolution (LegalAI repository)
 
 ### Objective

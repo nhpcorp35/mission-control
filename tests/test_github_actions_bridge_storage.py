@@ -589,6 +589,19 @@ class Case00RefResolutionTests(unittest.TestCase):
             return Resp(204), None, None
         return Resp(500), {"message": "unexpected"}, None
 
+    async def _absent_sha_github_json(self, status_code: int, method, path, **kwargs):
+        class Resp:
+            def __init__(self, code: int):
+                self.status_code = code
+
+        if method == "GET" and path.endswith(f"/commits/{self.WRONG_REPO_SHA}"):
+            message = "Not Found" if status_code == 404 else "Validation Failed"
+            return Resp(status_code), {"message": message}, None
+        if method == "POST" and path.endswith("/dispatches"):
+            self.dispatches.append({"path": path, "json": kwargs.get("json")})
+            return Resp(204), None, None
+        return Resp(500), {"message": "unexpected"}, None
+
     def test_main_resolves_from_configured_legalai_repo_and_dispatches_sha(self) -> None:
         submit = self._submit()
 
@@ -638,16 +651,29 @@ class Case00RefResolutionTests(unittest.TestCase):
         )
 
     def test_wrong_repository_sha_fails_before_dispatch(self) -> None:
+        """Absent explicit SHA: GitHub 404 → ref_not_in_repository, no dispatch."""
+        self._assert_absent_sha_classified(404)
+
+    def test_absent_sha_http_422_fails_before_dispatch(self) -> None:
+        """Absent explicit SHA: GitHub 422 → ref_not_in_repository, no dispatch."""
+        self._assert_absent_sha_classified(422)
+
+    def _assert_absent_sha_classified(self, status_code: int) -> None:
         submit = self._submit()
+
+        async def handler(method, path, **kwargs):
+            return await self._absent_sha_github_json(
+                status_code, method, path, **kwargs
+            )
 
         async def run():
             with mock.patch.object(
                 self.server, "_require_allowed_user", return_value="nhpcorp35"
-            ), self._patch_github_json(self._fake_github_json):
+            ), self._patch_github_json(handler):
                 return await submit(
                     ref=self.WRONG_REPO_SHA,
                     authorization_confirmed=True,
-                    mission_id="mission-wrong-repo",
+                    mission_id=f"mission-absent-sha-{status_code}",
                 )
 
         with self.assertRaises(Exception) as ctx:
@@ -655,6 +681,7 @@ class Case00RefResolutionTests(unittest.TestCase):
         result = self._tool_error_payload(ctx.exception)
         self.assertEqual(result["error_code"], self.server.ERROR_REF_NOT_IN_REPOSITORY)
         self.assertIn("nhpcorp35/legal-ai", result["message"])
+        self.assertIn(self.WRONG_REPO_SHA, result["message"])
         self.assertEqual(self.dispatches, [])
 
     def test_arbitrary_branch_tag_and_malformed_refs_fail_before_dispatch(self) -> None:
