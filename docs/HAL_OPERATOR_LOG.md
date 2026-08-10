@@ -1,5 +1,74 @@
 # HAL Operator Log
 
+## 2026-08-10 — Unified Case-00 acceptance + legacy plugin cleanup
+
+### Objective
+
+Record successful end-to-end LegalAI Case-00 acceptance through **HAL LegalAI
+Gateway Unified** alone, and the subsequent removal of legacy duplicate
+ChatGPT plugins. Do **not** revise Question 1, contact John Cuomo, or send
+anything externally. Do **not** record candidate answer contents, attorney
+correspondence, recipient data, private payloads, or credentials.
+
+### Submission / enforcement evidence
+
+- Initial `ref=main` Case submission was safely rejected (Case requires an
+  exact lowercase 40-character SHA); no workflow was created.
+- First dispatched attempt used a SHA from the wrong repository and failed at
+  exact LegalAI checkout — immutable checkout enforcement. GitHub Actions
+  run ID `31403783182`.
+- Clean success: LegalAI SHA
+  `49f6881c08e7e4fdf76d8500d52a27d057c0804b`, mission_id
+  `case00-unified-acceptance2-20260810`, GitHub Actions run `31404004716`,
+  conclusion `success`.
+
+### Artifact / inventory verification (Unified only)
+
+Candidate directory `q1-candidate-20260810T153540Z` — four B2 objects
+retrieved and size-verified:
+
+| Object | Bytes |
+| --- | --- |
+| `Q1_candidate_answer.json` | 282566 |
+| `Q1_candidate_answer.md` | 4232 |
+| `generation_manifest.json` | 2098 |
+| `model_input_audit.json` | 2574 |
+
+- `case.get_artifact` retrieved `generation_manifest.json` with
+  `verified=true`, generation-only candidate status,
+  `attorney_approved=false`.
+- `storage.verify_archive` independently confirmed all four objects with
+  matching sizes and ETags in canonical B2 inventory.
+- Request IDs, correlation IDs, and failure-stage reporting were present
+  throughout.
+
+### Acceptance + plugin posture
+
+Acceptance condition **passed**. Legacy duplicate ChatGPT plugins removed:
+
+- HAL_LegalAi_Bridge
+- HAL LegalAI Bridge
+- HAL LegalAI Bridge v2
+- Hal LegalAi Storage
+- Mission Control Four Tool Test
+- Mission Control Five Tool Test
+- Mission Control Six Tool Test
+- Mission Control Six Tool Test2
+- mission control
+
+`legal-ai-mcp` was already not installed. **Sole LegalAI interface:** HAL
+LegalAI Gateway Unified. Keep Railway and GitHub administrative plugins.
+
+### Documentation mission notes
+
+Commit/push to `main` was **not** performed here (mission constraints forbid
+Git). Platform persistence may land the docs after agent completion.
+
+### Next Objective
+
+Operate LegalAI Case work exclusively through Unified; use Railway/GitHub
+admin plugins only for service administration.
+
 ## 2026-08-09 — Unified Gateway cutover (primary) + rollback hold
 
 ### Objective

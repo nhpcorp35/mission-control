@@ -203,38 +203,41 @@ This repository does **not** auto-create a new Railway service for the gateway.
 7. Expose public networking; health check path is `/health`.
 8. Verify `GET /health` shows `deployed_commit_sha`, `registered_tools`, `auth.inbound=github_oauth`, and independent `downstream.*` entries.
 9. Point ChatGPT Business custom MCP at the gateway `/mcp` OAuth URL (HAL
-   LegalAI Gateway Unified). Keep legacy plugins installed but unused until
-   removal criteria below are met.
+   LegalAI Gateway Unified). Unified is the sole LegalAI interface; keep
+   Railway and GitHub administrative plugins only.
 
-## Live cutover status (verified 2026-08-09)
+## Live operating status (accepted 2026-08-10)
 
-**Primary ChatGPT connection:** HAL LegalAI Gateway Unified.
+**Sole LegalAI ChatGPT connection:** HAL LegalAI Gateway Unified.
 
 | Fact | Value |
 | --- | --- |
-| Live Gateway/Bridge code SHA | `a7a9cad952844973c16c4fb937d7c84ad55dc87e` |
+| Accepted LegalAI Case SHA | `49f6881c08e7e4fdf76d8500d52a27d057c0804b` |
+| Acceptance mission_id | `case00-unified-acceptance2-20260810` |
+| GitHub Actions run (success) | `31404004716` |
 | Bridge service path | `/mcp/service` via `StreamableHttpTransport(auth=…)` with synchronized `GATEWAY_BRIDGE_AUTHORIZATION` / `BRIDGE_SERVICE_TOKEN`; inbound user OAuth never forwarded |
 | Mission namespace | `GATEWAY_MISSION_CONTROL_URL=https://mission-control-mcp-production.up.railway.app` |
-| Verified storage packet | `packet-q1-20260809-e88c963fdee4` — `LegalAI-Case00-Q1-Benchmark-Review-Packet.docx` (40,089 bytes), `review-packet-preservation-manifest.json` (615 bytes) |
+| Accepted candidate directory | `q1-candidate-20260810T153540Z` — four B2 objects (JSON/MD/manifest/audit; sizes in operator log) |
 | Private corpus | Backblaze B2 `legalai-corpus` (GitHub = code/docs only; no private artifacts/secrets) |
 
-**Read-only Unified checks:** `storage.verify_archive` passed; `mission.status`
-passed after MCP URL correction; `case.get_artifact` reached artifacts and
-returned expected `run_not_found` (non-Case mission ID used in the probe).
+**Enforcement observed:** `ref=main` rejected (exact lowercase 40-char SHA
+required; no workflow). Wrong-repo SHA failed at exact LegalAI checkout (run
+`31403783182`). Clean SHA run succeeded.
 
-**Rollback:** Keep legacy Bridge, Storage, Mission Control test, and older
-Gateway ChatGPT plugins installed but unused. **Do not remove** them until
-**one real end-to-end LegalAI workflow** succeeds using **only** HAL LegalAI
-Gateway Unified.
+**Unified verification:** Retrieved/verified four candidate artifacts;
+`case.get_artifact` on `generation_manifest.json` → `verified=true`,
+generation-only, `attorney_approved=false`; `storage.verify_archive`
+confirmed matching sizes/ETags. Request IDs, correlation IDs, and
+failure-stage reporting present end-to-end. Acceptance condition **passed**.
 
-**Acceptance (next):** real Case-00 artifact with a valid Case mission ID;
-submit/monitor a real Mission Control run; verify archive/inventory; confirm
-request IDs and failure-stage reporting. Do not revise Question 1, contact John
-Cuomo, or send anything externally.
+**Plugin posture:** Legacy duplicate LegalAI/Bridge/Storage/Mission Control
+test plugins removed (list in `docs/HAL_OPERATOR_LOG.md`). Keep Unified as
+the sole LegalAI interface; keep Railway and GitHub administrative plugins.
+Do not revise Question 1, contact John Cuomo, or send anything externally.
 
 ## Non-goals
 
 - No Case-00 Q1 generation, private benchmark access, recipient-policy, or storage archive mutation inside the gateway
 - No replacement of Mission Control, bridge, or B2 business logic
 - No automatic Railway service creation from this repo alone
-- No removal of legacy ChatGPT / HAL plugins until one real end-to-end LegalAI workflow succeeds on Unified alone (rollback hold)
+- No reintroduction of legacy duplicate LegalAI ChatGPT plugins; Unified remains the sole LegalAI interface
