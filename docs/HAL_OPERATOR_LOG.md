@@ -1,5 +1,11 @@
 # HAL Operator Log
 
+## 2026-08-11 — Platform-only persistence canary
+
+Platform-only persistence canary executed after commit
+`67b01a8dc66007c91de7c94c98c0a001db44d9d2`. No other files changed; commit/push
+left to Mission Control platform persistence.
+
 ## 2026-08-11 — Persistence temp-path guard and consolidated status
 
 ### Objective
