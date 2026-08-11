@@ -191,6 +191,8 @@ Rules:
 - `commit` never pushes.
 - Legacy `POST /execute` does not apply `persist_workspace_changes`; prefer `POST /runs` when platform persistence is required.
 
+**Remote reconciliation (phase 2):** After workspace clone, Mission Control captures a baseline commit SHA before agent execution. Immediately before `persistence.mode=push` commit/push, it fetches the target remote branch and compares baseline, workspace HEAD, working-tree dirty state, and the current remote tip. When only the workspace changed, platform commit/push proceeds and records `commit_sha` with `pushed=true` as usual. When the remote already equals the exact workspace commit (safely determinable), Mission Control reports `pushed_by_external_or_agent=true`, `pushed=false`, `reconciled=true`, and the authoritative remote `commit_sha` — never “no repository changes.” When the remote advanced with a non-matching tip, persistence fails closed with `failure_stage=remote_reconciliation` (including `baseline_sha`, `remote_sha`, `workspace_sha`, dirty state, and a recommended next action) and never force-pushes, resets, or silently overwrites. Secret values are excluded from reconciliation output.
+
 `persistence.mode: push` is privileged: it can update the shared remote and trigger downstream deploy / sync. It must remain gated.
 
 ---

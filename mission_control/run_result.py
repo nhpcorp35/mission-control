@@ -97,6 +97,12 @@ class PersistenceEvidence:
     persistence layer. It is never inferred from agent stdout.
 
     ``pushed`` is True only when a platform push completed successfully.
+
+    Remote-reconciliation fields describe unexpected remote advancement during
+    a run. ``pushed_by_external_or_agent`` with ``reconciled=true`` means the
+    authoritative remote tip already matched the workspace commit; this is
+    not a "no repository changes" outcome. ``failure_stage`` of
+    ``remote_reconciliation`` means Mission Control refused to overwrite.
     """
 
     mode: str | None
@@ -104,6 +110,14 @@ class PersistenceEvidence:
     ok: bool | None
     commit_sha: str | None = None
     pushed: bool | None = None
+    baseline_sha: str | None = None
+    remote_sha: str | None = None
+    workspace_sha: str | None = None
+    dirty: bool | None = None
+    reconciled: bool | None = None
+    pushed_by_external_or_agent: bool | None = None
+    failure_stage: str | None = None
+    recommended_next_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -212,12 +226,44 @@ class StructuredRunResult:
                 pushed = None
             else:
                 pushed = bool(pushed_raw) if pushed_raw is not None else None
+
+            def _optional_bool(key: str) -> bool | None:
+                if key not in persistence_raw:
+                    return None
+                value = persistence_raw.get(key)
+                return bool(value) if value is not None else None
+
+            def _optional_str(key: str) -> str | None:
+                value = persistence_raw.get(key)
+                if value is None:
+                    return None
+                return str(value)
+
+            dirty_raw = persistence_raw.get("dirty")
+            dirty: bool | None
+            if dirty_raw is None and "dirty" not in persistence_raw:
+                dirty = None
+            else:
+                dirty = bool(dirty_raw) if dirty_raw is not None else None
+
             persistence = PersistenceEvidence(
                 mode=str(mode) if mode is not None else None,
                 attempted=bool(persistence_raw.get("attempted")),
                 ok=persistence_raw.get("ok"),
                 commit_sha=persistence_raw.get("commit_sha"),
                 pushed=pushed,
+                baseline_sha=_optional_str("baseline_sha"),
+                remote_sha=_optional_str("remote_sha"),
+                workspace_sha=_optional_str("workspace_sha"),
+                dirty=dirty,
+                reconciled=_optional_bool("reconciled"),
+                pushed_by_external_or_agent=_optional_bool(
+                    "pushed_by_external_or_agent"
+                ),
+                failure_stage=_optional_str("failure_stage"),
+                recommended_next_action=_optional_str(
+                    "recommended_next_action"
+                ),
             )
 
         documentation = None
@@ -453,7 +499,15 @@ def build_run_summary(
             push_note = ", pushed=true"
         elif persistence.pushed is False and mode == "push":
             push_note = ", pushed=false"
-        if persistence.commit_sha:
+        if persistence.pushed_by_external_or_agent is True:
+            # Transitional: exact workspace commit already on remote.
+            sha = persistence.commit_sha or persistence.remote_sha or "unknown"
+            persistence_line = (
+                "Platform persistence reconciled workspace commit already on "
+                f"remote (mode={mode}, commit_sha={sha}, pushed=false, "
+                "pushed_by_external_or_agent=true, reconciled=true)."
+            )
+        elif persistence.commit_sha:
             persistence_line = (
                 "Platform persistence succeeded "
                 f"(mode={mode}, commit_sha={persistence.commit_sha}"
@@ -468,7 +522,32 @@ def build_run_summary(
             )
     elif persistence.ok is False:
         mode = persistence.mode or "unknown"
-        if error:
+        if persistence.failure_stage == "remote_reconciliation":
+            persistence_line = (
+                "Platform persistence failed "
+                f"(mode={mode}, failure_stage=remote_reconciliation"
+            )
+            if persistence.baseline_sha:
+                persistence_line += f", baseline_sha={persistence.baseline_sha}"
+            if persistence.remote_sha:
+                persistence_line += f", remote_sha={persistence.remote_sha}"
+            if persistence.workspace_sha:
+                persistence_line += (
+                    f", workspace_sha={persistence.workspace_sha}"
+                )
+            if persistence.dirty is not None:
+                persistence_line += (
+                    f", dirty={str(persistence.dirty).lower()}"
+                )
+            if persistence.recommended_next_action:
+                persistence_line += (
+                    ", recommended_next_action="
+                    f"{persistence.recommended_next_action}"
+                )
+            persistence_line += ")."
+            if error:
+                persistence_line += f" {error}"
+        elif error:
             persistence_line = (
                 f"Platform persistence failed (mode={mode}): {error}"
             )

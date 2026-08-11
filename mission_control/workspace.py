@@ -104,11 +104,23 @@ PERSISTENCE_TEMP_PATH_ALLOWLIST: frozenset[str] = frozenset()
 AGENT_GIT_PUSH_DISABLED_URL = "disabled://mission-control-platform-only-push"
 
 
+# Structured failure stage when remote advanced unexpectedly during a run.
+REMOTE_RECONCILIATION_FAILURE_STAGE = "remote_reconciliation"
+
+# Recommended operator action when remote advancement cannot be safely
+# classified as already containing the workspace commit.
+REMOTE_RECONCILIATION_NEXT_ACTION = (
+    "inspect_diverged_remote_then_resubmit_or_rebase"
+)
+
+
 @dataclass(frozen=True)
 class WorkspacePrepResult:
     ok: bool
     workspace_path: str | None = None
     error: str | None = None
+    # Local/remote tip SHA captured after clone, before agent execution.
+    baseline_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +135,12 @@ class PersistenceResult:
 
     ``pushed`` is True only after a successful ``git push``, False when push
     did not succeed, and None when unknown (legacy/partial results).
+
+    Phase-2 remote reconciliation fields (``baseline_sha``, ``remote_sha``,
+    ``workspace_sha``, ``dirty``, ``reconciled``,
+    ``pushed_by_external_or_agent``, ``failure_stage``,
+    ``recommended_next_action``) describe unexpected remote advancement
+    handling. They must never include secret values.
     """
 
     ok: bool
@@ -130,6 +148,14 @@ class PersistenceResult:
     error: str | None = None
     mode: str | None = None
     pushed: bool | None = None
+    baseline_sha: str | None = None
+    remote_sha: str | None = None
+    workspace_sha: str | None = None
+    dirty: bool | None = None
+    reconciled: bool | None = None
+    pushed_by_external_or_agent: bool | None = None
+    failure_stage: str | None = None
+    recommended_next_action: str | None = None
 
 
 def resolve_persistence_mode(mission: dict) -> str:
@@ -634,9 +660,18 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
         _safe_cleanup(real_workspace)
         return WorkspacePrepResult(ok=False, error=push_deny_error)
 
+    baseline_sha, baseline_error = _read_commit_sha(real_workspace, "HEAD")
+    if baseline_error is not None or not baseline_sha:
+        _safe_cleanup(real_workspace)
+        return WorkspacePrepResult(
+            ok=False,
+            error=baseline_error or "failed to capture baseline commit SHA",
+        )
+
     return WorkspacePrepResult(
         ok=True,
         workspace_path=real_workspace,
+        baseline_sha=baseline_sha,
     )
 
 
@@ -704,6 +739,95 @@ def _git_status_porcelain(workspace_path: str) -> subprocess.CompletedProcess[st
     return _run_git(["-C", workspace_path, "status", "--porcelain"])
 
 
+def _redact_secret_text(message: str) -> str:
+    """Remove known secret values from operator-facing Git messages."""
+    redacted = message
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        redacted = redacted.replace(token, "***")
+    # HTTPS basic-auth credentials embedded in URLs.
+    redacted = re.sub(
+        r"(https?://)([^/@\s]+)@",
+        r"\1***@",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    return redacted
+
+
+def _read_commit_sha(
+    workspace_path: str,
+    ref: str,
+) -> tuple[str | None, str | None]:
+    """Return ``(sha, error)`` for ``ref`` in ``workspace_path``."""
+    rev_parse = _run_git(["-C", workspace_path, "rev-parse", ref])
+    if rev_parse.returncode != 0:
+        message = rev_parse.stderr.strip() or rev_parse.stdout.strip()
+        if not message:
+            message = f"git rev-parse {ref} failed with code {rev_parse.returncode}"
+        return None, _redact_secret_text(message)
+    commit_sha = rev_parse.stdout.strip()
+    if not commit_sha:
+        return None, f"git rev-parse {ref} returned an empty commit SHA"
+    return commit_sha, None
+
+
+def _fetch_remote_branch_sha(
+    workspace_path: str,
+    base_branch: str,
+    *,
+    env: dict[str, str] | None,
+) -> tuple[str | None, str | None]:
+    """Fetch ``origin/<base_branch>`` and return its tip SHA.
+
+    Uses the origin fetch URL (agent pushurl denial does not affect fetch).
+    """
+    fetch = _run_git(
+        ["-C", workspace_path, "fetch", "--quiet", "origin", str(base_branch)],
+        env=env,
+    )
+    if fetch.returncode != 0:
+        message = fetch.stderr.strip() or fetch.stdout.strip()
+        if not message:
+            message = f"git fetch failed with code {fetch.returncode}"
+        return None, _redact_secret_text(message)
+
+    remote_ref = f"origin/{base_branch}"
+    remote_sha, error = _read_commit_sha(workspace_path, remote_ref)
+    if error is not None:
+        # FETCH_HEAD is a reliable fallback after a successful refspec fetch.
+        remote_sha, fetch_head_error = _read_commit_sha(workspace_path, "FETCH_HEAD")
+        if fetch_head_error is not None or not remote_sha:
+            return None, error
+    return remote_sha, None
+
+
+def _remote_reconciliation_failure(
+    *,
+    mode: str,
+    baseline_sha: str | None,
+    remote_sha: str | None,
+    workspace_sha: str | None,
+    dirty: bool,
+    detail: str,
+) -> PersistenceResult:
+    """Fail closed when remote advanced with non-matching workspace state."""
+    return PersistenceResult(
+        ok=False,
+        error=_redact_secret_text(detail),
+        mode=mode,
+        pushed=False,
+        commit_sha=None,
+        baseline_sha=baseline_sha,
+        remote_sha=remote_sha,
+        workspace_sha=workspace_sha,
+        dirty=dirty,
+        reconciled=False,
+        pushed_by_external_or_agent=False,
+        failure_stage=REMOTE_RECONCILIATION_FAILURE_STAGE,
+        recommended_next_action=REMOTE_RECONCILIATION_NEXT_ACTION,
+    )
+
 
 def configure_git_identity(workspace_path: str) -> str | None:
     """Configure the repository-local Git author identity."""
@@ -760,26 +884,22 @@ def _read_head_commit_sha(
     *,
     mode: str,
     pushed: bool = False,
+    baseline_sha: str | None = None,
+    remote_sha: str | None = None,
+    workspace_sha: str | None = None,
+    dirty: bool | None = None,
 ) -> PersistenceResult:
-    rev_parse = _run_git(["-C", workspace_path, "rev-parse", "HEAD"])
-    if rev_parse.returncode != 0:
-        message = rev_parse.stderr.strip() or rev_parse.stdout.strip()
-        if not message:
-            message = f"git rev-parse failed with code {rev_parse.returncode}"
+    commit_sha, error = _read_commit_sha(workspace_path, "HEAD")
+    if error is not None or not commit_sha:
         return PersistenceResult(
             ok=False,
-            error=message,
+            error=error or "git rev-parse returned an empty commit SHA",
             mode=mode,
             pushed=False,
-        )
-
-    commit_sha = rev_parse.stdout.strip()
-    if not commit_sha:
-        return PersistenceResult(
-            ok=False,
-            error="git rev-parse returned an empty commit SHA",
-            mode=mode,
-            pushed=False,
+            baseline_sha=baseline_sha,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
 
     return PersistenceResult(
@@ -787,6 +907,10 @@ def _read_head_commit_sha(
         commit_sha=commit_sha,
         mode=mode,
         pushed=pushed,
+        baseline_sha=baseline_sha,
+        remote_sha=remote_sha,
+        workspace_sha=workspace_sha or commit_sha,
+        dirty=dirty,
     )
 
 
@@ -794,6 +918,8 @@ def persist_workspace_changes(
     run_id: str,
     mission: dict,
     workspace_path: str,
+    *,
+    baseline_sha: str | None = None,
 ) -> PersistenceResult:
     """Apply platform Git persistence according to ``persistence.mode``.
 
@@ -810,6 +936,12 @@ def persist_workspace_changes(
     persistence path; ``persistence.mode`` is authoritative. Approval is
     enforced again here so a run cannot bypass the gate merely because earlier
     validation succeeded.
+
+    For ``push``, immediately before commit/push Mission Control fetches the
+    target remote branch and reconciles baseline, workspace HEAD, dirty state,
+    and current remote tip. Unexpected remote advancement never force-pushes
+    or silently overwrites; exact already-pushed workspace commits are
+    classified as transitional reconciliation instead.
     """
     mode = resolve_persistence_mode(mission)
     if mode not in SUPPORTED_PERSISTENCE_MODES:
@@ -857,75 +989,215 @@ def persist_workspace_changes(
             message = f"git status failed with code {status.returncode}"
         return PersistenceResult(
             ok=False,
-            error=message,
+            error=_redact_secret_text(message),
             mode=mode,
             pushed=False,
         )
 
-    if not status.stdout.strip():
-        return PersistenceResult(
-            ok=True,
-            commit_sha=None,
-            mode=mode,
-            pushed=False,
-        )
-
-    changed_paths = parse_git_status_porcelain_paths(status.stdout)
-    temp_path_error = persistence_temp_path_guard_error(changed_paths)
-    if temp_path_error is not None:
+    dirty = bool(status.stdout.strip())
+    workspace_sha, workspace_sha_error = _read_commit_sha(workspace_path, "HEAD")
+    if workspace_sha_error is not None or not workspace_sha:
         return PersistenceResult(
             ok=False,
-            error=temp_path_error,
+            error=workspace_sha_error or "failed to read workspace HEAD",
             mode=mode,
             pushed=False,
+            dirty=dirty,
         )
 
-    add = _run_git(["-C", workspace_path, "add", "-A"])
-    if add.returncode != 0:
-        message = add.stderr.strip() or add.stdout.strip()
-        if not message:
-            message = f"git add failed with code {add.returncode}"
-        return PersistenceResult(
-            ok=False,
-            error=message,
-            mode=mode,
-            pushed=False,
-        )
+    resolved_baseline = baseline_sha
+    if not resolved_baseline:
+        # Transitional callers that omit prep baseline: use current HEAD.
+        # Dirty trees still share the pre-agent tip when no local commits exist.
+        resolved_baseline = workspace_sha
 
-    identity_error = configure_git_identity(workspace_path)
-    if identity_error is not None:
-        return PersistenceResult(
-            ok=False,
-            error=identity_error,
-            mode=mode,
-            pushed=False,
-        )
-
-    commit = _run_git(
-        [
-            "-C",
+    remote_sha: str | None = None
+    if mode == "push":
+        push_env, push_auth_error = _github_push_environment()
+        # Local/file remotes used in tests need no token; GitHub HTTPS does.
+        fetch_env = push_env
+        if push_env is None:
+            fetch_env = None
+        remote_sha, fetch_error = _fetch_remote_branch_sha(
             workspace_path,
-            "commit",
-            "-m",
-            f"Mission Control run {run_id}",
-        ]
-    )
-    if commit.returncode != 0:
-        message = commit.stderr.strip() or commit.stdout.strip()
-        if not message:
-            message = f"git commit failed with code {commit.returncode}"
-        return PersistenceResult(
-            ok=False,
-            error=message,
-            mode=mode,
-            pushed=False,
+            str(mission["repository"]["base_branch"]),
+            env=fetch_env,
         )
+        if fetch_error is not None or not remote_sha:
+            # Missing token on a private remote surfaces here or at push time.
+            if push_auth_error is not None and fetch_env is None:
+                return PersistenceResult(
+                    ok=False,
+                    error=push_auth_error,
+                    mode="push",
+                    pushed=False,
+                    baseline_sha=resolved_baseline,
+                    workspace_sha=workspace_sha,
+                    dirty=dirty,
+                )
+            return _remote_reconciliation_failure(
+                mode=mode,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=dirty,
+                detail=(
+                    "Failed to fetch target remote branch for reconciliation: "
+                    f"{fetch_error or 'unknown fetch error'}"
+                ),
+            )
+
+        if remote_sha != resolved_baseline:
+            # Unexpected remote advancement during the run.
+            if (
+                remote_sha == workspace_sha
+                and not dirty
+            ):
+                # Exact workspace commit already on remote (agent/external).
+                return PersistenceResult(
+                    ok=True,
+                    commit_sha=remote_sha,
+                    mode=mode,
+                    pushed=False,
+                    baseline_sha=resolved_baseline,
+                    remote_sha=remote_sha,
+                    workspace_sha=workspace_sha,
+                    dirty=False,
+                    reconciled=True,
+                    pushed_by_external_or_agent=True,
+                    failure_stage=None,
+                    recommended_next_action=None,
+                )
+            return _remote_reconciliation_failure(
+                mode=mode,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=dirty,
+                detail=(
+                    "Remote branch advanced unexpectedly during the run; "
+                    "refusing to overwrite, force-push, or claim no changes. "
+                    f"baseline_sha={resolved_baseline} "
+                    f"remote_sha={remote_sha} "
+                    f"workspace_sha={workspace_sha} "
+                    f"dirty={str(dirty).lower()}"
+                ),
+            )
+
+    if not dirty:
+        # Clean tree at baseline: genuine no-op. Clean tree ahead of baseline
+        # with unchanged remote: publish existing local commits when pushing.
+        if workspace_sha == resolved_baseline:
+            return PersistenceResult(
+                ok=True,
+                commit_sha=None,
+                mode=mode,
+                pushed=False,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=False,
+            )
+        if mode != "push":
+            return _read_head_commit_sha(
+                workspace_path,
+                mode=mode,
+                pushed=False,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=False,
+            )
+        # Fall through to push existing local commits (no new commit).
+    else:
+        changed_paths = parse_git_status_porcelain_paths(status.stdout)
+        temp_path_error = persistence_temp_path_guard_error(changed_paths)
+        if temp_path_error is not None:
+            return PersistenceResult(
+                ok=False,
+                error=temp_path_error,
+                mode=mode,
+                pushed=False,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=True,
+            )
+
+        add = _run_git(["-C", workspace_path, "add", "-A"])
+        if add.returncode != 0:
+            message = add.stderr.strip() or add.stdout.strip()
+            if not message:
+                message = f"git add failed with code {add.returncode}"
+            return PersistenceResult(
+                ok=False,
+                error=_redact_secret_text(message),
+                mode=mode,
+                pushed=False,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=True,
+            )
+
+        identity_error = configure_git_identity(workspace_path)
+        if identity_error is not None:
+            return PersistenceResult(
+                ok=False,
+                error=identity_error,
+                mode=mode,
+                pushed=False,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=True,
+            )
+
+        commit = _run_git(
+            [
+                "-C",
+                workspace_path,
+                "commit",
+                "-m",
+                f"Mission Control run {run_id}",
+            ]
+        )
+        if commit.returncode != 0:
+            message = commit.stderr.strip() or commit.stdout.strip()
+            if not message:
+                message = f"git commit failed with code {commit.returncode}"
+            return PersistenceResult(
+                ok=False,
+                error=_redact_secret_text(message),
+                mode=mode,
+                pushed=False,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                workspace_sha=workspace_sha,
+                dirty=True,
+            )
+
+        workspace_sha, workspace_sha_error = _read_commit_sha(workspace_path, "HEAD")
+        if workspace_sha_error is not None or not workspace_sha:
+            return PersistenceResult(
+                ok=False,
+                error=workspace_sha_error or "failed to read post-commit HEAD",
+                mode=mode,
+                pushed=False,
+                baseline_sha=resolved_baseline,
+                remote_sha=remote_sha,
+                dirty=True,
+            )
 
     if mode == "commit":
         return _read_head_commit_sha(
             workspace_path,
             mode="commit",
             pushed=False,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
 
     push_env, push_auth_error = _github_push_environment()
@@ -934,6 +1206,10 @@ def persist_workspace_changes(
             workspace_path,
             mode="push",
             pushed=False,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
         return PersistenceResult(
             ok=False,
@@ -941,6 +1217,10 @@ def persist_workspace_changes(
             mode="push",
             pushed=False,
             commit_sha=sha_result.commit_sha if sha_result.ok else None,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
 
     # Push to the origin fetch URL explicitly so a workspace-local disabled
@@ -951,6 +1231,10 @@ def persist_workspace_changes(
             workspace_path,
             mode="push",
             pushed=False,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
         return PersistenceResult(
             ok=False,
@@ -958,6 +1242,10 @@ def persist_workspace_changes(
             mode="push",
             pushed=False,
             commit_sha=sha_result.commit_sha if sha_result.ok else None,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
 
     base_branch = mission["repository"]["base_branch"]
@@ -979,19 +1267,31 @@ def persist_workspace_changes(
             workspace_path,
             mode="push",
             pushed=False,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
         return PersistenceResult(
             ok=False,
-            error=message,
+            error=_redact_secret_text(message),
             mode="push",
             pushed=False,
             commit_sha=sha_result.commit_sha if sha_result.ok else None,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
         )
 
     return _read_head_commit_sha(
         workspace_path,
         mode="push",
         pushed=True,
+        baseline_sha=resolved_baseline,
+        remote_sha=remote_sha,
+        workspace_sha=workspace_sha,
+        dirty=dirty,
     )
 
 
@@ -1261,6 +1561,14 @@ def build_persistence_evidence(
     commit_sha: str | None = None,
     mode: str | None = None,
     pushed: bool | None = None,
+    baseline_sha: str | None = None,
+    remote_sha: str | None = None,
+    workspace_sha: str | None = None,
+    dirty: bool | None = None,
+    reconciled: bool | None = None,
+    pushed_by_external_or_agent: bool | None = None,
+    failure_stage: str | None = None,
+    recommended_next_action: str | None = None,
 ) -> PersistenceEvidence:
     """Record platform persistence outcome for the structured result.
 
@@ -1277,6 +1585,14 @@ def build_persistence_evidence(
         ok=ok,
         commit_sha=commit_sha,
         pushed=pushed,
+        baseline_sha=baseline_sha,
+        remote_sha=remote_sha,
+        workspace_sha=workspace_sha,
+        dirty=dirty,
+        reconciled=reconciled,
+        pushed_by_external_or_agent=pushed_by_external_or_agent,
+        failure_stage=failure_stage,
+        recommended_next_action=recommended_next_action,
     )
 
 
@@ -1336,6 +1652,7 @@ def execute_registered_run(
         # realpath: same absolute checkout for agent --workspace and persistence.
         workspace_path = os.path.realpath(prep.workspace_path)
         assert workspace_path is not None
+        persistence_baseline_sha = prep.baseline_sha
 
         # repository.path from the mission selects a subdirectory inside the
         # checkout ('.' → repository root). Git persistence always uses the
@@ -1542,6 +1859,7 @@ def execute_registered_run(
             run_id,
             mission,
             workspace_path,
+            baseline_sha=persistence_baseline_sha,
         )
         structured.persistence = build_persistence_evidence(
             mission,
@@ -1550,6 +1868,18 @@ def execute_registered_run(
             commit_sha=persistence_result.commit_sha,
             mode=persistence_result.mode,
             pushed=persistence_result.pushed,
+            baseline_sha=persistence_result.baseline_sha,
+            remote_sha=persistence_result.remote_sha,
+            workspace_sha=persistence_result.workspace_sha,
+            dirty=persistence_result.dirty,
+            reconciled=persistence_result.reconciled,
+            pushed_by_external_or_agent=(
+                persistence_result.pushed_by_external_or_agent
+            ),
+            failure_stage=persistence_result.failure_stage,
+            recommended_next_action=(
+                persistence_result.recommended_next_action
+            ),
         )
         # Re-read changed files after persistence so commit-only cleanliness
         # does not erase the pre-persist change list already captured.

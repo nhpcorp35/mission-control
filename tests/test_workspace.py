@@ -20,11 +20,13 @@ from mission_control.workspace import (
     LEGAL_AI_REPOSITORY_URL_ENV,
     NESTED_WORKSPACE_CONTAMINATION_PREFIX,
     PLATFORM_PUSH_APPROVAL_REQUIRED,
+    REMOTE_RECONCILIATION_FAILURE_STAGE,
     REPOSITORY_ORIGIN_MISMATCH_PREFIX,
     REPOSITORY_URL_MAP_ENV,
     SELF_REPOSITORY_URL_ENV,
     PersistenceResult,
     WorkspacePrepResult,
+    build_persistence_evidence,
     cleanup_workspace,
     collect_deliverable_evidence,
     configure_workspace_origin,
@@ -43,6 +45,10 @@ from mission_control.workspace import (
     resolve_safe_workspace_deliverable,
     verify_declared_file_deliverables,
     verify_workspace_origin_matches_mission,
+)
+from mission_control.run_result import (
+    PersistenceEvidence,
+    build_run_summary,
 )
 
 
@@ -532,31 +538,36 @@ class TestWorkspacePersistence(unittest.TestCase):
     def test_persist_workspace_changes_commit_failure(self) -> None:
         workspace_path = self._prepare_workspace()
         try:
-            status = subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=" M README.md\n",
-                stderr="",
-            )
-            add = subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout="",
-                stderr="",
-            )
-            commit = subprocess.CompletedProcess(
-                args=[],
-                returncode=1,
-                stdout="",
-                stderr="commit failed",
-            )
+            baseline = _run_git(
+                ["-C", workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            real_run_git = persist_workspace_changes.__globals__["_run_git"]
+
+            def fake_run_git(
+                args: list[str],
+                *,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                if "commit" in args:
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=1,
+                        stdout="",
+                        stderr="commit failed",
+                    )
+                return real_run_git(args, env=env)
+
             with patch(
-                "mission_control.workspace.verify_workspace_origin_matches_mission",
-                return_value=None,
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
             ), patch(
                 "mission_control.workspace._run_git",
-                side_effect=[status, add, commit],
+                side_effect=fake_run_git,
             ):
+                (Path(workspace_path) / "README.md").write_text(
+                    "changed\n",
+                    encoding="utf-8",
+                )
                 result = persist_workspace_changes(
                     "run-commit-fail",
                     self.fixture.mission(
@@ -564,6 +575,7 @@ class TestWorkspacePersistence(unittest.TestCase):
                         platform_push_approved=True,
                     ),
                     workspace_path,
+                    baseline_sha=baseline,
                 )
             self.assertFalse(result.ok)
             self.assertIn("commit failed", result.error or "")
@@ -573,37 +585,36 @@ class TestWorkspacePersistence(unittest.TestCase):
     def test_persist_workspace_changes_push_failure(self) -> None:
         workspace_path = self._prepare_workspace()
         try:
-            status = subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=" M README.md\n",
-                stderr="",
-            )
-            add = subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout="",
-                stderr="",
-            )
-            commit = subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout="[main abc1234] Mission Control run run-push-fail\n",
-                stderr="",
-            )
-            push = subprocess.CompletedProcess(
-                args=[],
-                returncode=1,
-                stdout="",
-                stderr="push rejected",
-            )
+            baseline = _run_git(
+                ["-C", workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            real_run_git = persist_workspace_changes.__globals__["_run_git"]
+
+            def fake_run_git(
+                args: list[str],
+                *,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                if "push" in args:
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=1,
+                        stdout="",
+                        stderr="push rejected",
+                    )
+                return real_run_git(args, env=env)
+
             with patch(
-                "mission_control.workspace.verify_workspace_origin_matches_mission",
-                return_value=None,
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
             ), patch(
                 "mission_control.workspace._run_git",
-                side_effect=[status, add, commit, push],
+                side_effect=fake_run_git,
             ):
+                (Path(workspace_path) / "README.md").write_text(
+                    "changed\n",
+                    encoding="utf-8",
+                )
                 result = persist_workspace_changes(
                     "run-push-fail",
                     self.fixture.mission(
@@ -611,6 +622,7 @@ class TestWorkspacePersistence(unittest.TestCase):
                         platform_push_approved=True,
                     ),
                     workspace_path,
+                    baseline_sha=baseline,
                 )
             self.assertFalse(result.ok)
             self.assertIn("push rejected", result.error or "")
@@ -1807,6 +1819,330 @@ class TestExplicitLegalAiRepositoryRouting(unittest.TestCase):
             (error or "").startswith(NESTED_WORKSPACE_CONTAMINATION_PREFIX)
         )
         self.assertIsNone(nested_workspace_contamination_error(["app/api.py"]))
+
+
+class TestRemoteReconciliationPhase2(unittest.TestCase):
+    """Phase-2 ownership: reconcile unexpected remote advancement."""
+
+    def setUp(self) -> None:
+        self.fixture = GitRepoFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _prepare(self) -> tuple[str, str]:
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        self.assertIsNotNone(prep.baseline_sha)
+        assert prep.baseline_sha is not None
+        return prep.workspace_path, prep.baseline_sha
+
+    def _push_mission(self) -> dict:
+        return self.fixture.mission(
+            persistence_mode="push",
+            platform_push_approved=True,
+        )
+
+    def _configure_identity(self, workspace_path: str) -> None:
+        _run_git(
+            ["-C", workspace_path, "config", "user.email", "test@example.com"]
+        )
+        _run_git(["-C", workspace_path, "config", "user.name", "Test User"])
+
+    def test_unchanged_remote_normal_platform_push(self) -> None:
+        workspace_path, baseline_sha = self._prepare()
+        try:
+            (Path(workspace_path) / "owned.txt").write_text(
+                "platform\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "recon-normal-push",
+                    self._push_mission(),
+                    workspace_path,
+                    baseline_sha=baseline_sha,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertTrue(result.pushed)
+            self.assertIsNotNone(result.commit_sha)
+            self.assertEqual(result.baseline_sha, baseline_sha)
+            self.assertEqual(result.remote_sha, baseline_sha)
+            self.assertNotEqual(result.commit_sha, baseline_sha)
+            self.assertIsNone(result.failure_stage)
+            self.assertFalse(bool(result.pushed_by_external_or_agent))
+            remote_sha = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(remote_sha, result.commit_sha)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_remote_already_equals_workspace_commit(self) -> None:
+        workspace_path, baseline_sha = self._prepare()
+        try:
+            self._configure_identity(workspace_path)
+            (Path(workspace_path) / "external.txt").write_text(
+                "already pushed\n",
+                encoding="utf-8",
+            )
+            _run_git(["-C", workspace_path, "add", "external.txt"])
+            _run_git(
+                ["-C", workspace_path, "commit", "-m", "external-or-agent"]
+            )
+            workspace_sha = _run_git(
+                ["-C", workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            origin = get_origin_url(workspace_path)
+            assert origin is not None
+            _run_git(
+                [
+                    "-C",
+                    workspace_path,
+                    "push",
+                    origin,
+                    f"HEAD:{self.fixture.base_branch}",
+                ]
+            )
+            remote_before = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(remote_before, workspace_sha)
+            self.assertNotEqual(remote_before, baseline_sha)
+
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "recon-already-pushed",
+                    self._push_mission(),
+                    workspace_path,
+                    baseline_sha=baseline_sha,
+                )
+
+            self.assertTrue(result.ok, result.error)
+            self.assertFalse(result.pushed)
+            self.assertTrue(result.reconciled)
+            self.assertTrue(result.pushed_by_external_or_agent)
+            self.assertEqual(result.commit_sha, workspace_sha)
+            self.assertEqual(result.remote_sha, workspace_sha)
+            self.assertEqual(result.workspace_sha, workspace_sha)
+            self.assertEqual(result.baseline_sha, baseline_sha)
+            self.assertFalse(result.dirty)
+            self.assertIsNone(result.failure_stage)
+            remote_after = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(remote_after, remote_before)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_unrelated_remote_advancement_fails_closed_without_overwrite(
+        self,
+    ) -> None:
+        workspace_path, baseline_sha = self._prepare()
+        try:
+            (Path(workspace_path) / "local-only.txt").write_text(
+                "workspace change\n",
+                encoding="utf-8",
+            )
+            # Advance remote with an unrelated commit via a sibling clone.
+            sibling = Path(self.fixture.temp.name) / "sibling"
+            _run_git(
+                [
+                    "clone",
+                    "--branch",
+                    self.fixture.base_branch,
+                    str(self.fixture.bare_remote),
+                    str(sibling),
+                ]
+            )
+            _run_git(
+                ["-C", str(sibling), "config", "user.email", "sib@example.com"]
+            )
+            _run_git(["-C", str(sibling), "config", "user.name", "Sibling"])
+            (sibling / "unrelated.txt").write_text("remote\n", encoding="utf-8")
+            _run_git(["-C", str(sibling), "add", "unrelated.txt"])
+            _run_git(["-C", str(sibling), "commit", "-m", "unrelated remote"])
+            _run_git(
+                ["-C", str(sibling), "push", "origin", self.fixture.base_branch]
+            )
+            advanced_remote = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertNotEqual(advanced_remote, baseline_sha)
+
+            recorded_args: list[list[str]] = []
+            real_run_git = persist_workspace_changes.__globals__["_run_git"]
+
+            def tracking_run_git(
+                args: list[str],
+                *,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                recorded_args.append(list(args))
+                return real_run_git(args, env=env)
+
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ), patch(
+                "mission_control.workspace._run_git",
+                side_effect=tracking_run_git,
+            ):
+                result = persist_workspace_changes(
+                    "recon-unrelated",
+                    self._push_mission(),
+                    workspace_path,
+                    baseline_sha=baseline_sha,
+                )
+
+            self.assertFalse(result.ok)
+            self.assertFalse(result.pushed)
+            self.assertEqual(
+                result.failure_stage,
+                REMOTE_RECONCILIATION_FAILURE_STAGE,
+            )
+            self.assertEqual(result.baseline_sha, baseline_sha)
+            self.assertEqual(result.remote_sha, advanced_remote)
+            self.assertTrue(result.dirty)
+            self.assertFalse(bool(result.reconciled))
+            self.assertFalse(bool(result.pushed_by_external_or_agent))
+            self.assertIsNotNone(result.recommended_next_action)
+            self.assertIn("refusing to overwrite", (result.error or "").lower())
+            self.assertFalse(
+                any("push" in args for args in recorded_args),
+                recorded_args,
+            )
+            remote_after = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(remote_after, advanced_remote)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_authoritative_summary_matches_structured_persistence_fields(
+        self,
+    ) -> None:
+        workspace_path, baseline_sha = self._prepare()
+        try:
+            self._configure_identity(workspace_path)
+            (Path(workspace_path) / "external.txt").write_text(
+                "already pushed\n",
+                encoding="utf-8",
+            )
+            _run_git(["-C", workspace_path, "add", "external.txt"])
+            _run_git(
+                ["-C", workspace_path, "commit", "-m", "external-or-agent"]
+            )
+            workspace_sha = _run_git(
+                ["-C", workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            origin = get_origin_url(workspace_path)
+            assert origin is not None
+            _run_git(
+                [
+                    "-C",
+                    workspace_path,
+                    "push",
+                    origin,
+                    f"HEAD:{self.fixture.base_branch}",
+                ]
+            )
+
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "recon-summary",
+                    self._push_mission(),
+                    workspace_path,
+                    baseline_sha=baseline_sha,
+                )
+
+            evidence = build_persistence_evidence(
+                self._push_mission(),
+                attempted=True,
+                ok=result.ok,
+                commit_sha=result.commit_sha,
+                mode=result.mode,
+                pushed=result.pushed,
+                baseline_sha=result.baseline_sha,
+                remote_sha=result.remote_sha,
+                workspace_sha=result.workspace_sha,
+                dirty=result.dirty,
+                reconciled=result.reconciled,
+                pushed_by_external_or_agent=result.pushed_by_external_or_agent,
+                failure_stage=result.failure_stage,
+                recommended_next_action=result.recommended_next_action,
+            )
+            summary = build_run_summary(persistence=evidence)
+            self.assertTrue(evidence.reconciled)
+            self.assertTrue(evidence.pushed_by_external_or_agent)
+            self.assertFalse(evidence.pushed)
+            self.assertEqual(evidence.commit_sha, workspace_sha)
+            self.assertIn("reconciled", summary)
+            self.assertIn("pushed_by_external_or_agent=true", summary)
+            self.assertIn(f"commit_sha={workspace_sha}", summary)
+            self.assertIn("pushed=false", summary)
+            self.assertNotIn("no repository changes", summary)
+
+            failed = PersistenceEvidence(
+                mode="push",
+                attempted=True,
+                ok=False,
+                commit_sha=None,
+                pushed=False,
+                baseline_sha=baseline_sha,
+                remote_sha="abc",
+                workspace_sha="def",
+                dirty=True,
+                reconciled=False,
+                pushed_by_external_or_agent=False,
+                failure_stage=REMOTE_RECONCILIATION_FAILURE_STAGE,
+                recommended_next_action="inspect_diverged_remote_then_resubmit_or_rebase",
+            )
+            failed_summary = build_run_summary(
+                persistence=failed,
+                error="Remote branch advanced unexpectedly",
+            )
+            self.assertIn("failure_stage=remote_reconciliation", failed_summary)
+            self.assertIn(f"baseline_sha={baseline_sha}", failed_summary)
+            self.assertIn("dirty=true", failed_summary)
+            self.assertNotIn("no repository changes", failed_summary)
+        finally:
+            cleanup_workspace(workspace_path)
 
 
 if __name__ == "__main__":
