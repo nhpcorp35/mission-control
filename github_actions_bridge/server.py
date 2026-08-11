@@ -57,14 +57,10 @@ ERROR_REF_RESOLUTION_FAILED = "ref_resolution_failed"
 ERROR_DISPATCH_FAILED = "dispatch_failed"
 ERROR_UNSUPPORTED_BENCHMARK_QUESTION = "unsupported_benchmark_question"
 
-# Question-agnostic Case-00 submit allowlist (fail closed for anything else).
-# Routes onto the existing generation-only Case-00 Q1 workflow without changing
-# Q1 prompts, pins, answers, or canonical artifacts.
-SUPPORTED_CASE00_BENCHMARK_QUESTIONS = frozenset(
-    {
-        ("Case-00-Triborough", "Q1"),
-    }
-)
+# Fail-closed Case-00 submit identity: exact benchmark + Q[1-9]\d* only.
+CASE00_BENCHMARK_ID = "Case-00-Triborough"
+_CASE00_QUESTION_ID_RE = re.compile(r"^Q[1-9]\d*$")
+_CASE00_QUESTION_TOKEN_RE = re.compile(r"^q[1-9]\d*$")
 
 # Explicit deployment provenance only — never infer or fabricate a SHA.
 DEPLOYED_COMMIT_SHA_ENV = "RAILWAY_GIT_COMMIT_SHA"
@@ -179,7 +175,8 @@ mcp = FastMCP(
         "dispatch the bounded generation-only workflow, require explicit private-evidence "
         "authorization, and return only B2-verified candidate artifact metadata. "
         "Question-agnostic Case-00 tools (submit_case00, get_case00_run, "
-        "cancel_case00_run, get_case00_artifacts) accept benchmark_id + question_id "
+        "cancel_case00_run, get_case00_artifacts) accept benchmark_id exactly "
+        "'Case-00-Triborough' with question_id matching ^Q[1-9]\\d*$ "
         "and an immutable 40-character commit SHA only; unsupported combinations "
         "fail closed. Use get_case_artifact to read one allowlisted, "
         "mission-correlated artifact after a successful run. Case-00 storage tools "
@@ -372,15 +369,50 @@ async def _resolve_run(mission_id: str) -> dict[str, Any] | None:
     return None
 
 
-async def _resolve_case00_run(mission_id: str) -> dict[str, Any] | None:
+def case00_question_token(question_id: str) -> str:
+    """Lowercase question token used in run markers and artifact names (Q2 → q2)."""
+    return question_id.strip().lower()
+
+
+def case00_run_marker(question_id: str, mission_id: str) -> str:
+    """GitHub Actions display-title / artifact marker for a Case-00 question run."""
+    return f"hal-case00-{case00_question_token(question_id)}-{mission_id}"
+
+
+def case00_result_filename(question_id: str) -> str:
+    """Workflow result JSON filename inside the Case-00 artifact zip."""
+    return f"case00-{case00_question_token(question_id)}-result.json"
+
+
+def parse_case00_question_token(text: str, mission_id: str) -> str | None:
+    """Extract q[1-9]\\d* from a Case-00 run title or artifact name, if present."""
+    match = re.search(
+        rf"hal-case00-(q[1-9]\d*)-{re.escape(mission_id)}(?:\b|$)",
+        text or "",
+    )
+    if match is None:
+        return None
+    token = match.group(1)
+    if not _CASE00_QUESTION_TOKEN_RE.fullmatch(token):
+        return None
+    return token
+
+
+async def _resolve_case00_run(
+    mission_id: str, question_id: str | None = None
+) -> dict[str, Any] | None:
     response = await _github(
         "GET",
         f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/runs",
         params={"event": "workflow_dispatch", "per_page": 50},
     )
-    marker = f"hal-case00-q1-{mission_id}"
     for run in response.json().get("workflow_runs", []):
-        if marker in (run.get("display_title") or ""):
+        title = run.get("display_title") or ""
+        if question_id is not None:
+            if case00_run_marker(question_id, mission_id) in title:
+                return run
+            continue
+        if parse_case00_question_token(title, mission_id) is not None:
             return run
     return None
 
@@ -454,21 +486,33 @@ async def _dispatch_case00_generation(
     mission_id: str,
     requested_ref: str,
     resolved_ref: str,
+    benchmark_id: str | None = None,
+    question_id: str | None = None,
 ) -> dict[str, Any]:
-    """Dispatch the existing safe Case-00 generation workflow (Q1 path)."""
+    """Dispatch the existing safe Case-00 generation workflow.
+
+    When ``benchmark_id`` / ``question_id`` are provided (generic submit_case00),
+    they are forwarded unchanged as workflow_dispatch inputs. The Q1-specific
+    submit path omits them so legacy workflow defaults remain intact.
+    """
     dispatch_path = (
         f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/dispatches"
     )
+    inputs: dict[str, str] = {
+        "mission_id": mission_id,
+        "legalai_ref": resolved_ref,
+        "authorization_confirmed": "true",
+    }
+    if benchmark_id is not None:
+        inputs["benchmark_id"] = benchmark_id
+    if question_id is not None:
+        inputs["question_id"] = question_id
     response, _body, transport_error = await _github_json(
         "POST",
         dispatch_path,
         json={
             "ref": CASE00_WORKFLOW_BRANCH,
-            "inputs": {
-                "mission_id": mission_id,
-                "legalai_ref": resolved_ref,
-                "authorization_confirmed": "true",
-            },
+            "inputs": inputs,
         },
     )
     if transport_error is not None:
@@ -496,23 +540,19 @@ async def _dispatch_case00_generation(
 
 
 def validate_case00_benchmark_question(benchmark_id: str, question_id: str) -> tuple[str, str]:
-    """Return normalized IDs or raise a structured unsupported-combination error."""
+    """Return normalized IDs or raise a structured unsupported-combination error.
+
+    Fail closed: only ``Case-00-Triborough`` with ``question_id`` matching
+    ``^Q[1-9]\\d*$`` (Q1, Q2, …) are accepted.
+    """
     benchmark = (benchmark_id or "").strip()
     question = (question_id or "").strip()
-    if not benchmark or not question:
+    if benchmark != CASE00_BENCHMARK_ID or not _CASE00_QUESTION_ID_RE.fullmatch(question):
         raise_case00_structured_error(
             ERROR_UNSUPPORTED_BENCHMARK_QUESTION,
-            "benchmark_id and question_id are required; supported combination is "
-            "benchmark_id='Case-00-Triborough' with question_id='Q1'",
-        )
-    if (benchmark, question) not in SUPPORTED_CASE00_BENCHMARK_QUESTIONS:
-        supported = ", ".join(
-            f"{b}/{q}" for b, q in sorted(SUPPORTED_CASE00_BENCHMARK_QUESTIONS)
-        )
-        raise_case00_structured_error(
-            ERROR_UNSUPPORTED_BENCHMARK_QUESTION,
-            f"unsupported benchmark_id/question_id combination {benchmark!r}/{question!r}; "
-            f"supported: {supported}",
+            "unsupported benchmark_id/question_id combination "
+            f"{benchmark!r}/{question!r}; supported: benchmark_id="
+            f"{CASE00_BENCHMARK_ID!r} with question_id matching ^Q[1-9]\\d*$",
         )
     return benchmark, question
 
@@ -587,10 +627,10 @@ async def submit_case00(
 ) -> dict[str, Any]:
     """Dispatch a question-agnostic Case-00 run at an immutable commit SHA.
 
-    Requires ``benchmark_id``, ``question_id``, and an exact lowercase
-    40-character ``commit_sha`` (mutable refs rejected). Only allowlisted
-    benchmark/question pairs are accepted; the current allowlist routes
-    Case-00-Triborough/Q1 onto the existing safe generation-only path.
+    Requires ``benchmark_id`` exactly ``Case-00-Triborough``, ``question_id``
+    matching ``^Q[1-9]\\d*$``, and an exact lowercase 40-character
+    ``commit_sha`` (mutable refs rejected). Unsupported combinations fail
+    closed. Accepted IDs are forwarded unchanged on workflow_dispatch.
     """
     _require_allowed_user()
     if not authorization_confirmed:
@@ -604,6 +644,8 @@ async def submit_case00(
         mission_id=mission_id,
         requested_ref=requested_ref,
         resolved_ref=resolved_ref,
+        benchmark_id=benchmark,
+        question_id=question,
     )
     result["benchmark_id"] = benchmark
     result["question_id"] = question
@@ -1158,19 +1200,25 @@ async def _verify_case00_artifacts(mission_id: str) -> dict[str, Any]:
     listing = await _github(
         "GET", f"/repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts"
     )
-    artifact_name = f"hal-case00-q1-{mission_id}"
-    artifact = next(
-        (a for a in listing.json().get("artifacts", []) if a.get("name") == artifact_name),
-        None,
-    )
-    if artifact is None:
+    artifacts = listing.json().get("artifacts", [])
+    artifact = None
+    question_token: str | None = None
+    for candidate in artifacts:
+        name = candidate.get("name") or ""
+        token = parse_case00_question_token(name, mission_id)
+        if token is not None:
+            artifact = candidate
+            question_token = token
+            break
+    if artifact is None or question_token is None:
         return {"ok": False, "mission_id": mission_id, "error": "artifact_not_found"}
 
     archive = await _github(
         "GET", f"/repos/{REPOSITORY}/actions/artifacts/{artifact['id']}/zip"
     )
+    result_name = f"case00-{question_token}-result.json"
     with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
-        payload = json.loads(bundle.read("case00-q1-result.json"))
+        payload = json.loads(bundle.read(result_name))
 
     durable = payload.get("durable_artifacts") or {}
     objects = durable.get("objects") or []
@@ -1257,19 +1305,25 @@ async def get_case_artifact(
     listing = await _github(
         "GET", f"/repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts"
     )
-    artifact_name = f"hal-case00-q1-{mission_id}"
-    artifact = next(
-        (a for a in listing.json().get("artifacts", []) if a.get("name") == artifact_name),
-        None,
-    )
-    if artifact is None:
+    artifacts = listing.json().get("artifacts", [])
+    artifact = None
+    question_token: str | None = None
+    for candidate in artifacts:
+        name = candidate.get("name") or ""
+        token = parse_case00_question_token(name, mission_id)
+        if token is not None:
+            artifact = candidate
+            question_token = token
+            break
+    if artifact is None or question_token is None:
         return {"ok": False, "mission_id": mission_id, "error": "artifact_not_found"}
 
     archive = await _github(
         "GET", f"/repos/{REPOSITORY}/actions/artifacts/{artifact['id']}/zip"
     )
+    result_name = f"case00-{question_token}-result.json"
     with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
-        payload = json.loads(bundle.read("case00-q1-result.json"))
+        payload = json.loads(bundle.read(result_name))
 
     durable = payload.get("durable_artifacts") or {}
     objects = durable.get("objects") or []

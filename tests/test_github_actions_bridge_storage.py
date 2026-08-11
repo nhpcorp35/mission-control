@@ -892,8 +892,57 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(payload["inputs"]["legalai_ref"], self.LEGALAI_SHA)
         self.assertEqual(payload["inputs"]["mission_id"], "mission-generic-valid")
         self.assertEqual(payload["inputs"]["authorization_confirmed"], "true")
+        self.assertEqual(payload["inputs"]["benchmark_id"], self.BENCHMARK_ID)
+        self.assertEqual(payload["inputs"]["question_id"], self.QUESTION_ID)
         self.assertTrue(
             self.dispatches[0]["path"].endswith("/actions/workflows/hal-case00-q1.yml/dispatches")
+        )
+        self.assertEqual(
+            self.server.case00_run_marker(self.QUESTION_ID, "mission-generic-valid"),
+            "hal-case00-q1-mission-generic-valid",
+        )
+        self.assertEqual(
+            self.server.case00_result_filename(self.QUESTION_ID),
+            "case00-q1-result.json",
+        )
+
+    def test_q2_accepted_and_forwarded_unchanged(self) -> None:
+        submit = self._tool("submit_case00")
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    commit_sha=self.LEGALAI_SHA,
+                    benchmark_id=self.BENCHMARK_ID,
+                    question_id="Q2",
+                    authorization_confirmed=True,
+                    mission_id="mission-generic-q2",
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["benchmark_id"], self.BENCHMARK_ID)
+        self.assertEqual(result["question_id"], "Q2")
+        self.assertEqual(len(self.dispatches), 1)
+        inputs = self.dispatches[0]["json"]["inputs"]
+        self.assertEqual(inputs["benchmark_id"], self.BENCHMARK_ID)
+        self.assertEqual(inputs["question_id"], "Q2")
+        self.assertEqual(inputs["legalai_ref"], self.LEGALAI_SHA)
+        self.assertEqual(
+            self.server.case00_run_marker("Q2", "mission-generic-q2"),
+            "hal-case00-q2-mission-generic-q2",
+        )
+        self.assertEqual(
+            self.server.case00_result_filename("Q2"),
+            "case00-q2-result.json",
+        )
+        self.assertEqual(
+            self.server.parse_case00_question_token(
+                "hal-case00-q2-mission-generic-q2", "mission-generic-q2"
+            ),
+            "q2",
         )
 
     def test_mutable_ref_rejected_before_dispatch(self) -> None:
@@ -963,34 +1012,72 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(result["resolved_ref"], self.LEGALAI_SHA)
         self.assertNotIn("benchmark_id", result)
         self.assertEqual(len(self.dispatches), 1)
+        inputs = self.dispatches[0]["json"]["inputs"]
+        self.assertEqual(inputs["mission_id"], "mission-q1-compat")
+        self.assertEqual(inputs["legalai_ref"], self.LEGALAI_SHA)
+        self.assertEqual(inputs["authorization_confirmed"], "true")
+        # Legacy Q1 path omits identity inputs so workflow defaults stay intact.
+        self.assertNotIn("benchmark_id", inputs)
+        self.assertNotIn("question_id", inputs)
 
-    def test_unsupported_question_fail_closed(self) -> None:
+    def test_malformed_question_and_wrong_benchmark_fail_closed(self) -> None:
         from fastmcp.exceptions import ToolError
 
         submit = self._tool("submit_case00")
+        rejected = [
+            (self.BENCHMARK_ID, "Q0"),
+            (self.BENCHMARK_ID, "q2"),
+            (self.BENCHMARK_ID, "Q01"),
+            (self.BENCHMARK_ID, "Q"),
+            (self.BENCHMARK_ID, "1"),
+            (self.BENCHMARK_ID, "Q-2"),
+            (self.BENCHMARK_ID, ""),
+            ("Case-00-Other", "Q1"),
+            ("Case-00-Other", "Q2"),
+            ("", "Q1"),
+        ]
 
-        async def run():
+        async def run(benchmark_id: str, question_id: str):
             with mock.patch.object(
                 self.server, "_require_allowed_user", return_value="nhpcorp35"
             ), self._patch_github_json(self._fake_github_json):
                 return await submit(
                     commit_sha=self.LEGALAI_SHA,
-                    benchmark_id=self.BENCHMARK_ID,
-                    question_id="Q99",
+                    benchmark_id=benchmark_id,
+                    question_id=question_id,
                     authorization_confirmed=True,
-                    mission_id="mission-unsupported-q",
+                    mission_id="mission-unsupported",
                 )
 
-        with self.assertRaises(ToolError) as ctx:
-            asyncio.run(run())
-        result = self._tool_error_payload(ctx.exception)
-        self.assertEqual(
-            result["error_code"], self.server.ERROR_UNSUPPORTED_BENCHMARK_QUESTION
-        )
-        self.assertIn("Q99", result["message"])
-        self.assertIn("Case-00-Triborough", result["message"])
+        for benchmark_id, question_id in rejected:
+            with self.assertRaises(ToolError) as ctx:
+                asyncio.run(run(benchmark_id, question_id))
+            result = self._tool_error_payload(ctx.exception)
+            self.assertEqual(
+                result["error_code"],
+                self.server.ERROR_UNSUPPORTED_BENCHMARK_QUESTION,
+                msg=f"{benchmark_id!r}/{question_id!r}",
+            )
+            self.assertIn("Case-00-Triborough", result["message"])
         self.assertEqual(self.dispatches, [])
 
+        # Direct validator accepts Q1/Q2 and rejects malformed ids.
+        self.assertEqual(
+            self.server.validate_case00_benchmark_question(
+                self.BENCHMARK_ID, "Q1"
+            ),
+            (self.BENCHMARK_ID, "Q1"),
+        )
+        self.assertEqual(
+            self.server.validate_case00_benchmark_question(
+                self.BENCHMARK_ID, "Q2"
+            ),
+            (self.BENCHMARK_ID, "Q2"),
+        )
+        with self.assertRaises(ToolError):
+            self.server.validate_case00_benchmark_question(
+                self.BENCHMARK_ID, "Q0"
+            )
     def test_status_artifact_cancel_routing(self) -> None:
         status = self._tool("get_case00_run")
         cancel = self._tool("cancel_case00_run")
