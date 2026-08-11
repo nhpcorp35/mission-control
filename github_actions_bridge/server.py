@@ -55,6 +55,16 @@ ERROR_REF_INVALID = "ref_invalid"
 ERROR_REF_NOT_IN_REPOSITORY = "ref_not_in_repository"
 ERROR_REF_RESOLUTION_FAILED = "ref_resolution_failed"
 ERROR_DISPATCH_FAILED = "dispatch_failed"
+ERROR_UNSUPPORTED_BENCHMARK_QUESTION = "unsupported_benchmark_question"
+
+# Question-agnostic Case-00 submit allowlist (fail closed for anything else).
+# Routes onto the existing generation-only Case-00 Q1 workflow without changing
+# Q1 prompts, pins, answers, or canonical artifacts.
+SUPPORTED_CASE00_BENCHMARK_QUESTIONS = frozenset(
+    {
+        ("Case-00-Triborough", "Q1"),
+    }
+)
 
 # Explicit deployment provenance only — never infer or fabricate a SHA.
 DEPLOYED_COMMIT_SHA_ENV = "RAILWAY_GIT_COMMIT_SHA"
@@ -71,6 +81,10 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "get_case00_q1_run",
         "cancel_case00_q1_run",
         "get_case00_q1_artifacts",
+        "submit_case00",
+        "get_case00_run",
+        "cancel_case00_run",
+        "get_case00_artifacts",
         "get_case_artifact",
         "list_case00_storage",
         "archive_case00_attorney_feedback",
@@ -164,11 +178,14 @@ mcp = FastMCP(
         "and retrieve the durable object key. The separate Case-00 Q1 tools "
         "dispatch the bounded generation-only workflow, require explicit private-evidence "
         "authorization, and return only B2-verified candidate artifact metadata. "
-        "Use get_case_artifact to read one allowlisted, mission-correlated artifact "
-        "after a successful run. Case-00 storage tools expose allowlisted inventory "
-        "metadata, archive a fixed attorney-feedback package, and archive one DOCX "
-        "review packet under canonical B2 prefixes without accepting bucket or key "
-        "inputs."
+        "Question-agnostic Case-00 tools (submit_case00, get_case00_run, "
+        "cancel_case00_run, get_case00_artifacts) accept benchmark_id + question_id "
+        "and an immutable 40-character commit SHA only; unsupported combinations "
+        "fail closed. Use get_case_artifact to read one allowlisted, "
+        "mission-correlated artifact after a successful run. Case-00 storage tools "
+        "expose allowlisted inventory metadata, archive a fixed attorney-feedback "
+        "package, and archive one DOCX review packet under canonical B2 prefixes "
+        "without accepting bucket or key inputs."
     ),
     auth=oauth_auth_provider,
 )
@@ -432,24 +449,13 @@ async def cancel_run(mission_id: str) -> dict[str, Any]:
     return {"ok": True, "mission_id": mission_id, "run_id": run["id"], "status": "cancellation_requested"}
 
 
-@mcp.tool()
-async def submit_case00_q1(
-    ref: str, authorization_confirmed: bool, mission_id: str | None = None
+async def _dispatch_case00_generation(
+    *,
+    mission_id: str,
+    requested_ref: str,
+    resolved_ref: str,
 ) -> dict[str, Any]:
-    """Dispatch generation-only Case-00 Q1 at an immutable verified commit SHA.
-
-    ``ref`` may be the configured workflow branch (normally ``main``), which is
-    resolved to HEAD of the configured ``GITHUB_REPOSITORY`` (LegalAI), or an
-    exact lowercase 40-character commit SHA preflight-checked in that same
-    repository. GitHub Actions always receives the resolved SHA.
-    """
-    _require_allowed_user()
-    if not authorization_confirmed:
-        raise ValueError(
-            "authorization_confirmed must be true before private evidence is sent"
-        )
-    requested_ref, resolved_ref = await resolve_case00_legalai_ref(ref)
-    mission_id = mission_id or str(uuid.uuid4())
+    """Dispatch the existing safe Case-00 generation workflow (Q1 path)."""
     dispatch_path = (
         f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/dispatches"
     )
@@ -489,17 +495,51 @@ async def submit_case00_q1(
     }
 
 
-@mcp.tool()
-async def get_case00_q1_run(mission_id: str) -> dict[str, Any]:
-    """Return the current GitHub status for a Case-00 Q1 run."""
-    _require_allowed_user()
+def validate_case00_benchmark_question(benchmark_id: str, question_id: str) -> tuple[str, str]:
+    """Return normalized IDs or raise a structured unsupported-combination error."""
+    benchmark = (benchmark_id or "").strip()
+    question = (question_id or "").strip()
+    if not benchmark or not question:
+        raise_case00_structured_error(
+            ERROR_UNSUPPORTED_BENCHMARK_QUESTION,
+            "benchmark_id and question_id are required; supported combination is "
+            "benchmark_id='Case-00-Triborough' with question_id='Q1'",
+        )
+    if (benchmark, question) not in SUPPORTED_CASE00_BENCHMARK_QUESTIONS:
+        supported = ", ".join(
+            f"{b}/{q}" for b, q in sorted(SUPPORTED_CASE00_BENCHMARK_QUESTIONS)
+        )
+        raise_case00_structured_error(
+            ERROR_UNSUPPORTED_BENCHMARK_QUESTION,
+            f"unsupported benchmark_id/question_id combination {benchmark!r}/{question!r}; "
+            f"supported: {supported}",
+        )
+    return benchmark, question
+
+
+async def resolve_case00_immutable_commit_sha(commit_sha: str) -> tuple[str, str]:
+    """Require an exact lowercase 40-character SHA; reject mutable refs.
+
+    Unlike ``resolve_case00_legalai_ref``, branch aliases (including ``main``)
+    are rejected. Returns ``(requested_sha, verified_sha)``.
+    """
+    requested = (commit_sha or "").strip()
+    if not _is_exact_commit_sha(requested):
+        raise_case00_structured_error(
+            ERROR_REF_INVALID,
+            "commit_sha must be an exact 40-character lowercase commit SHA; "
+            "mutable refs (branches, tags, HEAD, abbreviated or uppercase SHAs) "
+            "are rejected",
+        )
+    # Reuse LegalAI repository preflight via the shared resolver.
+    return await resolve_case00_legalai_ref(requested)
+
+
+async def _case00_run_status(mission_id: str) -> dict[str, Any]:
     return _run_result(mission_id, await _resolve_case00_run(mission_id))
 
 
-@mcp.tool()
-async def cancel_case00_q1_run(mission_id: str) -> dict[str, Any]:
-    """Cancel the Case-00 Q1 GitHub Actions run correlated with mission_id."""
-    _require_allowed_user()
+async def _case00_cancel_run(mission_id: str) -> dict[str, Any]:
     run = await _resolve_case00_run(mission_id)
     if run is None:
         return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
@@ -510,6 +550,92 @@ async def cancel_case00_q1_run(mission_id: str) -> dict[str, Any]:
         "run_id": run["id"],
         "status": "cancellation_requested",
     }
+
+
+@mcp.tool()
+async def submit_case00_q1(
+    ref: str, authorization_confirmed: bool, mission_id: str | None = None
+) -> dict[str, Any]:
+    """Dispatch generation-only Case-00 Q1 at an immutable verified commit SHA.
+
+    ``ref`` may be the configured workflow branch (normally ``main``), which is
+    resolved to HEAD of the configured ``GITHUB_REPOSITORY`` (LegalAI), or an
+    exact lowercase 40-character commit SHA preflight-checked in that same
+    repository. GitHub Actions always receives the resolved SHA.
+    """
+    _require_allowed_user()
+    if not authorization_confirmed:
+        raise ValueError(
+            "authorization_confirmed must be true before private evidence is sent"
+        )
+    requested_ref, resolved_ref = await resolve_case00_legalai_ref(ref)
+    mission_id = mission_id or str(uuid.uuid4())
+    return await _dispatch_case00_generation(
+        mission_id=mission_id,
+        requested_ref=requested_ref,
+        resolved_ref=resolved_ref,
+    )
+
+
+@mcp.tool()
+async def submit_case00(
+    commit_sha: str,
+    benchmark_id: str,
+    question_id: str,
+    authorization_confirmed: bool,
+    mission_id: str | None = None,
+) -> dict[str, Any]:
+    """Dispatch a question-agnostic Case-00 run at an immutable commit SHA.
+
+    Requires ``benchmark_id``, ``question_id``, and an exact lowercase
+    40-character ``commit_sha`` (mutable refs rejected). Only allowlisted
+    benchmark/question pairs are accepted; the current allowlist routes
+    Case-00-Triborough/Q1 onto the existing safe generation-only path.
+    """
+    _require_allowed_user()
+    if not authorization_confirmed:
+        raise ValueError(
+            "authorization_confirmed must be true before private evidence is sent"
+        )
+    benchmark, question = validate_case00_benchmark_question(benchmark_id, question_id)
+    requested_ref, resolved_ref = await resolve_case00_immutable_commit_sha(commit_sha)
+    mission_id = mission_id or str(uuid.uuid4())
+    result = await _dispatch_case00_generation(
+        mission_id=mission_id,
+        requested_ref=requested_ref,
+        resolved_ref=resolved_ref,
+    )
+    result["benchmark_id"] = benchmark
+    result["question_id"] = question
+    return result
+
+
+@mcp.tool()
+async def get_case00_q1_run(mission_id: str) -> dict[str, Any]:
+    """Return the current GitHub status for a Case-00 Q1 run."""
+    _require_allowed_user()
+    return await _case00_run_status(mission_id)
+
+
+@mcp.tool()
+async def get_case00_run(mission_id: str) -> dict[str, Any]:
+    """Return the current GitHub status for a Case-00 mission_id."""
+    _require_allowed_user()
+    return await _case00_run_status(mission_id)
+
+
+@mcp.tool()
+async def cancel_case00_q1_run(mission_id: str) -> dict[str, Any]:
+    """Cancel the Case-00 Q1 GitHub Actions run correlated with mission_id."""
+    _require_allowed_user()
+    return await _case00_cancel_run(mission_id)
+
+
+@mcp.tool()
+async def cancel_case00_run(mission_id: str) -> dict[str, Any]:
+    """Cancel the Case-00 GitHub Actions run correlated with mission_id."""
+    _require_allowed_user()
+    return await _case00_cancel_run(mission_id)
 
 
 def _b2_client():
@@ -1015,10 +1141,8 @@ async def get_artifacts(mission_id: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
-async def get_case00_q1_artifacts(mission_id: str) -> dict[str, Any]:
-    """Return and independently HEAD-verify the four durable Case-00 Q1 B2 objects."""
-    _require_allowed_user()
+async def _verify_case00_artifacts(mission_id: str) -> dict[str, Any]:
+    """HEAD-verify durable Case-00 candidate artifacts for mission_id."""
     run = await _resolve_case00_run(mission_id)
     if run is None:
         return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
@@ -1086,6 +1210,20 @@ async def get_case00_q1_artifacts(mission_id: str) -> dict[str, Any]:
         "object_keys": [item["object_key"] for item in verified_objects],
         "objects": verified_objects,
     }
+
+
+@mcp.tool()
+async def get_case00_q1_artifacts(mission_id: str) -> dict[str, Any]:
+    """Return and independently HEAD-verify the four durable Case-00 Q1 B2 objects."""
+    _require_allowed_user()
+    return await _verify_case00_artifacts(mission_id)
+
+
+@mcp.tool()
+async def get_case00_artifacts(mission_id: str) -> dict[str, Any]:
+    """List and HEAD-verify durable Case-00 B2 objects for mission_id."""
+    _require_allowed_user()
+    return await _verify_case00_artifacts(mission_id)
 
 
 @mcp.tool()

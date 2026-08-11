@@ -808,6 +808,283 @@ class Case00RefResolutionTests(unittest.TestCase):
         self.assertEqual(self.dispatches, [])
 
 
+class Case00GenericWorkflowTests(unittest.TestCase):
+    """Question-agnostic Case-00 submit/status/artifact/cancel validation + routing."""
+
+    LEGALAI_SHA = "49f6881c08e7e4fdf76d8500d52a27d057c0804b"
+    BENCHMARK_ID = "Case-00-Triborough"
+    QUESTION_ID = "Q1"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = _import_bridge_server()
+
+    def setUp(self) -> None:
+        self.dispatches: list[dict] = []
+        self._orig_repo = self.server.REPOSITORY
+        self._orig_branch = self.server.CASE00_WORKFLOW_BRANCH
+        self._orig_workflow = self.server.CASE00_WORKFLOW
+        self.server.REPOSITORY = "nhpcorp35/legal-ai"
+        self.server.CASE00_WORKFLOW_BRANCH = "main"
+        self.server.CASE00_WORKFLOW = "hal-case00-q1.yml"
+
+    def tearDown(self) -> None:
+        self.server.REPOSITORY = self._orig_repo
+        self.server.CASE00_WORKFLOW_BRANCH = self._orig_branch
+        self.server.CASE00_WORKFLOW = self._orig_workflow
+
+    def _tool(self, name: str):
+        tool = getattr(self.server, name)
+        return getattr(tool, "fn", tool)
+
+    def _tool_error_payload(self, exc: Exception) -> dict:
+        from fastmcp.exceptions import ToolError
+
+        self.assertIsInstance(exc, ToolError)
+        payload = json.loads(str(exc))
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload.get("ok"), False)
+        return payload
+
+    def _patch_github_json(self, handler):
+        return mock.patch.object(self.server, "_github_json", side_effect=handler)
+
+    async def _fake_github_json(self, method, path, **kwargs):
+        class Resp:
+            def __init__(self, status_code: int):
+                self.status_code = status_code
+
+        if method == "GET" and path.endswith(f"/commits/{self.LEGALAI_SHA}"):
+            return Resp(200), {"sha": self.LEGALAI_SHA}, None
+        if method == "GET" and path.endswith(f"/commits/{self.server.CASE00_WORKFLOW_BRANCH}"):
+            return Resp(200), {"sha": self.LEGALAI_SHA}, None
+        if method == "POST" and path.endswith("/dispatches"):
+            self.dispatches.append({"path": path, "json": kwargs.get("json")})
+            return Resp(204), None, None
+        return Resp(500), {"message": "unexpected"}, None
+
+    def test_valid_generic_submission_schema_and_routing(self) -> None:
+        submit = self._tool("submit_case00")
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    commit_sha=self.LEGALAI_SHA,
+                    benchmark_id=self.BENCHMARK_ID,
+                    question_id=self.QUESTION_ID,
+                    authorization_confirmed=True,
+                    mission_id="mission-generic-valid",
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["mission_id"], "mission-generic-valid")
+        self.assertEqual(result["benchmark_id"], self.BENCHMARK_ID)
+        self.assertEqual(result["question_id"], self.QUESTION_ID)
+        self.assertEqual(result["requested_ref"], self.LEGALAI_SHA)
+        self.assertEqual(result["resolved_ref"], self.LEGALAI_SHA)
+        self.assertEqual(result["workflow"], "hal-case00-q1.yml")
+        self.assertEqual(len(self.dispatches), 1)
+        payload = self.dispatches[0]["json"]
+        self.assertEqual(payload["ref"], "main")
+        self.assertEqual(payload["inputs"]["legalai_ref"], self.LEGALAI_SHA)
+        self.assertEqual(payload["inputs"]["mission_id"], "mission-generic-valid")
+        self.assertEqual(payload["inputs"]["authorization_confirmed"], "true")
+        self.assertTrue(
+            self.dispatches[0]["path"].endswith("/actions/workflows/hal-case00-q1.yml/dispatches")
+        )
+
+    def test_mutable_ref_rejected_before_dispatch(self) -> None:
+        from fastmcp.exceptions import ToolError
+
+        submit = self._tool("submit_case00")
+        bad_refs = ["main", "develop", "HEAD", "49f6881", self.LEGALAI_SHA.upper()]
+
+        async def run(commit_sha: str):
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    commit_sha=commit_sha,
+                    benchmark_id=self.BENCHMARK_ID,
+                    question_id=self.QUESTION_ID,
+                    authorization_confirmed=True,
+                    mission_id="mission-mutable-ref",
+                )
+
+        for commit_sha in bad_refs:
+            with self.assertRaises(ToolError) as ctx:
+                asyncio.run(run(commit_sha))
+            result = self._tool_error_payload(ctx.exception)
+            self.assertEqual(
+                result["error_code"],
+                self.server.ERROR_REF_INVALID,
+                msg=f"commit_sha={commit_sha!r}",
+            )
+        self.assertEqual(self.dispatches, [])
+
+    def test_authorization_rejection(self) -> None:
+        submit = self._tool("submit_case00")
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    commit_sha=self.LEGALAI_SHA,
+                    benchmark_id=self.BENCHMARK_ID,
+                    question_id=self.QUESTION_ID,
+                    authorization_confirmed=False,
+                )
+
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(run())
+        self.assertIn("authorization_confirmed", str(ctx.exception))
+        self.assertEqual(self.dispatches, [])
+
+    def test_q1_specific_tools_remain_backward_compatible(self) -> None:
+        submit = self._tool("submit_case00_q1")
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    ref="main",
+                    authorization_confirmed=True,
+                    mission_id="mission-q1-compat",
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["requested_ref"], "main")
+        self.assertEqual(result["resolved_ref"], self.LEGALAI_SHA)
+        self.assertNotIn("benchmark_id", result)
+        self.assertEqual(len(self.dispatches), 1)
+
+    def test_unsupported_question_fail_closed(self) -> None:
+        from fastmcp.exceptions import ToolError
+
+        submit = self._tool("submit_case00")
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), self._patch_github_json(self._fake_github_json):
+                return await submit(
+                    commit_sha=self.LEGALAI_SHA,
+                    benchmark_id=self.BENCHMARK_ID,
+                    question_id="Q99",
+                    authorization_confirmed=True,
+                    mission_id="mission-unsupported-q",
+                )
+
+        with self.assertRaises(ToolError) as ctx:
+            asyncio.run(run())
+        result = self._tool_error_payload(ctx.exception)
+        self.assertEqual(
+            result["error_code"], self.server.ERROR_UNSUPPORTED_BENCHMARK_QUESTION
+        )
+        self.assertIn("Q99", result["message"])
+        self.assertIn("Case-00-Triborough", result["message"])
+        self.assertEqual(self.dispatches, [])
+
+    def test_status_artifact_cancel_routing(self) -> None:
+        status = self._tool("get_case00_run")
+        cancel = self._tool("cancel_case00_run")
+        artifacts = self._tool("get_case00_artifacts")
+        run_payload = {
+            "id": 31404004716,
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": self.LEGALAI_SHA,
+            "html_url": "https://github.com/example/actions/runs/1",
+        }
+
+        async def run_status():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), mock.patch.object(
+                self.server, "_resolve_case00_run", return_value=run_payload
+            ):
+                return await status(mission_id="mission-status-1")
+
+        async def run_cancel():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), mock.patch.object(
+                self.server, "_resolve_case00_run", return_value=run_payload
+            ), mock.patch.object(
+                self.server, "_github", new_callable=mock.AsyncMock
+            ) as github:
+                github.return_value = mock.Mock(status_code=202)
+                result = await cancel(mission_id="mission-cancel-1")
+                github.assert_awaited()
+                return result
+
+        async def run_artifacts():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), mock.patch.object(
+                self.server,
+                "_verify_case00_artifacts",
+                new_callable=mock.AsyncMock,
+                return_value={
+                    "ok": True,
+                    "mission_id": "mission-artifacts-1",
+                    "verified": True,
+                    "objects": [],
+                },
+            ) as verify:
+                result = await artifacts(mission_id="mission-artifacts-1")
+                verify.assert_awaited_once_with("mission-artifacts-1")
+                return result
+
+        status_result = asyncio.run(run_status())
+        self.assertEqual(status_result["ok"], True)
+        self.assertEqual(status_result["mission_id"], "mission-status-1")
+        self.assertEqual(status_result["run_id"], run_payload["id"])
+        self.assertEqual(status_result["status"], "completed")
+
+        cancel_result = asyncio.run(run_cancel())
+        self.assertEqual(cancel_result["ok"], True)
+        self.assertEqual(cancel_result["mission_id"], "mission-cancel-1")
+        self.assertEqual(cancel_result["status"], "cancellation_requested")
+
+        artifacts_result = asyncio.run(run_artifacts())
+        self.assertEqual(artifacts_result["ok"], True)
+        self.assertEqual(artifacts_result["mission_id"], "mission-artifacts-1")
+
+    def test_unified_gateway_registry_routes_generic_case_tools(self) -> None:
+        registry_path = (
+            Path(__file__).resolve().parent.parent
+            / "hal_legalai_gateway"
+            / "registry.json"
+        )
+        document = json.loads(registry_path.read_text(encoding="utf-8"))
+        expected = {
+            "case.submit": "submit_case00",
+            "case.status": "get_case00_run",
+            "case.cancel": "cancel_case00_run",
+            "case.list_artifacts": "get_case00_artifacts",
+            "case.submit_case00_q1": "submit_case00_q1",
+        }
+        by_tool = {
+            item["tool"]: item["downstream_tool"]
+            for item in document["tool_bindings"]
+            if item["namespace"] == "case"
+        }
+        for gateway_tool, downstream in expected.items():
+            self.assertEqual(by_tool[gateway_tool], downstream)
+            self.assertIn(gateway_tool, document["namespaces"]["case"]["tools"])
+        # Q1-specific tools remain registered alongside the generic surface.
+        self.assertIn("case.get_case00_q1_run", by_tool)
+        self.assertIn("case.cancel_case00_q1_run", by_tool)
+        self.assertIn("case.get_case00_q1_artifacts", by_tool)
+
+
 def _synthetic_acceptance_contract(**overrides: object) -> dict[str, object]:
     """Cross-interface fixture matching LegalAI ``build_synthetic_contract``."""
     object_key = (

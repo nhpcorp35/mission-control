@@ -37,9 +37,13 @@
   },
   "namespaces": {
     "case": {
-      "description": "LegalAI case workflow tools (Case-00 Q1 and related).",
+      "description": "LegalAI case workflow tools (question-agnostic Case-00 and Q1-specific).",
       "downstream_service": "bridge",
       "tools": [
+        "case.submit",
+        "case.status",
+        "case.cancel",
+        "case.list_artifacts",
         "case.submit_case00_q1",
         "case.get_case00_q1_run",
         "case.cancel_case00_q1_run",
@@ -90,6 +94,34 @@
     }
   ],
   "tool_bindings": [
+    {
+      "tool": "case.submit",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "submit_case00",
+      "description": "Dispatch a question-agnostic Case-00 run. Requires benchmark_id, question_id, authorization_confirmed, and an exact lowercase 40-character commit_sha (mutable refs rejected)."
+    },
+    {
+      "tool": "case.status",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "get_case00_run",
+      "description": "Return the current GitHub status for a Case-00 mission_id."
+    },
+    {
+      "tool": "case.cancel",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "cancel_case00_run",
+      "description": "Cancel the Case-00 GitHub Actions run for mission_id."
+    },
+    {
+      "tool": "case.list_artifacts",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "get_case00_artifacts",
+      "description": "List and HEAD-verify durable Case-00 B2 objects for mission_id."
+    },
     {
       "tool": "case.submit_case00_q1",
       "namespace": "case",

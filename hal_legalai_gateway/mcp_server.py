@@ -26,6 +26,40 @@ logger = logging.getLogger(__name__)
 # Settled gateway surface (Phase 2). Downstream tool names stay on the services.
 DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
     ToolBinding(
+        gateway_tool="case.submit",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="submit_case00",
+        description=(
+            "Dispatch a question-agnostic Case-00 run. Requires benchmark_id, "
+            "question_id, authorization_confirmed, and an exact lowercase "
+            "40-character commit_sha (mutable refs rejected). Only allowlisted "
+            "benchmark/question pairs are accepted; Case-00-Triborough/Q1 routes "
+            "to the existing safe generation-only path."
+        ),
+    ),
+    ToolBinding(
+        gateway_tool="case.status",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="get_case00_run",
+        description="Return the current GitHub status for a Case-00 mission_id.",
+    ),
+    ToolBinding(
+        gateway_tool="case.cancel",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="cancel_case00_run",
+        description="Cancel the Case-00 GitHub Actions run for mission_id.",
+    ),
+    ToolBinding(
+        gateway_tool="case.list_artifacts",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="get_case00_artifacts",
+        description="List and HEAD-verify durable Case-00 B2 objects for mission_id.",
+    ),
+    ToolBinding(
         gateway_tool="case.submit_case00_q1",
         namespace="case",
         downstream_service="bridge",
@@ -319,6 +353,39 @@ def register_forwarding_tools(
         )
 
     # --- case ---
+    @mcp.tool(name="case.submit", description=by_name["case.submit"].description)
+    async def case_submit(
+        commit_sha: str,
+        benchmark_id: str,
+        question_id: str,
+        authorization_confirmed: bool,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "commit_sha": commit_sha,
+            "benchmark_id": benchmark_id,
+            "question_id": question_id,
+            "authorization_confirmed": authorization_confirmed,
+        }
+        if mission_id is not None:
+            args["mission_id"] = mission_id
+        return await _forward("case.submit", args)
+
+    @mcp.tool(name="case.status", description=by_name["case.status"].description)
+    async def case_status(mission_id: str) -> dict[str, Any]:
+        return await _forward("case.status", {"mission_id": mission_id})
+
+    @mcp.tool(name="case.cancel", description=by_name["case.cancel"].description)
+    async def case_cancel(mission_id: str) -> dict[str, Any]:
+        return await _forward("case.cancel", {"mission_id": mission_id})
+
+    @mcp.tool(
+        name="case.list_artifacts",
+        description=by_name["case.list_artifacts"].description,
+    )
+    async def case_list_artifacts(mission_id: str) -> dict[str, Any]:
+        return await _forward("case.list_artifacts", {"mission_id": mission_id})
+
     @mcp.tool(name="case.submit_case00_q1", description=by_name["case.submit_case00_q1"].description)
     async def case_submit_case00_q1(
         ref: str,
