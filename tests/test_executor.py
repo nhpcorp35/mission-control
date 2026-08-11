@@ -73,6 +73,9 @@ class TestBuildCursorInstruction(unittest.TestCase):
         self.assertIn("repository.name is clone identity only", instruction)
         self.assertIn("do NOT infer a filesystem path from it", instruction)
         self.assertIn("never absolute paths", instruction)
+        self.assertIn("mktemp -d", instruction)
+        self.assertIn("absolute system `/tmp`", instruction)
+        self.assertIn("__pycache__", instruction)
 
     def test_workspace_binding_omitted_without_repository_path(self) -> None:
         mission = {

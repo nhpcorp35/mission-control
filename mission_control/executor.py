@@ -161,8 +161,13 @@ def _workspace_binding_constraints(mission: dict) -> tuple[str, ...]:
         "(for example `mission_control/executor.py`); never absolute paths "
         "such as `/tmp/.../mission_control/executor.py`.",
         "repository.name is clone identity only — do NOT infer a filesystem "
-        "path from it, and do NOT create, clone, or edit any repository under "
-        "/tmp or any other absolute path outside this workspace.",
+        "path from it, and do NOT create, clone, or edit any other repository "
+        "checkout outside this workspace.",
+        "For ephemeral inspection or extraction, use `mktemp -d` or absolute "
+        "system `/tmp` paths outside the repository. Do not write temporary "
+        "files under repository-relative `tmp/`, `.tmp/`, `scratch/`, "
+        "`extracted/`, or any `__pycache__` path; platform persistence fails "
+        "closed on those paths and never deletes them.",
     )
 
 

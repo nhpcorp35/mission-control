@@ -397,15 +397,35 @@ def build_run_summary(
     *,
     persistence: PersistenceEvidence | None,
     error: str | None = None,
+    agent_ok: bool | None = None,
+    agent_return_code: int | None = None,
 ) -> str:
     """Build the authoritative client-facing run summary.
 
-    Platform persistence runs after the Cursor agent completes, so agent
-    stdout may correctly claim that no agent commit/push occurred while
-    Mission Control still records a successful platform persistence outcome.
+    Composed after platform persistence evidence is recorded so agent prose
+    cannot contradict commit/push results. Explicitly separates the agent
+    execution outcome from authoritative platform persistence.
+
     Clients must prefer this summary (and ``result.persistence`` /
     ``commit_sha``) over agent prose for persistence claims.
     """
+    if agent_ok is True:
+        if agent_return_code is None:
+            agent_line = "Agent result: succeeded."
+        else:
+            agent_line = (
+                f"Agent result: succeeded (return_code={agent_return_code})."
+            )
+    elif agent_ok is False:
+        if agent_return_code is None:
+            agent_line = "Agent result: failed."
+        else:
+            agent_line = (
+                f"Agent result: failed (return_code={agent_return_code})."
+            )
+    else:
+        agent_line = "Agent result: not executed."
+
     if persistence is None:
         persistence_line = "Platform persistence evidence is unavailable."
     elif not persistence.attempted:
@@ -450,9 +470,21 @@ def build_run_summary(
     trust_line = (
         "Agent stdout is diagnostic only and was captured before platform "
         "persistence when persistence ran; prefer this summary, "
-        "result.persistence, and commit_sha for persistence claims."
+        "result.persistence, and commit_sha for persistence claims — never "
+        "treat agent prose as authoritative over platform persistence."
     )
-    return f"{persistence_line} {trust_line}"
+    return f"{agent_line} {persistence_line} {trust_line}"
+
+
+def _agent_outcome_from_commands(
+    result: StructuredRunResult,
+) -> tuple[bool | None, int | None]:
+    """Derive agent success from Mission Control command evidence."""
+    for command in result.commands:
+        if command.kind != "cursor_agent":
+            continue
+        return command.passed, command.exit_code
+    return None, None
 
 
 def finalize_structured_summary(
@@ -460,11 +492,14 @@ def finalize_structured_summary(
     *,
     error: str | None = None,
 ) -> None:
-    """Set ``result.summary`` from platform persistence evidence.
+    """Set ``result.summary`` after persistence evidence is attached.
+
+    The summary is composed only here (post-persistence bookkeeping) and
+    clearly separates agent execution from authoritative platform persistence
+    so stale agent prose cannot contradict commit/push results.
 
     When persistence was attempted, also record that agent stdout predates
-    the platform persistence step so clients do not treat agent "no commit
-    or push" prose as conflicting with a successful platform outcome.
+    the platform persistence step.
     """
     if result.persistence is not None and result.persistence.attempted:
         append_warning(result, WARNING_STDOUT_PREDATES_PERSISTENCE)
@@ -478,7 +513,10 @@ def finalize_structured_summary(
         }
     ):
         append_warning(result, WARNING_DOCUMENTATION_PATH_HEURISTIC)
+    agent_ok, agent_return_code = _agent_outcome_from_commands(result)
     result.summary = build_run_summary(
         persistence=result.persistence,
         error=error,
+        agent_ok=agent_ok,
+        agent_return_code=agent_return_code,
     )

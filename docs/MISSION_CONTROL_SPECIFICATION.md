@@ -154,8 +154,10 @@ For asynchronous `POST /runs` (and the shared registered-run lifecycle):
 1. Workspace preparation must succeed.
 2. Agent execution must return success.
 3. Declared **file** deliverables must exist as regular files under the isolated workspace (typed `file:` / `kind: file` preferred; bare path-like strings supported conservatively).
-4. Only then may platform persistence run.
-5. Only after successful persistence (when attempted) may the run be marked `completed`.
+4. Changed/untracked repository-relative paths under top-level `tmp/`, `.tmp/`, `scratch/`, or `extracted/`, or containing `__pycache__`, fail closed before persistence unless a narrow exact-path allowlist applies (blocked paths are reported; never deleted). System absolute `/tmp` outside the checkout is unaffected.
+5. Only then may platform persistence run.
+6. Only after successful persistence (when attempted) may the run be marked `completed`.
+7. Authoritative `summary` is composed after persistence and separates agent result from platform persistence outcomes.
 
 Missing file deliverables fail the run before persistence with a machine-readable error. Descriptive deliverables are not checked on disk. File *content* is not validated—only presence of regular files at safe relative paths. Absolute or escaping paths are not read outside the workspace.
 
@@ -212,7 +214,7 @@ Structured `result` typically includes:
 - `persistence` — mode, attempted/ok, `commit_sha`, `pushed`
 - `documentation` — requested mode and status when documentation policy applies
 - `warnings` — explicit limitations (never fabricated metrics)
-- `summary` — Mission Control-authored text aligned with persistence outcome
+- `summary` — Mission Control-authored text composed after persistence; separates agent result from authoritative platform persistence
 
 Failed and timed-out runs retain partial evidence actually collected. Retries create a new run from stored mission YAML of a failed run without mutating the source record.
 

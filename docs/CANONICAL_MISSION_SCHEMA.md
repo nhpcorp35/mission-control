@@ -455,10 +455,20 @@ For **`POST /runs`** (async execute):
 4. Verify declared file deliverables exist as regular files in that
    workspace (fail the run before persistence if any are missing). Reject
    `.legalai_work/` nesting that would legitimize the wrong repository.
-5. Apply platform persistence for that workspace only after origin/target
+5. Fail closed before platform persistence when changed/untracked
+   repository-relative paths are under top-level `tmp/`, `.tmp/`,
+   `scratch/`, or `extracted/`, or contain `__pycache__`, unless a narrow
+   repository allowlist names that exact path. Report blocked relative
+   paths; never silently delete. System absolute `/tmp` outside the
+   checkout is unaffected (agents should use `mktemp -d` or absolute
+   `/tmp` for inspection/extraction).
+6. Apply platform persistence for that workspace only after origin/target
    identity matches `repository.name` (fail closed on mismatch; never report
    persistence success for a different remote).
-6. Always attempt `cleanup_workspace` (delete the temp directory) in `finally`.
+7. Compose the authoritative run `summary` only after persistence evidence
+   is recorded, clearly separating agent result from platform persistence
+   so agent stdout cannot contradict commit/push outcomes.
+8. Always attempt `cleanup_workspace` (delete the temp directory) in `finally`.
 
 Consequences:
 

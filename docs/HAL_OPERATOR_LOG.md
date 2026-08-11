@@ -1,5 +1,43 @@
 # HAL Operator Log
 
+## 2026-08-11 — Persistence temp-path guard and consolidated status
+
+### Objective
+
+Prevent accidental repository-relative temp/`__pycache__` paths from being
+platform-persisted, guide agents to use `mktemp -d` or absolute system `/tmp`
+for inspection/extraction, and compose final run status after persistence so
+agent prose cannot contradict commit/push results.
+
+### Change summary
+
+- `mission_control/workspace.py`: fail-closed persistence temp-path guard for
+  top-level `tmp/`, `.tmp/`, `scratch/`, `extracted/`, and any `__pycache__`
+  segment (narrow exact-path allowlist; report blocked paths; never delete).
+- `mission_control/executor.py`: agent guidance for `mktemp -d` / absolute
+  system `/tmp` scratch; do not write repo-relative temp paths.
+- `mission_control/run_result.py`: post-persistence consolidated summary
+  separates `Agent result` from authoritative `Platform persistence`.
+- Focused synthetic tests in `tests/test_persistence_temp_path_guard.py`.
+
+### Tests executed
+
+```text
+PYTHONPATH=. python -m unittest \
+  tests.test_persistence_temp_path_guard \
+  tests.test_structured_run_results \
+  tests.test_documentation_policy \
+  tests.test_canonical_mission_schema_docs \
+  tests.test_executor.TestBuildCursorInstruction \
+  -v
+# Ran 58 tests — OK
+```
+
+### Next Objective
+
+Confirm a mission that writes under repository-relative `tmp/` fails closed
+before push, while `mktemp -d` inspection remains unaffected.
+
 ## 2026-08-10 — Explicit SHA preflight: classify GitHub 422 as ref_not_in_repository
 
 ### Objective

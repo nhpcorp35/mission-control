@@ -81,6 +81,22 @@ NESTED_LEGALAI_WORK_DIR = ".legalai_work"
 
 REPOSITORY_ORIGIN_MISMATCH_PREFIX = "REPOSITORY_ORIGIN_MISMATCH:"
 NESTED_WORKSPACE_CONTAMINATION_PREFIX = "NESTED_WORKSPACE_CONTAMINATION:"
+PERSISTENCE_TEMP_PATH_BLOCKED_PREFIX = "PERSISTENCE_TEMP_PATH_BLOCKED:"
+
+# Top-level repository directories that must not be platform-persisted.
+# System absolute /tmp outside the checkout is unrelated and unaffected.
+_PERSISTENCE_BLOCKED_TOP_LEVEL_DIRS = frozenset(
+    {
+        "tmp",
+        ".tmp",
+        "scratch",
+        "extracted",
+    }
+)
+
+# Exact repository-relative paths that may override the temp-path guard.
+# Keep empty by default; add only deliberate, narrow exceptions.
+PERSISTENCE_TEMP_PATH_ALLOWLIST: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -361,6 +377,92 @@ def nested_workspace_contamination_error(paths: list[str]) -> str | None:
                 "for the selected repository"
             )
     return None
+
+
+def normalize_repository_relative_path(path: str) -> str:
+    """Normalize a repo-relative path for guard comparisons (POSIX-style)."""
+    text = str(path).strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def is_blocked_persistence_temp_path(
+    relative_path: str,
+    *,
+    allowlist: frozenset[str] | None = None,
+) -> bool:
+    """Return whether a repo-relative path is blocked from platform persistence.
+
+    Fail closed for:
+
+    - paths under top-level ``tmp/``, ``.tmp/``, ``scratch/``, or ``extracted/``
+    - paths containing a ``__pycache__`` segment
+
+    Exact allowlisted relative paths are exempt. Absolute system ``/tmp`` paths
+    are outside this check (Git status reports repository-relative paths only).
+    """
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        return False
+    # Absolute / home paths are not repository-relative persistence inputs.
+    if relative_path.startswith(("/", "~")):
+        return False
+    if (
+        len(relative_path) >= 3
+        and relative_path[1] == ":"
+        and relative_path[0].isalpha()
+        and relative_path[2] in "/\\"
+    ):
+        return False
+    normalized = normalize_repository_relative_path(relative_path)
+    normalized = normalized.strip("/")
+    if not normalized:
+        return False
+    effective_allowlist = (
+        PERSISTENCE_TEMP_PATH_ALLOWLIST if allowlist is None else allowlist
+    )
+    if normalized in effective_allowlist:
+        return False
+    parts = tuple(part for part in normalized.split("/") if part and part != ".")
+    if not parts:
+        return False
+    if parts[0] in _PERSISTENCE_BLOCKED_TOP_LEVEL_DIRS:
+        return True
+    if "__pycache__" in parts:
+        return True
+    return False
+
+
+def persistence_temp_path_guard_error(
+    paths: list[str],
+    *,
+    allowlist: frozenset[str] | None = None,
+) -> str | None:
+    """Return a fail-closed error when blocked temp paths would be persisted.
+
+    Reports every blocked relative path. Never deletes files.
+    """
+    blocked: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        if not isinstance(raw, str) or not raw:
+            continue
+        if not is_blocked_persistence_temp_path(raw, allowlist=allowlist):
+            continue
+        normalized = normalize_repository_relative_path(raw).strip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        blocked.append(normalized)
+    if not blocked:
+        return None
+    blocked_display = ", ".join(blocked)
+    return (
+        f"{PERSISTENCE_TEMP_PATH_BLOCKED_PREFIX} blocked relative paths: "
+        f"{blocked_display}. Use mktemp -d or absolute system /tmp outside the "
+        "repository for inspection/extraction; platform persistence does not "
+        "delete blocked paths."
+    )
 
 
 def resolve_mission_clone_url(mission: dict) -> tuple[str | None, str | None]:
@@ -715,6 +817,16 @@ def persist_workspace_changes(
         return PersistenceResult(
             ok=True,
             commit_sha=None,
+            mode=mode,
+            pushed=False,
+        )
+
+    changed_paths = parse_git_status_porcelain_paths(status.stdout)
+    temp_path_error = persistence_temp_path_guard_error(changed_paths)
+    if temp_path_error is not None:
+        return PersistenceResult(
+            ok=False,
+            error=temp_path_error,
             mode=mode,
             pushed=False,
         )
@@ -1307,6 +1419,29 @@ def execute_registered_run(
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=deliverable_error,
+                return_code=execution_result.return_code,
+                result=structured,
+            )
+            registry.update_status(run_id, RunStatus.FAILED)
+            return
+
+        temp_path_error = persistence_temp_path_guard_error(
+            structured.files_changed,
+        )
+        if temp_path_error is not None:
+            append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
+            _attach_documentation(handling_completed=True)
+            finalize_structured_summary(structured, error=temp_path_error)
+            registry.store_result(
+                run_id,
+                stdout=execution_result.stdout,
+                stderr=execution_result.stderr,
+                error=temp_path_error,
                 return_code=execution_result.return_code,
                 result=structured,
             )
