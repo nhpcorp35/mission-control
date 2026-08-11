@@ -30,6 +30,7 @@ from storage_policy import (
     assert_archive_objects_absent,
     assert_canonical_legalai_bucket,
     build_acceptance_contract_archive,
+    build_acceptance_contract_template,
     build_attorney_review_archive,
     build_review_packet_archive,
     inventory_prefix,
@@ -77,6 +78,7 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "archive_acceptance_contract",
         "verify_acceptance_contract",
         "list_acceptance_contracts",
+        "get_acceptance_contract_template",
     }
 )
 
@@ -756,35 +758,46 @@ def _acceptance_contract_integrity_ok(
 
 
 @mcp.tool()
+async def get_acceptance_contract_template() -> dict[str, Any]:
+    """Return the acceptance_contract.v1 schema, hashing rules, and synthetic example.
+
+    Read-only. No B2 writes. Example uses wholly generic synthetic IDs only.
+    """
+    _require_allowed_user()
+    return build_acceptance_contract_template()
+
+
+@mcp.tool()
 async def archive_acceptance_contract(
     contract_json_base64: str,
-    expected_object_key: str,
     expected_benchmark_id: str,
     expected_question_id: str,
     expected_contract_id: str,
     expected_version: str,
     expected_contract_sha256: str = "",
     expected_sha256: str = "",
+    expected_object_key: str = "",
 ) -> dict[str, Any]:
     """Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON object in B2.
 
-    Accepts transport-safe base64 JSON plus expected nested identity/key and
-    LegalAI canonical ``contract_sha256`` (``content_sha256``). Stores and returns
-    unambiguous ``contract_sha256`` and ``object_sha256`` metadata. Never accepts
-    or logs credentials/prose. ``verified`` requires HEAD size plus both integrity
-    checks.
+    Accepts transport-safe base64 JSON plus expected nested identity and LegalAI
+    canonical ``contract_sha256`` (``content_sha256``). The server generates the
+    canonical B2 object key from validated identity fields; ``expected_object_key``
+    is optional and must match when provided. Stores and returns unambiguous
+    ``contract_sha256`` and ``object_sha256`` metadata. Never accepts or logs
+    credentials/prose. ``verified`` requires HEAD size plus both integrity checks.
     """
     _require_allowed_user()
     assert_canonical_legalai_bucket(B2_BUCKET)
     item = build_acceptance_contract_archive(
         contract_json_base64=contract_json_base64,
-        expected_object_key=expected_object_key,
         expected_benchmark_id=expected_benchmark_id,
         expected_question_id=expected_question_id,
         expected_contract_id=expected_contract_id,
         expected_version=expected_version,
         expected_contract_sha256=expected_contract_sha256 or None,
         expected_sha256=expected_sha256 or None,
+        expected_object_key=expected_object_key or None,
     )
     client = _b2_client()
     existing = _head_acceptance_contract_metadata(client, item["object_key"])

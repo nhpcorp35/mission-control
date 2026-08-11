@@ -16,6 +16,7 @@ from cryptography.fernet import Fernet
 from github_actions_bridge.storage_policy import (
     ACCEPTANCE_CONTRACT_PREFIX,
     ACCEPTANCE_CONTRACT_SCHEMA,
+    AcceptanceContractValidationError,
     CANONICAL_LEGALAI_BUCKET,
     CASE00_PREFIXES,
     MAX_REVIEW_PACKET_BYTES,
@@ -24,11 +25,13 @@ from github_actions_bridge.storage_policy import (
     assert_archive_objects_absent,
     assert_canonical_legalai_bucket,
     build_acceptance_contract_archive,
+    build_acceptance_contract_template,
     build_attorney_review_archive,
     build_review_packet_archive,
     build_synthetic_acceptance_contract,
     compute_acceptance_contract_sha256,
     compute_acceptance_object_sha256,
+    canonical_acceptance_contract_object_key,
     canonical_acceptance_contract_sha256,
     decode_review_packet_docx_base64,
     inventory_prefix,
@@ -1163,6 +1166,7 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             "archive_acceptance_contract",
             "verify_acceptance_contract",
             "list_acceptance_contracts",
+            "get_acceptance_contract_template",
         ):
             self.assertIn(name, server.REQUIRED_PRODUCTION_TOOLS)
         names = asyncio.run(server.list_registered_tool_names())
@@ -1171,8 +1175,138 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
                 "archive_acceptance_contract",
                 "verify_acceptance_contract",
                 "list_acceptance_contracts",
+                "get_acceptance_contract_template",
             }.issubset(names)
         )
+
+    def test_template_returns_schema_hashing_and_synthetic_example(self) -> None:
+        template = build_acceptance_contract_template()
+        self.assertTrue(template["ok"])
+        self.assertEqual(template["schema_version"], ACCEPTANCE_CONTRACT_SCHEMA)
+        schema = template["json_schema"]
+        self.assertEqual(schema["properties"]["identity"]["required"], [
+            "benchmark_id",
+            "question_id",
+        ])
+        hashing = template["canonical_hashing"]
+        self.assertEqual(
+            hashing["contract_sha256"]["excludes_field"], "content_sha256"
+        )
+        self.assertIn("object_sha256", hashing)
+        example = template["example"]
+        self.assertEqual(
+            example["object_key"],
+            canonical_acceptance_contract_object_key(
+                benchmark_id=str(example["identity"]["benchmark_id"]),
+                question_id=str(example["identity"]["question_id"]),
+                contract_id=str(example["contract_id"]),
+                version=str(example["version"]),
+            ),
+        )
+        self.assertEqual(
+            example["content_sha256"],
+            compute_acceptance_contract_sha256(example),
+        )
+        self.assertNotIn("Case-00", json.dumps(example))
+
+    def test_deterministic_key_generation_and_optional_legacy_key(self) -> None:
+        key = canonical_acceptance_contract_object_key(
+            benchmark_id="synth-benchmark-alpha",
+            question_id="Q-SYNTH-01",
+            contract_id="contract-synth-alpha-q01",
+            version="1.0.0",
+        )
+        self.assertEqual(
+            key,
+            f"{ACCEPTANCE_CONTRACT_PREFIX}"
+            "synth-benchmark-alpha/Q-SYNTH-01/contract-synth-alpha-q01/"
+            "v1.0.0/acceptance_contract.json",
+        )
+        kwargs = _acceptance_archive_kwargs()
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        # Server generates key; omitting expected_object_key still works.
+        without_key = dict(build_kwargs)
+        without_key.pop("expected_object_key", None)
+        item = build_acceptance_contract_archive(**without_key)
+        self.assertEqual(item["object_key"], key)
+
+        # Matching optional legacy key is accepted.
+        matched = build_acceptance_contract_archive(**build_kwargs)
+        self.assertEqual(matched["object_key"], key)
+
+        mismatched = dict(without_key)
+        mismatched["expected_object_key"] = (
+            f"{ACCEPTANCE_CONTRACT_PREFIX}other/Q1/c1/v1.0.0/acceptance_contract.json"
+        )
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            build_acceptance_contract_archive(**mismatched)
+        self.assertEqual(ctx.exception.path, "expected_object_key")
+        self.assertIn("generated key", ctx.exception.constraint)
+        self.assertEqual(ctx.exception.received_type, "string")
+
+    def test_malformed_and_path_unsafe_identity_errors(self) -> None:
+        kwargs = _acceptance_archive_kwargs()
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        bad = dict(build_kwargs)
+        bad["expected_benchmark_id"] = "../escape"
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            build_acceptance_contract_archive(**bad)
+        self.assertEqual(ctx.exception.path, "expected_benchmark_id")
+        self.assertIn("identity shape", ctx.exception.constraint)
+        self.assertEqual(ctx.exception.received_type, "string")
+        self.assertIn("../escape", ctx.exception.received_value)
+
+        bad_type = dict(build_kwargs)
+        bad_type["expected_question_id"] = 123
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            build_acceptance_contract_archive(**bad_type)
+        self.assertEqual(ctx.exception.path, "expected_question_id")
+        self.assertEqual(ctx.exception.received_type, "integer")
+        self.assertEqual(ctx.exception.received_value, "123")
+
+        unsafe_doc = dict(_synthetic_acceptance_contract())
+        unsafe_doc["identity"] = {
+            "benchmark_id": "bad/id",
+            "question_id": "Q-SYNTH-01",
+        }
+        unsafe_doc["content_sha256"] = compute_acceptance_contract_sha256(unsafe_doc)
+        payload = json.dumps(
+            unsafe_doc, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        payload_build = dict(build_kwargs)
+        payload_build["contract_json_base64"] = base64.b64encode(payload).decode(
+            "ascii"
+        )
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            build_acceptance_contract_archive(**payload_build)
+        self.assertEqual(ctx.exception.path, "$.identity.benchmark_id")
+        self.assertNotIn("fallback_text", str(ctx.exception))
+        self.assertNotIn("presence_phrases", str(ctx.exception))
+
+    def test_zero_write_on_validation_failure(self) -> None:
+        server = _import_bridge_server()
+        kwargs = _acceptance_archive_kwargs()
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        build_kwargs["expected_benchmark_id"] = "../escape"
+        client = mock.Mock()
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    with self.assertRaises(ValueError) as ctx:
+                        asyncio.run(
+                            server.archive_acceptance_contract.fn(**build_kwargs)
+                        )
+        self.assertIn("expected_benchmark_id", str(ctx.exception))
+        client.put_object.assert_not_called()
+        client.head_object.assert_not_called()
 
 
 if __name__ == "__main__":

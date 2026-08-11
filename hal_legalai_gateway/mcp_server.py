@@ -101,8 +101,8 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_tool="archive_acceptance_contract",
         description=(
             "Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON "
-            "object (nested identity, canonical contract_sha256 + object_sha256) "
-            "under the canonical acceptance-contracts prefix."
+            "object. Server generates the canonical object key from nested "
+            "identity; optional expected_object_key must match when provided."
         ),
     ),
     ToolBinding(
@@ -123,6 +123,16 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description=(
             "List object metadata under the canonical acceptance-contracts "
             "B2 prefix for acceptance_contract.v1 archives."
+        ),
+    ),
+    ToolBinding(
+        gateway_tool="storage.get_acceptance_contract_template",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="get_acceptance_contract_template",
+        description=(
+            "Read-only acceptance_contract.v1 nested-identity JSON Schema, "
+            "canonical hashing rules, and one synthetic non-private example."
         ),
     ),
     ToolBinding(
@@ -427,23 +437,25 @@ def register_forwarding_tools(
     )
     async def storage_archive_acceptance_contract(
         contract_json_base64: str,
-        expected_object_key: str,
         expected_benchmark_id: str,
         expected_question_id: str,
         expected_contract_id: str,
         expected_version: str,
-        expected_sha256: str,
+        expected_contract_sha256: str = "",
+        expected_sha256: str = "",
+        expected_object_key: str = "",
     ) -> dict[str, Any]:
         return await _forward(
             "storage.archive_acceptance_contract",
             {
                 "contract_json_base64": contract_json_base64,
-                "expected_object_key": expected_object_key,
                 "expected_benchmark_id": expected_benchmark_id,
                 "expected_question_id": expected_question_id,
                 "expected_contract_id": expected_contract_id,
                 "expected_version": expected_version,
+                "expected_contract_sha256": expected_contract_sha256,
                 "expected_sha256": expected_sha256,
+                "expected_object_key": expected_object_key,
             },
         )
 
@@ -453,14 +465,16 @@ def register_forwarding_tools(
     )
     async def storage_verify_acceptance_contract(
         object_key: str,
-        expected_sha256: str,
+        expected_contract_sha256: str,
+        expected_object_sha256: str,
         expected_size: int,
     ) -> dict[str, Any]:
         return await _forward(
             "storage.verify_acceptance_contract",
             {
                 "object_key": object_key,
-                "expected_sha256": expected_sha256,
+                "expected_contract_sha256": expected_contract_sha256,
+                "expected_object_sha256": expected_object_sha256,
                 "expected_size": expected_size,
             },
         )
@@ -475,6 +489,16 @@ def register_forwarding_tools(
         return await _forward(
             "storage.list_acceptance_contracts",
             {"max_keys": max_keys},
+        )
+
+    @mcp.tool(
+        name="storage.get_acceptance_contract_template",
+        description=by_name["storage.get_acceptance_contract_template"].description,
+    )
+    async def storage_get_acceptance_contract_template() -> dict[str, Any]:
+        return await _forward(
+            "storage.get_acceptance_contract_template",
+            {},
         )
 
     @mcp.tool(

@@ -397,6 +397,82 @@ _REQUIRED_ACCEPTANCE_TOP_LEVEL = (
     "object_key",
     "content_sha256",
 )
+_SAFE_SCALAR_ECHO_PATH_PREFIXES = (
+    "$.schema_version",
+    "$.contract_id",
+    "$.version",
+    "$.identity.",
+    "$.object_key",
+    "$.content_sha256",
+    "expected_",
+)
+
+
+class AcceptanceContractValidationError(ValueError):
+    """Fail-closed validation error with safe, actionable diagnostics."""
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        constraint: str,
+        received: object,
+    ) -> None:
+        self.path = path
+        self.constraint = constraint
+        self.received_type = _received_type_name(received)
+        self.received_value = _safe_received_value(path, received)
+        super().__init__(
+            f"{path}: expected {constraint}; "
+            f"received_type={self.received_type} "
+            f"received_value={self.received_value}"
+        )
+
+
+def _received_type_name(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _safe_received_value(path: str, value: object) -> str:
+    """Return a safe diagnostic value that never echoes contract prose/content."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return str(value)
+    if isinstance(value, list):
+        return f"array(len={len(value)})"
+    if isinstance(value, dict):
+        return f"object(keys={len(value)})"
+    if isinstance(value, str):
+        allow_echo = any(path.startswith(prefix) for prefix in _SAFE_SCALAR_ECHO_PATH_PREFIXES)
+        if allow_echo and len(value) <= MAX_ACCEPTANCE_IDENTITY_CHARS:
+            return repr(value)
+        return f"string(len={len(value)})"
+    return f"unsupported({type(value).__name__})"
+
+
+def _reject(path: str, constraint: str, received: object) -> None:
+    raise AcceptanceContractValidationError(
+        path=path, constraint=constraint, received=received
+    )
 
 
 def acceptance_contract_prefix() -> str:
@@ -404,65 +480,304 @@ def acceptance_contract_prefix() -> str:
     return ACCEPTANCE_CONTRACT_PREFIX
 
 
-def _validate_acceptance_identity(value: object, *, label: str) -> str:
+def acceptance_contract_json_schema() -> dict[str, Any]:
+    """Exact acceptance_contract.v1 nested-identity JSON Schema (generic)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(_REQUIRED_ACCEPTANCE_TOP_LEVEL),
+        "properties": {
+            "schema_version": {
+                "type": "string",
+                "enum": [ACCEPTANCE_CONTRACT_SCHEMA_VERSION],
+            },
+            "contract_id": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1},
+            "identity": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["benchmark_id", "question_id"],
+                "properties": {
+                    "benchmark_id": {"type": "string", "minLength": 1},
+                    "question_id": {"type": "string", "minLength": 1},
+                },
+            },
+            "required_criterion_ids": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "evidence_constraints": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "allowed_source_types",
+                    "require_page_citations",
+                    "max_excerpts_per_criterion",
+                ],
+                "properties": {
+                    "allowed_source_types": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "require_page_citations": {"type": "boolean"},
+                    "max_excerpts_per_criterion": {
+                        "type": "integer",
+                        "minimum": 1,
+                    },
+                },
+            },
+            "semantic_preservation": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "require_same_party_roles",
+                    "forbid_material_omissions",
+                    "require_preserve_negation",
+                ],
+                "properties": {
+                    "require_same_party_roles": {"type": "boolean"},
+                    "forbid_material_omissions": {"type": "boolean"},
+                    "require_preserve_negation": {"type": "boolean"},
+                },
+            },
+            "duplication_rules": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "forbid_duplicate_criterion_ids",
+                    "forbid_overlapping_evidence_spans",
+                    "max_duplicate_phrase_ratio",
+                ],
+                "properties": {
+                    "forbid_duplicate_criterion_ids": {"type": "boolean"},
+                    "forbid_overlapping_evidence_spans": {"type": "boolean"},
+                    "max_duplicate_phrase_ratio": {"type": "number", "minimum": 0},
+                },
+            },
+            "criteria": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "minLength": 1},
+                        "presence_phrases": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                        "evidence_phrases": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                        "semantic_required_phrases": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                        "semantic_forbidden_phrases": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                        "fallback_text": {"type": "string"},
+                        "category": {"type": "string"},
+                    },
+                },
+            },
+            "structure_requirements": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "required_kinds",
+                    "required_ranges",
+                    "required_categories",
+                ],
+                "properties": {
+                    "required_kinds": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "required_ranges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["kind", "start", "end"],
+                            "properties": {
+                                "kind": {"type": "string", "minLength": 1},
+                                "start": {"type": "integer"},
+                                "end": {"type": "integer"},
+                                "category": {"type": "string"},
+                            },
+                        },
+                    },
+                    "required_categories": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
+            "object_key": {"type": "string", "minLength": 1},
+            "content_sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+    }
+
+
+def canonical_acceptance_hashing_rules() -> dict[str, Any]:
+    """Document LegalAI canonical hashing rules (no private material)."""
+    return {
+        "contract_sha256": {
+            "description": (
+                "SHA-256 of canonical UTF-8 JSON excluding the content_sha256 field"
+            ),
+            "json_dumps": {
+                "sort_keys": True,
+                "separators": [",", ":"],
+                "ensure_ascii": False,
+            },
+            "excludes_field": "content_sha256",
+        },
+        "content_sha256": {
+            "description": (
+                "Embedded field that must equal contract_sha256 for the same document"
+            ),
+        },
+        "object_sha256": {
+            "description": (
+                "SHA-256 of the exact serialized object bytes stored in B2 "
+                "(independent of canonical JSON reformatting)"
+            ),
+        },
+        "canonical_object_key": {
+            "template": (
+                f"{ACCEPTANCE_CONTRACT_PREFIX}"
+                "{benchmark_id}/{question_id}/{contract_id}/v{version}/"
+                "acceptance_contract.json"
+            ),
+            "prefix": ACCEPTANCE_CONTRACT_PREFIX,
+            "version_path_prefix": "v",
+        },
+    }
+
+
+def _validate_acceptance_identity(value: object, *, path: str) -> str:
     if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be a non-empty string")
+        _reject(
+            path,
+            f"non-empty string (max {MAX_ACCEPTANCE_IDENTITY_CHARS} chars, "
+            r"shape ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$)",
+            value,
+        )
     if len(value) > MAX_ACCEPTANCE_IDENTITY_CHARS:
-        raise ValueError(f"{label} exceeds {MAX_ACCEPTANCE_IDENTITY_CHARS} characters")
+        _reject(
+            path,
+            f"identity string length <= {MAX_ACCEPTANCE_IDENTITY_CHARS}",
+            value,
+        )
     if not _ACCEPTANCE_IDENTITY_RE.fullmatch(value):
-        raise ValueError(f"{label} has an invalid identity shape")
+        _reject(
+            path,
+            r"identity shape ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            value,
+        )
     return value
 
 
+def canonical_acceptance_contract_object_key(
+    *,
+    benchmark_id: str,
+    question_id: str,
+    contract_id: str,
+    version: str,
+) -> str:
+    """Build the deterministic B2 object key from validated identity fields."""
+    key = (
+        f"{ACCEPTANCE_CONTRACT_PREFIX}"
+        f"{benchmark_id}/{question_id}/{contract_id}/v{version}/"
+        "acceptance_contract.json"
+    )
+    return validate_acceptance_contract_object_key(key)
+
+
 def validate_sha256_hex(value: object, *, label: str = "expected_sha256") -> str:
+    path = label if label.startswith(("$", "expected_")) else label
     if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be a non-empty hex string")
+        _reject(path, "non-empty 64-character lowercase hex SHA-256", value)
     normalized = value.lower()
     if not _SHA256_HEX_RE.fullmatch(normalized):
-        raise ValueError(f"{label} must be a 64-character lowercase hex SHA-256")
+        _reject(path, "64-character lowercase hex SHA-256", value)
     return normalized
 
 
 def decode_acceptance_contract_json_base64(contract_json_base64: str) -> bytes:
     if not isinstance(contract_json_base64, str) or not contract_json_base64:
-        raise ValueError("contract_json_base64 must be a non-empty base64 string")
+        _reject(
+            "contract_json_base64",
+            "non-empty strict standard base64 string",
+            contract_json_base64,
+        )
     if len(contract_json_base64) > MAX_ACCEPTANCE_CONTRACT_BASE64_CHARS:
-        raise ValueError("contract_json_base64 exceeds the bounded payload size")
+        _reject(
+            "contract_json_base64",
+            f"base64 length <= {MAX_ACCEPTANCE_CONTRACT_BASE64_CHARS}",
+            contract_json_base64,
+        )
     if any(ch.isspace() for ch in contract_json_base64):
-        raise ValueError("contract_json_base64 must not contain whitespace")
+        _reject(
+            "contract_json_base64",
+            "base64 without whitespace",
+            contract_json_base64,
+        )
     try:
         payload = base64.b64decode(contract_json_base64, validate=True)
     except (ValueError, binascii.Error) as exc:
-        raise ValueError(
-            "contract_json_base64 must be strict standard base64"
+        raise AcceptanceContractValidationError(
+            path="contract_json_base64",
+            constraint="strict standard base64",
+            received=contract_json_base64,
         ) from exc
     if not payload:
-        raise ValueError("decoded acceptance contract payload must not be empty")
+        _reject("contract_json_base64", "non-empty decoded payload", payload)
     if len(payload) > MAX_ACCEPTANCE_CONTRACT_BYTES:
-        raise ValueError("decoded acceptance contract exceeds the 2 MiB archive limit")
+        _reject(
+            "contract_json_base64",
+            f"decoded payload <= {MAX_ACCEPTANCE_CONTRACT_BYTES} bytes",
+            payload,
+        )
     return payload
 
 
 def validate_acceptance_contract_object_key(object_key: object) -> str:
+    path = "$.object_key"
     if not isinstance(object_key, str) or not object_key:
-        raise ValueError("object_key must be a non-empty string")
+        _reject(path, "non-empty string under canonical prefix", object_key)
     if len(object_key) > MAX_ACCEPTANCE_CONTRACT_KEY_CHARS:
-        raise ValueError(
-            f"object_key exceeds {MAX_ACCEPTANCE_CONTRACT_KEY_CHARS} characters"
+        _reject(
+            path,
+            f"length <= {MAX_ACCEPTANCE_CONTRACT_KEY_CHARS}",
+            object_key,
         )
     if object_key.startswith("/") or "\\" in object_key:
-        raise ValueError("object_key must not be absolute or use backslashes")
+        _reject(path, "relative key without backslashes", object_key)
     if ".." in object_key.split("/"):
-        raise ValueError("object_key must not contain path traversal segments")
+        _reject(path, "no path traversal segments", object_key)
     if "//" in object_key:
-        raise ValueError("object_key must not contain empty path segments")
+        _reject(path, "no empty path segments", object_key)
     if not object_key.startswith(ACCEPTANCE_CONTRACT_PREFIX):
-        raise ValueError(
-            "object_key must stay under the canonical acceptance-contracts prefix"
+        _reject(
+            path,
+            f"prefix {ACCEPTANCE_CONTRACT_PREFIX!r}",
+            object_key,
         )
     remainder = object_key[len(ACCEPTANCE_CONTRACT_PREFIX) :]
     if not remainder or remainder.endswith("/"):
-        raise ValueError("object_key must name a concrete object under the prefix")
+        _reject(path, "concrete object name under prefix", object_key)
     return object_key
 
 
@@ -476,20 +791,22 @@ def assert_canonical_legalai_bucket(bucket: object) -> str:
     return bucket
 
 
-def _require_non_empty_string_list(value: object, *, label: str) -> list[str]:
+def _require_non_empty_string_list(value: object, *, path: str) -> list[str]:
     if not isinstance(value, list) or not value:
-        raise ValueError(f"{label} must be a non-empty array")
+        _reject(path, "non-empty array of strings", value)
     out: list[str] = []
     for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
         if not isinstance(item, str) or not item:
-            raise ValueError(f"{label}[{index}] must be a non-empty string")
+            _reject(item_path, "non-empty string", item)
         out.append(item)
     return out
 
 
 def _validate_evidence_constraints(value: object) -> None:
+    path = "$.evidence_constraints"
     if not isinstance(value, dict):
-        raise ValueError("evidence_constraints must be an object")
+        _reject(path, "object", value)
     required = (
         "allowed_source_types",
         "require_page_citations",
@@ -497,23 +814,37 @@ def _validate_evidence_constraints(value: object) -> None:
     )
     missing = [key for key in required if key not in value]
     if missing:
-        raise ValueError("evidence_constraints missing required properties")
+        _reject(path, f"required properties {list(required)}", value)
     extra = sorted(set(value) - set(required))
     if extra:
-        raise ValueError("evidence_constraints has unexpected properties")
+        _reject(path, f"only properties {list(required)}", value)
     _require_non_empty_string_list(
-        value.get("allowed_source_types"), label="evidence_constraints.allowed_source_types"
+        value.get("allowed_source_types"),
+        path=f"{path}.allowed_source_types",
     )
     if not isinstance(value.get("require_page_citations"), bool):
-        raise ValueError("evidence_constraints.require_page_citations must be boolean")
+        _reject(
+            f"{path}.require_page_citations",
+            "boolean",
+            value.get("require_page_citations"),
+        )
     max_excerpts = value.get("max_excerpts_per_criterion")
-    if not isinstance(max_excerpts, int) or isinstance(max_excerpts, bool) or max_excerpts < 1:
-        raise ValueError("evidence_constraints.max_excerpts_per_criterion invalid")
+    if (
+        not isinstance(max_excerpts, int)
+        or isinstance(max_excerpts, bool)
+        or max_excerpts < 1
+    ):
+        _reject(
+            f"{path}.max_excerpts_per_criterion",
+            "integer >= 1",
+            max_excerpts,
+        )
 
 
 def _validate_semantic_preservation(value: object) -> None:
+    path = "$.semantic_preservation"
     if not isinstance(value, dict):
-        raise ValueError("semantic_preservation must be an object")
+        _reject(path, "object", value)
     required = (
         "require_same_party_roles",
         "forbid_material_omissions",
@@ -521,18 +852,19 @@ def _validate_semantic_preservation(value: object) -> None:
     )
     missing = [key for key in required if key not in value]
     if missing:
-        raise ValueError("semantic_preservation missing required properties")
+        _reject(path, f"required properties {list(required)}", value)
     extra = sorted(set(value) - set(required))
     if extra:
-        raise ValueError("semantic_preservation has unexpected properties")
+        _reject(path, f"only properties {list(required)}", value)
     for key in required:
         if not isinstance(value.get(key), bool):
-            raise ValueError(f"semantic_preservation.{key} must be boolean")
+            _reject(f"{path}.{key}", "boolean", value.get(key))
 
 
 def _validate_duplication_rules(value: object) -> None:
+    path = "$.duplication_rules"
     if not isinstance(value, dict):
-        raise ValueError("duplication_rules must be an object")
+        _reject(path, "object", value)
     required = (
         "forbid_duplicate_criterion_ids",
         "forbid_overlapping_evidence_spans",
@@ -540,32 +872,33 @@ def _validate_duplication_rules(value: object) -> None:
     )
     missing = [key for key in required if key not in value]
     if missing:
-        raise ValueError("duplication_rules missing required properties")
+        _reject(path, f"required properties {list(required)}", value)
     extra = sorted(set(value) - set(required))
     if extra:
-        raise ValueError("duplication_rules has unexpected properties")
+        _reject(path, f"only properties {list(required)}", value)
     for key in (
         "forbid_duplicate_criterion_ids",
         "forbid_overlapping_evidence_spans",
     ):
         if not isinstance(value.get(key), bool):
-            raise ValueError(f"duplication_rules.{key} must be boolean")
+            _reject(f"{path}.{key}", "boolean", value.get(key))
     ratio = value.get("max_duplicate_phrase_ratio")
     if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or float(ratio) < 0:
-        raise ValueError("duplication_rules.max_duplicate_phrase_ratio invalid")
+        _reject(f"{path}.max_duplicate_phrase_ratio", "number >= 0", ratio)
 
 
-def _validate_optional_string_list(value: object, *, label: str) -> None:
+def _validate_optional_string_list(value: object, *, path: str) -> None:
     if not isinstance(value, list):
-        raise ValueError(f"{label} must be an array")
+        _reject(path, "array of strings", value)
     for index, item in enumerate(value):
         if not isinstance(item, str) or not item:
-            raise ValueError(f"{label}[{index}] must be a non-empty string")
+            _reject(f"{path}[{index}]", "non-empty string", item)
 
 
 def _validate_optional_criteria(value: object) -> None:
+    path = "$.criteria"
     if not isinstance(value, list):
-        raise ValueError("criteria must be an array")
+        _reject(path, "array", value)
     allowed = {
         "id",
         "presence_phrases",
@@ -576,15 +909,16 @@ def _validate_optional_criteria(value: object) -> None:
         "category",
     }
     for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
         if not isinstance(item, dict):
-            raise ValueError(f"criteria[{index}] must be an object")
+            _reject(item_path, "object", item)
         if "id" not in item:
-            raise ValueError(f"criteria[{index}] missing required property 'id'")
+            _reject(item_path, "required property 'id'", item)
         if not isinstance(item.get("id"), str) or not item["id"]:
-            raise ValueError(f"criteria[{index}].id must be a non-empty string")
+            _reject(f"{item_path}.id", "non-empty string", item.get("id"))
         extra = sorted(set(item) - allowed)
         if extra:
-            raise ValueError(f"criteria[{index}] has unexpected properties")
+            _reject(item_path, f"only properties {sorted(allowed)}", item)
         for key in (
             "presence_phrases",
             "evidence_phrases",
@@ -592,61 +926,53 @@ def _validate_optional_criteria(value: object) -> None:
             "semantic_forbidden_phrases",
         ):
             if key in item:
-                _validate_optional_string_list(item[key], label=f"criteria[{index}].{key}")
+                _validate_optional_string_list(
+                    item[key], path=f"{item_path}.{key}"
+                )
         for key in ("fallback_text", "category"):
             if key in item and not isinstance(item[key], str):
-                raise ValueError(f"criteria[{index}].{key} must be a string")
+                _reject(f"{item_path}.{key}", "string", item[key])
 
 
 def _validate_optional_structure_requirements(value: object) -> None:
+    path = "$.structure_requirements"
     if not isinstance(value, dict):
-        raise ValueError("structure_requirements must be an object")
+        _reject(path, "object", value)
     required = ("required_kinds", "required_ranges", "required_categories")
     missing = [key for key in required if key not in value]
     if missing:
-        raise ValueError("structure_requirements missing required properties")
+        _reject(path, f"required properties {list(required)}", value)
     extra = sorted(set(value) - set(required))
     if extra:
-        raise ValueError("structure_requirements has unexpected properties")
+        _reject(path, f"only properties {list(required)}", value)
     _validate_optional_string_list(
-        value.get("required_kinds"), label="structure_requirements.required_kinds"
+        value.get("required_kinds"), path=f"{path}.required_kinds"
     )
     _validate_optional_string_list(
         value.get("required_categories"),
-        label="structure_requirements.required_categories",
+        path=f"{path}.required_categories",
     )
     ranges = value.get("required_ranges")
     if not isinstance(ranges, list):
-        raise ValueError("structure_requirements.required_ranges must be an array")
+        _reject(f"{path}.required_ranges", "array", ranges)
     for index, item in enumerate(ranges):
+        item_path = f"{path}.required_ranges[{index}]"
         if not isinstance(item, dict):
-            raise ValueError(
-                f"structure_requirements.required_ranges[{index}] must be an object"
-            )
+            _reject(item_path, "object", item)
         for key in ("kind", "start", "end"):
             if key not in item:
-                raise ValueError(
-                    f"structure_requirements.required_ranges[{index}] missing '{key}'"
-                )
+                _reject(item_path, f"required property '{key}'", item)
         if not isinstance(item.get("kind"), str) or not item["kind"]:
-            raise ValueError(
-                f"structure_requirements.required_ranges[{index}].kind invalid"
-            )
+            _reject(f"{item_path}.kind", "non-empty string", item.get("kind"))
         for key in ("start", "end"):
             if not isinstance(item.get(key), int) or isinstance(item.get(key), bool):
-                raise ValueError(
-                    f"structure_requirements.required_ranges[{index}].{key} invalid"
-                )
+                _reject(f"{item_path}.{key}", "integer", item.get(key))
         allowed = {"kind", "start", "end", "category"}
         extra_item = sorted(set(item) - allowed)
         if extra_item:
-            raise ValueError(
-                f"structure_requirements.required_ranges[{index}] unexpected properties"
-            )
+            _reject(item_path, f"only properties {sorted(allowed)}", item)
         if "category" in item and not isinstance(item["category"], str):
-            raise ValueError(
-                f"structure_requirements.required_ranges[{index}].category invalid"
-            )
+            _reject(f"{item_path}.category", "string", item["category"])
 
 
 def canonical_acceptance_contract_json_bytes(document: Mapping[str, Any]) -> bytes:
@@ -675,9 +1001,13 @@ def canonical_acceptance_contract_sha256(payload: bytes) -> str:
     try:
         document = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("acceptance contract must be UTF-8 JSON") from exc
+        raise AcceptanceContractValidationError(
+            path="$",
+            constraint="UTF-8 JSON object",
+            received=None,
+        ) from exc
     if not isinstance(document, dict):
-        raise ValueError("acceptance contract root must be a JSON object")
+        _reject("$", "JSON object", document)
     return compute_acceptance_contract_sha256(document)
 
 
@@ -751,35 +1081,84 @@ def build_synthetic_acceptance_contract(
     return document
 
 
+def build_acceptance_contract_template() -> dict[str, Any]:
+    """Read-only template: schema, hashing rules, and one synthetic example."""
+    benchmark_id = "synth-benchmark-alpha"
+    question_id = "Q-SYNTH-01"
+    contract_id = "contract-synth-alpha-q01"
+    version = "1.0.0"
+    object_key = canonical_acceptance_contract_object_key(
+        benchmark_id=benchmark_id,
+        question_id=question_id,
+        contract_id=contract_id,
+        version=version,
+    )
+    example = build_synthetic_acceptance_contract(
+        contract_id=contract_id,
+        version=version,
+        benchmark_id=benchmark_id,
+        question_id=question_id,
+        object_key=object_key,
+        required_criterion_ids=["crit-presence", "crit-negation", "crit-roles"],
+    )
+    return {
+        "ok": True,
+        "schema_version": ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
+        "prefix": ACCEPTANCE_CONTRACT_PREFIX,
+        "bucket": CANONICAL_LEGALAI_BUCKET,
+        "json_schema": acceptance_contract_json_schema(),
+        "canonical_hashing": canonical_acceptance_hashing_rules(),
+        "example": example,
+    }
+
+
 def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
     """Parse and strictly validate LegalAI acceptance_contract.v1 (safe metadata only)."""
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError("acceptance contract must be UTF-8 JSON") from exc
+        raise AcceptanceContractValidationError(
+            path="$",
+            constraint="UTF-8 JSON object",
+            received=None,
+        ) from exc
     try:
         document = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError("acceptance contract must be valid JSON") from exc
+        raise AcceptanceContractValidationError(
+            path="$",
+            constraint="valid JSON object",
+            received=None,
+        ) from exc
     if not isinstance(document, dict):
-        raise ValueError("acceptance contract root must be a JSON object")
+        _reject("$", "JSON object", document)
 
     # Reject the pre-LegalAI flat shape (schema / top-level benchmark_id / question_id).
     if "schema" in document or (
         ("benchmark_id" in document or "question_id" in document)
         and "identity" not in document
     ):
-        raise ValueError("acceptance contract rejects obsolete flat schema shape")
+        _reject(
+            "$",
+            "nested-identity acceptance_contract.v1 (obsolete flat schema rejected)",
+            document,
+        )
 
     schema_version = document.get("schema_version")
     if schema_version != ACCEPTANCE_CONTRACT_SCHEMA_VERSION:
-        raise ValueError(
-            f"schema_version must be {ACCEPTANCE_CONTRACT_SCHEMA_VERSION}"
+        _reject(
+            "$.schema_version",
+            f"enum [{ACCEPTANCE_CONTRACT_SCHEMA_VERSION}]",
+            schema_version,
         )
 
     missing = [key for key in _REQUIRED_ACCEPTANCE_TOP_LEVEL if key not in document]
     if missing:
-        raise ValueError("acceptance contract missing required top-level properties")
+        _reject(
+            "$",
+            f"required properties {list(_REQUIRED_ACCEPTANCE_TOP_LEVEL)}",
+            document,
+        )
 
     allowed_top = set(_REQUIRED_ACCEPTANCE_TOP_LEVEL) | {
         "criteria",
@@ -787,27 +1166,31 @@ def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
     }
     unexpected = sorted(set(document) - allowed_top)
     if unexpected:
-        raise ValueError("acceptance contract has unexpected top-level properties")
+        _reject("$", f"only properties {sorted(allowed_top)}", document)
 
     contract_id = _validate_acceptance_identity(
-        document.get("contract_id"), label="contract_id"
+        document.get("contract_id"), path="$.contract_id"
     )
-    version = _validate_acceptance_identity(document.get("version"), label="version")
+    version = _validate_acceptance_identity(document.get("version"), path="$.version")
 
     identity = document.get("identity")
     if not isinstance(identity, dict):
-        raise ValueError("identity must be an object")
+        _reject("$.identity", "object", identity)
     if sorted(identity.keys()) != ["benchmark_id", "question_id"]:
-        raise ValueError("identity must contain only benchmark_id and question_id")
+        _reject(
+            "$.identity",
+            "only properties ['benchmark_id', 'question_id']",
+            identity,
+        )
     benchmark_id = _validate_acceptance_identity(
-        identity.get("benchmark_id"), label="identity.benchmark_id"
+        identity.get("benchmark_id"), path="$.identity.benchmark_id"
     )
     question_id = _validate_acceptance_identity(
-        identity.get("question_id"), label="identity.question_id"
+        identity.get("question_id"), path="$.identity.question_id"
     )
 
     required_criterion_ids = _require_non_empty_string_list(
-        document.get("required_criterion_ids"), label="required_criterion_ids"
+        document.get("required_criterion_ids"), path="$.required_criterion_ids"
     )
     _validate_evidence_constraints(document.get("evidence_constraints"))
     _validate_semantic_preservation(document.get("semantic_preservation"))
@@ -823,11 +1206,15 @@ def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
         document.get("object_key")
     )
     embedded_content_sha256 = validate_sha256_hex(
-        document.get("content_sha256"), label="content_sha256"
+        document.get("content_sha256"), label="$.content_sha256"
     )
     recomputed = compute_acceptance_contract_sha256(document)
     if embedded_content_sha256 != recomputed:
-        raise ValueError("content_sha256 does not match recomputed contract digest")
+        _reject(
+            "$.content_sha256",
+            "digest equal to recomputed contract_sha256",
+            embedded_content_sha256,
+        )
 
     # Safe metadata only — never return criteria / rule prose.
     return {
@@ -847,39 +1234,74 @@ def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
 def build_acceptance_contract_archive(
     *,
     contract_json_base64: str,
-    expected_object_key: str,
     expected_benchmark_id: str,
     expected_question_id: str,
     expected_contract_id: str,
     expected_version: str,
     expected_contract_sha256: str | None = None,
     expected_sha256: str | None = None,
+    expected_object_key: str | None = None,
 ) -> dict[str, Any]:
     """Validate inputs and return one create-only archive item (safe metadata).
 
-    ``expected_contract_sha256`` is the LegalAI canonical content digest.
-    ``expected_sha256`` remains accepted as an alias for the same digest.
+    The server generates the canonical B2 object key from validated identity
+    fields. ``expected_object_key`` is optional; when provided it must equal the
+    generated key. ``expected_contract_sha256`` is the LegalAI canonical content
+    digest. ``expected_sha256`` remains accepted as an alias for the same digest.
     """
-    object_key = validate_acceptance_contract_object_key(expected_object_key)
     expected_benchmark = _validate_acceptance_identity(
-        expected_benchmark_id, label="expected_benchmark_id"
+        expected_benchmark_id, path="expected_benchmark_id"
     )
     expected_question = _validate_acceptance_identity(
-        expected_question_id, label="expected_question_id"
+        expected_question_id, path="expected_question_id"
     )
     expected_contract = _validate_acceptance_identity(
-        expected_contract_id, label="expected_contract_id"
+        expected_contract_id, path="expected_contract_id"
     )
     expected_ver = _validate_acceptance_identity(
-        expected_version, label="expected_version"
+        expected_version, path="expected_version"
     )
+    object_key = canonical_acceptance_contract_object_key(
+        benchmark_id=expected_benchmark,
+        question_id=expected_question,
+        contract_id=expected_contract,
+        version=expected_ver,
+    )
+    if expected_object_key is not None and expected_object_key != "":
+        provided_key = expected_object_key
+        if not isinstance(provided_key, str):
+            _reject(
+                "expected_object_key",
+                "optional string equal to server-generated canonical key",
+                provided_key,
+            )
+        # Validate shape first so path-unsafe legacy keys get actionable errors.
+        try:
+            validate_acceptance_contract_object_key(provided_key)
+        except AcceptanceContractValidationError as exc:
+            raise AcceptanceContractValidationError(
+                path="expected_object_key",
+                constraint=exc.constraint,
+                received=provided_key,
+            ) from exc
+        if provided_key != object_key:
+            _reject(
+                "expected_object_key",
+                f"equal to generated key {object_key!r}",
+                provided_key,
+            )
+
     expected_digest_raw = (
         expected_contract_sha256
         if expected_contract_sha256 is not None
         else expected_sha256
     )
     if expected_digest_raw is None:
-        raise ValueError("expected_contract_sha256 is required")
+        _reject(
+            "expected_contract_sha256",
+            "non-empty 64-character lowercase hex SHA-256",
+            expected_digest_raw,
+        )
     expected_digest = validate_sha256_hex(
         expected_digest_raw, label="expected_contract_sha256"
     )
@@ -890,21 +1312,47 @@ def build_acceptance_contract_archive(
     object_sha256 = compute_acceptance_object_sha256(payload)
 
     if contract_sha256 != expected_digest:
-        raise ValueError(
-            "acceptance contract contract_sha256 does not match expected_contract_sha256"
+        _reject(
+            "expected_contract_sha256",
+            "equal to recomputed contract_sha256",
+            expected_digest,
         )
     if identity["content_sha256"] != expected_digest:
-        raise ValueError("embedded content_sha256 does not match expected_contract_sha256")
+        _reject(
+            "$.content_sha256",
+            "equal to expected_contract_sha256",
+            identity["content_sha256"],
+        )
     if identity["object_key"] != object_key:
-        raise ValueError("embedded object_key does not match expected_object_key")
+        _reject(
+            "$.object_key",
+            f"equal to generated key {object_key!r}",
+            identity["object_key"],
+        )
     if identity["benchmark_id"] != expected_benchmark:
-        raise ValueError("benchmark_id does not match expected_benchmark_id")
+        _reject(
+            "$.identity.benchmark_id",
+            f"equal to expected_benchmark_id {expected_benchmark!r}",
+            identity["benchmark_id"],
+        )
     if identity["question_id"] != expected_question:
-        raise ValueError("question_id does not match expected_question_id")
+        _reject(
+            "$.identity.question_id",
+            f"equal to expected_question_id {expected_question!r}",
+            identity["question_id"],
+        )
     if identity["contract_id"] != expected_contract:
-        raise ValueError("contract_id does not match expected_contract_id")
+        _reject(
+            "$.contract_id",
+            f"equal to expected_contract_id {expected_contract!r}",
+            identity["contract_id"],
+        )
     if identity["version"] != expected_ver:
-        raise ValueError("version does not match expected_version")
+        _reject(
+            "$.version",
+            f"equal to expected_version {expected_ver!r}",
+            identity["version"],
+        )
 
     filename = object_key.rsplit("/", 1)[-1]
     return {

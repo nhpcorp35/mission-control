@@ -156,6 +156,12 @@ class RegistryTests(unittest.TestCase):
             "list_acceptance_contracts",
         )
         self.assertEqual(
+            registry.downstream_tool_for_gateway_tool(
+                "storage.get_acceptance_contract_template"
+            ),
+            "get_acceptance_contract_template",
+        )
+        self.assertEqual(
             registry.downstream_tool_for_gateway_tool("mission.submit"),
             "submit_run",
         )
@@ -801,6 +807,7 @@ class McpRegistrationTests(unittest.TestCase):
         self.assertIn("storage.archive_acceptance_contract", names)
         self.assertIn("storage.verify_acceptance_contract", names)
         self.assertIn("storage.list_acceptance_contracts", names)
+        self.assertIn("storage.get_acceptance_contract_template", names)
 
 
 class ApiTests(unittest.TestCase):
