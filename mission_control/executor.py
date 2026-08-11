@@ -155,6 +155,13 @@ SPLIT_RUN_POLICY_INSTRUCTIONS = (
     ),
 )
 
+# Injected into every agent prompt. Coding agents may edit/test the workspace;
+# only Mission Control platform persistence may commit, push, or record SHA.
+PLATFORM_PERSISTENCE_OWNERSHIP_INSTRUCTIONS = (
+    "Do not commit, push, create pull requests, or mutate remotes; leave "
+    "tested changes in the workspace for Mission Control persistence.",
+)
+
 
 def build_timeout_split_guidance(
     *,
@@ -241,6 +248,9 @@ def build_cursor_instruction(
     lines.extend(f"- {constraint}" for constraint in constraints)
     lines.extend(
         f"- {constraint}" for constraint in _workspace_binding_constraints(mission)
+    )
+    lines.extend(
+        f"- {item}" for item in PLATFORM_PERSISTENCE_OWNERSHIP_INSTRUCTIONS
     )
 
     lines.extend(

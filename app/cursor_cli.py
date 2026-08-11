@@ -20,7 +20,27 @@ _MISSION_CONTROL_SUBMISSION_ENV = (
     "MISSION_CONTROL_API_KEY",
     "MISSION_CONTROL_URL",
 )
+# GitHub / Git write credentials — agents may edit and test locally, but only
+# Mission Control platform persistence may commit or push. Values are never
+# logged.
+_GITHUB_WRITE_CREDENTIAL_ENV = (
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_PAT",
+    "GIT_ASKPASS",
+    "GH_ASKPASS",
+)
 RECURSIVE_SUBMISSIONS_ENV = "MISSION_CONTROL_RECURSIVE_SUBMISSIONS"
+
+
+def _is_git_config_override_env(name: str) -> bool:
+    """Return True for GIT_CONFIG_* overrides that can inject write auth."""
+    return (
+        name == "GIT_CONFIG_COUNT"
+        or name.startswith("GIT_CONFIG_KEY_")
+        or name.startswith("GIT_CONFIG_VALUE_")
+    )
 
 ERROR_CURSOR_AGENT_UNAVAILABLE = "CURSOR_AGENT_UNAVAILABLE"
 ERROR_CURSOR_API_KEY_MISSING = "CURSOR_API_KEY_MISSING"
@@ -60,13 +80,21 @@ def augment_path(path: str | None = None) -> str:
 def cursor_cli_env() -> dict[str, str]:
     """Return a copy of the process environment with Cursor CLI PATH applied.
 
-    Mission Control submission credentials are removed so a Cursor agent cannot
-    authenticate recursive local ``POST /runs`` submissions back to this API.
+    Mission Control submission credentials and GitHub write credentials are
+    removed so a Cursor agent cannot authenticate recursive local
+    ``POST /runs`` submissions or push to GitHub. Variables needed for local
+    coding and tests (for example ``CURSOR_API_KEY``, ``PATH``) are preserved.
+    Secret values are never logged.
     """
     env = os.environ.copy()
     env["PATH"] = augment_path(env.get("PATH"))
     for key in _MISSION_CONTROL_SUBMISSION_ENV:
         env.pop(key, None)
+    for key in _GITHUB_WRITE_CREDENTIAL_ENV:
+        env.pop(key, None)
+    for key in list(env):
+        if _is_git_config_override_env(key):
+            env.pop(key, None)
     env[RECURSIVE_SUBMISSIONS_ENV] = "blocked"
     return env
 

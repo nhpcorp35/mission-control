@@ -98,6 +98,11 @@ _PERSISTENCE_BLOCKED_TOP_LEVEL_DIRS = frozenset(
 # Keep empty by default; add only deliberate, narrow exceptions.
 PERSISTENCE_TEMP_PATH_ALLOWLIST: frozenset[str] = frozenset()
 
+# Per-workspace push URL that rejects agent-side ``git push``. Platform
+# persistence pushes to the origin fetch URL explicitly so this denial cannot
+# block Mission Control's authorized push path.
+AGENT_GIT_PUSH_DISABLED_URL = "disabled://mission-control-platform-only-push"
+
 
 @dataclass(frozen=True)
 class WorkspacePrepResult:
@@ -203,6 +208,45 @@ def configure_workspace_origin(
 ) -> subprocess.CompletedProcess[str]:
     """Point the isolated workspace's origin remote at ``origin_url``."""
     return _run_git(["-C", workspace_path, "remote", "set-url", "origin", origin_url])
+
+
+def disable_agent_git_push(workspace_path: str) -> str | None:
+    """Deny agent-side ``git push`` via a per-workspace disabled push URL.
+
+    Sets ``remote.origin.pushurl`` to :data:`AGENT_GIT_PUSH_DISABLED_URL`.
+    Platform persistence must push using the origin fetch URL (not the remote
+    name alone) so this denial cannot affect Mission Control's authorized push.
+    Returns an error message on failure, else ``None``.
+    """
+    result = _run_git(
+        [
+            "-C",
+            workspace_path,
+            "config",
+            "remote.origin.pushurl",
+            AGENT_GIT_PUSH_DISABLED_URL,
+        ]
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        if not message:
+            message = (
+                "git config remote.origin.pushurl failed with code "
+                f"{result.returncode}"
+            )
+        return message
+    return None
+
+
+def get_agent_push_url(workspace_path: str) -> str | None:
+    """Return the configured origin push URL, if any."""
+    completed = _run_git(
+        ["-C", workspace_path, "config", "--get", "remote.origin.pushurl"]
+    )
+    if completed.returncode != 0:
+        return None
+    url = completed.stdout.strip()
+    return url or None
 
 
 def _repository_name(mission: dict) -> str:
@@ -585,6 +629,11 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
         _safe_cleanup(real_workspace)
         return WorkspacePrepResult(ok=False, error=mismatch)
 
+    push_deny_error = disable_agent_git_push(real_workspace)
+    if push_deny_error is not None:
+        _safe_cleanup(real_workspace)
+        return WorkspacePrepResult(ok=False, error=push_deny_error)
+
     return WorkspacePrepResult(
         ok=True,
         workspace_path=real_workspace,
@@ -894,13 +943,30 @@ def persist_workspace_changes(
             commit_sha=sha_result.commit_sha if sha_result.ok else None,
         )
 
+    # Push to the origin fetch URL explicitly so a workspace-local disabled
+    # pushurl (agent denial) cannot block platform-owned persistence.
+    origin_url = get_origin_url(workspace_path)
+    if not origin_url:
+        sha_result = _read_head_commit_sha(
+            workspace_path,
+            mode="push",
+            pushed=False,
+        )
+        return PersistenceResult(
+            ok=False,
+            error="origin remote URL is not configured for platform push",
+            mode="push",
+            pushed=False,
+            commit_sha=sha_result.commit_sha if sha_result.ok else None,
+        )
+
     base_branch = mission["repository"]["base_branch"]
     push = _run_git(
         [
             "-C",
             workspace_path,
             "push",
-            "origin",
+            origin_url,
             f"HEAD:{base_branch}",
         ],
         env=push_env,
@@ -1306,6 +1372,30 @@ def execute_registered_run(
             **mission["repository"],
             "path": agent_workspace,
         }
+
+        # Re-assert agent push denial immediately before launch so a mutated
+        # workspace config cannot regain a write-capable push URL.
+        push_deny_error = disable_agent_git_push(workspace_path)
+        if push_deny_error is not None:
+            append_warning(structured, WARNING_PERSISTENCE_NOT_ATTEMPTED)
+            structured.persistence = build_persistence_evidence(
+                mission,
+                attempted=False,
+                ok=None,
+            )
+            structured.deliverables = DeliverableEvidence(
+                verified=False,
+                passed=None,
+            )
+            _attach_documentation(handling_completed=False)
+            finalize_structured_summary(structured, error=push_deny_error)
+            registry.store_result(
+                run_id,
+                error=push_deny_error,
+                result=structured,
+            )
+            registry.update_status(run_id, RunStatus.FAILED)
+            return
 
         execution_result = execute_cursor_agent(
             isolated_mission,
