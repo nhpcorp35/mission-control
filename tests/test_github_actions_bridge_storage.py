@@ -14,17 +14,24 @@ from unittest import mock
 from cryptography.fernet import Fernet
 
 from github_actions_bridge.storage_policy import (
+    ACCEPTANCE_CONTRACT_PREFIX,
+    ACCEPTANCE_CONTRACT_SCHEMA,
+    CANONICAL_LEGALAI_BUCKET,
     CASE00_PREFIXES,
     MAX_REVIEW_PACKET_BYTES,
     REVIEW_PACKET_MANIFEST_FILENAME,
     archive_create_only_put_params,
     assert_archive_objects_absent,
+    assert_canonical_legalai_bucket,
+    build_acceptance_contract_archive,
     build_attorney_review_archive,
     build_review_packet_archive,
+    canonical_acceptance_contract_sha256,
     decode_review_packet_docx_base64,
     inventory_prefix,
     map_archive_put_precondition_failure,
     normalize_review_packet_recipient,
+    validate_acceptance_contract_object_key,
     validate_docx_bytes,
 )
 
@@ -792,6 +799,251 @@ class Case00RefResolutionTests(unittest.TestCase):
             asyncio.run(run())
         self.assertIn("authorization_confirmed", str(ctx.exception))
         self.assertEqual(self.dispatches, [])
+
+
+def _synthetic_acceptance_contract(**overrides: object) -> dict[str, object]:
+    """Synthetic acceptance_contract.v1 fixture — no private benchmark content."""
+    document: dict[str, object] = {
+        "schema": ACCEPTANCE_CONTRACT_SCHEMA,
+        "contract_id": "synth-contract-01",
+        "version": "1.0.0",
+        "benchmark_id": "synth-benchmark",
+        "question_id": "Q-synth",
+        "criteria": [{"id": "c1", "status": "pending"}],
+    }
+    document.update(overrides)
+    return document
+
+
+def _acceptance_archive_kwargs(
+    document: dict[str, object] | None = None, **overrides: object
+) -> dict[str, object]:
+    payload_doc = document if document is not None else _synthetic_acceptance_contract()
+    payload = json.dumps(payload_doc, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    digest = canonical_acceptance_contract_sha256(payload)
+    object_key = (
+        f"{ACCEPTANCE_CONTRACT_PREFIX}"
+        f"{payload_doc['benchmark_id']}/{payload_doc['question_id']}/"
+        f"{payload_doc['contract_id']}/v{payload_doc['version']}/"
+        "acceptance_contract.json"
+    )
+    values: dict[str, object] = {
+        "contract_json_base64": base64.b64encode(payload).decode("ascii"),
+        "expected_object_key": object_key,
+        "expected_benchmark_id": payload_doc["benchmark_id"],
+        "expected_question_id": payload_doc["question_id"],
+        "expected_contract_id": payload_doc["contract_id"],
+        "expected_version": payload_doc["version"],
+        "expected_sha256": digest,
+    }
+    values.update(overrides)
+    return values
+
+
+class AcceptanceContractStoragePolicyTests(unittest.TestCase):
+    def test_prefix_and_bucket_are_canonical(self) -> None:
+        self.assertEqual(
+            ACCEPTANCE_CONTRACT_PREFIX, "Benchmarks/acceptance-contracts/"
+        )
+        self.assertEqual(
+            assert_canonical_legalai_bucket(CANONICAL_LEGALAI_BUCKET),
+            "legalai-corpus",
+        )
+        with self.assertRaises(ValueError):
+            assert_canonical_legalai_bucket("other-bucket")
+
+    def test_object_key_rejects_traversal_and_wrong_prefix(self) -> None:
+        validate_acceptance_contract_object_key(
+            f"{ACCEPTANCE_CONTRACT_PREFIX}synth/Q1/c1/v1/acceptance_contract.json"
+        )
+        with self.assertRaises(ValueError):
+            validate_acceptance_contract_object_key(
+                "Benchmarks/other/acceptance_contract.json"
+            )
+        with self.assertRaises(ValueError):
+            validate_acceptance_contract_object_key(
+                f"{ACCEPTANCE_CONTRACT_PREFIX}../escape.json"
+            )
+        with self.assertRaises(ValueError):
+            validate_acceptance_contract_object_key(
+                f"/{ACCEPTANCE_CONTRACT_PREFIX}x.json"
+            )
+
+    def test_build_validates_identity_and_hash(self) -> None:
+        kwargs = _acceptance_archive_kwargs()
+        item = build_acceptance_contract_archive(**kwargs)
+        self.assertEqual(item["schema"], ACCEPTANCE_CONTRACT_SCHEMA)
+        self.assertEqual(item["sha256"], kwargs["expected_sha256"])
+        self.assertTrue(item["object_key"].startswith(ACCEPTANCE_CONTRACT_PREFIX))
+        # Safe metadata only — payload exists for upload but identity fields are public.
+        self.assertEqual(item["contract_id"], "synth-contract-01")
+        self.assertNotIn("criteria", item)
+
+        bad_hash = dict(kwargs)
+        bad_hash["expected_sha256"] = "0" * 64
+        with self.assertRaises(ValueError) as ctx:
+            build_acceptance_contract_archive(**bad_hash)
+        self.assertIn("SHA-256", str(ctx.exception))
+
+        bad_id = dict(kwargs)
+        bad_id["expected_contract_id"] = "other-id"
+        with self.assertRaises(ValueError):
+            build_acceptance_contract_archive(**bad_id)
+
+    def test_rejects_wrong_schema_and_malformed_base64(self) -> None:
+        bad_schema = _acceptance_archive_kwargs(
+            _synthetic_acceptance_contract(schema="acceptance_contract.v0")
+        )
+        with self.assertRaises(ValueError) as ctx:
+            build_acceptance_contract_archive(**bad_schema)
+        self.assertIn("schema", str(ctx.exception))
+
+        kwargs = _acceptance_archive_kwargs()
+        kwargs["contract_json_base64"] = "not%%base64"
+        with self.assertRaises(ValueError):
+            build_acceptance_contract_archive(**kwargs)
+
+    def test_archive_and_verify_head_round_trip(self) -> None:
+        server = _import_bridge_server()
+        kwargs = _acceptance_archive_kwargs()
+        item = build_acceptance_contract_archive(**kwargs)
+        client = mock.Mock()
+        written: dict[str, dict[str, object]] = {}
+
+        def _put_object(**put_kwargs: object) -> dict[str, object]:
+            key = str(put_kwargs["Key"])
+            body = put_kwargs["Body"]
+            assert isinstance(body, (bytes, bytearray))
+            metadata = put_kwargs["Metadata"]
+            assert isinstance(metadata, dict)
+            written[key] = {
+                "payload": bytes(body),
+                "sha256": metadata["sha256"],
+            }
+            return {}
+
+        def _head_object(*, Bucket: str, Key: str) -> dict[str, object]:
+            del Bucket
+            stored = written.get(Key)
+            if stored is None:
+                raise server.ClientError(
+                    {"Error": {"Code": "404", "Message": "Not Found"}},
+                    "HeadObject",
+                )
+            payload = stored["payload"]
+            assert isinstance(payload, bytes)
+            return {
+                "ContentLength": len(payload),
+                "ETag": '"etag-synth"',
+                "Metadata": {"sha256": stored["sha256"]},
+            }
+
+        client.put_object.side_effect = _put_object
+        client.head_object.side_effect = _head_object
+        client.list_objects_v2.return_value = {
+            "Contents": [
+                {
+                    "Key": item["object_key"],
+                    "Size": item["size"],
+                    "ETag": '"etag-synth"',
+                    "LastModified": mock.Mock(
+                        isoformat=lambda: "2026-08-11T00:00:00+00:00"
+                    ),
+                }
+            ],
+            "IsTruncated": False,
+        }
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    archived = asyncio.run(
+                        server.archive_acceptance_contract.fn(**kwargs)
+                    )
+                    verified = asyncio.run(
+                        server.verify_acceptance_contract.fn(
+                            object_key=str(kwargs["expected_object_key"]),
+                            expected_sha256=str(kwargs["expected_sha256"]),
+                            expected_size=item["size"],
+                        )
+                    )
+                    listed = asyncio.run(
+                        server.list_acceptance_contracts.fn(max_keys=50)
+                    )
+
+        self.assertTrue(archived["ok"])
+        self.assertTrue(archived["verified"])
+        self.assertFalse(archived["already_present"])
+        self.assertEqual(archived["sha256"], kwargs["expected_sha256"])
+        self.assertNotIn("criteria", archived)
+        self.assertNotIn("contract_json", archived)
+        self.assertTrue(verified["verified"])
+        self.assertTrue(verified["size_match"])
+        self.assertTrue(verified["sha256_match"])
+        self.assertEqual(listed["prefix"], ACCEPTANCE_CONTRACT_PREFIX)
+        client.put_object.assert_called_once()
+
+    def test_rejects_overwrite_with_different_content(self) -> None:
+        server = _import_bridge_server()
+        kwargs = _acceptance_archive_kwargs()
+        item = build_acceptance_contract_archive(**kwargs)
+        client = mock.Mock()
+        client.head_object.return_value = {
+            "ContentLength": item["size"] + 1,
+            "ETag": '"other"',
+            "Metadata": {"sha256": "1" * 64},
+        }
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    with self.assertRaises(ValueError) as ctx:
+                        asyncio.run(server.archive_acceptance_contract.fn(**kwargs))
+        self.assertIn("different content", str(ctx.exception))
+        client.put_object.assert_not_called()
+
+    def test_idempotent_when_same_content_already_present(self) -> None:
+        server = _import_bridge_server()
+        kwargs = _acceptance_archive_kwargs()
+        item = build_acceptance_contract_archive(**kwargs)
+        client = mock.Mock()
+        client.head_object.return_value = {
+            "ContentLength": item["size"],
+            "ETag": '"same"',
+            "Metadata": {"sha256": item["sha256"]},
+        }
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    result = asyncio.run(
+                        server.archive_acceptance_contract.fn(**kwargs)
+                    )
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["already_present"])
+        client.put_object.assert_not_called()
+
+    def test_required_tools_include_acceptance_contract_ops(self) -> None:
+        server = _import_bridge_server()
+        for name in (
+            "archive_acceptance_contract",
+            "verify_acceptance_contract",
+            "list_acceptance_contracts",
+        ):
+            self.assertIn(name, server.REQUIRED_PRODUCTION_TOOLS)
+        names = asyncio.run(server.list_registered_tool_names())
+        self.assertTrue(
+            {
+                "archive_acceptance_contract",
+                "verify_acceptance_contract",
+                "list_acceptance_contracts",
+            }.issubset(names)
+        )
 
 
 if __name__ == "__main__":

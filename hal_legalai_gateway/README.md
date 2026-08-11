@@ -27,13 +27,16 @@ is copied into the gateway.
 | `case.get_artifact` | artifacts | `get_case_artifact` |
 | `storage.archive_feedback` | storage | `archive_case00_attorney_feedback` |
 | `storage.archive_review_packet` | storage | `archive_case00_review_packet` |
+| `storage.archive_acceptance_contract` | storage | `archive_acceptance_contract` |
+| `storage.verify_acceptance_contract` | storage | `verify_acceptance_contract` |
 | `storage.verify_archive` | storage | `list_case00_storage` (closest truthful inventory verification) |
 | `mission.submit` | mission_control | `submit_run` |
 | `mission.status` | mission_control | `get_run` |
 
 Also exposed: Case-00 lifecycle (`case.submit_case00_q1`, `case.get_case00_q1_run`,
 `case.cancel_case00_q1_run`, `case.get_case00_q1_artifacts`, `case.get_artifacts`),
-`storage.list_inventory`, and mission helpers (`mission.submit_structured`,
+`storage.list_inventory`, `storage.list_acceptance_contracts`, and mission helpers
+(`mission.submit_structured`,
 `mission.wait`, `mission.submit_and_wait`, `mission.run_repository_command`).
 
 ## Authentication and forwarding

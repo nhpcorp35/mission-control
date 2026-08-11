@@ -138,6 +138,24 @@ class RegistryTests(unittest.TestCase):
             "archive_case00_attorney_feedback",
         )
         self.assertEqual(
+            registry.downstream_tool_for_gateway_tool(
+                "storage.archive_acceptance_contract"
+            ),
+            "archive_acceptance_contract",
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool(
+                "storage.verify_acceptance_contract"
+            ),
+            "verify_acceptance_contract",
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool(
+                "storage.list_acceptance_contracts"
+            ),
+            "list_acceptance_contracts",
+        )
+        self.assertEqual(
             registry.downstream_tool_for_gateway_tool("mission.submit"),
             "submit_run",
         )
@@ -780,6 +798,9 @@ class McpRegistrationTests(unittest.TestCase):
             self.assertIn(required, names)
         self.assertIn("case.submit_case00_q1", names)
         self.assertIn("storage.archive_review_packet", names)
+        self.assertIn("storage.archive_acceptance_contract", names)
+        self.assertIn("storage.verify_acceptance_contract", names)
+        self.assertIn("storage.list_acceptance_contracts", names)
 
 
 class ApiTests(unittest.TestCase):

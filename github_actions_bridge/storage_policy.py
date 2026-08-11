@@ -369,3 +369,196 @@ def build_review_packet_archive(
         if ".." in item["object_key"]:
             raise ValueError("review packet object key must not contain '..'")
     return archive_id, items
+
+
+# ---------------------------------------------------------------------------
+# Generic acceptance_contract.v1 archival (no case-/person-specific allowlists)
+# ---------------------------------------------------------------------------
+
+ACCEPTANCE_CONTRACT_SCHEMA = "acceptance_contract.v1"
+ACCEPTANCE_CONTRACT_PREFIX = "Benchmarks/acceptance-contracts/"
+CANONICAL_LEGALAI_BUCKET = "legalai-corpus"
+MAX_ACCEPTANCE_CONTRACT_BYTES = MAX_ARCHIVE_ITEM_BYTES
+MAX_ACCEPTANCE_CONTRACT_BASE64_CHARS = ((MAX_ACCEPTANCE_CONTRACT_BYTES + 2) // 3) * 4
+MAX_ACCEPTANCE_CONTRACT_KEY_CHARS = 512
+MAX_ACCEPTANCE_IDENTITY_CHARS = 128
+_ACCEPTANCE_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def acceptance_contract_prefix() -> str:
+    """Canonical B2 prefix for private acceptance-contract objects."""
+    return ACCEPTANCE_CONTRACT_PREFIX
+
+
+def _validate_acceptance_identity(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    if len(value) > MAX_ACCEPTANCE_IDENTITY_CHARS:
+        raise ValueError(f"{label} exceeds {MAX_ACCEPTANCE_IDENTITY_CHARS} characters")
+    if not _ACCEPTANCE_IDENTITY_RE.fullmatch(value):
+        raise ValueError(f"{label} has an invalid identity shape")
+    return value
+
+
+def validate_sha256_hex(value: object, *, label: str = "expected_sha256") -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty hex string")
+    normalized = value.lower()
+    if not _SHA256_HEX_RE.fullmatch(normalized):
+        raise ValueError(f"{label} must be a 64-character lowercase hex SHA-256")
+    return normalized
+
+
+def decode_acceptance_contract_json_base64(contract_json_base64: str) -> bytes:
+    if not isinstance(contract_json_base64, str) or not contract_json_base64:
+        raise ValueError("contract_json_base64 must be a non-empty base64 string")
+    if len(contract_json_base64) > MAX_ACCEPTANCE_CONTRACT_BASE64_CHARS:
+        raise ValueError("contract_json_base64 exceeds the bounded payload size")
+    if any(ch.isspace() for ch in contract_json_base64):
+        raise ValueError("contract_json_base64 must not contain whitespace")
+    try:
+        payload = base64.b64decode(contract_json_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(
+            "contract_json_base64 must be strict standard base64"
+        ) from exc
+    if not payload:
+        raise ValueError("decoded acceptance contract payload must not be empty")
+    if len(payload) > MAX_ACCEPTANCE_CONTRACT_BYTES:
+        raise ValueError("decoded acceptance contract exceeds the 2 MiB archive limit")
+    return payload
+
+
+def validate_acceptance_contract_object_key(object_key: object) -> str:
+    if not isinstance(object_key, str) or not object_key:
+        raise ValueError("object_key must be a non-empty string")
+    if len(object_key) > MAX_ACCEPTANCE_CONTRACT_KEY_CHARS:
+        raise ValueError(
+            f"object_key exceeds {MAX_ACCEPTANCE_CONTRACT_KEY_CHARS} characters"
+        )
+    if object_key.startswith("/") or "\\" in object_key:
+        raise ValueError("object_key must not be absolute or use backslashes")
+    if ".." in object_key.split("/"):
+        raise ValueError("object_key must not contain path traversal segments")
+    if "//" in object_key:
+        raise ValueError("object_key must not contain empty path segments")
+    if not object_key.startswith(ACCEPTANCE_CONTRACT_PREFIX):
+        raise ValueError(
+            "object_key must stay under the canonical acceptance-contracts prefix"
+        )
+    remainder = object_key[len(ACCEPTANCE_CONTRACT_PREFIX) :]
+    if not remainder or remainder.endswith("/"):
+        raise ValueError("object_key must name a concrete object under the prefix")
+    return object_key
+
+
+def assert_canonical_legalai_bucket(bucket: object) -> str:
+    if not isinstance(bucket, str) or not bucket:
+        raise ValueError("bucket must be configured")
+    if bucket != CANONICAL_LEGALAI_BUCKET:
+        raise ValueError(
+            f"refusing non-canonical bucket; expected {CANONICAL_LEGALAI_BUCKET}"
+        )
+    return bucket
+
+
+def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
+    """Parse and strictly validate the generic acceptance_contract.v1 object."""
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("acceptance contract must be UTF-8 JSON") from exc
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("acceptance contract must be valid JSON") from exc
+    if not isinstance(document, dict):
+        raise ValueError("acceptance contract root must be a JSON object")
+
+    schema = document.get("schema")
+    if schema != ACCEPTANCE_CONTRACT_SCHEMA:
+        raise ValueError(
+            f"acceptance contract schema must be {ACCEPTANCE_CONTRACT_SCHEMA}"
+        )
+
+    contract_id = _validate_acceptance_identity(
+        document.get("contract_id"), label="contract_id"
+    )
+    version = _validate_acceptance_identity(document.get("version"), label="version")
+    benchmark_id = _validate_acceptance_identity(
+        document.get("benchmark_id"), label="benchmark_id"
+    )
+    question_id = _validate_acceptance_identity(
+        document.get("question_id"), label="question_id"
+    )
+    # Return only safe identity fields — never criterion prose or private content.
+    return {
+        "schema": ACCEPTANCE_CONTRACT_SCHEMA,
+        "contract_id": contract_id,
+        "version": version,
+        "benchmark_id": benchmark_id,
+        "question_id": question_id,
+    }
+
+
+def canonical_acceptance_contract_sha256(payload: bytes) -> str:
+    """SHA-256 of the exact archived UTF-8 JSON bytes (content-addressed)."""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def build_acceptance_contract_archive(
+    *,
+    contract_json_base64: str,
+    expected_object_key: str,
+    expected_benchmark_id: str,
+    expected_question_id: str,
+    expected_contract_id: str,
+    expected_version: str,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Validate inputs and return one create-only archive item (safe metadata)."""
+    object_key = validate_acceptance_contract_object_key(expected_object_key)
+    expected_benchmark = _validate_acceptance_identity(
+        expected_benchmark_id, label="expected_benchmark_id"
+    )
+    expected_question = _validate_acceptance_identity(
+        expected_question_id, label="expected_question_id"
+    )
+    expected_contract = _validate_acceptance_identity(
+        expected_contract_id, label="expected_contract_id"
+    )
+    expected_ver = _validate_acceptance_identity(
+        expected_version, label="expected_version"
+    )
+    expected_digest = validate_sha256_hex(expected_sha256)
+
+    payload = decode_acceptance_contract_json_base64(contract_json_base64)
+    identity = parse_acceptance_contract_v1(payload)
+    digest = canonical_acceptance_contract_sha256(payload)
+    if digest != expected_digest:
+        raise ValueError("acceptance contract SHA-256 does not match expected_sha256")
+
+    if identity["benchmark_id"] != expected_benchmark:
+        raise ValueError("benchmark_id does not match expected_benchmark_id")
+    if identity["question_id"] != expected_question:
+        raise ValueError("question_id does not match expected_question_id")
+    if identity["contract_id"] != expected_contract:
+        raise ValueError("contract_id does not match expected_contract_id")
+    if identity["version"] != expected_ver:
+        raise ValueError("version does not match expected_version")
+
+    filename = object_key.rsplit("/", 1)[-1]
+    return {
+        "filename": filename,
+        "object_key": object_key,
+        "payload": payload,
+        "content_type": "application/json",
+        "sha256": digest,
+        "size": len(payload),
+        "contract_id": identity["contract_id"],
+        "version": identity["version"],
+        "benchmark_id": identity["benchmark_id"],
+        "question_id": identity["question_id"],
+        "schema": identity["schema"],
+    }

@@ -55,6 +55,9 @@
         "storage.list_inventory",
         "storage.archive_feedback",
         "storage.archive_review_packet",
+        "storage.archive_acceptance_contract",
+        "storage.verify_acceptance_contract",
+        "storage.list_acceptance_contracts",
         "storage.verify_archive"
       ]
     },
@@ -139,6 +142,29 @@
       "namespace": "storage",
       "downstream_service": "storage",
       "downstream_tool": "archive_case00_review_packet"
+    },
+    {
+      "tool": "storage.archive_acceptance_contract",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "archive_acceptance_contract",
+      "description": "Archive and HEAD-verify one generic acceptance_contract.v1 JSON object under the canonical acceptance-contracts prefix.",
+      "notes": "Transport-safe base64 JSON + expected identity/key/hash. Returns verified metadata only."
+    },
+    {
+      "tool": "storage.verify_acceptance_contract",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "verify_acceptance_contract",
+      "description": "Independently HEAD-verify one acceptance-contract object by key, size, and SHA-256.",
+      "notes": "Safe metadata only; never returns contract contents."
+    },
+    {
+      "tool": "storage.list_acceptance_contracts",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "list_acceptance_contracts",
+      "description": "List object metadata under the canonical acceptance-contracts B2 prefix."
     },
     {
       "tool": "storage.verify_archive",

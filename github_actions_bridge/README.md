@@ -23,6 +23,12 @@ Case-00 storage tools:
 - `archive_case00_attorney_feedback`
 - `archive_case00_review_packet`
 
+Generic acceptance-contract storage tools:
+
+- `archive_acceptance_contract`
+- `verify_acceptance_contract`
+- `list_acceptance_contracts`
+
 The Case-00 path accepts the configured workflow branch alias (normally
 `main`) or an exact 40-character lowercase commit SHA, and requires
 explicit authorization before private evidence can be transmitted to the model
@@ -56,6 +62,15 @@ rejects collisions instead of overwriting; and returns `verified: true` only
 after HEAD size and SHA-256 metadata checks. None of these tools permit
 arbitrary bucket names or object keys. Private benchmark data and generated
 packet content are not stored in GitHub.
+
+The acceptance-contract tools archive a generic `acceptance_contract.v1` JSON
+object (transport-safe base64) beneath
+`Benchmarks/acceptance-contracts/`, validate schema/identity/object-key/SHA-256
+before upload, refuse non-canonical buckets and path traversal, reject
+overwrites with different content, and return `verified: true` only after HEAD
+size and SHA-256 checks. Independent `verify_acceptance_contract` and
+`list_acceptance_contracts` confirm objects by key/size/hash metadata without
+returning contract contents. Credentials are never accepted or logged.
 
 Mission Control remains unchanged and is not used by this bridge.
 

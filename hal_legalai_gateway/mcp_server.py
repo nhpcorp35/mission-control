@@ -95,6 +95,36 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="Archive and HEAD-verify one Case-00 attorney review-packet DOCX.",
     ),
     ToolBinding(
+        gateway_tool="storage.archive_acceptance_contract",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="archive_acceptance_contract",
+        description=(
+            "Archive and HEAD-verify one generic acceptance_contract.v1 JSON "
+            "object under the canonical acceptance-contracts prefix."
+        ),
+    ),
+    ToolBinding(
+        gateway_tool="storage.verify_acceptance_contract",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="verify_acceptance_contract",
+        description=(
+            "Independently HEAD-verify one acceptance-contract object by key, "
+            "size, and SHA-256 (safe metadata only)."
+        ),
+    ),
+    ToolBinding(
+        gateway_tool="storage.list_acceptance_contracts",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="list_acceptance_contracts",
+        description=(
+            "List object metadata under the canonical acceptance-contracts "
+            "B2 prefix."
+        ),
+    ),
+    ToolBinding(
         gateway_tool="storage.verify_archive",
         namespace="storage",
         downstream_service="storage",
@@ -388,6 +418,62 @@ def register_forwarding_tools(
                 "sent_at": sent_at,
                 "original_filename": original_filename,
             },
+        )
+
+    @mcp.tool(
+        name="storage.archive_acceptance_contract",
+        description=by_name["storage.archive_acceptance_contract"].description,
+    )
+    async def storage_archive_acceptance_contract(
+        contract_json_base64: str,
+        expected_object_key: str,
+        expected_benchmark_id: str,
+        expected_question_id: str,
+        expected_contract_id: str,
+        expected_version: str,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.archive_acceptance_contract",
+            {
+                "contract_json_base64": contract_json_base64,
+                "expected_object_key": expected_object_key,
+                "expected_benchmark_id": expected_benchmark_id,
+                "expected_question_id": expected_question_id,
+                "expected_contract_id": expected_contract_id,
+                "expected_version": expected_version,
+                "expected_sha256": expected_sha256,
+            },
+        )
+
+    @mcp.tool(
+        name="storage.verify_acceptance_contract",
+        description=by_name["storage.verify_acceptance_contract"].description,
+    )
+    async def storage_verify_acceptance_contract(
+        object_key: str,
+        expected_sha256: str,
+        expected_size: int,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.verify_acceptance_contract",
+            {
+                "object_key": object_key,
+                "expected_sha256": expected_sha256,
+                "expected_size": expected_size,
+            },
+        )
+
+    @mcp.tool(
+        name="storage.list_acceptance_contracts",
+        description=by_name["storage.list_acceptance_contracts"].description,
+    )
+    async def storage_list_acceptance_contracts(
+        max_keys: int = 200,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.list_acceptance_contracts",
+            {"max_keys": max_keys},
         )
 
     @mcp.tool(
