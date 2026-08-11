@@ -130,6 +130,54 @@ DOCUMENTATION_REQUIRED_INSTRUCTIONS = (
     "Treat documentation review as part of completion.",
 )
 
+# Soft budget before the hard EXECUTION_TIMEOUT_SECONDS ceiling.
+SPLIT_RUN_SOFT_TIMEOUT_SECONDS = 360
+
+RECOMMENDED_SPLIT_PHASES = (
+    "implementation (one objective, four files or fewer)",
+    "focused testing for that change only",
+    "documentation updates",
+    "deployment/verification",
+)
+
+SPLIT_RUN_POLICY_INSTRUCTIONS = (
+    "Pursue exactly one objective per mission.",
+    "Target four files or fewer.",
+    "Separate implementation, broad testing, documentation, and "
+    "deployment/verification into distinct missions.",
+    "Never blindly retry a timed-out mission; split remaining work into "
+    "smaller follow-up missions instead.",
+    (
+        f"At {SPLIT_RUN_SOFT_TIMEOUT_SECONDS // 60} minutes of agent work, "
+        "treat remaining broad scope as oversized: stop expanding scope and "
+        "return a structured split recommendation before the "
+        f"{EXECUTION_TIMEOUT_SECONDS}-second hard timeout when possible."
+    ),
+)
+
+
+def build_timeout_split_guidance(
+    *,
+    timeout_stage: str = "agent_execution",
+    observed_changed_paths: list[str] | None = None,
+) -> dict[str, object]:
+    """Structured next-step guidance when agent execution times out.
+
+    Observed workspace paths are diagnostic only. Mission Control does not
+    persist partial agent work after a timeout.
+    """
+    return {
+        "timeout_stage": timeout_stage,
+        "observed_changed_paths": list(observed_changed_paths or []),
+        "persistence_not_attempted": True,
+        "recommended_phases": list(RECOMMENDED_SPLIT_PHASES),
+        "guidance": (
+            "Do not claim partial work was persisted. Do not blindly retry "
+            "the same mission; submit smaller follow-up missions for the "
+            "recommended phases."
+        ),
+    }
+
 
 @dataclass
 class ExecutionResult:
@@ -140,6 +188,9 @@ class ExecutionResult:
     return_code: int | None = None
     # Redacted argv Mission Control actually launched (instruction omitted).
     command: list[str] | None = None
+    # Present only on agent hard-timeout; authoritative copy lives on the
+    # structured run result after finalize.
+    timeout_split_guidance: dict[str, object] | None = None
 
 
 def _workspace_binding_constraints(mission: dict) -> tuple[str, ...]:
@@ -191,6 +242,14 @@ def build_cursor_instruction(
     lines.extend(
         f"- {constraint}" for constraint in _workspace_binding_constraints(mission)
     )
+
+    lines.extend(
+        [
+            "",
+            "Split-run scope policy:",
+        ]
+    )
+    lines.extend(f"- {item}" for item in SPLIT_RUN_POLICY_INSTRUCTIONS)
 
     if resolve_documentation_mode(mission) == "required":
         lines.extend(
@@ -449,6 +508,9 @@ def _run_cursor_agent(
                 f"{EXECUTION_TIMEOUT_SECONDS} seconds"
             ),
             command=command_evidence,
+            timeout_split_guidance=build_timeout_split_guidance(
+                timeout_stage="agent_execution",
+            ),
         )
     except Exception:
         logger.exception(

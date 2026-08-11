@@ -102,6 +102,8 @@ Legacy agent Git flags (`stage_changes`, `commit`, `push`) are ignored for platf
 
 Mission Control appends constraint text to agent instructions based on the allowed create/modify combination (create-and-modify, modify-only, create-only, or read-only). Plan / read-only paths keep mutation permissions false. Genuine read-only execute missions are supported with an exact permission set so inspection and planning can run through the async execute pipeline without writes.
 
+Every coding-agent run also receives a durable **split-run scope policy** in the composed instruction prompt: one objective per mission; target four files or fewer; separate implementation, broad testing, documentation, and deployment/verification into distinct missions; never blindly retry a timed-out mission; and at six minutes treat remaining broad scope as oversized and return a structured split recommendation before the 600-second hard timeout when possible. On hard timeout, the authoritative structured result includes `timeout_split_guidance` (`timeout_stage`, observed changed paths when available, `persistence_not_attempted`, and recommended smaller phases) and must not claim partial work was persisted.
+
 Enforcement is layered: eligibility validation rejects unauthorized missions; instruction constraints constrain the agent; platform persistence and deliverable gates do not trust agent compliance alone.
 
 ---
@@ -215,8 +217,9 @@ Structured `result` typically includes:
 - `documentation` — requested mode and status when documentation policy applies
 - `warnings` — explicit limitations (never fabricated metrics)
 - `summary` — Mission Control-authored text composed after persistence; separates agent result from authoritative platform persistence
+- `timeout_split_guidance` — on agent hard-timeout only: `timeout_stage`, observed changed paths, `persistence_not_attempted`, and recommended smaller phases (partial work is never treated as persisted)
 
-Failed and timed-out runs retain partial evidence actually collected. Retries create a new run from stored mission YAML of a failed run without mutating the source record.
+Failed and timed-out runs retain partial evidence actually collected. Retries create a new run from stored mission YAML of a failed run without mutating the source record. Timed-out runs should be followed by smaller split missions rather than a blind identical retry.
 
 HAL and operators should interpret completion from these fields and from repository state—not from conversational agent summaries alone.
 

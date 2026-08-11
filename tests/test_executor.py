@@ -7,10 +7,19 @@ from unittest.mock import MagicMock, patch
 from mission_control.executor import (
     CURSOR_AGENT,
     EXECUTION_TIMEOUT_SECONDS,
+    SPLIT_RUN_POLICY_INSTRUCTIONS,
     build_cursor_agent_command,
     build_cursor_instruction,
+    build_timeout_split_guidance,
     execute_cursor_agent,
     run_cursor_agent,
+)
+from mission_control.run_result import (
+    PersistenceEvidence,
+    StructuredRunResult,
+    WARNING_PERSISTENCE_NOT_ATTEMPTED,
+    command_evidence_from_execution,
+    finalize_structured_summary,
 )
 
 
@@ -58,6 +67,84 @@ class TestBuildCursorInstruction(unittest.TestCase):
         self.assertIn(
             "Do not submit recursive Mission Control missions.",
             instruction,
+        )
+
+    def test_split_run_policy_injected_and_timeout_split_guidance(self) -> None:
+        """Every agent prompt carries split-run policy; timeouts guide splits."""
+        instruction = build_cursor_instruction(_sample_mission())
+        self.assertIn("Split-run scope policy:", instruction)
+        for line in SPLIT_RUN_POLICY_INSTRUCTIONS:
+            self.assertIn(line, instruction)
+
+        with patch(
+            "mission_control.executor.find_cursor_agent_binary",
+            return_value=CURSOR_AGENT,
+        ), patch(
+            "mission_control.executor.subprocess.Popen",
+        ) as mock_popen:
+            proc = MagicMock()
+            proc.pid = 99
+            proc.communicate.side_effect = [
+                subprocess.TimeoutExpired(
+                    cmd=[CURSOR_AGENT],
+                    timeout=EXECUTION_TIMEOUT_SECONDS,
+                ),
+                ("", ""),
+            ]
+            mock_popen.return_value = proc
+            result = execute_cursor_agent(_sample_mission())
+
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error or "")
+        self.assertIsNotNone(result.timeout_split_guidance)
+        assert result.timeout_split_guidance is not None
+        self.assertEqual(
+            result.timeout_split_guidance["timeout_stage"],
+            "agent_execution",
+        )
+        self.assertTrue(
+            result.timeout_split_guidance["persistence_not_attempted"],
+        )
+        self.assertIn(
+            "implementation (one objective, four files or fewer)",
+            result.timeout_split_guidance["recommended_phases"],
+        )
+
+        structured = StructuredRunResult(
+            files_changed=["mission_control/executor.py"],
+            commands=[command_evidence_from_execution(result)],
+            persistence=PersistenceEvidence(
+                mode="push",
+                attempted=False,
+                ok=None,
+            ),
+            warnings=[WARNING_PERSISTENCE_NOT_ATTEMPTED],
+        )
+        finalize_structured_summary(structured, error=result.error)
+        self.assertIsNotNone(structured.timeout_split_guidance)
+        assert structured.timeout_split_guidance is not None
+        self.assertEqual(
+            structured.timeout_split_guidance["timeout_stage"],
+            "agent_execution",
+        )
+        self.assertEqual(
+            structured.timeout_split_guidance["observed_changed_paths"],
+            ["mission_control/executor.py"],
+        )
+        self.assertTrue(
+            structured.timeout_split_guidance["persistence_not_attempted"],
+        )
+        self.assertEqual(
+            structured.timeout_split_guidance["recommended_phases"],
+            build_timeout_split_guidance()["recommended_phases"],
+        )
+        assert structured.summary is not None
+        self.assertIn("Timeout split guidance", structured.summary)
+        self.assertIn("not persisted", structured.summary)
+        self.assertIn("Do not blindly retry", structured.summary)
+        self.assertIn(
+            "Platform persistence was not attempted",
+            structured.summary,
         )
 
     def test_binds_writes_to_concrete_repository_path(self) -> None:

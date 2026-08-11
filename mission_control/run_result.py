@@ -13,7 +13,11 @@ from dataclasses import asdict, dataclass, field
 import json
 from typing import Any
 
-from mission_control.executor import CURSOR_AGENT, ExecutionResult
+from mission_control.executor import (
+    CURSOR_AGENT,
+    ExecutionResult,
+    build_timeout_split_guidance,
+)
 
 WARNING_NO_TEST_COUNTS = (
     "Aggregate test counts are unavailable; Mission Control does not parse "
@@ -129,6 +133,8 @@ class StructuredRunResult:
     warnings: list[str] = field(default_factory=list)
     # Mission Control-authored client summary; authoritative for persistence.
     summary: str | None = None
+    # Present on agent hard-timeout; never implies partial work was persisted.
+    timeout_split_guidance: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +154,7 @@ class StructuredRunResult:
             ),
             "warnings": list(self.warnings),
             "summary": self.summary,
+            "timeout_split_guidance": self.timeout_split_guidance,
         }
 
     @classmethod
@@ -239,6 +246,10 @@ class StructuredRunResult:
         summary_raw = data.get("summary")
         summary = str(summary_raw) if summary_raw is not None else None
 
+        timeout_guidance = data.get("timeout_split_guidance")
+        if timeout_guidance is not None and not isinstance(timeout_guidance, dict):
+            timeout_guidance = None
+
         return cls(
             files_changed=[str(path) for path in files_changed],
             commands=commands,
@@ -248,6 +259,7 @@ class StructuredRunResult:
             documentation=documentation,
             warnings=[str(item) for item in warnings],
             summary=summary,
+            timeout_split_guidance=timeout_guidance,
         )
 
 
@@ -399,6 +411,7 @@ def build_run_summary(
     error: str | None = None,
     agent_ok: bool | None = None,
     agent_return_code: int | None = None,
+    timeout_split_guidance: dict[str, object] | None = None,
 ) -> str:
     """Build the authoritative client-facing run summary.
 
@@ -473,7 +486,20 @@ def build_run_summary(
         "result.persistence, and commit_sha for persistence claims — never "
         "treat agent prose as authoritative over platform persistence."
     )
-    return f"{agent_line} {persistence_line} {trust_line}"
+    parts = [agent_line, persistence_line, trust_line]
+    if timeout_split_guidance is not None:
+        stage = timeout_split_guidance.get("timeout_stage", "agent_execution")
+        phases = timeout_split_guidance.get("recommended_phases") or []
+        if isinstance(phases, list) and phases:
+            phase_text = "; ".join(str(item) for item in phases)
+        else:
+            phase_text = "split into smaller follow-up missions"
+        parts.append(
+            f"Timeout split guidance (stage={stage}): persistence was not "
+            f"attempted and partial work was not persisted; recommend "
+            f"smaller phases — {phase_text}. Do not blindly retry."
+        )
+    return " ".join(parts)
 
 
 def _agent_outcome_from_commands(
@@ -514,9 +540,24 @@ def finalize_structured_summary(
     ):
         append_warning(result, WARNING_DOCUMENTATION_PATH_HEURISTIC)
     agent_ok, agent_return_code = _agent_outcome_from_commands(result)
+    if (
+        error is not None
+        and "timed out" in error
+        and result.timeout_split_guidance is None
+    ):
+        result.timeout_split_guidance = build_timeout_split_guidance(
+            timeout_stage="agent_execution",
+            observed_changed_paths=list(result.files_changed),
+        )
+        if WARNING_PERSISTENCE_NOT_ATTEMPTED not in result.warnings:
+            # Timeout path always skips platform persistence; keep the
+            # structured flag and warning aligned when callers omit it.
+            if result.persistence is not None and not result.persistence.attempted:
+                append_warning(result, WARNING_PERSISTENCE_NOT_ATTEMPTED)
     result.summary = build_run_summary(
         persistence=result.persistence,
         error=error,
         agent_ok=agent_ok,
         agent_return_code=agent_return_code,
+        timeout_split_guidance=result.timeout_split_guidance,
     )
