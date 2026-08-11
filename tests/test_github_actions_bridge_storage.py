@@ -26,6 +26,9 @@ from github_actions_bridge.storage_policy import (
     build_acceptance_contract_archive,
     build_attorney_review_archive,
     build_review_packet_archive,
+    build_synthetic_acceptance_contract,
+    compute_acceptance_contract_sha256,
+    compute_acceptance_object_sha256,
     canonical_acceptance_contract_sha256,
     decode_review_packet_docx_base64,
     inventory_prefix,
@@ -802,16 +805,29 @@ class Case00RefResolutionTests(unittest.TestCase):
 
 
 def _synthetic_acceptance_contract(**overrides: object) -> dict[str, object]:
-    """Synthetic acceptance_contract.v1 fixture — no private benchmark content."""
-    document: dict[str, object] = {
-        "schema": ACCEPTANCE_CONTRACT_SCHEMA,
-        "contract_id": "synth-contract-01",
-        "version": "1.0.0",
-        "benchmark_id": "synth-benchmark",
-        "question_id": "Q-synth",
-        "criteria": [{"id": "c1", "status": "pending"}],
-    }
-    document.update(overrides)
+    """Cross-interface fixture matching LegalAI ``build_synthetic_contract``."""
+    object_key = (
+        f"{ACCEPTANCE_CONTRACT_PREFIX}"
+        "synth-benchmark-alpha/Q-SYNTH-01/contract-synth-alpha-q01/"
+        "v1.0.0/acceptance_contract.json"
+    )
+    document = build_synthetic_acceptance_contract(
+        contract_id="contract-synth-alpha-q01",
+        version="1.0.0",
+        benchmark_id="synth-benchmark-alpha",
+        question_id="Q-SYNTH-01",
+        object_key=object_key,
+        required_criterion_ids=["crit-presence", "crit-negation", "crit-roles"],
+    )
+    if overrides:
+        document = dict(document)
+        document.update(overrides)
+        if "content_sha256" not in overrides and isinstance(document, dict):
+            # Keep digest coherent unless the test intentionally tampers with it.
+            try:
+                document["content_sha256"] = compute_acceptance_contract_sha256(document)
+            except Exception:
+                pass
     return document
 
 
@@ -822,23 +838,45 @@ def _acceptance_archive_kwargs(
     payload = json.dumps(payload_doc, separators=(",", ":"), ensure_ascii=False).encode(
         "utf-8"
     )
-    digest = canonical_acceptance_contract_sha256(payload)
-    object_key = (
-        f"{ACCEPTANCE_CONTRACT_PREFIX}"
-        f"{payload_doc['benchmark_id']}/{payload_doc['question_id']}/"
-        f"{payload_doc['contract_id']}/v{payload_doc['version']}/"
-        "acceptance_contract.json"
-    )
+    identity = payload_doc.get("identity")
+    if isinstance(identity, dict):
+        benchmark_id = str(identity.get("benchmark_id") or "synth-benchmark-alpha")
+        question_id = str(identity.get("question_id") or "Q-SYNTH-01")
+        object_key = str(
+            payload_doc.get("object_key")
+            or (
+                f"{ACCEPTANCE_CONTRACT_PREFIX}{benchmark_id}/{question_id}/"
+                f"{payload_doc.get('contract_id')}/v{payload_doc.get('version')}/"
+                "acceptance_contract.json"
+            )
+        )
+    else:
+        benchmark_id = str(payload_doc.get("benchmark_id") or "synth-benchmark")
+        question_id = str(payload_doc.get("question_id") or "Q-synth")
+        object_key = (
+            f"{ACCEPTANCE_CONTRACT_PREFIX}{benchmark_id}/{question_id}/"
+            f"{payload_doc.get('contract_id')}/v{payload_doc.get('version')}/"
+            "acceptance_contract.json"
+        )
+    try:
+        contract_digest = compute_acceptance_contract_sha256(payload_doc)
+    except Exception:
+        contract_digest = "0" * 64
+    object_digest = compute_acceptance_object_sha256(payload)
     values: dict[str, object] = {
         "contract_json_base64": base64.b64encode(payload).decode("ascii"),
         "expected_object_key": object_key,
-        "expected_benchmark_id": payload_doc["benchmark_id"],
-        "expected_question_id": payload_doc["question_id"],
+        "expected_benchmark_id": benchmark_id,
+        "expected_question_id": question_id,
         "expected_contract_id": payload_doc["contract_id"],
         "expected_version": payload_doc["version"],
-        "expected_sha256": digest,
+        "expected_contract_sha256": contract_digest,
+        "expected_sha256": contract_digest,
     }
     values.update(overrides)
+    values["_object_sha256"] = object_digest
+    values["_contract_sha256"] = contract_digest
+    values["_size"] = len(payload)
     return values
 
 
@@ -871,44 +909,113 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
                 f"/{ACCEPTANCE_CONTRACT_PREFIX}x.json"
             )
 
+    def test_cross_interface_synthetic_matches_legalai_shape_and_hash(self) -> None:
+        doc = _synthetic_acceptance_contract()
+        self.assertEqual(doc["schema_version"], ACCEPTANCE_CONTRACT_SCHEMA)
+        self.assertIn("identity", doc)
+        self.assertNotIn("schema", doc)
+        self.assertNotIn("benchmark_id", doc)
+        self.assertEqual(
+            doc["content_sha256"],
+            "c43d54b3923c519fbca52d6127dc5b76fb3cbd9bc12a40b018aa461e284d4b4f",
+        )
+        # Canonical contract hash is stable across whitespace / key ordering.
+        variants = [
+            json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8"),
+            json.dumps(doc, sort_keys=False, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            ),
+            json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            ),
+        ]
+        digests = {
+            compute_acceptance_contract_sha256(json.loads(raw.decode("utf-8")))
+            for raw in variants
+        }
+        self.assertEqual(digests, {doc["content_sha256"]})
+        object_digests = {compute_acceptance_object_sha256(raw) for raw in variants}
+        self.assertEqual(len(object_digests), 3)
+        # Alias still derives contract digest from object bytes.
+        self.assertEqual(
+            canonical_acceptance_contract_sha256(variants[0]), doc["content_sha256"]
+        )
+
+    def test_rejects_old_flat_schema_shape(self) -> None:
+        flat = {
+            "schema": ACCEPTANCE_CONTRACT_SCHEMA,
+            "contract_id": "synth-contract-01",
+            "version": "1.0.0",
+            "benchmark_id": "synth-benchmark",
+            "question_id": "Q-synth",
+            "criteria": [{"id": "c1", "status": "pending"}],
+        }
+        kwargs = _acceptance_archive_kwargs(flat)
+        with self.assertRaises(ValueError) as ctx:
+            build_acceptance_contract_archive(
+                **{
+                    k: v
+                    for k, v in kwargs.items()
+                    if not str(k).startswith("_")
+                }
+            )
+        self.assertIn("flat", str(ctx.exception).lower())
+
     def test_build_validates_identity_and_hash(self) -> None:
         kwargs = _acceptance_archive_kwargs()
-        item = build_acceptance_contract_archive(**kwargs)
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        item = build_acceptance_contract_archive(**build_kwargs)
         self.assertEqual(item["schema"], ACCEPTANCE_CONTRACT_SCHEMA)
-        self.assertEqual(item["sha256"], kwargs["expected_sha256"])
+        self.assertEqual(item["schema_version"], ACCEPTANCE_CONTRACT_SCHEMA)
+        self.assertEqual(item["contract_sha256"], kwargs["expected_contract_sha256"])
+        self.assertEqual(item["object_sha256"], kwargs["_object_sha256"])
+        self.assertEqual(item["content_sha256"], kwargs["_contract_sha256"])
         self.assertTrue(item["object_key"].startswith(ACCEPTANCE_CONTRACT_PREFIX))
-        # Safe metadata only — payload exists for upload but identity fields are public.
-        self.assertEqual(item["contract_id"], "synth-contract-01")
+        self.assertEqual(item["contract_id"], "contract-synth-alpha-q01")
         self.assertNotIn("criteria", item)
+        self.assertEqual(
+            item["b2_metadata"]["contract_sha256"], item["contract_sha256"]
+        )
+        self.assertEqual(item["b2_metadata"]["object_sha256"], item["object_sha256"])
 
-        bad_hash = dict(kwargs)
+        bad_hash = dict(build_kwargs)
+        bad_hash["expected_contract_sha256"] = "0" * 64
         bad_hash["expected_sha256"] = "0" * 64
         with self.assertRaises(ValueError) as ctx:
             build_acceptance_contract_archive(**bad_hash)
-        self.assertIn("SHA-256", str(ctx.exception))
+        self.assertIn("contract_sha256", str(ctx.exception))
 
-        bad_id = dict(kwargs)
+        bad_id = dict(build_kwargs)
         bad_id["expected_contract_id"] = "other-id"
         with self.assertRaises(ValueError):
             build_acceptance_contract_archive(**bad_id)
 
     def test_rejects_wrong_schema_and_malformed_base64(self) -> None:
         bad_schema = _acceptance_archive_kwargs(
-            _synthetic_acceptance_contract(schema="acceptance_contract.v0")
+            _synthetic_acceptance_contract(schema_version="acceptance_contract.v0")
         )
+        build_kwargs = {
+            k: v for k, v in bad_schema.items() if not str(k).startswith("_")
+        }
         with self.assertRaises(ValueError) as ctx:
-            build_acceptance_contract_archive(**bad_schema)
-        self.assertIn("schema", str(ctx.exception))
+            build_acceptance_contract_archive(**build_kwargs)
+        self.assertIn("schema_version", str(ctx.exception))
 
         kwargs = _acceptance_archive_kwargs()
-        kwargs["contract_json_base64"] = "not%%base64"
+        build_kwargs = {k: v for k, v in kwargs.items() if not str(k).startswith("_")}
+        build_kwargs["contract_json_base64"] = "not%%base64"
         with self.assertRaises(ValueError):
-            build_acceptance_contract_archive(**kwargs)
+            build_acceptance_contract_archive(**build_kwargs)
 
     def test_archive_and_verify_head_round_trip(self) -> None:
         server = _import_bridge_server()
         kwargs = _acceptance_archive_kwargs()
-        item = build_acceptance_contract_archive(**kwargs)
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        item = build_acceptance_contract_archive(**build_kwargs)
         client = mock.Mock()
         written: dict[str, dict[str, object]] = {}
 
@@ -920,7 +1027,7 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             assert isinstance(metadata, dict)
             written[key] = {
                 "payload": bytes(body),
-                "sha256": metadata["sha256"],
+                "metadata": dict(metadata),
             }
             return {}
 
@@ -937,7 +1044,7 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             return {
                 "ContentLength": len(payload),
                 "ETag": '"etag-synth"',
-                "Metadata": {"sha256": stored["sha256"]},
+                "Metadata": stored["metadata"],
             }
 
         client.put_object.side_effect = _put_object
@@ -961,12 +1068,13 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             ):
                 with mock.patch.object(server, "_b2_client", return_value=client):
                     archived = asyncio.run(
-                        server.archive_acceptance_contract.fn(**kwargs)
+                        server.archive_acceptance_contract.fn(**build_kwargs)
                     )
                     verified = asyncio.run(
                         server.verify_acceptance_contract.fn(
                             object_key=str(kwargs["expected_object_key"]),
-                            expected_sha256=str(kwargs["expected_sha256"]),
+                            expected_contract_sha256=str(item["contract_sha256"]),
+                            expected_object_sha256=str(item["object_sha256"]),
                             expected_size=item["size"],
                         )
                     )
@@ -977,24 +1085,34 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
         self.assertTrue(archived["ok"])
         self.assertTrue(archived["verified"])
         self.assertFalse(archived["already_present"])
-        self.assertEqual(archived["sha256"], kwargs["expected_sha256"])
+        self.assertEqual(archived["contract_sha256"], item["contract_sha256"])
+        self.assertEqual(archived["object_sha256"], item["object_sha256"])
         self.assertNotIn("criteria", archived)
         self.assertNotIn("contract_json", archived)
         self.assertTrue(verified["verified"])
         self.assertTrue(verified["size_match"])
-        self.assertTrue(verified["sha256_match"])
+        self.assertTrue(verified["contract_sha256_match"])
+        self.assertTrue(verified["object_sha256_match"])
         self.assertEqual(listed["prefix"], ACCEPTANCE_CONTRACT_PREFIX)
+        self.assertEqual(listed["schema_version"], ACCEPTANCE_CONTRACT_SCHEMA)
         client.put_object.assert_called_once()
 
     def test_rejects_overwrite_with_different_content(self) -> None:
         server = _import_bridge_server()
         kwargs = _acceptance_archive_kwargs()
-        item = build_acceptance_contract_archive(**kwargs)
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        item = build_acceptance_contract_archive(**build_kwargs)
         client = mock.Mock()
         client.head_object.return_value = {
             "ContentLength": item["size"] + 1,
             "ETag": '"other"',
-            "Metadata": {"sha256": "1" * 64},
+            "Metadata": {
+                "contract_sha256": "1" * 64,
+                "object_sha256": "2" * 64,
+                "sha256": "2" * 64,
+            },
         }
         with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
             with mock.patch.object(
@@ -1002,19 +1120,28 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             ):
                 with mock.patch.object(server, "_b2_client", return_value=client):
                     with self.assertRaises(ValueError) as ctx:
-                        asyncio.run(server.archive_acceptance_contract.fn(**kwargs))
+                        asyncio.run(
+                            server.archive_acceptance_contract.fn(**build_kwargs)
+                        )
         self.assertIn("different content", str(ctx.exception))
         client.put_object.assert_not_called()
 
     def test_idempotent_when_same_content_already_present(self) -> None:
         server = _import_bridge_server()
         kwargs = _acceptance_archive_kwargs()
-        item = build_acceptance_contract_archive(**kwargs)
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        item = build_acceptance_contract_archive(**build_kwargs)
         client = mock.Mock()
         client.head_object.return_value = {
             "ContentLength": item["size"],
             "ETag": '"same"',
-            "Metadata": {"sha256": item["sha256"]},
+            "Metadata": {
+                "contract_sha256": item["contract_sha256"],
+                "object_sha256": item["object_sha256"],
+                "sha256": item["object_sha256"],
+            },
         }
         with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
             with mock.patch.object(
@@ -1022,10 +1149,12 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             ):
                 with mock.patch.object(server, "_b2_client", return_value=client):
                     result = asyncio.run(
-                        server.archive_acceptance_contract.fn(**kwargs)
+                        server.archive_acceptance_contract.fn(**build_kwargs)
                     )
         self.assertTrue(result["verified"])
         self.assertTrue(result["already_present"])
+        self.assertEqual(result["contract_sha256"], item["contract_sha256"])
+        self.assertEqual(result["object_sha256"], item["object_sha256"])
         client.put_object.assert_not_called()
 
     def test_required_tools_include_acceptance_contract_ops(self) -> None:

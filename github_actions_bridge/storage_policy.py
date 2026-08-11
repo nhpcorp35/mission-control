@@ -7,7 +7,7 @@ import io
 import json
 import re
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -372,10 +372,11 @@ def build_review_packet_archive(
 
 
 # ---------------------------------------------------------------------------
-# Generic acceptance_contract.v1 archival (no case-/person-specific allowlists)
+# Generic acceptance_contract.v1 archival (LegalAI-compatible schema/hashing)
 # ---------------------------------------------------------------------------
 
 ACCEPTANCE_CONTRACT_SCHEMA = "acceptance_contract.v1"
+ACCEPTANCE_CONTRACT_SCHEMA_VERSION = ACCEPTANCE_CONTRACT_SCHEMA
 ACCEPTANCE_CONTRACT_PREFIX = "Benchmarks/acceptance-contracts/"
 CANONICAL_LEGALAI_BUCKET = "legalai-corpus"
 MAX_ACCEPTANCE_CONTRACT_BYTES = MAX_ARCHIVE_ITEM_BYTES
@@ -384,6 +385,18 @@ MAX_ACCEPTANCE_CONTRACT_KEY_CHARS = 512
 MAX_ACCEPTANCE_IDENTITY_CHARS = 128
 _ACCEPTANCE_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_REQUIRED_ACCEPTANCE_TOP_LEVEL = (
+    "schema_version",
+    "contract_id",
+    "version",
+    "identity",
+    "required_criterion_ids",
+    "evidence_constraints",
+    "semantic_preservation",
+    "duplication_rules",
+    "object_key",
+    "content_sha256",
+)
 
 
 def acceptance_contract_prefix() -> str:
@@ -463,8 +476,283 @@ def assert_canonical_legalai_bucket(bucket: object) -> str:
     return bucket
 
 
+def _require_non_empty_string_list(value: object, *, label: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label} must be a non-empty array")
+    out: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"{label}[{index}] must be a non-empty string")
+        out.append(item)
+    return out
+
+
+def _validate_evidence_constraints(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("evidence_constraints must be an object")
+    required = (
+        "allowed_source_types",
+        "require_page_citations",
+        "max_excerpts_per_criterion",
+    )
+    missing = [key for key in required if key not in value]
+    if missing:
+        raise ValueError("evidence_constraints missing required properties")
+    extra = sorted(set(value) - set(required))
+    if extra:
+        raise ValueError("evidence_constraints has unexpected properties")
+    _require_non_empty_string_list(
+        value.get("allowed_source_types"), label="evidence_constraints.allowed_source_types"
+    )
+    if not isinstance(value.get("require_page_citations"), bool):
+        raise ValueError("evidence_constraints.require_page_citations must be boolean")
+    max_excerpts = value.get("max_excerpts_per_criterion")
+    if not isinstance(max_excerpts, int) or isinstance(max_excerpts, bool) or max_excerpts < 1:
+        raise ValueError("evidence_constraints.max_excerpts_per_criterion invalid")
+
+
+def _validate_semantic_preservation(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("semantic_preservation must be an object")
+    required = (
+        "require_same_party_roles",
+        "forbid_material_omissions",
+        "require_preserve_negation",
+    )
+    missing = [key for key in required if key not in value]
+    if missing:
+        raise ValueError("semantic_preservation missing required properties")
+    extra = sorted(set(value) - set(required))
+    if extra:
+        raise ValueError("semantic_preservation has unexpected properties")
+    for key in required:
+        if not isinstance(value.get(key), bool):
+            raise ValueError(f"semantic_preservation.{key} must be boolean")
+
+
+def _validate_duplication_rules(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("duplication_rules must be an object")
+    required = (
+        "forbid_duplicate_criterion_ids",
+        "forbid_overlapping_evidence_spans",
+        "max_duplicate_phrase_ratio",
+    )
+    missing = [key for key in required if key not in value]
+    if missing:
+        raise ValueError("duplication_rules missing required properties")
+    extra = sorted(set(value) - set(required))
+    if extra:
+        raise ValueError("duplication_rules has unexpected properties")
+    for key in (
+        "forbid_duplicate_criterion_ids",
+        "forbid_overlapping_evidence_spans",
+    ):
+        if not isinstance(value.get(key), bool):
+            raise ValueError(f"duplication_rules.{key} must be boolean")
+    ratio = value.get("max_duplicate_phrase_ratio")
+    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or float(ratio) < 0:
+        raise ValueError("duplication_rules.max_duplicate_phrase_ratio invalid")
+
+
+def _validate_optional_string_list(value: object, *, label: str) -> None:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"{label}[{index}] must be a non-empty string")
+
+
+def _validate_optional_criteria(value: object) -> None:
+    if not isinstance(value, list):
+        raise ValueError("criteria must be an array")
+    allowed = {
+        "id",
+        "presence_phrases",
+        "evidence_phrases",
+        "semantic_required_phrases",
+        "semantic_forbidden_phrases",
+        "fallback_text",
+        "category",
+    }
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"criteria[{index}] must be an object")
+        if "id" not in item:
+            raise ValueError(f"criteria[{index}] missing required property 'id'")
+        if not isinstance(item.get("id"), str) or not item["id"]:
+            raise ValueError(f"criteria[{index}].id must be a non-empty string")
+        extra = sorted(set(item) - allowed)
+        if extra:
+            raise ValueError(f"criteria[{index}] has unexpected properties")
+        for key in (
+            "presence_phrases",
+            "evidence_phrases",
+            "semantic_required_phrases",
+            "semantic_forbidden_phrases",
+        ):
+            if key in item:
+                _validate_optional_string_list(item[key], label=f"criteria[{index}].{key}")
+        for key in ("fallback_text", "category"):
+            if key in item and not isinstance(item[key], str):
+                raise ValueError(f"criteria[{index}].{key} must be a string")
+
+
+def _validate_optional_structure_requirements(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("structure_requirements must be an object")
+    required = ("required_kinds", "required_ranges", "required_categories")
+    missing = [key for key in required if key not in value]
+    if missing:
+        raise ValueError("structure_requirements missing required properties")
+    extra = sorted(set(value) - set(required))
+    if extra:
+        raise ValueError("structure_requirements has unexpected properties")
+    _validate_optional_string_list(
+        value.get("required_kinds"), label="structure_requirements.required_kinds"
+    )
+    _validate_optional_string_list(
+        value.get("required_categories"),
+        label="structure_requirements.required_categories",
+    )
+    ranges = value.get("required_ranges")
+    if not isinstance(ranges, list):
+        raise ValueError("structure_requirements.required_ranges must be an array")
+    for index, item in enumerate(ranges):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"structure_requirements.required_ranges[{index}] must be an object"
+            )
+        for key in ("kind", "start", "end"):
+            if key not in item:
+                raise ValueError(
+                    f"structure_requirements.required_ranges[{index}] missing '{key}'"
+                )
+        if not isinstance(item.get("kind"), str) or not item["kind"]:
+            raise ValueError(
+                f"structure_requirements.required_ranges[{index}].kind invalid"
+            )
+        for key in ("start", "end"):
+            if not isinstance(item.get(key), int) or isinstance(item.get(key), bool):
+                raise ValueError(
+                    f"structure_requirements.required_ranges[{index}].{key} invalid"
+                )
+        allowed = {"kind", "start", "end", "category"}
+        extra_item = sorted(set(item) - allowed)
+        if extra_item:
+            raise ValueError(
+                f"structure_requirements.required_ranges[{index}] unexpected properties"
+            )
+        if "category" in item and not isinstance(item["category"], str):
+            raise ValueError(
+                f"structure_requirements.required_ranges[{index}].category invalid"
+            )
+
+
+def canonical_acceptance_contract_json_bytes(document: Mapping[str, Any]) -> bytes:
+    """LegalAI canonical UTF-8 JSON: sorted keys, compact, excluding content_sha256."""
+    without = {k: v for k, v in document.items() if k != "content_sha256"}
+    return json.dumps(
+        without,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def compute_acceptance_contract_sha256(document: Mapping[str, Any]) -> str:
+    """SHA-256 of LegalAI canonical JSON excluding content_sha256 (contract_sha256)."""
+    return hashlib.sha256(canonical_acceptance_contract_json_bytes(document)).hexdigest()
+
+
+def compute_acceptance_object_sha256(payload: bytes) -> str:
+    """SHA-256 of the exact serialized object bytes stored in B2."""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_acceptance_contract_sha256(payload: bytes) -> str:
+    """Backward-compatible alias: contract_sha256 from parsed object bytes."""
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("acceptance contract must be UTF-8 JSON") from exc
+    if not isinstance(document, dict):
+        raise ValueError("acceptance contract root must be a JSON object")
+    return compute_acceptance_contract_sha256(document)
+
+
+def build_synthetic_acceptance_contract(
+    *,
+    contract_id: str,
+    version: str,
+    benchmark_id: str,
+    question_id: str,
+    object_key: str,
+    required_criterion_ids: list[str],
+    schema_version: str = ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
+    criteria: list[dict[str, Any]] | None = None,
+    structure_requirements: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Match LegalAI ``build_synthetic_contract`` (generic IDs only; tests/fixtures)."""
+    if criteria is None:
+        built_criteria: list[dict[str, Any]] = []
+        for cid in required_criterion_ids:
+            token = cid.replace("-", " ")
+            built_criteria.append(
+                {
+                    "id": cid,
+                    "presence_phrases": [token],
+                    "evidence_phrases": [f"evidence:{cid}"],
+                    "semantic_required_phrases": [f"preserve:{cid}"],
+                    "semantic_forbidden_phrases": [f"negate:{cid}"],
+                    "fallback_text": (
+                        f"Synthetic fallback for {cid} covering {token} "
+                        f"with evidence:{cid} and preserve:{cid}."
+                    ),
+                    "category": "",
+                }
+            )
+        criteria = built_criteria
+    if structure_requirements is None:
+        structure_requirements = {
+            "required_kinds": [],
+            "required_ranges": [],
+            "required_categories": [],
+        }
+    document: dict[str, Any] = {
+        "schema_version": schema_version,
+        "contract_id": contract_id,
+        "version": version,
+        "identity": {
+            "benchmark_id": benchmark_id,
+            "question_id": question_id,
+        },
+        "required_criterion_ids": list(required_criterion_ids),
+        "evidence_constraints": {
+            "allowed_source_types": ["complaint", "answer"],
+            "require_page_citations": True,
+            "max_excerpts_per_criterion": 3,
+        },
+        "semantic_preservation": {
+            "require_same_party_roles": True,
+            "forbid_material_omissions": True,
+            "require_preserve_negation": True,
+        },
+        "duplication_rules": {
+            "forbid_duplicate_criterion_ids": True,
+            "forbid_overlapping_evidence_spans": False,
+            "max_duplicate_phrase_ratio": 0.25,
+        },
+        "criteria": list(criteria),
+        "structure_requirements": dict(structure_requirements),
+        "object_key": object_key,
+    }
+    document["content_sha256"] = compute_acceptance_contract_sha256(document)
+    return document
+
+
 def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
-    """Parse and strictly validate the generic acceptance_contract.v1 object."""
+    """Parse and strictly validate LegalAI acceptance_contract.v1 (safe metadata only)."""
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -476,35 +764,84 @@ def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise ValueError("acceptance contract root must be a JSON object")
 
-    schema = document.get("schema")
-    if schema != ACCEPTANCE_CONTRACT_SCHEMA:
+    # Reject the pre-LegalAI flat shape (schema / top-level benchmark_id / question_id).
+    if "schema" in document or (
+        ("benchmark_id" in document or "question_id" in document)
+        and "identity" not in document
+    ):
+        raise ValueError("acceptance contract rejects obsolete flat schema shape")
+
+    schema_version = document.get("schema_version")
+    if schema_version != ACCEPTANCE_CONTRACT_SCHEMA_VERSION:
         raise ValueError(
-            f"acceptance contract schema must be {ACCEPTANCE_CONTRACT_SCHEMA}"
+            f"schema_version must be {ACCEPTANCE_CONTRACT_SCHEMA_VERSION}"
         )
+
+    missing = [key for key in _REQUIRED_ACCEPTANCE_TOP_LEVEL if key not in document]
+    if missing:
+        raise ValueError("acceptance contract missing required top-level properties")
+
+    allowed_top = set(_REQUIRED_ACCEPTANCE_TOP_LEVEL) | {
+        "criteria",
+        "structure_requirements",
+    }
+    unexpected = sorted(set(document) - allowed_top)
+    if unexpected:
+        raise ValueError("acceptance contract has unexpected top-level properties")
 
     contract_id = _validate_acceptance_identity(
         document.get("contract_id"), label="contract_id"
     )
     version = _validate_acceptance_identity(document.get("version"), label="version")
+
+    identity = document.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("identity must be an object")
+    if sorted(identity.keys()) != ["benchmark_id", "question_id"]:
+        raise ValueError("identity must contain only benchmark_id and question_id")
     benchmark_id = _validate_acceptance_identity(
-        document.get("benchmark_id"), label="benchmark_id"
+        identity.get("benchmark_id"), label="identity.benchmark_id"
     )
     question_id = _validate_acceptance_identity(
-        document.get("question_id"), label="question_id"
+        identity.get("question_id"), label="identity.question_id"
     )
-    # Return only safe identity fields — never criterion prose or private content.
+
+    required_criterion_ids = _require_non_empty_string_list(
+        document.get("required_criterion_ids"), label="required_criterion_ids"
+    )
+    _validate_evidence_constraints(document.get("evidence_constraints"))
+    _validate_semantic_preservation(document.get("semantic_preservation"))
+    _validate_duplication_rules(document.get("duplication_rules"))
+    if "criteria" in document:
+        _validate_optional_criteria(document.get("criteria"))
+    if "structure_requirements" in document:
+        _validate_optional_structure_requirements(
+            document.get("structure_requirements")
+        )
+
+    embedded_object_key = validate_acceptance_contract_object_key(
+        document.get("object_key")
+    )
+    embedded_content_sha256 = validate_sha256_hex(
+        document.get("content_sha256"), label="content_sha256"
+    )
+    recomputed = compute_acceptance_contract_sha256(document)
+    if embedded_content_sha256 != recomputed:
+        raise ValueError("content_sha256 does not match recomputed contract digest")
+
+    # Safe metadata only — never return criteria / rule prose.
     return {
-        "schema": ACCEPTANCE_CONTRACT_SCHEMA,
+        "schema_version": ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
+        "schema": ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
         "contract_id": contract_id,
         "version": version,
         "benchmark_id": benchmark_id,
         "question_id": question_id,
+        "required_criterion_ids": required_criterion_ids,
+        "object_key": embedded_object_key,
+        "content_sha256": embedded_content_sha256,
+        "contract_sha256": recomputed,
     }
-
-
-def canonical_acceptance_contract_sha256(payload: bytes) -> str:
-    """SHA-256 of the exact archived UTF-8 JSON bytes (content-addressed)."""
-    return hashlib.sha256(payload).hexdigest()
 
 
 def build_acceptance_contract_archive(
@@ -515,9 +852,14 @@ def build_acceptance_contract_archive(
     expected_question_id: str,
     expected_contract_id: str,
     expected_version: str,
-    expected_sha256: str,
+    expected_contract_sha256: str | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Validate inputs and return one create-only archive item (safe metadata)."""
+    """Validate inputs and return one create-only archive item (safe metadata).
+
+    ``expected_contract_sha256`` is the LegalAI canonical content digest.
+    ``expected_sha256`` remains accepted as an alias for the same digest.
+    """
     object_key = validate_acceptance_contract_object_key(expected_object_key)
     expected_benchmark = _validate_acceptance_identity(
         expected_benchmark_id, label="expected_benchmark_id"
@@ -531,14 +873,30 @@ def build_acceptance_contract_archive(
     expected_ver = _validate_acceptance_identity(
         expected_version, label="expected_version"
     )
-    expected_digest = validate_sha256_hex(expected_sha256)
+    expected_digest_raw = (
+        expected_contract_sha256
+        if expected_contract_sha256 is not None
+        else expected_sha256
+    )
+    if expected_digest_raw is None:
+        raise ValueError("expected_contract_sha256 is required")
+    expected_digest = validate_sha256_hex(
+        expected_digest_raw, label="expected_contract_sha256"
+    )
 
     payload = decode_acceptance_contract_json_base64(contract_json_base64)
     identity = parse_acceptance_contract_v1(payload)
-    digest = canonical_acceptance_contract_sha256(payload)
-    if digest != expected_digest:
-        raise ValueError("acceptance contract SHA-256 does not match expected_sha256")
+    contract_sha256 = identity["contract_sha256"]
+    object_sha256 = compute_acceptance_object_sha256(payload)
 
+    if contract_sha256 != expected_digest:
+        raise ValueError(
+            "acceptance contract contract_sha256 does not match expected_contract_sha256"
+        )
+    if identity["content_sha256"] != expected_digest:
+        raise ValueError("embedded content_sha256 does not match expected_contract_sha256")
+    if identity["object_key"] != object_key:
+        raise ValueError("embedded object_key does not match expected_object_key")
     if identity["benchmark_id"] != expected_benchmark:
         raise ValueError("benchmark_id does not match expected_benchmark_id")
     if identity["question_id"] != expected_question:
@@ -554,11 +912,21 @@ def build_acceptance_contract_archive(
         "object_key": object_key,
         "payload": payload,
         "content_type": "application/json",
-        "sha256": digest,
+        "sha256": object_sha256,
+        "contract_sha256": contract_sha256,
+        "object_sha256": object_sha256,
+        "content_sha256": identity["content_sha256"],
         "size": len(payload),
         "contract_id": identity["contract_id"],
         "version": identity["version"],
         "benchmark_id": identity["benchmark_id"],
         "question_id": identity["question_id"],
-        "schema": identity["schema"],
+        "schema": identity["schema_version"],
+        "schema_version": identity["schema_version"],
+        "required_criterion_ids": identity["required_criterion_ids"],
+        "b2_metadata": {
+            "contract_sha256": contract_sha256,
+            "object_sha256": object_sha256,
+            "sha256": object_sha256,
+        },
     }

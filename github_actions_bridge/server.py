@@ -627,13 +627,16 @@ def _put_archive_object_create_only(client: Any, item: dict[str, Any]) -> None:
     Callers must run assert_archive_objects_absent first. B2 rejects
     IfNoneMatch on PutObject, so collision fail-closed is the preflight.
     """
+    metadata = item.get("b2_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {"sha256": item["sha256"]}
     try:
         client.put_object(
             Bucket=B2_BUCKET,
             Key=item["object_key"],
             Body=item["payload"],
             ContentType=item["content_type"],
-            Metadata={"sha256": item["sha256"]},
+            Metadata=metadata,
             **archive_create_only_put_params(),
         )
     except ClientError as exc:
@@ -722,12 +725,34 @@ def _head_acceptance_contract_metadata(
         if code in {"404", "NoSuchKey", "NotFound"}:
             return None
         raise
+    meta = head.get("Metadata") or {}
+    contract_sha256 = meta.get("contract_sha256")
+    object_sha256 = meta.get("object_sha256") or meta.get("sha256")
     return {
         "object_key": object_key,
         "size": head.get("ContentLength"),
         "etag": (head.get("ETag") or "").strip('"'),
-        "sha256": (head.get("Metadata") or {}).get("sha256"),
+        "contract_sha256": contract_sha256,
+        "object_sha256": object_sha256,
+        # Legacy alias kept for older objects that only stored sha256.
+        "sha256": object_sha256,
     }
+
+
+def _acceptance_contract_integrity_ok(
+    *,
+    size: object,
+    expected_size: int,
+    stored_contract_sha256: object,
+    expected_contract_sha256: str,
+    stored_object_sha256: object,
+    expected_object_sha256: str,
+) -> tuple[bool, bool, bool, bool]:
+    size_ok = size == expected_size
+    contract_ok = stored_contract_sha256 == expected_contract_sha256
+    object_ok = stored_object_sha256 == expected_object_sha256
+    verified = bool(size_ok and contract_ok and object_ok)
+    return size_ok, contract_ok, object_ok, verified
 
 
 @mcp.tool()
@@ -738,14 +763,16 @@ async def archive_acceptance_contract(
     expected_question_id: str,
     expected_contract_id: str,
     expected_version: str,
-    expected_sha256: str,
+    expected_contract_sha256: str = "",
+    expected_sha256: str = "",
 ) -> dict[str, Any]:
-    """Archive and HEAD-verify one generic acceptance_contract.v1 JSON object in B2.
+    """Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON object in B2.
 
-    Accepts transport-safe base64 JSON bytes plus expected identity/key/hash.
-    Never accepts or logs credentials. Returns safe metadata only (no contract
-    contents or criterion prose). ``verified`` is true only after tool-level
-    HEAD size/hash checks.
+    Accepts transport-safe base64 JSON plus expected nested identity/key and
+    LegalAI canonical ``contract_sha256`` (``content_sha256``). Stores and returns
+    unambiguous ``contract_sha256`` and ``object_sha256`` metadata. Never accepts
+    or logs credentials/prose. ``verified`` requires HEAD size plus both integrity
+    checks.
     """
     _require_allowed_user()
     assert_canonical_legalai_bucket(B2_BUCKET)
@@ -756,15 +783,21 @@ async def archive_acceptance_contract(
         expected_question_id=expected_question_id,
         expected_contract_id=expected_contract_id,
         expected_version=expected_version,
-        expected_sha256=expected_sha256,
+        expected_contract_sha256=expected_contract_sha256 or None,
+        expected_sha256=expected_sha256 or None,
     )
     client = _b2_client()
     existing = _head_acceptance_contract_metadata(client, item["object_key"])
     if existing is not None:
-        if (
-            existing.get("size") == item["size"]
-            and existing.get("sha256") == item["sha256"]
-        ):
+        size_ok, contract_ok, object_ok, verified = _acceptance_contract_integrity_ok(
+            size=existing.get("size"),
+            expected_size=item["size"],
+            stored_contract_sha256=existing.get("contract_sha256"),
+            expected_contract_sha256=item["contract_sha256"],
+            stored_object_sha256=existing.get("object_sha256"),
+            expected_object_sha256=item["object_sha256"],
+        )
+        if verified:
             return {
                 "ok": True,
                 "verified": True,
@@ -772,6 +805,7 @@ async def archive_acceptance_contract(
                 "b2_bucket": B2_BUCKET,
                 "prefix": ACCEPTANCE_CONTRACT_PREFIX,
                 "schema": item["schema"],
+                "schema_version": item["schema_version"],
                 "contract_id": item["contract_id"],
                 "version": item["version"],
                 "benchmark_id": item["benchmark_id"],
@@ -779,7 +813,12 @@ async def archive_acceptance_contract(
                 "object_key": item["object_key"],
                 "size": existing["size"],
                 "etag": existing["etag"],
-                "sha256": existing["sha256"],
+                "contract_sha256": existing.get("contract_sha256"),
+                "object_sha256": existing.get("object_sha256"),
+                "content_sha256": item["content_sha256"],
+                "size_match": size_ok,
+                "contract_sha256_match": contract_ok,
+                "object_sha256_match": object_ok,
             }
         raise ValueError(
             f"archive object already exists with different content: {item['object_key']}"
@@ -791,10 +830,19 @@ async def archive_acceptance_contract(
     )
     _put_archive_object_create_only(client, item)
     head = client.head_object(Bucket=B2_BUCKET, Key=item["object_key"])
-    if head.get("ContentLength") != item["size"]:
-        raise ValueError(f"B2 size mismatch for {item['object_key']}")
-    if (head.get("Metadata") or {}).get("sha256") != item["sha256"]:
-        raise ValueError(f"B2 SHA-256 metadata mismatch for {item['object_key']}")
+    meta = head.get("Metadata") or {}
+    size_ok, contract_ok, object_ok, verified = _acceptance_contract_integrity_ok(
+        size=head.get("ContentLength"),
+        expected_size=item["size"],
+        stored_contract_sha256=meta.get("contract_sha256"),
+        expected_contract_sha256=item["contract_sha256"],
+        stored_object_sha256=meta.get("object_sha256") or meta.get("sha256"),
+        expected_object_sha256=item["object_sha256"],
+    )
+    if not verified:
+        raise ValueError(
+            f"B2 acceptance-contract integrity mismatch for {item['object_key']}"
+        )
     return {
         "ok": True,
         "verified": True,
@@ -802,6 +850,7 @@ async def archive_acceptance_contract(
         "b2_bucket": B2_BUCKET,
         "prefix": ACCEPTANCE_CONTRACT_PREFIX,
         "schema": item["schema"],
+        "schema_version": item["schema_version"],
         "contract_id": item["contract_id"],
         "version": item["version"],
         "benchmark_id": item["benchmark_id"],
@@ -809,21 +858,32 @@ async def archive_acceptance_contract(
         "object_key": item["object_key"],
         "size": head["ContentLength"],
         "etag": (head.get("ETag") or "").strip('"'),
-        "sha256": item["sha256"],
+        "contract_sha256": item["contract_sha256"],
+        "object_sha256": item["object_sha256"],
+        "content_sha256": item["content_sha256"],
+        "size_match": size_ok,
+        "contract_sha256_match": contract_ok,
+        "object_sha256_match": object_ok,
     }
 
 
 @mcp.tool()
 async def verify_acceptance_contract(
     object_key: str,
-    expected_sha256: str,
+    expected_contract_sha256: str,
+    expected_object_sha256: str,
     expected_size: int,
 ) -> dict[str, Any]:
-    """Independently HEAD-verify one acceptance-contract object by key/size/hash."""
+    """HEAD-verify one acceptance-contract by key/size/contract_sha256/object_sha256."""
     _require_allowed_user()
     assert_canonical_legalai_bucket(B2_BUCKET)
     key = validate_acceptance_contract_object_key(object_key)
-    digest = validate_sha256_hex(expected_sha256)
+    contract_digest = validate_sha256_hex(
+        expected_contract_sha256, label="expected_contract_sha256"
+    )
+    object_digest = validate_sha256_hex(
+        expected_object_sha256, label="expected_object_sha256"
+    )
     if not isinstance(expected_size, int) or isinstance(expected_size, bool):
         raise ValueError("expected_size must be an integer")
     if expected_size < 1 or expected_size > 2 * 1024 * 1024:
@@ -838,9 +898,14 @@ async def verify_acceptance_contract(
             "object_key": key,
             "error": "object_not_found",
         }
-    size_ok = head.get("size") == expected_size
-    hash_ok = head.get("sha256") == digest
-    verified = bool(size_ok and hash_ok)
+    size_ok, contract_ok, object_ok, verified = _acceptance_contract_integrity_ok(
+        size=head.get("size"),
+        expected_size=expected_size,
+        stored_contract_sha256=head.get("contract_sha256"),
+        expected_contract_sha256=contract_digest,
+        stored_object_sha256=head.get("object_sha256"),
+        expected_object_sha256=object_digest,
+    )
     return {
         "ok": verified,
         "verified": verified,
@@ -849,15 +914,17 @@ async def verify_acceptance_contract(
         "object_key": key,
         "size": head.get("size"),
         "etag": head.get("etag"),
-        "sha256": head.get("sha256"),
+        "contract_sha256": head.get("contract_sha256"),
+        "object_sha256": head.get("object_sha256"),
         "size_match": size_ok,
-        "sha256_match": hash_ok,
+        "contract_sha256_match": contract_ok,
+        "object_sha256_match": object_ok,
     }
 
 
 @mcp.tool()
 async def list_acceptance_contracts(max_keys: int = 200) -> dict[str, Any]:
-    """List metadata for objects under the canonical acceptance-contracts prefix."""
+    """List safe metadata for objects under the acceptance-contracts prefix."""
     _require_allowed_user()
     assert_canonical_legalai_bucket(B2_BUCKET)
     if max_keys < 1 or max_keys > 200:
@@ -879,6 +946,7 @@ async def list_acceptance_contracts(max_keys: int = 200) -> dict[str, Any]:
         "ok": True,
         "b2_bucket": B2_BUCKET,
         "prefix": prefix,
+        "schema_version": "acceptance_contract.v1",
         "objects": objects,
         "count": len(objects),
         "truncated": bool(response.get("IsTruncated")),

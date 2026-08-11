@@ -100,8 +100,9 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_service="storage",
         downstream_tool="archive_acceptance_contract",
         description=(
-            "Archive and HEAD-verify one generic acceptance_contract.v1 JSON "
-            "object under the canonical acceptance-contracts prefix."
+            "Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON "
+            "object (nested identity, canonical contract_sha256 + object_sha256) "
+            "under the canonical acceptance-contracts prefix."
         ),
     ),
     ToolBinding(
@@ -111,7 +112,7 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_tool="verify_acceptance_contract",
         description=(
             "Independently HEAD-verify one acceptance-contract object by key, "
-            "size, and SHA-256 (safe metadata only)."
+            "size, contract_sha256, and object_sha256 (safe metadata only)."
         ),
     ),
     ToolBinding(
@@ -121,7 +122,7 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_tool="list_acceptance_contracts",
         description=(
             "List object metadata under the canonical acceptance-contracts "
-            "B2 prefix."
+            "B2 prefix for acceptance_contract.v1 archives."
         ),
     ),
     ToolBinding(

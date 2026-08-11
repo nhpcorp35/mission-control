@@ -1,0 +1,51 @@
+"""Generic acceptance-contract schema validation and private B2 loader."""
+
+from acceptance_contract.loader import (
+ ERROR_HASH_MISMATCH,
+ ERROR_IDENTITY_MISMATCH,
+ ERROR_MALFORMED_JSON,
+ ERROR_MISSING_OBJECT,
+ ERROR_MISSING_VERSION,
+ ERROR_OBJECT_KEY_MISMATCH,
+ ERROR_SCHEMA_INVALID,
+ ERROR_UNSUPPORTED_VERSION,
+ AcceptanceContractError,
+ AcceptanceContractLoadResult,
+ ContractIdentity,
+ SafeContractMetadata,
+ build_synthetic_contract,
+ compute_content_sha256,
+ load_acceptance_contract_from_b2,
+ load_acceptance_contract_from_bytes,
+ validate_and_authenticate_contract,
+)
+from acceptance_contract.schema import (
+ SCHEMA_VERSION,
+ SUPPORTED_SCHEMA_VERSIONS,
+ acceptance_contract_json_schema,
+ validate_acceptance_contract_schema,
+)
+
+__all__ = [
+ "SCHEMA_VERSION",
+ "SUPPORTED_SCHEMA_VERSIONS",
+ "ERROR_HASH_MISMATCH",
+ "ERROR_IDENTITY_MISMATCH",
+ "ERROR_MALFORMED_JSON",
+ "ERROR_MISSING_OBJECT",
+ "ERROR_MISSING_VERSION",
+ "ERROR_OBJECT_KEY_MISMATCH",
+ "ERROR_SCHEMA_INVALID",
+ "ERROR_UNSUPPORTED_VERSION",
+ "AcceptanceContractError",
+ "AcceptanceContractLoadResult",
+ "ContractIdentity",
+ "SafeContractMetadata",
+ "acceptance_contract_json_schema",
+ "build_synthetic_contract",
+ "compute_content_sha256",
+ "load_acceptance_contract_from_b2",
+ "load_acceptance_contract_from_bytes",
+ "validate_acceptance_contract_schema",
+ "validate_and_authenticate_contract",
+]

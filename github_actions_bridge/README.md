@@ -63,13 +63,17 @@ after HEAD size and SHA-256 metadata checks. None of these tools permit
 arbitrary bucket names or object keys. Private benchmark data and generated
 packet content are not stored in GitHub.
 
-The acceptance-contract tools archive a generic `acceptance_contract.v1` JSON
+The acceptance-contract tools archive a LegalAI `acceptance_contract.v1` JSON
 object (transport-safe base64) beneath
-`Benchmarks/acceptance-contracts/`, validate schema/identity/object-key/SHA-256
-before upload, refuse non-canonical buckets and path traversal, reject
-overwrites with different content, and return `verified: true` only after HEAD
-size and SHA-256 checks. Independent `verify_acceptance_contract` and
-`list_acceptance_contracts` confirm objects by key/size/hash metadata without
+`Benchmarks/acceptance-contracts/`. They accept nested
+`identity{benchmark_id,question_id}`, required rule blocks, and
+`content_sha256`, reject the obsolete flat schema shape, match LegalAI
+canonical `contract_sha256` (sorted compact UTF-8 JSON excluding
+`content_sha256`) plus exact serialized `object_sha256`, refuse non-canonical
+buckets and path traversal, reject overwrites with different content, and
+return `verified: true` only after HEAD size and both integrity checks.
+Independent `verify_acceptance_contract` and `list_acceptance_contracts`
+confirm objects by key/size/`contract_sha256`/`object_sha256` metadata without
 returning contract contents. Credentials are never accepted or logged.
 
 Mission Control remains unchanged and is not used by this bridge.
