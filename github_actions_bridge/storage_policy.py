@@ -986,6 +986,16 @@ def canonical_acceptance_contract_json_bytes(document: Mapping[str, Any]) -> byt
     ).encode("utf-8")
 
 
+def serialize_acceptance_contract_stored_bytes(document: Mapping[str, Any]) -> bytes:
+    """Deterministic UTF-8 JSON bytes for the exact object stored in B2."""
+    return json.dumps(
+        dict(document),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
 def compute_acceptance_contract_sha256(document: Mapping[str, Any]) -> str:
     """SHA-256 of LegalAI canonical JSON excluding content_sha256 (contract_sha256)."""
     return hashlib.sha256(canonical_acceptance_contract_json_bytes(document)).hexdigest()
@@ -1109,6 +1119,15 @@ def build_acceptance_contract_template() -> dict[str, Any]:
         "json_schema": acceptance_contract_json_schema(),
         "canonical_hashing": canonical_acceptance_hashing_rules(),
         "example": example,
+        "archive_preparation": {
+            "tool": "archive_acceptance_contract",
+            "preferred_field": "contract",
+            "pass_example_directly": True,
+            "notes": (
+                "Pass template['example'] as archive_acceptance_contract(contract=...) "
+                "with no Base64, Web Crypto, or client-side hash/key computation."
+            ),
+        },
     }
 
 
@@ -1233,41 +1252,204 @@ def parse_acceptance_contract_v1(payload: bytes) -> dict[str, Any]:
 
 def build_acceptance_contract_archive(
     *,
-    contract_json_base64: str,
-    expected_benchmark_id: str,
-    expected_question_id: str,
-    expected_contract_id: str,
-    expected_version: str,
+    contract: Mapping[str, Any] | None = None,
+    contract_json_base64: str | None = None,
+    expected_benchmark_id: str | None = None,
+    expected_question_id: str | None = None,
+    expected_contract_id: str | None = None,
+    expected_version: str | None = None,
     expected_contract_sha256: str | None = None,
     expected_sha256: str | None = None,
     expected_object_key: str | None = None,
 ) -> dict[str, Any]:
     """Validate inputs and return one create-only archive item (safe metadata).
 
-    The server generates the canonical B2 object key from validated identity
-    fields. ``expected_object_key`` is optional; when provided it must equal the
-    generated key. ``expected_contract_sha256`` is the LegalAI canonical content
-    digest. ``expected_sha256`` remains accepted as an alias for the same digest.
+    Preferred path: pass ``contract`` as a structured acceptance_contract.v1 object.
+    The server performs canonical UTF-8 serialization, validates the schema,
+    computes/verifies ``contract_sha256`` (excluding ``content_sha256``), generates
+    the canonical object key, and computes ``object_sha256`` of the stored bytes.
+    Identity and digest ``expected_*`` fields are not required on this path.
+
+    Legacy path: ``contract_json_base64`` plus required nested identity expectations
+    remains supported for backward compatibility.
     """
-    expected_benchmark = _validate_acceptance_identity(
-        expected_benchmark_id, path="expected_benchmark_id"
-    )
-    expected_question = _validate_acceptance_identity(
-        expected_question_id, path="expected_question_id"
-    )
-    expected_contract = _validate_acceptance_identity(
-        expected_contract_id, path="expected_contract_id"
-    )
-    expected_ver = _validate_acceptance_identity(
-        expected_version, path="expected_version"
-    )
-    object_key = canonical_acceptance_contract_object_key(
-        benchmark_id=expected_benchmark,
-        question_id=expected_question,
-        contract_id=expected_contract,
-        version=expected_ver,
-    )
-    if expected_object_key is not None and expected_object_key != "":
+    has_contract = contract is not None
+    has_base64 = bool(contract_json_base64)
+    if has_contract and has_base64:
+        _reject(
+            "contract",
+            "provide either structured contract or contract_json_base64, not both",
+            "both",
+        )
+    if not has_contract and not has_base64:
+        _reject(
+            "contract",
+            "structured JSON object (preferred) or legacy contract_json_base64",
+            None,
+        )
+
+    def _optional_str(value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        return value
+
+    expected_object_key = _optional_str(expected_object_key)
+    expected_contract_sha256 = _optional_str(expected_contract_sha256)
+    expected_sha256 = _optional_str(expected_sha256)
+    expected_benchmark_id = _optional_str(expected_benchmark_id)
+    expected_question_id = _optional_str(expected_question_id)
+    expected_contract_id = _optional_str(expected_contract_id)
+    expected_version = _optional_str(expected_version)
+
+    if has_contract:
+        if not isinstance(contract, Mapping) or isinstance(contract, (str, bytes)):
+            _reject("contract", "JSON object", contract)
+        try:
+            # Normalize to a plain JSON-compatible dict (rejects non-JSON values).
+            document = json.loads(
+                json.dumps(dict(contract), ensure_ascii=False, allow_nan=False)
+            )
+        except (TypeError, ValueError) as exc:
+            raise AcceptanceContractValidationError(
+                path="contract",
+                constraint="JSON-serializable object",
+                received=None,
+            ) from exc
+        if not isinstance(document, dict):
+            _reject("contract", "JSON object", document)
+        payload = serialize_acceptance_contract_stored_bytes(document)
+        identity = parse_acceptance_contract_v1(payload)
+        object_key = canonical_acceptance_contract_object_key(
+            benchmark_id=identity["benchmark_id"],
+            question_id=identity["question_id"],
+            contract_id=identity["contract_id"],
+            version=identity["version"],
+        )
+        if identity["object_key"] != object_key:
+            _reject(
+                "$.object_key",
+                f"equal to generated key {object_key!r}",
+                identity["object_key"],
+            )
+        # Optional caller checks (never required for structured path).
+        if expected_benchmark_id is not None:
+            expected_benchmark = _validate_acceptance_identity(
+                expected_benchmark_id, path="expected_benchmark_id"
+            )
+            if identity["benchmark_id"] != expected_benchmark:
+                _reject(
+                    "$.identity.benchmark_id",
+                    f"equal to expected_benchmark_id {expected_benchmark!r}",
+                    identity["benchmark_id"],
+                )
+        if expected_question_id is not None:
+            expected_question = _validate_acceptance_identity(
+                expected_question_id, path="expected_question_id"
+            )
+            if identity["question_id"] != expected_question:
+                _reject(
+                    "$.identity.question_id",
+                    f"equal to expected_question_id {expected_question!r}",
+                    identity["question_id"],
+                )
+        if expected_contract_id is not None:
+            expected_contract = _validate_acceptance_identity(
+                expected_contract_id, path="expected_contract_id"
+            )
+            if identity["contract_id"] != expected_contract:
+                _reject(
+                    "$.contract_id",
+                    f"equal to expected_contract_id {expected_contract!r}",
+                    identity["contract_id"],
+                )
+        if expected_version is not None:
+            expected_ver = _validate_acceptance_identity(
+                expected_version, path="expected_version"
+            )
+            if identity["version"] != expected_ver:
+                _reject(
+                    "$.version",
+                    f"equal to expected_version {expected_ver!r}",
+                    identity["version"],
+                )
+    else:
+        if expected_benchmark_id is None:
+            _reject(
+                "expected_benchmark_id",
+                "non-empty identity string (required with contract_json_base64)",
+                expected_benchmark_id,
+            )
+        if expected_question_id is None:
+            _reject(
+                "expected_question_id",
+                "non-empty identity string (required with contract_json_base64)",
+                expected_question_id,
+            )
+        if expected_contract_id is None:
+            _reject(
+                "expected_contract_id",
+                "non-empty identity string (required with contract_json_base64)",
+                expected_contract_id,
+            )
+        if expected_version is None:
+            _reject(
+                "expected_version",
+                "non-empty identity string (required with contract_json_base64)",
+                expected_version,
+            )
+        expected_benchmark = _validate_acceptance_identity(
+            expected_benchmark_id, path="expected_benchmark_id"
+        )
+        expected_question = _validate_acceptance_identity(
+            expected_question_id, path="expected_question_id"
+        )
+        expected_contract = _validate_acceptance_identity(
+            expected_contract_id, path="expected_contract_id"
+        )
+        expected_ver = _validate_acceptance_identity(
+            expected_version, path="expected_version"
+        )
+        object_key = canonical_acceptance_contract_object_key(
+            benchmark_id=expected_benchmark,
+            question_id=expected_question,
+            contract_id=expected_contract,
+            version=expected_ver,
+        )
+        assert contract_json_base64 is not None
+        payload = decode_acceptance_contract_json_base64(contract_json_base64)
+        identity = parse_acceptance_contract_v1(payload)
+        if identity["object_key"] != object_key:
+            _reject(
+                "$.object_key",
+                f"equal to generated key {object_key!r}",
+                identity["object_key"],
+            )
+        if identity["benchmark_id"] != expected_benchmark:
+            _reject(
+                "$.identity.benchmark_id",
+                f"equal to expected_benchmark_id {expected_benchmark!r}",
+                identity["benchmark_id"],
+            )
+        if identity["question_id"] != expected_question:
+            _reject(
+                "$.identity.question_id",
+                f"equal to expected_question_id {expected_question!r}",
+                identity["question_id"],
+            )
+        if identity["contract_id"] != expected_contract:
+            _reject(
+                "$.contract_id",
+                f"equal to expected_contract_id {expected_contract!r}",
+                identity["contract_id"],
+            )
+        if identity["version"] != expected_ver:
+            _reject(
+                "$.version",
+                f"equal to expected_version {expected_ver!r}",
+                identity["version"],
+            )
+
+    if expected_object_key is not None:
         provided_key = expected_object_key
         if not isinstance(provided_key, str):
             _reject(
@@ -1275,7 +1457,6 @@ def build_acceptance_contract_archive(
                 "optional string equal to server-generated canonical key",
                 provided_key,
             )
-        # Validate shape first so path-unsafe legacy keys get actionable errors.
         try:
             validate_acceptance_contract_object_key(provided_key)
         except AcceptanceContractValidationError as exc:
@@ -1291,68 +1472,36 @@ def build_acceptance_contract_archive(
                 provided_key,
             )
 
+    contract_sha256 = identity["contract_sha256"]
+    object_sha256 = compute_acceptance_object_sha256(payload)
+
     expected_digest_raw = (
         expected_contract_sha256
         if expected_contract_sha256 is not None
         else expected_sha256
     )
-    if expected_digest_raw is None:
+    if has_base64 and expected_digest_raw is None:
         _reject(
             "expected_contract_sha256",
             "non-empty 64-character lowercase hex SHA-256",
             expected_digest_raw,
         )
-    expected_digest = validate_sha256_hex(
-        expected_digest_raw, label="expected_contract_sha256"
-    )
-
-    payload = decode_acceptance_contract_json_base64(contract_json_base64)
-    identity = parse_acceptance_contract_v1(payload)
-    contract_sha256 = identity["contract_sha256"]
-    object_sha256 = compute_acceptance_object_sha256(payload)
-
-    if contract_sha256 != expected_digest:
-        _reject(
-            "expected_contract_sha256",
-            "equal to recomputed contract_sha256",
-            expected_digest,
+    if expected_digest_raw is not None:
+        expected_digest = validate_sha256_hex(
+            expected_digest_raw, label="expected_contract_sha256"
         )
-    if identity["content_sha256"] != expected_digest:
-        _reject(
-            "$.content_sha256",
-            "equal to expected_contract_sha256",
-            identity["content_sha256"],
-        )
-    if identity["object_key"] != object_key:
-        _reject(
-            "$.object_key",
-            f"equal to generated key {object_key!r}",
-            identity["object_key"],
-        )
-    if identity["benchmark_id"] != expected_benchmark:
-        _reject(
-            "$.identity.benchmark_id",
-            f"equal to expected_benchmark_id {expected_benchmark!r}",
-            identity["benchmark_id"],
-        )
-    if identity["question_id"] != expected_question:
-        _reject(
-            "$.identity.question_id",
-            f"equal to expected_question_id {expected_question!r}",
-            identity["question_id"],
-        )
-    if identity["contract_id"] != expected_contract:
-        _reject(
-            "$.contract_id",
-            f"equal to expected_contract_id {expected_contract!r}",
-            identity["contract_id"],
-        )
-    if identity["version"] != expected_ver:
-        _reject(
-            "$.version",
-            f"equal to expected_version {expected_ver!r}",
-            identity["version"],
-        )
+        if contract_sha256 != expected_digest:
+            _reject(
+                "expected_contract_sha256",
+                "equal to recomputed contract_sha256",
+                expected_digest,
+            )
+        if identity["content_sha256"] != expected_digest:
+            _reject(
+                "$.content_sha256",
+                "equal to expected_contract_sha256",
+                identity["content_sha256"],
+            )
 
     filename = object_key.rsplit("/", 1)[-1]
     return {

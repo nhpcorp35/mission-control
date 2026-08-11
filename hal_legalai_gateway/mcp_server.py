@@ -101,8 +101,9 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_tool="archive_acceptance_contract",
         description=(
             "Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON "
-            "object. Server generates the canonical object key from nested "
-            "identity; optional expected_object_key must match when provided."
+            "object. Preferred input is structured contract (template example "
+            "pass-through). Server serializes, hashes, and generates the "
+            "canonical object key; legacy base64 inputs remain optional."
         ),
     ),
     ToolBinding(
@@ -132,7 +133,8 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_tool="get_acceptance_contract_template",
         description=(
             "Read-only acceptance_contract.v1 nested-identity JSON Schema, "
-            "canonical hashing rules, and one synthetic non-private example."
+            "canonical hashing rules, and one synthetic non-private example "
+            "passable directly as archive contract."
         ),
     ),
     ToolBinding(
@@ -436,27 +438,38 @@ def register_forwarding_tools(
         description=by_name["storage.archive_acceptance_contract"].description,
     )
     async def storage_archive_acceptance_contract(
-        contract_json_base64: str,
-        expected_benchmark_id: str,
-        expected_question_id: str,
-        expected_contract_id: str,
-        expected_version: str,
+        contract: dict[str, Any] | None = None,
+        contract_json_base64: str = "",
+        expected_benchmark_id: str = "",
+        expected_question_id: str = "",
+        expected_contract_id: str = "",
+        expected_version: str = "",
         expected_contract_sha256: str = "",
         expected_sha256: str = "",
         expected_object_key: str = "",
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if contract is not None:
+            payload["contract"] = contract
+        if contract_json_base64:
+            payload["contract_json_base64"] = contract_json_base64
+        if expected_benchmark_id:
+            payload["expected_benchmark_id"] = expected_benchmark_id
+        if expected_question_id:
+            payload["expected_question_id"] = expected_question_id
+        if expected_contract_id:
+            payload["expected_contract_id"] = expected_contract_id
+        if expected_version:
+            payload["expected_version"] = expected_version
+        if expected_contract_sha256:
+            payload["expected_contract_sha256"] = expected_contract_sha256
+        if expected_sha256:
+            payload["expected_sha256"] = expected_sha256
+        if expected_object_key:
+            payload["expected_object_key"] = expected_object_key
         return await _forward(
             "storage.archive_acceptance_contract",
-            {
-                "contract_json_base64": contract_json_base64,
-                "expected_benchmark_id": expected_benchmark_id,
-                "expected_question_id": expected_question_id,
-                "expected_contract_id": expected_contract_id,
-                "expected_version": expected_version,
-                "expected_contract_sha256": expected_contract_sha256,
-                "expected_sha256": expected_sha256,
-                "expected_object_key": expected_object_key,
-            },
+            payload,
         )
 
     @mcp.tool(

@@ -149,8 +149,8 @@
       "namespace": "storage",
       "downstream_service": "storage",
       "downstream_tool": "archive_acceptance_contract",
-      "description": "Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON object. Server generates the canonical object key from nested identity; optional expected_object_key must match when provided.",
-      "notes": "Transport-safe base64 JSON + expected nested identity/contract_sha256. expected_object_key optional. verified requires size and both integrity checks. Returns safe metadata only."
+      "description": "Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON object. Preferred input is structured contract (template example pass-through). Server serializes, hashes, and generates the canonical object key; legacy base64 inputs remain optional.",
+      "notes": "Preferred MCP field: contract (structured JSON). Server-side canonical UTF-8 serialization, contract_sha256 (excludes content_sha256), object key, and object_sha256. No client Base64/Web Crypto/hash required. Legacy contract_json_base64 + expected identity/digest optional. Returns object_key, size, contract_sha256, object_sha256, verified."
     },
     {
       "tool": "storage.verify_acceptance_contract",
@@ -173,7 +173,7 @@
       "downstream_service": "storage",
       "downstream_tool": "get_acceptance_contract_template",
       "description": "Read-only acceptance_contract.v1 nested-identity JSON Schema, canonical hashing rules, and one synthetic non-private example.",
-      "notes": "No B2 writes. Example uses generic synthetic IDs only."
+      "notes": "No B2 writes. Example uses generic synthetic IDs only and can be passed directly as archive_acceptance_contract(contract=example)."
     },
     {
       "tool": "storage.verify_archive",

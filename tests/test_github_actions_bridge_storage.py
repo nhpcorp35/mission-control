@@ -37,6 +37,7 @@ from github_actions_bridge.storage_policy import (
     inventory_prefix,
     map_archive_put_precondition_failure,
     normalize_review_packet_recipient,
+    serialize_acceptance_contract_stored_bytes,
     validate_acceptance_contract_object_key,
     validate_docx_bytes,
 )
@@ -1208,6 +1209,138 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             compute_acceptance_contract_sha256(example),
         )
         self.assertNotIn("Case-00", json.dumps(example))
+        prep = template["archive_preparation"]
+        self.assertEqual(prep["preferred_field"], "contract")
+        self.assertTrue(prep["pass_example_directly"])
+
+    def test_structured_contract_template_example_archive_preparation(self) -> None:
+        """Template example archives directly as contract with no client encoding."""
+        template = build_acceptance_contract_template()
+        example = template["example"]
+        assert isinstance(example, dict)
+
+        # Unstable key order / whitespace must not affect server-side result.
+        shuffled = json.loads(json.dumps(example, sort_keys=False))
+        item_a = build_acceptance_contract_archive(contract=shuffled)
+        item_b = build_acceptance_contract_archive(contract=dict(reversed(list(example.items()))))
+
+        expected_key = canonical_acceptance_contract_object_key(
+            benchmark_id=str(example["identity"]["benchmark_id"]),
+            question_id=str(example["identity"]["question_id"]),
+            contract_id=str(example["contract_id"]),
+            version=str(example["version"]),
+        )
+        expected_payload = serialize_acceptance_contract_stored_bytes(example)
+        expected_contract = compute_acceptance_contract_sha256(example)
+        expected_object = compute_acceptance_object_sha256(expected_payload)
+
+        for item in (item_a, item_b):
+            self.assertEqual(item["object_key"], expected_key)
+            self.assertEqual(item["payload"], expected_payload)
+            self.assertEqual(item["size"], len(expected_payload))
+            self.assertEqual(item["contract_sha256"], expected_contract)
+            self.assertEqual(item["object_sha256"], expected_object)
+            self.assertEqual(item["content_sha256"], expected_contract)
+
+        # No client Base64 / expected digest / identity fields required.
+        self.assertEqual(item_a["contract_sha256"], item_b["contract_sha256"])
+        self.assertEqual(item_a["object_sha256"], item_b["object_sha256"])
+        self.assertEqual(item_a["object_key"], item_b["object_key"])
+
+    def test_structured_contract_server_round_trip_and_zero_write(self) -> None:
+        server = _import_bridge_server()
+        example = build_acceptance_contract_template()["example"]
+        assert isinstance(example, dict)
+        item = build_acceptance_contract_archive(contract=example)
+        client = mock.Mock()
+        written: dict[str, dict[str, object]] = {}
+
+        def _put_object(**put_kwargs: object) -> dict[str, object]:
+            key = str(put_kwargs["Key"])
+            body = put_kwargs["Body"]
+            assert isinstance(body, (bytes, bytearray))
+            metadata = put_kwargs["Metadata"]
+            assert isinstance(metadata, dict)
+            written[key] = {
+                "payload": bytes(body),
+                "metadata": dict(metadata),
+            }
+            return {}
+
+        def _head_object(*, Bucket: str, Key: str) -> dict[str, object]:
+            del Bucket
+            stored = written.get(Key)
+            if stored is None:
+                raise server.ClientError(
+                    {"Error": {"Code": "404", "Message": "Not Found"}},
+                    "HeadObject",
+                )
+            payload = stored["payload"]
+            assert isinstance(payload, bytes)
+            return {
+                "ContentLength": len(payload),
+                "ETag": '"etag-struct"',
+                "Metadata": stored["metadata"],
+            }
+
+        client.put_object.side_effect = _put_object
+        client.head_object.side_effect = _head_object
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    archived = asyncio.run(
+                        server.archive_acceptance_contract.fn(contract=example)
+                    )
+
+        self.assertTrue(archived["ok"])
+        self.assertTrue(archived["verified"])
+        self.assertEqual(archived["object_key"], item["object_key"])
+        self.assertEqual(archived["size"], item["size"])
+        self.assertEqual(archived["contract_sha256"], item["contract_sha256"])
+        self.assertEqual(archived["object_sha256"], item["object_sha256"])
+        self.assertEqual(written[item["object_key"]]["payload"], item["payload"])
+        client.put_object.assert_called_once()
+
+        bad_client = mock.Mock()
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=bad_client):
+                    with self.assertRaises(ValueError):
+                        asyncio.run(
+                            server.archive_acceptance_contract.fn(
+                                contract={
+                                    "schema_version": "acceptance_contract.v0",
+                                    "contract_id": "x",
+                                }
+                            )
+                        )
+        bad_client.put_object.assert_not_called()
+        bad_client.head_object.assert_not_called()
+
+    def test_legacy_base64_path_still_accepted(self) -> None:
+        kwargs = _acceptance_archive_kwargs()
+        build_kwargs = {
+            k: v for k, v in kwargs.items() if not str(k).startswith("_")
+        }
+        legacy = build_acceptance_contract_archive(**build_kwargs)
+        structured = build_acceptance_contract_archive(
+            contract=_synthetic_acceptance_contract()
+        )
+        self.assertEqual(legacy["object_key"], structured["object_key"])
+        self.assertEqual(legacy["contract_sha256"], structured["contract_sha256"])
+        # Legacy stores caller-provided bytes; structured stores canonical bytes.
+        self.assertEqual(
+            structured["payload"],
+            serialize_acceptance_contract_stored_bytes(_synthetic_acceptance_contract()),
+        )
+        self.assertEqual(
+            structured["object_sha256"],
+            compute_acceptance_object_sha256(structured["payload"]),
+        )
 
     def test_deterministic_key_generation_and_optional_legacy_key(self) -> None:
         key = canonical_acceptance_contract_object_key(

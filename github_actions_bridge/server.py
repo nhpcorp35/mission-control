@@ -769,32 +769,37 @@ async def get_acceptance_contract_template() -> dict[str, Any]:
 
 @mcp.tool()
 async def archive_acceptance_contract(
-    contract_json_base64: str,
-    expected_benchmark_id: str,
-    expected_question_id: str,
-    expected_contract_id: str,
-    expected_version: str,
+    contract: dict[str, Any] | None = None,
+    contract_json_base64: str = "",
+    expected_benchmark_id: str = "",
+    expected_question_id: str = "",
+    expected_contract_id: str = "",
+    expected_version: str = "",
     expected_contract_sha256: str = "",
     expected_sha256: str = "",
     expected_object_key: str = "",
 ) -> dict[str, Any]:
     """Archive and HEAD-verify one LegalAI acceptance_contract.v1 JSON object in B2.
 
-    Accepts transport-safe base64 JSON plus expected nested identity and LegalAI
-    canonical ``contract_sha256`` (``content_sha256``). The server generates the
-    canonical B2 object key from validated identity fields; ``expected_object_key``
-    is optional and must match when provided. Stores and returns unambiguous
-    ``contract_sha256`` and ``object_sha256`` metadata. Never accepts or logs
-    credentials/prose. ``verified`` requires HEAD size plus both integrity checks.
+    Preferred: pass ``contract`` as a structured JSON object (e.g. template
+    ``example`` directly). The server validates acceptance_contract.v1, computes
+    ``contract_sha256`` (excluding ``content_sha256``), generates the canonical
+    object key, serializes stored bytes deterministically, and computes
+    ``object_sha256``. No client Base64, Web Crypto, or hash/key work required.
+
+    Legacy: ``contract_json_base64`` plus expected nested identity /
+    ``expected_contract_sha256`` remains optional backward compatibility.
+    ``verified`` requires HEAD size plus both integrity checks.
     """
     _require_allowed_user()
     assert_canonical_legalai_bucket(B2_BUCKET)
     item = build_acceptance_contract_archive(
-        contract_json_base64=contract_json_base64,
-        expected_benchmark_id=expected_benchmark_id,
-        expected_question_id=expected_question_id,
-        expected_contract_id=expected_contract_id,
-        expected_version=expected_version,
+        contract=contract,
+        contract_json_base64=contract_json_base64 or None,
+        expected_benchmark_id=expected_benchmark_id or None,
+        expected_question_id=expected_question_id or None,
+        expected_contract_id=expected_contract_id or None,
+        expected_version=expected_version or None,
         expected_contract_sha256=expected_contract_sha256 or None,
         expected_sha256=expected_sha256 or None,
         expected_object_key=expected_object_key or None,
