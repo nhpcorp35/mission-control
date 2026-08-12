@@ -146,12 +146,20 @@ CASE_ARTIFACT_PREFIX = (
     "Benchmarks/Case-00-Triborough/derived/"
     "attorney-feedback-eval/candidate-answers/"
 )
-CASE_ARTIFACT_LIMITS = {
-    "Q1_candidate_answer.json": 1_000_000,
-    "Q1_candidate_answer.md": 100_000,
-    "generation_manifest.json": 100_000,
-    "model_input_audit.json": 100_000,
-}
+# Shared manifests are valid for every Case-00 question; candidate answers are
+# question-scoped (Q<N>_candidate_answer.*) and resolved from Bridge metadata.
+CASE_ARTIFACT_SHARED_FILENAMES = frozenset(
+    {
+        "generation_manifest.json",
+        "model_input_audit.json",
+    }
+)
+CASE_ARTIFACT_CANDIDATE_JSON_LIMIT = 1_000_000
+CASE_ARTIFACT_CANDIDATE_MD_LIMIT = 100_000
+CASE_ARTIFACT_SHARED_LIMIT = 100_000
+_CASE_ARTIFACT_CANDIDATE_FILENAME_RE = re.compile(
+    r"^(Q[1-9]\d*)_candidate_answer\.(json|md)$"
+)
 
 # Public /mcp surface: GitHub OAuth only (ChatGPT / operator clients).
 # Gateway uses the separate /mcp/service TokenVerifier surface — never composite.
@@ -183,7 +191,9 @@ mcp = FastMCP(
         "'Case-00-Triborough' with question_id matching ^Q[1-9]\\d*$ "
         "and an immutable 40-character commit SHA only; unsupported combinations "
         "fail closed. Use get_case_artifact to read one allowlisted, "
-        "mission-correlated artifact after a successful run. Case-00 storage tools "
+        "mission-correlated artifact after a successful Case-00 run "
+        "(Q<N>_candidate_answer.json|.md for that mission's question, plus "
+        "generation_manifest.json and model_input_audit.json). Case-00 storage tools "
         "expose allowlisted inventory metadata, archive a fixed attorney-feedback "
         "package, and archive one DOCX review packet under canonical B2 prefixes "
         "without accepting bucket or key inputs."
@@ -401,6 +411,72 @@ def parse_case00_question_token(text: str, mission_id: str) -> str | None:
     if match is None:
         return None
     token = match.group(1).lower()
+    if not _CASE00_QUESTION_TOKEN_RE.fullmatch(token):
+        return None
+    return token
+
+
+def case00_question_id_from_token(question_token: str) -> str:
+    """Normalize a lowercase question token (q2) to canonical question_id (Q2)."""
+    token = (question_token or "").strip().lower()
+    if not _CASE00_QUESTION_TOKEN_RE.fullmatch(token):
+        raise ValueError("invalid case question token")
+    return token.upper()
+
+
+def allowed_case_artifact_filenames(question_token: str) -> frozenset[str]:
+    """Exact basenames permitted for one Case-00 question plus shared manifests."""
+    question_id = case00_question_id_from_token(question_token)
+    return frozenset(
+        {
+            f"{question_id}_candidate_answer.json",
+            f"{question_id}_candidate_answer.md",
+        }
+    ) | CASE_ARTIFACT_SHARED_FILENAMES
+
+
+def assert_safe_case_artifact_basename(filename: str) -> str:
+    """Reject path traversal, absolute paths, and non-basename artifact keys."""
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("filename must be a bare allowlisted basename")
+    if (
+        filename != filename.strip()
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+        or filename in {".", ".."}
+        or ".." in filename
+    ):
+        raise ValueError("filename must be a bare allowlisted basename")
+    return filename
+
+
+def case_artifact_size_limit(filename: str) -> int | None:
+    """Byte cap for an allowlisted case artifact basename, else None."""
+    if filename in CASE_ARTIFACT_SHARED_FILENAMES:
+        return CASE_ARTIFACT_SHARED_LIMIT
+    match = _CASE_ARTIFACT_CANDIDATE_FILENAME_RE.fullmatch(filename)
+    if match is None:
+        return None
+    if match.group(2) == "json":
+        return CASE_ARTIFACT_CANDIDATE_JSON_LIMIT
+    return CASE_ARTIFACT_CANDIDATE_MD_LIMIT
+
+
+def question_token_from_verified_objects(objects: list[Any]) -> str | None:
+    """Derive q[1-9]\\d* from independently verified durable object filenames."""
+    tokens: set[str] = set()
+    for item in objects:
+        name = item.get("filename") if isinstance(item, dict) else None
+        if not isinstance(name, str):
+            continue
+        match = _CASE_ARTIFACT_CANDIDATE_FILENAME_RE.fullmatch(name)
+        if match is None:
+            continue
+        tokens.add(match.group(1).lower())
+    if len(tokens) != 1:
+        return None
+    token = next(iter(tokens))
     if not _CASE00_QUESTION_TOKEN_RE.fullmatch(token):
         return None
     return token
@@ -1369,19 +1445,20 @@ async def get_case00_artifacts(mission_id: str) -> dict[str, Any]:
 @mcp.tool()
 async def get_case_artifact(
     mission_id: str,
-    filename: Literal[
-        "Q1_candidate_answer.json",
-        "Q1_candidate_answer.md",
-        "generation_manifest.json",
-        "model_input_audit.json",
-    ],
+    filename: str,
 ) -> dict[str, Any]:
-    """Read one allowlisted B2 artifact correlated to a successful case mission."""
-    _require_allowed_user()
-    size_limit = CASE_ARTIFACT_LIMITS.get(filename)
-    if size_limit is None:
-        raise ValueError("filename is not an allowlisted case artifact")
+    """Read one allowlisted B2 artifact correlated to a successful case mission.
 
+    Question is taken from the Bridge Case-00 run / verified B2 object set.
+    Allowed basenames are exactly ``Q<N>_candidate_answer.json``,
+    ``Q<N>_candidate_answer.md`` for that mission's question, plus
+    ``generation_manifest.json`` and ``model_input_audit.json``.
+    """
+    _require_allowed_user()
+    filename = assert_safe_case_artifact_basename(filename)
+
+    # Same Bridge Case-00 identity as get_case00_artifacts / case.list_artifacts —
+    # do not require registration in the generic proof get_artifacts run registry.
     run = await _resolve_case00_run(mission_id)
     if run is None:
         return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
@@ -1427,6 +1504,20 @@ async def get_case_artifact(
         }
     if durable.get("bucket") != B2_BUCKET:
         raise ValueError("artifact bucket did not match the configured private bucket")
+
+    objects_token = question_token_from_verified_objects(objects)
+    if objects_token is not None and objects_token != question_token:
+        raise ValueError("durable artifact question did not match Bridge run metadata")
+
+    allowed = allowed_case_artifact_filenames(question_token)
+    if filename not in allowed:
+        raise ValueError(
+            "filename is not an allowlisted case artifact for this mission question"
+        )
+
+    size_limit = case_artifact_size_limit(filename)
+    if size_limit is None:
+        raise ValueError("filename is not an allowlisted case artifact")
 
     item = next((entry for entry in objects if entry.get("filename") == filename), None)
     if item is None:
@@ -1494,6 +1585,7 @@ async def get_case_artifact(
         "head_sha": run.get("head_sha"),
         "verified": True,
         "filename": filename,
+        "question_id": case00_question_id_from_token(question_token),
         "b2_bucket": B2_BUCKET,
         "object_key": key,
         "size": actual_size,

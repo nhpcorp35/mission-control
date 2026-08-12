@@ -1293,6 +1293,263 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         self.assertIn("case.cancel_case00_q1_run", by_tool)
         self.assertIn("case.get_case00_q1_artifacts", by_tool)
 
+    def test_allowed_case_artifact_filenames_are_question_scoped(self) -> None:
+        self.assertEqual(
+            self.server.allowed_case_artifact_filenames("q1"),
+            frozenset(
+                {
+                    "Q1_candidate_answer.json",
+                    "Q1_candidate_answer.md",
+                    "generation_manifest.json",
+                    "model_input_audit.json",
+                }
+            ),
+        )
+        self.assertEqual(
+            self.server.allowed_case_artifact_filenames("q2"),
+            frozenset(
+                {
+                    "Q2_candidate_answer.json",
+                    "Q2_candidate_answer.md",
+                    "generation_manifest.json",
+                    "model_input_audit.json",
+                }
+            ),
+        )
+        self.assertNotIn(
+            "Q1_candidate_answer.json",
+            self.server.allowed_case_artifact_filenames("q2"),
+        )
+        with self.assertRaises(ValueError):
+            self.server.assert_safe_case_artifact_basename("../Q2_candidate_answer.json")
+        with self.assertRaises(ValueError):
+            self.server.assert_safe_case_artifact_basename("q2/Q2_candidate_answer.json")
+        with self.assertRaises(ValueError):
+            self.server.assert_safe_case_artifact_basename("")
+
+    def _synthetic_case_artifact_bundle(self, question_id: str, mission_id: str):
+        """Synthetic Bridge zip + B2 bodies — no private benchmark content."""
+        token = question_id.lower()
+        prefix = (
+            "Benchmarks/Case-00-Triborough/derived/"
+            "attorney-feedback-eval/candidate-answers/"
+            f"synth-{token}-candidate/"
+        )
+        files = [
+            (f"{question_id}_candidate_answer.json", b'{"synthetic":true,"ok":true}'),
+            (f"{question_id}_candidate_answer.md", b"# synthetic candidate\n"),
+            ("generation_manifest.json", b'{"synthetic_manifest":true}'),
+            ("model_input_audit.json", b'{"synthetic_audit":true}'),
+        ]
+        objects = []
+        bodies: dict[str, bytes] = {}
+        for name, body in files:
+            key = f"{prefix}{name}"
+            objects.append(
+                {
+                    "filename": name,
+                    "object_key": key,
+                    "size": len(body),
+                    "etag": f"etag-{name}",
+                }
+            )
+            bodies[key] = body
+        result_payload = {
+            "ok": True,
+            "durable_artifacts": {
+                "bucket": self.server.B2_BUCKET,
+                "objects": objects,
+            },
+        }
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as bundle:
+            bundle.writestr(
+                f"case00-{token}-result.json",
+                json.dumps(result_payload),
+            )
+        artifact_name = f"hal-case00-{token}-{mission_id}"
+        return {
+            "token": token,
+            "objects": objects,
+            "bodies": bodies,
+            "zip_bytes": buffer.getvalue(),
+            "artifact_name": artifact_name,
+            "run": {
+                "id": 31415926535,
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": self.LEGALAI_SHA,
+                "html_url": "https://github.com/example/actions/runs/31415926535",
+            },
+        }
+
+    def _run_get_case_artifact(
+        self,
+        *,
+        mission_id: str,
+        filename: str,
+        question_id: str,
+        resolve_proof_run=None,
+    ):
+        get_artifact = self._tool("get_case_artifact")
+        bundle = self._synthetic_case_artifact_bundle(question_id, mission_id)
+        bodies = bundle["bodies"]
+
+        class FakeBody:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+
+            def read(self, _n: int = -1) -> bytes:
+                return self._data
+
+            def close(self) -> None:
+                return None
+
+        class FakeB2:
+            def head_object(self, Bucket, Key):  # noqa: N803
+                body = bodies[Key]
+                name = Key.rsplit("/", 1)[-1]
+                return {"ContentLength": len(body), "ETag": f'"etag-{name}"'}
+
+            def get_object(self, Bucket, Key):  # noqa: N803
+                return {"Body": FakeBody(bodies[Key])}
+
+        async def fake_github(method, path, **kwargs):
+            if method == "GET" and path.endswith(
+                f"/actions/runs/{bundle['run']['id']}/artifacts"
+            ):
+                return mock.Mock(
+                    json=lambda: {
+                        "artifacts": [
+                            {"id": 99, "name": bundle["artifact_name"]},
+                        ]
+                    }
+                )
+            if method == "GET" and path.endswith("/actions/artifacts/99/zip"):
+                return mock.Mock(content=bundle["zip_bytes"])
+            raise AssertionError(f"unexpected github call {method} {path}")
+
+        async def run():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), mock.patch.object(
+                self.server,
+                "_resolve_case00_run",
+                new_callable=mock.AsyncMock,
+                return_value=bundle["run"],
+            ), mock.patch.object(
+                self.server,
+                "_github",
+                new_callable=mock.AsyncMock,
+                side_effect=fake_github,
+            ), mock.patch.object(
+                self.server, "_b2_client", return_value=FakeB2()
+            ), mock.patch.object(
+                self.server,
+                "_resolve_run",
+                new_callable=mock.AsyncMock,
+                return_value=resolve_proof_run,
+            ):
+                return await get_artifact(mission_id=mission_id, filename=filename)
+
+        return asyncio.run(run()), bundle
+
+    def test_get_case_artifact_q1_compatibility(self) -> None:
+        result, bundle = self._run_get_case_artifact(
+            mission_id="mission-artifact-q1",
+            filename="Q1_candidate_answer.json",
+            question_id="Q1",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["filename"], "Q1_candidate_answer.json")
+        self.assertEqual(result["question_id"], "Q1")
+        self.assertEqual(result["run_id"], bundle["run"]["id"])
+        self.assertEqual(result["content"], {"synthetic": True, "ok": True})
+        shared, _ = self._run_get_case_artifact(
+            mission_id="mission-artifact-q1-shared",
+            filename="generation_manifest.json",
+            question_id="Q1",
+        )
+        self.assertTrue(shared["ok"])
+        self.assertEqual(shared["filename"], "generation_manifest.json")
+
+    def test_get_case_artifact_q2_retrieval(self) -> None:
+        result, _bundle = self._run_get_case_artifact(
+            mission_id="mission-artifact-q2",
+            filename="Q2_candidate_answer.md",
+            question_id="Q2",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["filename"], "Q2_candidate_answer.md")
+        self.assertEqual(result["question_id"], "Q2")
+        self.assertEqual(result["content_type"], "text/markdown")
+        self.assertIn("synthetic candidate", result["content"])
+        self.assertTrue(result["object_key"].endswith("/Q2_candidate_answer.md"))
+        audit, _ = self._run_get_case_artifact(
+            mission_id="mission-artifact-q2-audit",
+            filename="model_input_audit.json",
+            question_id="Q2",
+        )
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["content"], {"synthetic_audit": True})
+
+    def test_get_case_artifact_rejects_cross_question_and_traversal(self) -> None:
+        with self.assertRaises(ValueError) as cross:
+            self._run_get_case_artifact(
+                mission_id="mission-artifact-q2-cross",
+                filename="Q1_candidate_answer.json",
+                question_id="Q2",
+            )
+        self.assertIn("allowlisted", str(cross.exception))
+
+        with self.assertRaises(ValueError) as traversal:
+            self._run_get_case_artifact(
+                mission_id="mission-artifact-q2-trav",
+                filename="../Q2_candidate_answer.json",
+                question_id="Q2",
+            )
+        self.assertIn("basename", str(traversal.exception))
+
+        with self.assertRaises(ValueError) as arbitrary:
+            self._run_get_case_artifact(
+                mission_id="mission-artifact-q2-arb",
+                filename="secrets.env",
+                question_id="Q2",
+            )
+        self.assertIn("allowlisted", str(arbitrary.exception))
+
+    def test_get_case_artifact_uses_bridge_identity_not_proof_registry(self) -> None:
+        """Case-00 Bridge missions work even when generic get_artifacts has no run."""
+        mission_id = "case00-q2-sharedvalidator-synth-01"
+        result, bundle = self._run_get_case_artifact(
+            mission_id=mission_id,
+            filename="Q2_candidate_answer.json",
+            question_id="Q2",
+            resolve_proof_run=None,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mission_id"], mission_id)
+        self.assertEqual(result["run_id"], bundle["run"]["id"])
+
+        get_proof = self._tool("get_artifacts")
+
+        async def run_proof():
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), mock.patch.object(
+                self.server,
+                "_resolve_run",
+                new_callable=mock.AsyncMock,
+                return_value=None,
+            ):
+                return await get_proof(mission_id=mission_id)
+
+        proof = asyncio.run(run_proof())
+        self.assertEqual(
+            proof,
+            {"ok": False, "mission_id": mission_id, "error": "run_not_found"},
+        )
+
 
 def _synthetic_acceptance_contract(**overrides: object) -> dict[str, object]:
     """Cross-interface fixture matching LegalAI ``build_synthetic_contract``."""

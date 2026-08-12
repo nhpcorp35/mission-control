@@ -98,7 +98,12 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         namespace="case",
         downstream_service="artifacts",
         downstream_tool="get_case_artifact",
-        description="Read one allowlisted B2 artifact for a successful case mission.",
+        description=(
+            "Read one allowlisted B2 artifact for a successful Case-00 mission. "
+            "Filename must be exactly Q<N>_candidate_answer.json|.md for the "
+            "mission's question (from Bridge run / verified B2 objects), or "
+            "generation_manifest.json / model_input_audit.json."
+        ),
     ),
     ToolBinding(
         gateway_tool="case.get_artifacts",
@@ -434,13 +439,15 @@ def register_forwarding_tools(
     @mcp.tool(name="case.get_artifact", description=by_name["case.get_artifact"].description)
     async def case_get_artifact(
         mission_id: str,
-        filename: Literal[
-            "Q1_candidate_answer.json",
-            "Q1_candidate_answer.md",
-            "generation_manifest.json",
-            "model_input_audit.json",
-        ],
+        filename: str,
     ) -> dict[str, Any]:
+        """Forward one allowlisted Case-00 artifact read.
+
+        ``filename`` must be a bare basename: ``Q<N>_candidate_answer.json`` or
+        ``.md`` for the mission's actual question, or one of the shared
+        ``generation_manifest.json`` / ``model_input_audit.json`` files.
+        Downstream Bridge enforces question correlation and rejects traversal.
+        """
         return await _forward(
             "case.get_artifact",
             {"mission_id": mission_id, "filename": filename},

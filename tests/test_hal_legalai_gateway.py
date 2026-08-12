@@ -890,6 +890,32 @@ class McpRegistrationTests(unittest.TestCase):
         self.assertIn("storage.get_acceptance_contract_template", names)
         self.assertIn("storage.get_acceptance_contract", names)
 
+    def test_case_get_artifact_filename_schema_is_question_agnostic(self) -> None:
+        """Unified case.get_artifact must not hardcode a Q1-only filename enum."""
+        settings = load_settings(
+            environ={
+                **REQUIRED_SECRETS,
+                "GATEWAY_BRIDGE_URL": "https://bridge.example",
+                "GATEWAY_STORAGE_URL": "https://storage.example",
+                "GATEWAY_MISSION_CONTROL_URL": "https://mission.example",
+                "GATEWAY_ARTIFACTS_URL": "https://artifacts.example",
+            },
+            registry=load_registry(REGISTRY_PATH),
+        )
+        mcp = create_mcp_server(settings, auth=_test_inbound_auth())
+        tools = asyncio.run(mcp.get_tools())
+        tool = tools["case.get_artifact"]
+        schema = tool.parameters
+        filename_schema = schema["properties"]["filename"]
+        self.assertEqual(filename_schema.get("type"), "string")
+        self.assertNotIn("enum", filename_schema)
+        self.assertNotIn("Q1_candidate_answer.json", json.dumps(filename_schema))
+        binding = next(
+            b for b in DEFAULT_TOOL_BINDINGS if b.gateway_tool == "case.get_artifact"
+        )
+        self.assertIn("Q<N>", binding.description)
+        self.assertIn("generation_manifest.json", binding.description)
+
 
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
