@@ -63,6 +63,7 @@
         "storage.verify_acceptance_contract",
         "storage.list_acceptance_contracts",
         "storage.get_acceptance_contract_template",
+        "storage.get_acceptance_contract",
         "storage.verify_archive"
       ]
     },
@@ -206,6 +207,14 @@
       "downstream_tool": "get_acceptance_contract_template",
       "description": "Read-only acceptance_contract.v1 nested-identity JSON Schema, canonical hashing rules, and one synthetic non-private example.",
       "notes": "No B2 writes. Example uses generic synthetic IDs only and can be passed directly as archive_acceptance_contract(contract=example)."
+    },
+    {
+      "tool": "storage.get_acceptance_contract",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "get_acceptance_contract",
+      "description": "Fetch and verify one acceptance_contract.v1 JSON object from canonical legalai-corpus B2 using bounded identity fields only.",
+      "notes": "Inputs: benchmark_id, question_id, contract_id, version. Server generates canonical key. Fail-closed on schema/identity/size/hash mismatch. Returns safe metadata plus structured contract. Never accepts arbitrary keys/URLs/paths. Does not log contract bodies or credentials."
     },
     {
       "tool": "storage.verify_archive",

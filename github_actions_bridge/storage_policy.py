@@ -1527,3 +1527,181 @@ def build_acceptance_contract_archive(
             "sha256": object_sha256,
         },
     }
+
+
+def resolve_acceptance_contract_retrieval_key(
+    *,
+    benchmark_id: object,
+    question_id: object,
+    contract_id: object,
+    version: object,
+) -> dict[str, str]:
+    """Validate bounded identity inputs and return the server-generated B2 key.
+
+    Callers must never accept arbitrary object keys, buckets, prefixes, URLs, or
+    filesystem paths — only these four identity fields.
+    """
+    bid = _validate_acceptance_identity(benchmark_id, path="benchmark_id")
+    qid = _validate_acceptance_identity(question_id, path="question_id")
+    cid = _validate_acceptance_identity(contract_id, path="contract_id")
+    ver = _validate_acceptance_identity(version, path="version")
+    object_key = canonical_acceptance_contract_object_key(
+        benchmark_id=bid,
+        question_id=qid,
+        contract_id=cid,
+        version=ver,
+    )
+    return {
+        "benchmark_id": bid,
+        "question_id": qid,
+        "contract_id": cid,
+        "version": ver,
+        "object_key": object_key,
+        "prefix": ACCEPTANCE_CONTRACT_PREFIX,
+        "schema_version": ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
+    }
+
+
+def verify_retrieved_acceptance_contract(
+    *,
+    payload: object,
+    benchmark_id: object,
+    question_id: object,
+    contract_id: object,
+    version: object,
+    expected_size: object = None,
+    stored_contract_sha256: object = None,
+    stored_object_sha256: object = None,
+) -> dict[str, Any]:
+    """Fail-closed verified read of one acceptance_contract.v1 object.
+
+    Checks canonical key/identity, byte size, embedded content_sha256 /
+    contract_sha256, and independently computed object_sha256 (against B2
+    metadata when present). Returns safe metadata plus the structured contract
+    only after every check passes. Never returns unrelated objects.
+    """
+    requested = resolve_acceptance_contract_retrieval_key(
+        benchmark_id=benchmark_id,
+        question_id=question_id,
+        contract_id=contract_id,
+        version=version,
+    )
+    object_key = requested["object_key"]
+
+    if not isinstance(payload, (bytes, bytearray)):
+        _reject("payload", "bytes", payload)
+    body = bytes(payload)
+    size = len(body)
+    if size < 1 or size > MAX_ACCEPTANCE_CONTRACT_BYTES:
+        _reject(
+            "payload",
+            f"byte length between 1 and {MAX_ACCEPTANCE_CONTRACT_BYTES}",
+            size,
+        )
+
+    if expected_size is not None:
+        if not isinstance(expected_size, int) or isinstance(expected_size, bool):
+            _reject("size", "positive integer ContentLength", expected_size)
+        if expected_size != size:
+            _reject(
+                "size",
+                f"equal to downloaded payload length {size}",
+                expected_size,
+            )
+
+    object_sha256 = compute_acceptance_object_sha256(body)
+    if stored_object_sha256 is None or stored_object_sha256 == "":
+        _reject(
+            "stored_object_sha256",
+            "non-empty 64-character lowercase hex SHA-256 from B2 metadata",
+            stored_object_sha256,
+        )
+    stored_object = validate_sha256_hex(
+        stored_object_sha256, label="stored_object_sha256"
+    )
+    if stored_object != object_sha256:
+        _reject(
+            "object_sha256",
+            "equal to independently computed object digest",
+            stored_object,
+        )
+
+    identity = parse_acceptance_contract_v1(body)
+
+    if identity["object_key"] != object_key:
+        _reject(
+            "$.object_key",
+            f"equal to canonical key {object_key!r}",
+            identity["object_key"],
+        )
+    if identity["benchmark_id"] != requested["benchmark_id"]:
+        _reject(
+            "$.identity.benchmark_id",
+            f"equal to requested benchmark_id {requested['benchmark_id']!r}",
+            identity["benchmark_id"],
+        )
+    if identity["question_id"] != requested["question_id"]:
+        _reject(
+            "$.identity.question_id",
+            f"equal to requested question_id {requested['question_id']!r}",
+            identity["question_id"],
+        )
+    if identity["contract_id"] != requested["contract_id"]:
+        _reject(
+            "$.contract_id",
+            f"equal to requested contract_id {requested['contract_id']!r}",
+            identity["contract_id"],
+        )
+    if identity["version"] != requested["version"]:
+        _reject(
+            "$.version",
+            f"equal to requested version {requested['version']!r}",
+            identity["version"],
+        )
+
+    if stored_contract_sha256 is None or stored_contract_sha256 == "":
+        _reject(
+            "stored_contract_sha256",
+            "non-empty 64-character lowercase hex SHA-256 from B2 metadata",
+            stored_contract_sha256,
+        )
+    stored_contract = validate_sha256_hex(
+        stored_contract_sha256, label="stored_contract_sha256"
+    )
+    if stored_contract != identity["contract_sha256"]:
+        _reject(
+            "contract_sha256",
+            "equal to recomputed contract_sha256 / $.content_sha256",
+            stored_contract,
+        )
+
+    # Structured contract only after fail-closed verification (do not log body).
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AcceptanceContractValidationError(
+            path="$",
+            constraint="UTF-8 JSON object",
+            received=None,
+        ) from exc
+    if not isinstance(document, dict):
+        _reject("$", "JSON object", document)
+
+    return {
+        "ok": True,
+        "verified": True,
+        "prefix": ACCEPTANCE_CONTRACT_PREFIX,
+        "schema": ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
+        "schema_version": ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
+        "benchmark_id": identity["benchmark_id"],
+        "question_id": identity["question_id"],
+        "contract_id": identity["contract_id"],
+        "version": identity["version"],
+        "object_key": object_key,
+        "size": size,
+        "content_sha256": identity["content_sha256"],
+        "contract_sha256": identity["contract_sha256"],
+        "object_sha256": object_sha256,
+        "required_criterion_ids": identity["required_criterion_ids"],
+        "contract": document,
+    }

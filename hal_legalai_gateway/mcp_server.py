@@ -172,6 +172,19 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         ),
     ),
     ToolBinding(
+        gateway_tool="storage.get_acceptance_contract",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="get_acceptance_contract",
+        description=(
+            "Fetch and verify one acceptance_contract.v1 JSON object from "
+            "canonical B2 using bounded identity fields only (benchmark_id, "
+            "question_id, contract_id, version). Server generates the key and "
+            "fail-closed verifies schema, identity, size, and hashes before "
+            "returning safe metadata plus structured contract."
+        ),
+    ),
+    ToolBinding(
         gateway_tool="storage.verify_archive",
         namespace="storage",
         downstream_service="storage",
@@ -579,6 +592,26 @@ def register_forwarding_tools(
         return await _forward(
             "storage.get_acceptance_contract_template",
             {},
+        )
+
+    @mcp.tool(
+        name="storage.get_acceptance_contract",
+        description=by_name["storage.get_acceptance_contract"].description,
+    )
+    async def storage_get_acceptance_contract(
+        benchmark_id: str,
+        question_id: str,
+        contract_id: str,
+        version: str,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.get_acceptance_contract",
+            {
+                "benchmark_id": benchmark_id,
+                "question_id": question_id,
+                "contract_id": contract_id,
+                "version": version,
+            },
         )
 
     @mcp.tool(

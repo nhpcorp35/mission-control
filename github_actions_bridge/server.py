@@ -26,6 +26,7 @@ from botocore.exceptions import ClientError
 
 from storage_policy import (
     ACCEPTANCE_CONTRACT_PREFIX,
+    MAX_ACCEPTANCE_CONTRACT_BYTES,
     archive_create_only_put_params,
     assert_archive_objects_absent,
     assert_canonical_legalai_bucket,
@@ -35,8 +36,10 @@ from storage_policy import (
     build_review_packet_archive,
     inventory_prefix,
     map_archive_put_precondition_failure,
+    resolve_acceptance_contract_retrieval_key,
     validate_acceptance_contract_object_key,
     validate_sha256_hex,
+    verify_retrieved_acceptance_contract,
 )
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
@@ -89,6 +92,7 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "verify_acceptance_contract",
         "list_acceptance_contracts",
         "get_acceptance_contract_template",
+        "get_acceptance_contract",
     }
 )
 
@@ -939,6 +943,88 @@ async def get_acceptance_contract_template() -> dict[str, Any]:
     """
     _require_allowed_user()
     return build_acceptance_contract_template()
+
+
+@mcp.tool()
+async def get_acceptance_contract(
+    benchmark_id: str,
+    question_id: str,
+    contract_id: str,
+    version: str,
+) -> dict[str, Any]:
+    """Fetch and verify one LegalAI acceptance_contract.v1 JSON object from B2.
+
+    Accepts only bounded identity fields. The canonical B2 object key is
+    generated server-side under the acceptance-contracts prefix — never accept
+    arbitrary object keys, buckets, prefixes, URLs, or filesystem paths.
+
+    Before returning structured contract JSON, verifies canonical key/identity,
+    byte size, embedded content_sha256/contract_sha256, and independently
+    computed object_sha256 against B2 metadata. Fail closed on any mismatch.
+    Contract bodies and credentials are never logged.
+    """
+    _require_allowed_user()
+    assert_canonical_legalai_bucket(B2_BUCKET)
+    requested = resolve_acceptance_contract_retrieval_key(
+        benchmark_id=benchmark_id,
+        question_id=question_id,
+        contract_id=contract_id,
+        version=version,
+    )
+    object_key = requested["object_key"]
+    client = _b2_client()
+    head = _head_acceptance_contract_metadata(client, object_key)
+    if head is None:
+        return {
+            "ok": False,
+            "verified": False,
+            "b2_bucket": B2_BUCKET,
+            "prefix": ACCEPTANCE_CONTRACT_PREFIX,
+            "schema_version": "acceptance_contract.v1",
+            "benchmark_id": requested["benchmark_id"],
+            "question_id": requested["question_id"],
+            "contract_id": requested["contract_id"],
+            "version": requested["version"],
+            "object_key": object_key,
+            "error": "object_not_found",
+        }
+
+    size = head.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise ValueError(f"B2 acceptance-contract size missing for {object_key}")
+    if size < 1 or size > MAX_ACCEPTANCE_CONTRACT_BYTES:
+        raise ValueError(
+            f"B2 acceptance-contract size out of bounds for {object_key}"
+        )
+
+    response = client.get_object(Bucket=B2_BUCKET, Key=object_key)
+    stream = response["Body"]
+    try:
+        body = stream.read(MAX_ACCEPTANCE_CONTRACT_BYTES + 1)
+    finally:
+        stream.close()
+    if len(body) != size:
+        raise ValueError(f"B2 body size mismatch for {object_key}")
+    if len(body) > MAX_ACCEPTANCE_CONTRACT_BYTES:
+        raise ValueError(
+            f"acceptance-contract exceeds {MAX_ACCEPTANCE_CONTRACT_BYTES}-byte limit"
+        )
+
+    verified = verify_retrieved_acceptance_contract(
+        payload=body,
+        benchmark_id=requested["benchmark_id"],
+        question_id=requested["question_id"],
+        contract_id=requested["contract_id"],
+        version=requested["version"],
+        expected_size=size,
+        stored_contract_sha256=head.get("contract_sha256"),
+        stored_object_sha256=head.get("object_sha256"),
+    )
+    return {
+        **verified,
+        "b2_bucket": B2_BUCKET,
+        "etag": head.get("etag"),
+    }
 
 
 @mcp.tool()

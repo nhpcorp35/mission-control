@@ -162,6 +162,12 @@ class RegistryTests(unittest.TestCase):
             "get_acceptance_contract_template",
         )
         self.assertEqual(
+            registry.downstream_tool_for_gateway_tool(
+                "storage.get_acceptance_contract"
+            ),
+            "get_acceptance_contract",
+        )
+        self.assertEqual(
             registry.downstream_tool_for_gateway_tool("mission.submit"),
             "submit_run",
         )
@@ -539,6 +545,80 @@ class ForwardingTests(unittest.TestCase):
         self.assertNotIn("bridge-service-secret-token", blob)
         self.assertNotIn("Bearer", blob)
 
+    def test_get_acceptance_contract_auth_and_tool_error_propagation(self) -> None:
+        binding = ToolBinding(
+            gateway_tool="storage.get_acceptance_contract",
+            namespace="storage",
+            downstream_service="storage",
+            downstream_tool="get_acceptance_contract",
+        )
+        args = {
+            "benchmark_id": "synth-benchmark-alpha",
+            "question_id": "Q-SYNTH-01",
+            "contract_id": "contract-synth-alpha-q01",
+            "version": "1.0.0",
+        }
+        auth_failed = asyncio.run(
+            forward_mcp_tool(
+                binding=binding,
+                arguments=args,
+                base_url="https://storage.example",
+                authorization=None,
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                require_authorization=True,
+            )
+        )
+        self.assertFalse(auth_failed["ok"])
+        self.assertEqual(auth_failed["failure_stage"], STAGE_AUTH)
+        self.assertEqual(auth_failed["downstream_service"], "storage")
+        self.assertEqual(auth_failed["downstream_tool"], "get_acceptance_contract")
+        self.assertEqual(auth_failed["request_id"], "req-forward-1")
+        self.assertEqual(auth_failed["correlation_id"], "corr-forward-1")
+        self.assertIsInstance(auth_failed["duration_ms"], (int, float))
+
+        class FakeResult:
+            is_error = True
+            data = None
+            structured_content = {
+                "ok": False,
+                "error_code": "object_not_found",
+                "message": "acceptance contract object was not found",
+            }
+            content = None
+
+        class OkClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, arguments, raise_on_error=False):
+                self.name = name
+                self.arguments = arguments
+                return FakeResult()
+
+        client = OkClient()
+        tool_failed = asyncio.run(
+            forward_mcp_tool(
+                binding=binding,
+                arguments=args,
+                base_url="https://storage.example",
+                authorization="Bearer storage-service-token",
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                client_factory=lambda: client,
+                extra_secrets=("storage-service-token",),
+            )
+        )
+        self.assertFalse(tool_failed["ok"])
+        self.assertEqual(tool_failed["failure_stage"], STAGE_TOOL)
+        self.assertEqual(client.name, "get_acceptance_contract")
+        self.assertEqual(client.arguments, args)
+        self.assertEqual(tool_failed["error"]["error_code"], "object_not_found")
+        self.assertNotIn("storage-service-token", json.dumps(tool_failed))
+
     def test_tool_error_redacts_secret_bearing_messages(self) -> None:
         class FakeResult:
             is_error = True
@@ -808,6 +888,7 @@ class McpRegistrationTests(unittest.TestCase):
         self.assertIn("storage.verify_acceptance_contract", names)
         self.assertIn("storage.list_acceptance_contracts", names)
         self.assertIn("storage.get_acceptance_contract_template", names)
+        self.assertIn("storage.get_acceptance_contract", names)
 
 
 class ApiTests(unittest.TestCase):

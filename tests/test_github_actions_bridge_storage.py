@@ -37,9 +37,11 @@ from github_actions_bridge.storage_policy import (
     inventory_prefix,
     map_archive_put_precondition_failure,
     normalize_review_packet_recipient,
+    resolve_acceptance_contract_retrieval_key,
     serialize_acceptance_contract_stored_bytes,
     validate_acceptance_contract_object_key,
     validate_docx_bytes,
+    verify_retrieved_acceptance_contract,
 )
 
 _BRIDGE_DIR = Path(__file__).resolve().parent.parent / "github_actions_bridge"
@@ -1652,6 +1654,7 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
             "verify_acceptance_contract",
             "list_acceptance_contracts",
             "get_acceptance_contract_template",
+            "get_acceptance_contract",
         ):
             self.assertIn(name, server.REQUIRED_PRODUCTION_TOOLS)
         names = asyncio.run(server.list_registered_tool_names())
@@ -1661,6 +1664,7 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
                 "verify_acceptance_contract",
                 "list_acceptance_contracts",
                 "get_acceptance_contract_template",
+                "get_acceptance_contract",
             }.issubset(names)
         )
 
@@ -1924,6 +1928,195 @@ class AcceptanceContractStoragePolicyTests(unittest.TestCase):
         self.assertIn("expected_benchmark_id", str(ctx.exception))
         client.put_object.assert_not_called()
         client.head_object.assert_not_called()
+
+
+class AcceptanceContractRetrievalTests(unittest.TestCase):
+    """Focused security/regression coverage for get_acceptance_contract."""
+
+    def _identity(self) -> dict[str, str]:
+        return {
+            "benchmark_id": "synth-benchmark-alpha",
+            "question_id": "Q-SYNTH-01",
+            "contract_id": "contract-synth-alpha-q01",
+            "version": "1.0.0",
+        }
+
+    def _valid_payload_and_meta(self) -> tuple[dict[str, object], bytes, dict[str, str]]:
+        doc = _synthetic_acceptance_contract()
+        item = build_acceptance_contract_archive(contract=doc)
+        payload = item["payload"]
+        assert isinstance(payload, bytes)
+        meta = {
+            "contract_sha256": str(item["contract_sha256"]),
+            "object_sha256": str(item["object_sha256"]),
+            "sha256": str(item["object_sha256"]),
+        }
+        return doc, payload, meta
+
+    def test_valid_retrieval_returns_metadata_and_contract(self) -> None:
+        doc, payload, meta = self._valid_payload_and_meta()
+        identity = self._identity()
+        result = verify_retrieved_acceptance_contract(
+            payload=payload,
+            expected_size=len(payload),
+            stored_contract_sha256=meta["contract_sha256"],
+            stored_object_sha256=meta["object_sha256"],
+            **identity,
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["object_key"], doc["object_key"])
+        self.assertEqual(result["contract_sha256"], meta["contract_sha256"])
+        self.assertEqual(result["object_sha256"], meta["object_sha256"])
+        self.assertEqual(result["contract"]["contract_id"], identity["contract_id"])
+        self.assertIn("required_criterion_ids", result["contract"])
+
+        server = _import_bridge_server()
+        client = mock.Mock()
+        client.head_object.return_value = {
+            "ContentLength": len(payload),
+            "ETag": '"etag-get"',
+            "Metadata": meta,
+        }
+
+        class _Body:
+            def read(self, _n: int) -> bytes:
+                return payload
+
+            def close(self) -> None:
+                return None
+
+        client.get_object.return_value = {"Body": _Body()}
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    fetched = asyncio.run(
+                        server.get_acceptance_contract.fn(**identity)
+                    )
+        self.assertTrue(fetched["ok"])
+        self.assertTrue(fetched["verified"])
+        self.assertEqual(fetched["b2_bucket"], CANONICAL_LEGALAI_BUCKET)
+        self.assertEqual(fetched["contract"]["schema_version"], ACCEPTANCE_CONTRACT_SCHEMA)
+        client.get_object.assert_called_once_with(
+            Bucket=CANONICAL_LEGALAI_BUCKET,
+            Key=str(doc["object_key"]),
+        )
+
+    def test_traversal_and_arbitrary_key_rejected_by_schema(self) -> None:
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            resolve_acceptance_contract_retrieval_key(
+                benchmark_id="../escape",
+                question_id="Q1",
+                contract_id="c1",
+                version="1.0.0",
+            )
+        self.assertEqual(ctx.exception.path, "benchmark_id")
+
+        with self.assertRaises(AcceptanceContractValidationError):
+            resolve_acceptance_contract_retrieval_key(
+                benchmark_id="ok",
+                question_id="Q1/../../etc",
+                contract_id="c1",
+                version="1.0.0",
+            )
+
+        # Tool surface accepts only identity fields — no object_key / bucket / URL.
+        server = _import_bridge_server()
+        tool = server.get_acceptance_contract
+        params = getattr(tool, "parameters", None) or {}
+        if isinstance(params, dict) and params:
+            self.assertNotIn("object_key", params)
+            self.assertNotIn("bucket", params)
+            self.assertNotIn("url", params)
+            self.assertNotIn("prefix", params)
+        for bad in ("object_key", "bucket", "url", "prefix", "path"):
+            with self.assertRaises(TypeError):
+                asyncio.run(
+                    server.get_acceptance_contract.fn(
+                        benchmark_id="synth-benchmark-alpha",
+                        question_id="Q-SYNTH-01",
+                        contract_id="contract-synth-alpha-q01",
+                        version="1.0.0",
+                        **{bad: "Benchmarks/other/secret.json"},
+                    )
+                )
+
+    def test_identity_mismatch_fail_closed(self) -> None:
+        _doc, payload, meta = self._valid_payload_and_meta()
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            verify_retrieved_acceptance_contract(
+                payload=payload,
+                benchmark_id="synth-benchmark-alpha",
+                question_id="Q-SYNTH-01",
+                contract_id="contract-other-id",
+                version="1.0.0",
+                expected_size=len(payload),
+                stored_contract_sha256=meta["contract_sha256"],
+                stored_object_sha256=meta["object_sha256"],
+            )
+        # Different contract_id yields a different canonical key than embedded.
+        self.assertIn(ctx.exception.path, {"$.object_key", "$.contract_id"})
+
+    def test_contract_hash_mismatch_fail_closed(self) -> None:
+        doc = _synthetic_acceptance_contract()
+        doc = dict(doc)
+        doc["content_sha256"] = "a" * 64
+        payload = serialize_acceptance_contract_stored_bytes(doc)
+        object_digest = compute_acceptance_object_sha256(payload)
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            verify_retrieved_acceptance_contract(
+                payload=payload,
+                expected_size=len(payload),
+                stored_contract_sha256="a" * 64,
+                stored_object_sha256=object_digest,
+                **self._identity(),
+            )
+        self.assertEqual(ctx.exception.path, "$.content_sha256")
+
+    def test_object_corruption_hash_mismatch_fail_closed(self) -> None:
+        _doc, payload, meta = self._valid_payload_and_meta()
+        corrupted = payload + b" "
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            verify_retrieved_acceptance_contract(
+                payload=corrupted,
+                expected_size=len(corrupted),
+                stored_contract_sha256=meta["contract_sha256"],
+                stored_object_sha256=meta["object_sha256"],
+                **self._identity(),
+            )
+        self.assertEqual(ctx.exception.path, "object_sha256")
+
+    def test_missing_object_returns_not_found(self) -> None:
+        server = _import_bridge_server()
+        identity = self._identity()
+        client = mock.Mock()
+
+        def _head_object(*, Bucket: str, Key: str) -> dict[str, object]:
+            del Bucket, Key
+            raise server.ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}},
+                "HeadObject",
+            )
+
+        client.head_object.side_effect = _head_object
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    result = asyncio.run(
+                        server.get_acceptance_contract.fn(**identity)
+                    )
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["error"], "object_not_found")
+        self.assertEqual(
+            result["object_key"],
+            canonical_acceptance_contract_object_key(**identity),
+        )
+        client.get_object.assert_not_called()
 
 
 if __name__ == "__main__":
