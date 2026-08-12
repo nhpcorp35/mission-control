@@ -945,6 +945,126 @@ class Case00GenericWorkflowTests(unittest.TestCase):
             "q2",
         )
 
+    def test_run_marker_correlation_normalizes_question_casing(self) -> None:
+        """Uppercase workflow titles correlate; artifact names stay lowercase."""
+        mission_q1 = "mission-corr-q1"
+        mission_q2 = "mission-corr-q2"
+        # Markers / artifact filenames remain lowercase at runtime.
+        self.assertEqual(
+            self.server.case00_run_marker("Q1", mission_q1),
+            f"hal-case00-q1-{mission_q1}",
+        )
+        self.assertEqual(
+            self.server.case00_run_marker("Q2", mission_q2),
+            f"hal-case00-q2-{mission_q2}",
+        )
+        self.assertEqual(
+            self.server.case00_result_filename("Q2"),
+            "case00-q2-result.json",
+        )
+
+        # Workflow display titles keep submitted Q casing; parser normalizes.
+        self.assertEqual(
+            self.server.parse_case00_question_token(
+                f"hal-case00-Q1-{mission_q1}", mission_q1
+            ),
+            "q1",
+        )
+        self.assertEqual(
+            self.server.parse_case00_question_token(
+                f"hal-case00-Q2-{mission_q2}", mission_q2
+            ),
+            "q2",
+        )
+        self.assertEqual(
+            self.server.parse_case00_question_token(
+                f"hal-case00-q1-{mission_q1}", mission_q1
+            ),
+            "q1",
+        )
+        self.assertEqual(
+            self.server.parse_case00_question_token(
+                f"hal-case00-q2-{mission_q2}", mission_q2
+            ),
+            "q2",
+        )
+        # Lowercase artifact-style names still parse.
+        self.assertEqual(
+            self.server.parse_case00_question_token(
+                f"hal-case00-q2-{mission_q2}-artifacts", mission_q2
+            ),
+            "q2",
+        )
+
+        # Wrong mission IDs and malformed question tokens fail closed.
+        self.assertIsNone(
+            self.server.parse_case00_question_token(
+                f"hal-case00-Q2-{mission_q2}", "mission-other"
+            )
+        )
+        self.assertIsNone(
+            self.server.parse_case00_question_token(
+                f"hal-case00-Q2-{mission_q1}", mission_q2
+            )
+        )
+        for bad in (
+            f"hal-case00-Q0-{mission_q2}",
+            f"hal-case00-Q02-{mission_q2}",
+            f"hal-case00-Q-{mission_q2}",
+            f"hal-case00-2-{mission_q2}",
+            f"hal-case00-qx-{mission_q2}",
+            f"prefix-hal-case00-Q2x-{mission_q2}",
+        ):
+            self.assertIsNone(
+                self.server.parse_case00_question_token(bad, mission_q2),
+                msg=bad,
+            )
+
+        q2_run = {
+            "id": 42,
+            "status": "in_progress",
+            "conclusion": None,
+            "display_title": f"hal-case00-Q2-{mission_q2}",
+            "head_sha": self.LEGALAI_SHA,
+            "html_url": "https://github.com/example/actions/runs/42",
+        }
+        q1_run = {
+            "id": 41,
+            "status": "completed",
+            "conclusion": "success",
+            "display_title": f"hal-case00-Q1-{mission_q1}",
+            "head_sha": self.LEGALAI_SHA,
+            "html_url": "https://github.com/example/actions/runs/41",
+        }
+
+        async def fake_github(method, path, **kwargs):
+            self.assertEqual(method, "GET")
+            self.assertIn("/actions/workflows/", path)
+            response = mock.Mock()
+            response.json.return_value = {"workflow_runs": [q2_run, q1_run]}
+            return response
+
+        async def resolve_uppercase_q2():
+            with mock.patch.object(self.server, "_github", side_effect=fake_github):
+                return await self.server._resolve_case00_run(mission_q2, "Q2")
+
+        async def resolve_q2_without_question():
+            with mock.patch.object(self.server, "_github", side_effect=fake_github):
+                return await self.server._resolve_case00_run(mission_q2)
+
+        async def resolve_q1():
+            with mock.patch.object(self.server, "_github", side_effect=fake_github):
+                return await self.server._resolve_case00_run(mission_q1, "Q1")
+
+        async def resolve_wrong_mission():
+            with mock.patch.object(self.server, "_github", side_effect=fake_github):
+                return await self.server._resolve_case00_run("mission-other", "Q2")
+
+        self.assertEqual(asyncio.run(resolve_uppercase_q2())["id"], 42)
+        self.assertEqual(asyncio.run(resolve_q2_without_question())["id"], 42)
+        self.assertEqual(asyncio.run(resolve_q1())["id"], 41)
+        self.assertIsNone(asyncio.run(resolve_wrong_mission()))
+
     def test_mutable_ref_rejected_before_dispatch(self) -> None:
         from fastmcp.exceptions import ToolError
 

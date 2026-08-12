@@ -385,14 +385,18 @@ def case00_result_filename(question_id: str) -> str:
 
 
 def parse_case00_question_token(text: str, mission_id: str) -> str | None:
-    """Extract q[1-9]\\d* from a Case-00 run title or artifact name, if present."""
+    """Extract q[1-9]\\d* from a Case-00 run title or artifact name, if present.
+
+    Workflow run titles keep the submitted question_id casing (Q2); artifact
+    names are lowercase (q2). Match only the Q/q token slot, then normalize.
+    """
     match = re.search(
-        rf"hal-case00-(q[1-9]\d*)-{re.escape(mission_id)}(?:\b|$)",
+        rf"hal-case00-([Qq][1-9]\d*)-{re.escape(mission_id)}(?:\b|$)",
         text or "",
     )
     if match is None:
         return None
-    token = match.group(1)
+    token = match.group(1).lower()
     if not _CASE00_QUESTION_TOKEN_RE.fullmatch(token):
         return None
     return token
@@ -409,7 +413,9 @@ async def _resolve_case00_run(
     for run in response.json().get("workflow_runs", []):
         title = run.get("display_title") or ""
         if question_id is not None:
-            if case00_run_marker(question_id, mission_id) in title:
+            # Marker is lowercase (q2); workflow display_title may keep Q2.
+            marker = case00_run_marker(question_id, mission_id)
+            if marker.lower() in title.lower():
                 return run
             continue
         if parse_case00_question_token(title, mission_id) is not None:
