@@ -484,6 +484,35 @@ class TestStructuredRunsApi(unittest.TestCase):
         self.assertIn("base_branch: main", mission_yaml)
         self.assertNotIn("name: Mission-Control", mission_yaml)
 
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_stale_workspace_legal_ai_path_does_not_block_submit(
+        self,
+        _mock_preflight,
+    ) -> None:
+        """Guessed /workspace/legal-ai must not fail when identity is legal-ai."""
+        with patch.object(
+            api_module.run_queue,
+            "enqueue",
+        ) as enqueue_mock:
+            response = self.client.post(
+                "/runs/structured",
+                json=_structured_payload(
+                    repository_name="legal-ai",
+                    repository_path="/workspace/legal-ai",
+                    persistence_mode="none",
+                    create_files=False,
+                    modify_files=False,
+                ),
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertIn("run_id", body)
+        self.assertEqual(body["status"], "queued")
+        enqueue_mock.assert_called_once()
+        queued_mission = enqueue_mock.call_args.args[1]
+        self.assertEqual(queued_mission["repository"]["name"], "legal-ai")
+        self.assertEqual(queued_mission["repository"]["path"], ".")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,11 +1,11 @@
 """Validation logic for Mission Specification v1.0 files."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import yaml
 
 from mission_control.workspace import (
+    normalize_submit_repository_path,
     require_platform_push_approval,
     resolve_persistence_mode,
 )
@@ -255,26 +255,14 @@ def _validate_repository_path(data: dict) -> ValidationResult:
             error="repository must be a mapping",
         )
 
-    repo_path = repository.get("path")
-
-    if not isinstance(repo_path, str) or not repo_path.strip():
+    # repository.name is authoritative. When it resolves to a managed clone
+    # identity, normalize or ignore stale caller paths (e.g. /workspace/…)
+    # instead of failing on a missing guessed host filesystem path.
+    normalized, path_error = normalize_submit_repository_path(data)
+    if path_error is not None or not normalized:
         return ValidationResult(
             ok=False,
-            error="repository.path must be a non-empty string",
-        )
-
-    path = Path(repo_path)
-
-    if not path.exists():
-        return ValidationResult(
-            ok=False,
-            error=f"Repository path does not exist: {repo_path}",
-        )
-
-    if not path.is_dir():
-        return ValidationResult(
-            ok=False,
-            error=f"Repository path is not a directory: {repo_path}",
+            error=path_error or "repository.path is invalid",
         )
 
     return ValidationResult(ok=True)

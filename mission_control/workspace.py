@@ -80,6 +80,7 @@ _LEGAL_AI_REPOSITORY_NAMES = frozenset(
 NESTED_LEGALAI_WORK_DIR = ".legalai_work"
 
 REPOSITORY_ORIGIN_MISMATCH_PREFIX = "REPOSITORY_ORIGIN_MISMATCH:"
+REPOSITORY_PATH_IDENTITY_MISMATCH_PREFIX = "REPOSITORY_PATH_IDENTITY_MISMATCH:"
 NESTED_WORKSPACE_CONTAMINATION_PREFIX = "NESTED_WORKSPACE_CONTAMINATION:"
 PERSISTENCE_TEMP_PATH_BLOCKED_PREFIX = "PERSISTENCE_TEMP_PATH_BLOCKED:"
 
@@ -432,6 +433,119 @@ def resolve_agent_workspace_path(
             f"{requested}"
         )
     return str(resolved), None
+
+
+def repository_identity_is_managed(mission: dict) -> bool:
+    """Return whether ``repository.name`` is a resolvable managed identity.
+
+    Managed identity means Mission Control can resolve a clone URL from the
+    canonical name (aliases, URL map, or explicit ``owner/repo``). Caller
+    ``repository.path`` is then advisory and must not gate submission on a
+    guessed host path such as ``/workspace/<repo>``.
+    """
+    clone_url, url_error = resolve_mission_clone_url(mission)
+    return url_error is None and bool(clone_url)
+
+
+def normalize_submit_repository_path(
+    mission: dict,
+) -> tuple[str | None, str | None]:
+    """Resolve ``repository.path`` from canonical ``repository.name``.
+
+    ``repository.name`` is authoritative clone identity. When that identity is
+    managed, a missing or stale caller ``repository.path`` (including guessed
+    ``/workspace/...`` paths that are absent on the API host) is normalized to
+    ``'.'`` so async isolated runs can proceed. An existing absolute path whose
+    origin does not match the selected identity returns a clear pre-queue
+    identity mismatch instead of a raw filesystem-path failure.
+
+    Returns ``(normalized_path, error)``. On success the mission mapping's
+    ``repository.path`` is updated in place. Relative paths may not escape via
+    ``..``; arbitrary filesystem access is not granted from identity alone.
+    """
+    repository = mission.get("repository")
+    if not isinstance(repository, dict):
+        return None, "repository must be a mapping"
+
+    name = _repository_name(mission)
+    raw_path = repository.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        if repository_identity_is_managed(mission):
+            # Absent path with a valid managed identity → server-managed root.
+            repository["path"] = "."
+            return ".", None
+        return None, "repository.path must be a non-empty string"
+
+    requested = raw_path.strip()
+    managed = repository_identity_is_managed(mission)
+
+    if requested in {".", "./"}:
+        repository["path"] = "."
+        return ".", None
+
+    # Reject path-traversal segments in relative submit paths before any FS use.
+    if not os.path.isabs(requested) and not requested.startswith("~"):
+        parts = Path(requested).parts
+        if ".." in parts:
+            return None, (
+                "repository.path must not contain '..' path segments "
+                f"(got {requested!r})"
+            )
+        # Relative subdirectories are clone-relative; existence is checked
+        # after isolated checkout, not against the API host filesystem.
+        if managed:
+            repository["path"] = requested
+            return requested, None
+        path = Path(requested)
+        if not path.exists():
+            return None, f"Repository path does not exist: {requested}"
+        if not path.is_dir():
+            return None, f"Repository path is not a directory: {requested}"
+        repository["path"] = requested
+        return requested, None
+
+    expanded = os.path.expanduser(requested)
+    path = Path(expanded)
+
+    if not path.exists():
+        if managed:
+            # Stale host guess (e.g. /workspace/legal-ai) — ignore.
+            repository["path"] = "."
+            return ".", None
+        return None, f"Repository path does not exist: {requested}"
+
+    if not path.is_dir():
+        return None, f"Repository path is not a directory: {requested}"
+
+    real_path = os.path.realpath(str(path))
+
+    if managed:
+        expected_url, url_error = resolve_mission_clone_url(mission)
+        if url_error is not None or not expected_url:
+            repository["path"] = "."
+            return ".", None
+        actual_url = get_origin_url(real_path)
+        if actual_url:
+            expected_id = normalize_remote_url_identity(expected_url)
+            actual_id = normalize_remote_url_identity(actual_url)
+            if expected_id and actual_id and expected_id != actual_id:
+                return None, (
+                    f"{REPOSITORY_PATH_IDENTITY_MISMATCH_PREFIX} "
+                    f"repository.name={name!r} does not match "
+                    f"repository.path={requested!r} "
+                    f"(expected origin {expected_url}, found {actual_url})"
+                )
+            # Valid managed checkout on this host — keep the concrete path for
+            # legacy sync endpoints; async runs rebind absolutes to the clone.
+            repository["path"] = real_path
+            return real_path, None
+        # Existing directory without a matching git origin: do not treat the
+        # caller path as authoritative; use the managed workspace root.
+        repository["path"] = "."
+        return ".", None
+
+    repository["path"] = real_path
+    return real_path, None
 
 
 def nested_workspace_contamination_error(paths: list[str]) -> str | None:
