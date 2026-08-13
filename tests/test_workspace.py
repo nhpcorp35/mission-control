@@ -19,7 +19,10 @@ from mission_control.workspace import (
     DEFAULT_MISSION_CONTROL_CLONE_URL,
     LEGAL_AI_REPOSITORY_URL_ENV,
     NESTED_WORKSPACE_CONTAMINATION_PREFIX,
+    PLATFORM_MAIN_WRITE_ACK_REQUIRED,
     PLATFORM_PUSH_APPROVAL_REQUIRED,
+    PLATFORM_TARGET_BRANCH_REQUIRED,
+    POST_PUSH_RECONCILIATION_FAILURE_STAGE,
     REMOTE_RECONCILIATION_FAILURE_STAGE,
     REPOSITORY_ORIGIN_MISMATCH_PREFIX,
     REPOSITORY_URL_MAP_ENV,
@@ -33,15 +36,19 @@ from mission_control.workspace import (
     execute_registered_run,
     file_path_from_deliverable,
     get_origin_url,
+    is_platform_main_write_acknowledged,
     is_platform_push_authorized,
+    is_protected_default_branch,
     looks_like_file_path_deliverable,
     nested_workspace_contamination_error,
     normalize_remote_url_identity,
     persist_workspace_changes,
     prepare_isolated_workspace,
+    require_persistence_push_target,
     require_platform_push_approval,
     resolve_agent_workspace_path,
     resolve_mission_clone_url,
+    resolve_persistence_target_branch,
     resolve_safe_workspace_deliverable,
     verify_declared_file_deliverables,
     verify_workspace_origin_matches_mission,
@@ -116,7 +123,10 @@ class GitRepoFixture:
         persistence_mode: str | None = "push",
         platform_push_approved: bool | None = None,
         allow_automatic_platform_push: bool | None = None,
+        platform_main_write_acknowledged: bool | None = None,
+        target_branch: str | None = None,
         permissions_push: bool = False,
+        include_default_push_target: bool = True,
     ) -> dict:
         mission = {
             "mission_id": "2026-07-19-workspace",
@@ -130,7 +140,14 @@ class GitRepoFixture:
             },
         }
         if persistence_mode is not None:
-            mission["persistence"] = {"mode": persistence_mode}
+            persistence: dict[str, str] = {"mode": persistence_mode}
+            if persistence_mode == "push" and include_default_push_target:
+                persistence["target_branch"] = (
+                    self.base_branch if target_branch is None else target_branch
+                )
+            elif target_branch is not None:
+                persistence["target_branch"] = target_branch
+            mission["persistence"] = persistence
         approval: dict[str, bool] = {}
         if platform_push_approved is not None:
             approval["platform_push_approved"] = platform_push_approved
@@ -138,6 +155,25 @@ class GitRepoFixture:
             approval["allow_automatic_platform_push"] = (
                 allow_automatic_platform_push
             )
+        if platform_main_write_acknowledged is not None:
+            approval["platform_main_write_acknowledged"] = (
+                platform_main_write_acknowledged
+            )
+        elif (
+            persistence_mode == "push"
+            and include_default_push_target
+            and (
+                platform_push_approved is True
+                or allow_automatic_platform_push is True
+            )
+        ):
+            # Fixture base_branch is main; approved push tests need the
+            # distinct main-write acknowledgement unless a test overrides it.
+            resolved_target = (
+                self.base_branch if target_branch is None else target_branch
+            )
+            if is_protected_default_branch(resolved_target):
+                approval["platform_main_write_acknowledged"] = True
         if approval:
             mission["approval"] = approval
         return mission
@@ -2141,6 +2177,286 @@ class TestRemoteReconciliationPhase2(unittest.TestCase):
             self.assertIn(f"baseline_sha={baseline_sha}", failed_summary)
             self.assertIn("dirty=true", failed_summary)
             self.assertNotIn("no repository changes", failed_summary)
+        finally:
+            cleanup_workspace(workspace_path)
+
+
+class TestSafePushTarget(unittest.TestCase):
+    """Fail-closed push target, main-write ack, and post-push tip checks."""
+
+    def setUp(self) -> None:
+        self.fixture = GitRepoFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _prepare(self) -> str:
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        return prep.workspace_path
+
+    def test_push_fails_closed_when_target_branch_missing(self) -> None:
+        workspace_path = self._prepare()
+        try:
+            (Path(workspace_path) / "created.txt").write_text(
+                "mission output\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                platform_main_write_acknowledged=True,
+                include_default_push_target=False,
+            )
+            self.assertNotIn("target_branch", mission.get("persistence", {}))
+            self.assertEqual(
+                require_persistence_push_target(mission),
+                PLATFORM_TARGET_BRANCH_REQUIRED,
+            )
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-missing-target",
+                    mission,
+                    workspace_path,
+                )
+            self.assertFalse(result.ok)
+            self.assertFalse(result.pushed)
+            self.assertTrue(
+                (result.error or "").startswith("PLATFORM_TARGET_BRANCH_REQUIRED"),
+                result.error,
+            )
+            self.assertIsNone(result.target_branch)
+            mock_git.assert_not_called()
+            execute = validate_mission_for_execute(
+                {
+                    **mission,
+                    "version": "1.0",
+                    "title": "Missing target",
+                    "execution": {
+                        "agent": "cursor",
+                        "mode": "execute",
+                        "sandbox": True,
+                        "worktree": False,
+                    },
+                    "permissions": {
+                        "read": True,
+                        "create_files": True,
+                        "modify_files": False,
+                        "delete_files": False,
+                        "run_commands": True,
+                        "stage_changes": False,
+                        "commit": False,
+                        "push": False,
+                    },
+                    "instructions": "Do not choose a push branch in prose.",
+                    "deliverables": ["summary"],
+                    "approval": mission.get("approval", {}),
+                }
+            )
+            self.assertFalse(execute.ok)
+            self.assertTrue(
+                (execute.error or "").startswith("PLATFORM_TARGET_BRANCH_REQUIRED"),
+                execute.error,
+            )
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_non_main_refspec_pushes_only_approved_target_branch(self) -> None:
+        target = "mission/safe-target"
+        # Seed remote target at the same tip as base so pre-push reconciliation
+        # sees an unchanged remote for the approved target_branch.
+        _run_git(
+            [
+                "-C",
+                str(self.fixture.source_repo),
+                "push",
+                "origin",
+                f"{self.fixture.base_branch}:{target}",
+            ]
+        )
+        workspace_path = self._prepare()
+        try:
+            (Path(workspace_path) / "feature.txt").write_text(
+                "non-main\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                platform_main_write_acknowledged=False,
+                target_branch=target,
+            )
+            self.assertEqual(resolve_persistence_target_branch(mission), target)
+            self.assertFalse(is_platform_main_write_acknowledged(mission))
+            recorded: list[list[str]] = []
+            real_run_git = persist_workspace_changes.__globals__["_run_git"]
+
+            def _tracking_run_git(args, **kwargs):
+                recorded.append(list(args))
+                return real_run_git(args, **kwargs)
+
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ), patch(
+                "mission_control.workspace._run_git",
+                side_effect=_tracking_run_git,
+            ):
+                result = persist_workspace_changes(
+                    "run-non-main-target",
+                    mission,
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertTrue(result.pushed)
+            self.assertEqual(result.target_branch, target)
+            self.assertEqual(result.remote_tip_sha, result.commit_sha)
+            self.assertTrue(result.reconciled)
+            push_args = [args for args in recorded if "push" in args]
+            self.assertTrue(push_args)
+            self.assertIn(f"HEAD:{target}", push_args[0])
+            self.assertNotIn(
+                f"HEAD:{self.fixture.base_branch}",
+                push_args[0],
+            )
+            remote_target = _run_git(
+                ["-C", str(self.fixture.bare_remote), "rev-parse", target]
+            ).stdout.strip()
+            self.assertEqual(remote_target, result.commit_sha)
+            main_tip = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertNotEqual(main_tip, result.commit_sha)
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_main_push_requires_distinct_acknowledgement(self) -> None:
+        workspace_path = self._prepare()
+        try:
+            (Path(workspace_path) / "main.txt").write_text(
+                "blocked\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                platform_main_write_acknowledged=False,
+                target_branch="main",
+            )
+            # Explicit false must win over fixture auto-ack for approved pushes.
+            mission["approval"]["platform_main_write_acknowledged"] = False
+            self.assertEqual(
+                require_persistence_push_target(mission),
+                PLATFORM_MAIN_WRITE_ACK_REQUIRED,
+            )
+            with patch("mission_control.workspace._run_git") as mock_git:
+                result = persist_workspace_changes(
+                    "run-main-no-ack",
+                    mission,
+                    workspace_path,
+                )
+            self.assertFalse(result.ok)
+            self.assertFalse(result.pushed)
+            self.assertEqual(result.target_branch, "main")
+            self.assertTrue(
+                (result.error or "").startswith("PLATFORM_MAIN_WRITE_ACK_REQUIRED"),
+                result.error,
+            )
+            mock_git.assert_not_called()
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_post_push_reconciliation_mismatch_keeps_pushed_false(self) -> None:
+        workspace_path = self._prepare()
+        try:
+            (Path(workspace_path) / "mismatch.txt").write_text(
+                "push then lie\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+            )
+            real_fetch = persist_workspace_changes.__globals__[
+                "_fetch_remote_branch_sha"
+            ]
+            fetch_calls = {"n": 0}
+
+            def _fetch_with_mismatch(workspace, branch, *, env):
+                fetch_calls["n"] += 1
+                sha, error = real_fetch(workspace, branch, env=env)
+                # After the platform push, lie about the remote tip.
+                if fetch_calls["n"] >= 2 and error is None and sha:
+                    return ("0" * 40, None)
+                return sha, error
+
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ), patch(
+                "mission_control.workspace._fetch_remote_branch_sha",
+                side_effect=_fetch_with_mismatch,
+            ):
+                result = persist_workspace_changes(
+                    "run-post-push-mismatch",
+                    mission,
+                    workspace_path,
+                )
+            self.assertFalse(result.ok)
+            self.assertFalse(result.pushed)
+            self.assertEqual(result.target_branch, self.fixture.base_branch)
+            self.assertEqual(result.remote_tip_sha, "0" * 40)
+            self.assertEqual(
+                result.failure_stage,
+                POST_PUSH_RECONCILIATION_FAILURE_STAGE,
+            )
+            self.assertFalse(bool(result.reconciled))
+            self.assertIn("Post-push reconciliation failed", result.error or "")
+            self.assertIn("target_branch=", result.error or "")
+        finally:
+            cleanup_workspace(workspace_path)
+
+    def test_approved_target_push_success_records_tip_evidence(self) -> None:
+        workspace_path = self._prepare()
+        try:
+            (Path(workspace_path) / "ok.txt").write_text(
+                "safe push\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+            )
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "run-safe-push-success",
+                    mission,
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertTrue(result.pushed)
+            self.assertEqual(result.target_branch, self.fixture.base_branch)
+            self.assertEqual(result.remote_tip_sha, result.commit_sha)
+            self.assertTrue(result.reconciled)
+            self.assertIsNone(result.failure_stage)
+            remote_tip = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(remote_tip, result.remote_tip_sha)
         finally:
             cleanup_workspace(workspace_path)
 

@@ -6,6 +6,7 @@ import yaml
 
 from mission_control.workspace import (
     normalize_submit_repository_path,
+    require_persistence_push_target,
     require_platform_push_approval,
     resolve_persistence_mode,
 )
@@ -158,6 +159,17 @@ def _validate_persistence(data: dict) -> ValidationResult:
                 "(expected one of: none, commit, push)"
             ),
         )
+
+    if "target_branch" in persistence and persistence.get("target_branch") is not None:
+        raw_target = persistence.get("target_branch")
+        if not isinstance(raw_target, str) or not raw_target.strip():
+            return ValidationResult(
+                ok=False,
+                error=(
+                    "persistence.target_branch must be a non-empty string "
+                    "when provided"
+                ),
+            )
 
     return ValidationResult(ok=True)
 
@@ -410,5 +422,12 @@ def validate_mission_for_execute(
     approval_error = require_platform_push_approval(data)
     if approval_error is not None:
         return ValidationResult(ok=False, error=approval_error)
+
+    # Push destination must be structured persistence.target_branch.
+    # Default-branch (main/master) also requires distinct main-write ack.
+    # Agent prose never selects or overrides the target.
+    target_error = require_persistence_push_target(data)
+    if target_error is not None:
+        return ValidationResult(ok=False, error=target_error)
 
     return ValidationResult(ok=True)

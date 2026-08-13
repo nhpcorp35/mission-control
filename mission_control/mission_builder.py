@@ -22,6 +22,7 @@ DEFAULT_BASE_BRANCH = "main"
 DEFAULT_RUN_COMMANDS = True
 DEFAULT_PLATFORM_PUSH_APPROVED = False
 DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH = False
+DEFAULT_PLATFORM_MAIN_WRITE_ACKNOWLEDGED = False
 
 
 def resolve_structured_persistence_mode(
@@ -57,6 +58,7 @@ def build_mission_spec(
     create_files: bool,
     modify_files: bool,
     persistence_mode: str | None = None,
+    target_branch: str | None = None,
     repository_name: str = DEFAULT_REPOSITORY_NAME,
     repository_path: str = DEFAULT_REPOSITORY_PATH,
     base_branch: str = DEFAULT_BASE_BRANCH,
@@ -65,13 +67,26 @@ def build_mission_spec(
     allow_automatic_platform_push: bool = (
         DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH
     ),
+    platform_main_write_acknowledged: bool = (
+        DEFAULT_PLATFORM_MAIN_WRITE_ACKNOWLEDGED
+    ),
 ) -> dict[str, Any]:
-    """Build a Mission Spec v1.0 dictionary with safe execute defaults."""
+    """Build a Mission Spec v1.0 dictionary with safe execute defaults.
+
+    ``target_branch`` maps to structured ``persistence.target_branch`` and is
+    never inferred from agent prose. Callers must supply it for push mode;
+    main/master also requires ``platform_main_write_acknowledged``.
+    """
     resolved_persistence_mode = resolve_structured_persistence_mode(
         create_files=create_files,
         modify_files=modify_files,
         persistence_mode=persistence_mode,
     )
+    persistence: dict[str, Any] = {
+        "mode": resolved_persistence_mode,
+    }
+    if target_branch is not None:
+        persistence["target_branch"] = target_branch
     return {
         "version": "1.0",
         "mission_id": mission_id,
@@ -105,10 +120,11 @@ def build_mission_spec(
             "push_requires_approval": True,
             "platform_push_approved": platform_push_approved,
             "allow_automatic_platform_push": allow_automatic_platform_push,
+            "platform_main_write_acknowledged": (
+                platform_main_write_acknowledged
+            ),
         },
-        "persistence": {
-            "mode": resolved_persistence_mode,
-        },
+        "persistence": persistence,
     }
 
 
@@ -121,6 +137,7 @@ def render_mission_yaml(
     create_files: bool,
     modify_files: bool,
     persistence_mode: str | None = None,
+    target_branch: str | None = None,
     repository_name: str = DEFAULT_REPOSITORY_NAME,
     repository_path: str = DEFAULT_REPOSITORY_PATH,
     base_branch: str = DEFAULT_BASE_BRANCH,
@@ -128,6 +145,9 @@ def render_mission_yaml(
     platform_push_approved: bool = DEFAULT_PLATFORM_PUSH_APPROVED,
     allow_automatic_platform_push: bool = (
         DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH
+    ),
+    platform_main_write_acknowledged: bool = (
+        DEFAULT_PLATFORM_MAIN_WRITE_ACKNOWLEDGED
     ),
 ) -> str:
     """Render Mission Spec v1.0 YAML text via ``yaml.safe_dump``."""
@@ -139,12 +159,14 @@ def render_mission_yaml(
         create_files=create_files,
         modify_files=modify_files,
         persistence_mode=persistence_mode,
+        target_branch=target_branch,
         repository_name=repository_name,
         repository_path=repository_path,
         base_branch=base_branch,
         run_commands=run_commands,
         platform_push_approved=platform_push_approved,
         allow_automatic_platform_push=allow_automatic_platform_push,
+        platform_main_write_acknowledged=platform_main_write_acknowledged,
     )
     return yaml.safe_dump(
         spec,

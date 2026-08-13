@@ -47,6 +47,27 @@ PLATFORM_PUSH_APPROVAL_REQUIRED = (
     "allow_automatic_platform_push=true policy)"
 )
 
+# Push destination must be an explicit structured field — never inferred from
+# agent prose, repository.base_branch alone, or branch-only approval.
+PLATFORM_TARGET_BRANCH_REQUIRED = (
+    "PLATFORM_TARGET_BRANCH_REQUIRED: persistence.mode=push requires "
+    "explicit persistence.target_branch"
+)
+
+# Updating main/master requires a distinct acknowledgement beyond
+# approval.platform_push_approved (branch-only approval never updates main).
+PLATFORM_MAIN_WRITE_ACK_REQUIRED = (
+    "PLATFORM_MAIN_WRITE_ACK_REQUIRED: persistence.target_branch main/master "
+    "requires approval.platform_main_write_acknowledged=true "
+    "(platform_push_approved alone is insufficient)"
+)
+
+# Protected default-branch names for main-write acknowledgement.
+PROTECTED_DEFAULT_BRANCH_NAMES = frozenset({"main", "master"})
+
+# Post-push tip must equal local HEAD before pushed=true.
+POST_PUSH_RECONCILIATION_FAILURE_STAGE = "post_push_reconciliation"
+
 # Optional JSON object mapping repository.name → clone URL.
 REPOSITORY_URL_MAP_ENV = "MISSION_CONTROL_REPOSITORY_URL_MAP"
 # Optional override when repository.name selects Mission Control itself.
@@ -142,6 +163,10 @@ class PersistenceResult:
     ``pushed_by_external_or_agent``, ``failure_stage``,
     ``recommended_next_action``) describe unexpected remote advancement
     handling. They must never include secret values.
+
+    ``target_branch`` is the structured ``persistence.target_branch`` used for
+    push (never selected from agent prose). ``remote_tip_sha`` is the resolved
+    remote tip of that branch after push reconciliation.
     """
 
     ok: bool
@@ -157,6 +182,8 @@ class PersistenceResult:
     pushed_by_external_or_agent: bool | None = None
     failure_stage: str | None = None
     recommended_next_action: str | None = None
+    target_branch: str | None = None
+    remote_tip_sha: str | None = None
 
 
 def resolve_persistence_mode(mission: dict) -> str:
@@ -204,6 +231,57 @@ def require_platform_push_approval(mission: dict) -> str | None:
     if is_platform_push_authorized(mission):
         return None
     return PLATFORM_PUSH_APPROVAL_REQUIRED
+
+
+def resolve_persistence_target_branch(mission: dict) -> str | None:
+    """Return structured ``persistence.target_branch``, or ``None`` if unset.
+
+    Agent instructions / stdout never supply this value. Empty strings are
+    treated as missing so push fails closed.
+    """
+    persistence = mission.get("persistence")
+    if not isinstance(persistence, dict):
+        return None
+    raw = persistence.get("target_branch")
+    if raw is None:
+        return None
+    target = str(raw).strip()
+    if not target:
+        return None
+    return target
+
+
+def is_protected_default_branch(branch: str) -> bool:
+    """Return whether ``branch`` is a protected default-branch name."""
+    return str(branch).strip() in PROTECTED_DEFAULT_BRANCH_NAMES
+
+
+def is_platform_main_write_acknowledged(mission: dict) -> bool:
+    """Return whether default-branch push acknowledgement is present.
+
+    Distinct from ``approval.platform_push_approved`` / automatic push policy.
+    Branch-only approval must never authorize updates to main/master.
+    """
+    approval = mission.get("approval")
+    if not isinstance(approval, dict):
+        return False
+    return approval.get("platform_main_write_acknowledged") is True
+
+
+def require_persistence_push_target(mission: dict) -> str | None:
+    """Return an error when push target is missing or main lacks acknowledgement.
+
+    Modes ``none`` and ``commit`` never require a push target.
+    """
+    if resolve_persistence_mode(mission) != "push":
+        return None
+    target = resolve_persistence_target_branch(mission)
+    if target is None:
+        return PLATFORM_TARGET_BRANCH_REQUIRED
+    if is_protected_default_branch(target):
+        if not is_platform_main_write_acknowledged(mission):
+            return PLATFORM_MAIN_WRITE_ACK_REQUIRED
+    return None
 
 
 def _run_git(
@@ -924,6 +1002,9 @@ def _remote_reconciliation_failure(
     workspace_sha: str | None,
     dirty: bool,
     detail: str,
+    target_branch: str | None = None,
+    remote_tip_sha: str | None = None,
+    failure_stage: str = REMOTE_RECONCILIATION_FAILURE_STAGE,
 ) -> PersistenceResult:
     """Fail closed when remote advanced with non-matching workspace state."""
     return PersistenceResult(
@@ -938,8 +1019,10 @@ def _remote_reconciliation_failure(
         dirty=dirty,
         reconciled=False,
         pushed_by_external_or_agent=False,
-        failure_stage=REMOTE_RECONCILIATION_FAILURE_STAGE,
+        failure_stage=failure_stage,
         recommended_next_action=REMOTE_RECONCILIATION_NEXT_ACTION,
+        target_branch=target_branch,
+        remote_tip_sha=remote_tip_sha,
     )
 
 
@@ -1002,29 +1085,44 @@ def _read_head_commit_sha(
     remote_sha: str | None = None,
     workspace_sha: str | None = None,
     dirty: bool | None = None,
+    target_branch: str | None = None,
+    remote_tip_sha: str | None = None,
+    reconciled: bool | None = None,
+    failure_stage: str | None = None,
+    error: str | None = None,
+    ok: bool = True,
 ) -> PersistenceResult:
-    commit_sha, error = _read_commit_sha(workspace_path, "HEAD")
-    if error is not None or not commit_sha:
+    commit_sha, read_error = _read_commit_sha(workspace_path, "HEAD")
+    if read_error is not None or not commit_sha:
         return PersistenceResult(
             ok=False,
-            error=error or "git rev-parse returned an empty commit SHA",
+            error=error or read_error or "git rev-parse returned an empty commit SHA",
             mode=mode,
             pushed=False,
             baseline_sha=baseline_sha,
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_tip_sha,
+            reconciled=False if reconciled is None else reconciled,
+            failure_stage=failure_stage,
         )
 
     return PersistenceResult(
-        ok=True,
+        ok=ok,
         commit_sha=commit_sha,
+        error=error,
         mode=mode,
         pushed=pushed,
         baseline_sha=baseline_sha,
         remote_sha=remote_sha,
         workspace_sha=workspace_sha or commit_sha,
         dirty=dirty,
+        target_branch=target_branch,
+        remote_tip_sha=remote_tip_sha,
+        reconciled=reconciled,
+        failure_stage=failure_stage,
     )
 
 
@@ -1041,21 +1139,26 @@ def persist_workspace_changes(
 
     - ``none``: do not stage, commit, or push
     - ``commit``: stage and create a local commit, but do not push
-    - ``push``: stage, commit, and push to the mission base branch
-      (requires explicit platform-push approval; see
-      ``require_platform_push_approval``)
+    - ``push``: stage, commit, and push HEAD only to structured
+      ``persistence.target_branch`` (requires explicit platform-push approval
+      via ``require_platform_push_approval``, an explicit target branch, and
+      ``approval.platform_main_write_acknowledged`` when the target is
+      main/master)
 
     Agent ``permissions.commit`` / ``permissions.push`` / ``permissions.stage_changes``
     are legacy agent-facing fields only. They do not control this platform
-    persistence path; ``persistence.mode`` is authoritative. Approval is
-    enforced again here so a run cannot bypass the gate merely because earlier
-    validation succeeded.
+    persistence path; ``persistence.mode`` is authoritative. Approval and
+    target gates are enforced again here so a run cannot bypass them merely
+    because earlier validation succeeded. Agent prose never selects or
+    overrides ``persistence.target_branch``.
 
     For ``push``, immediately before commit/push Mission Control fetches the
-    target remote branch and reconciles baseline, workspace HEAD, dirty state,
-    and current remote tip. Unexpected remote advancement never force-pushes
-    or silently overwrites; exact already-pushed workspace commits are
-    classified as transitional reconciliation instead.
+    approved target remote branch and reconciles baseline, workspace HEAD,
+    dirty state, and current remote tip. Unexpected remote advancement never
+    force-pushes or silently overwrites; exact already-pushed workspace
+    commits are classified as transitional reconciliation instead. After a
+    successful ``git push``, the remote target tip must equal local HEAD
+    before ``pushed=true``.
     """
     mode = resolve_persistence_mode(mission)
     if mode not in SUPPORTED_PERSISTENCE_MODES:
@@ -1077,6 +1180,7 @@ def persist_workspace_changes(
             pushed=False,
         )
 
+    target_branch: str | None = None
     if mode == "push":
         approval_error = require_platform_push_approval(mission)
         if approval_error is not None:
@@ -1086,6 +1190,17 @@ def persist_workspace_changes(
                 mode="push",
                 pushed=False,
             )
+        target_error = require_persistence_push_target(mission)
+        if target_error is not None:
+            return PersistenceResult(
+                ok=False,
+                error=target_error,
+                mode="push",
+                pushed=False,
+                target_branch=resolve_persistence_target_branch(mission),
+            )
+        target_branch = resolve_persistence_target_branch(mission)
+        assert target_branch is not None
 
     mismatch = verify_workspace_origin_matches_mission(mission, workspace_path)
     if mismatch is not None:
@@ -1094,6 +1209,7 @@ def persist_workspace_changes(
             error=mismatch,
             mode=mode,
             pushed=False,
+            target_branch=target_branch,
         )
 
     status = _git_status_porcelain(workspace_path)
@@ -1106,6 +1222,7 @@ def persist_workspace_changes(
             error=_redact_secret_text(message),
             mode=mode,
             pushed=False,
+            target_branch=target_branch,
         )
 
     dirty = bool(status.stdout.strip())
@@ -1117,6 +1234,7 @@ def persist_workspace_changes(
             mode=mode,
             pushed=False,
             dirty=dirty,
+            target_branch=target_branch,
         )
 
     resolved_baseline = baseline_sha
@@ -1127,6 +1245,7 @@ def persist_workspace_changes(
 
     remote_sha: str | None = None
     if mode == "push":
+        assert target_branch is not None
         push_env, push_auth_error = _github_push_environment()
         # Local/file remotes used in tests need no token; GitHub HTTPS does.
         fetch_env = push_env
@@ -1134,7 +1253,7 @@ def persist_workspace_changes(
             fetch_env = None
         remote_sha, fetch_error = _fetch_remote_branch_sha(
             workspace_path,
-            str(mission["repository"]["base_branch"]),
+            target_branch,
             env=fetch_env,
         )
         if fetch_error is not None or not remote_sha:
@@ -1148,6 +1267,7 @@ def persist_workspace_changes(
                     baseline_sha=resolved_baseline,
                     workspace_sha=workspace_sha,
                     dirty=dirty,
+                    target_branch=target_branch,
                 )
             return _remote_reconciliation_failure(
                 mode=mode,
@@ -1155,6 +1275,8 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=dirty,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
                 detail=(
                     "Failed to fetch target remote branch for reconciliation: "
                     f"{fetch_error or 'unknown fetch error'}"
@@ -1181,6 +1303,8 @@ def persist_workspace_changes(
                     pushed_by_external_or_agent=True,
                     failure_stage=None,
                     recommended_next_action=None,
+                    target_branch=target_branch,
+                    remote_tip_sha=remote_sha,
                 )
             return _remote_reconciliation_failure(
                 mode=mode,
@@ -1188,9 +1312,12 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=dirty,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
                 detail=(
                     "Remote branch advanced unexpectedly during the run; "
                     "refusing to overwrite, force-push, or claim no changes. "
+                    f"target_branch={target_branch} "
                     f"baseline_sha={resolved_baseline} "
                     f"remote_sha={remote_sha} "
                     f"workspace_sha={workspace_sha} "
@@ -1211,6 +1338,8 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=False,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
             )
         if mode != "push":
             return _read_head_commit_sha(
@@ -1221,6 +1350,8 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=False,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
             )
         # Fall through to push existing local commits (no new commit).
     else:
@@ -1236,6 +1367,8 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=True,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
             )
 
         add = _run_git(["-C", workspace_path, "add", "-A"])
@@ -1252,6 +1385,8 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=True,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
             )
 
         identity_error = configure_git_identity(workspace_path)
@@ -1265,6 +1400,8 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=True,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
             )
 
         commit = _run_git(
@@ -1289,6 +1426,8 @@ def persist_workspace_changes(
                 remote_sha=remote_sha,
                 workspace_sha=workspace_sha,
                 dirty=True,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
             )
 
         workspace_sha, workspace_sha_error = _read_commit_sha(workspace_path, "HEAD")
@@ -1301,6 +1440,8 @@ def persist_workspace_changes(
                 baseline_sha=resolved_baseline,
                 remote_sha=remote_sha,
                 dirty=True,
+                target_branch=target_branch,
+                remote_tip_sha=remote_sha,
             )
 
     if mode == "commit":
@@ -1312,8 +1453,11 @@ def persist_workspace_changes(
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_sha,
         )
 
+    assert target_branch is not None
     push_env, push_auth_error = _github_push_environment()
     if push_auth_error is not None:
         sha_result = _read_head_commit_sha(
@@ -1324,6 +1468,8 @@ def persist_workspace_changes(
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_sha,
         )
         return PersistenceResult(
             ok=False,
@@ -1335,6 +1481,8 @@ def persist_workspace_changes(
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_sha,
         )
 
     # Push to the origin fetch URL explicitly so a workspace-local disabled
@@ -1349,6 +1497,8 @@ def persist_workspace_changes(
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_sha,
         )
         return PersistenceResult(
             ok=False,
@@ -1360,16 +1510,19 @@ def persist_workspace_changes(
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_sha,
         )
 
-    base_branch = mission["repository"]["base_branch"]
+    # Push HEAD only to the approved structured target_branch — never to
+    # repository.base_branch by implication and never from agent prose.
     push = _run_git(
         [
             "-C",
             workspace_path,
             "push",
             origin_url,
-            f"HEAD:{base_branch}",
+            f"HEAD:{target_branch}",
         ],
         env=push_env,
     )
@@ -1385,6 +1538,8 @@ def persist_workspace_changes(
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_sha,
         )
         return PersistenceResult(
             ok=False,
@@ -1396,16 +1551,70 @@ def persist_workspace_changes(
             remote_sha=remote_sha,
             workspace_sha=workspace_sha,
             dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_sha,
+            reconciled=False,
         )
 
-    return _read_head_commit_sha(
+    local_sha, local_sha_error = _read_commit_sha(workspace_path, "HEAD")
+    if local_sha_error is not None or not local_sha:
+        return PersistenceResult(
+            ok=False,
+            error=local_sha_error or "failed to read local HEAD after push",
+            mode="push",
+            pushed=False,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=workspace_sha,
+            dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=None,
+            reconciled=False,
+            failure_stage=POST_PUSH_RECONCILIATION_FAILURE_STAGE,
+        )
+
+    remote_tip_sha, tip_error = _fetch_remote_branch_sha(
         workspace_path,
+        target_branch,
+        env=push_env,
+    )
+    if tip_error is not None or not remote_tip_sha or remote_tip_sha != local_sha:
+        detail = (
+            "Post-push reconciliation failed: remote target tip must equal "
+            f"local HEAD before pushed=true. target_branch={target_branch} "
+            f"local_sha={local_sha} "
+            f"remote_tip_sha={remote_tip_sha or 'unknown'} "
+            f"error={tip_error or 'tip mismatch'}"
+        )
+        return PersistenceResult(
+            ok=False,
+            error=_redact_secret_text(detail),
+            mode="push",
+            pushed=False,
+            commit_sha=local_sha,
+            baseline_sha=resolved_baseline,
+            remote_sha=remote_sha,
+            workspace_sha=local_sha,
+            dirty=dirty,
+            target_branch=target_branch,
+            remote_tip_sha=remote_tip_sha,
+            reconciled=False,
+            failure_stage=POST_PUSH_RECONCILIATION_FAILURE_STAGE,
+            recommended_next_action=REMOTE_RECONCILIATION_NEXT_ACTION,
+        )
+
+    return PersistenceResult(
+        ok=True,
+        commit_sha=local_sha,
         mode="push",
         pushed=True,
         baseline_sha=resolved_baseline,
         remote_sha=remote_sha,
-        workspace_sha=workspace_sha,
+        workspace_sha=local_sha,
         dirty=dirty,
+        target_branch=target_branch,
+        remote_tip_sha=remote_tip_sha,
+        reconciled=True,
     )
 
 
