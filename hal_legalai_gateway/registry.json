@@ -245,13 +245,15 @@
       "tool": "mission.wait",
       "namespace": "mission",
       "downstream_service": "mission_control",
-      "downstream_tool": "wait_for_run"
+      "downstream_tool": "wait_for_run",
+      "description": "Wait for a Mission Control run to reach a terminal status (completed, failed, timed_out, or cancelled) or timeout_seconds. Forwards Phase 2B monitoring fields (heartbeat_health, stale_heartbeat, monitoring_history, cursor, stale_threshold_seconds) unchanged from Mission Control. Optional cursor resumes bounded history after wait_expired; omit for legacy callers. Wait expiry never mutates or cancels the run."
     },
     {
       "tool": "mission.submit_and_wait",
       "namespace": "mission",
       "downstream_service": "mission_control",
-      "downstream_tool": "submit_and_wait"
+      "downstream_tool": "submit_and_wait",
+      "description": "Submit exact mission YAML and wait for a terminal run state. Returns Phase 2B monitoring fields from Mission Control. When wait_expired is true, resume with mission.wait using the same run_id and returned cursor."
     },
     {
       "tool": "mission.run_repository_command",

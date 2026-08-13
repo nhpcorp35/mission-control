@@ -49,14 +49,16 @@ mcp = FastMCP(
         "checkout without free-form YAML, use run_repository_command. "
         "Intended HAL flow: submit_and_wait with exact YAML, or "
         "submit_structured_run (or submit_run) then wait_for_run until "
-        "status is terminal (or repeat when wait_expired is true), then "
-        "inspect status, summary, result.persistence, and commit_sha. "
-        "Prefer summary / result.persistence / commit_sha over agent stdout "
-        "for persistence claims (platform persistence runs after the agent "
-        "completes). wait_for_run / submit_and_wait default timeout is "
+        "status is terminal (completed, failed, timed_out, or cancelled) "
+        "or repeat when wait_expired is true with the same run_id and "
+        "optional cursor, then inspect status, summary, result.persistence, "
+        "commit_sha, and Phase 2B monitoring fields. Prefer summary / "
+        "result.persistence / commit_sha over agent stdout for persistence "
+        "claims (platform persistence runs after the agent completes). "
+        "wait_for_run / submit_and_wait default timeout is "
         f"{MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s; requested timeouts are "
-        f"honored up to {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s. When "
-        "wait_expired is true, call wait_for_run again with the same run_id."
+        f"honored up to {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s and never "
+        "mutate or cancel the run on wait expiry."
     ),
     host="0.0.0.0",
     port=int(os.environ.get("PORT", "8001")),
@@ -175,23 +177,30 @@ async def wait_for_run(
     run_id: str,
     timeout_seconds: float = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
     poll_interval_seconds: float = MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+    cursor: str | None = None,
 ) -> dict[str, Any]:
     """Wait for a run to reach a terminal status.
 
-    Polls through the same authenticated get_run path until the run is
-    terminal (completed, failed, or timed_out) or timeout_seconds elapses.
-    Returns immediately when already terminal. poll_interval_seconds
-    controls delay between get_run polls.
+    Forwards to authenticated POST /runs/{run_id}/wait (Mission Control is
+    the monitoring source of truth). Polls until the run is terminal
+    (completed, failed, timed_out, or cancelled) or timeout_seconds
+    elapses. Returns immediately when already terminal.
+    poll_interval_seconds controls delay between registry lookups.
 
     Default timeout_seconds is 20. Requested timeouts are honored up to
-    3600s (aligned with POST /runs/{run_id}/wait); larger values are
-    capped. Zero/negative values are rejected. When wait_expired is true,
-    call wait_for_run again with the same run_id.
+    3600s; larger values are capped. Zero/negative values are rejected.
+    Optional cursor resumes bounded monitoring_history after wait_expired;
+    omit cursor for legacy callers. When wait_expired is true, call again
+    with the same run_id and returned cursor. Wait expiry never mutates
+    or cancels the run.
 
-    On terminal status returns ok=true with run fields, wait_expired=false,
-    and timeout_seconds (effective). When the wait window expires while
-    still queued/running, returns ok=true with the latest run fields,
-    wait_expired=true, and timeout_seconds — not a transport/tool error.
+    On terminal status returns ok=true with run fields plus Phase 2B
+    monitoring fields (heartbeat_health, stale_heartbeat,
+    monitoring_history, cursor, stale_threshold_seconds),
+    wait_expired=false, and timeout_seconds (effective). When the wait
+    window expires while still queued/running, returns ok=true with the
+    latest run fields, wait_expired=true, resumable cursor, and
+    timeout_seconds — not a transport/tool error.
     """
     try:
         if not run_id.strip():
@@ -201,6 +210,7 @@ async def wait_for_run(
             run_id,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
+            cursor=cursor,
         )
         return {"ok": True, **result}
     except Exception as exc:
@@ -212,15 +222,17 @@ async def submit_and_wait(
     mission_yaml: str,
     timeout_seconds: float = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
     poll_interval_seconds: float = MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+    cursor: str | None = None,
 ) -> dict[str, Any]:
     """Submit exact mission YAML and wait for a terminal run state.
 
     One-shot HAL path: reuses authenticated submit_run then wait_for_run
-    (same timeout_seconds / poll_interval_seconds validation and limits as
-    wait_for_run). Returns the accepted run_id and final authoritative run
-    payload. Submission failures return the existing structured submission
-    error without waiting. When wait_expired is true, resume with
-    wait_for_run using the same run_id.
+    (same timeout_seconds / poll_interval_seconds / cursor validation and
+    limits as wait_for_run). Returns the accepted run_id and final
+    authoritative run payload including Phase 2B monitoring fields.
+    Submission failures return the existing structured submission error
+    without waiting. When wait_expired is true, resume with wait_for_run
+    using the same run_id and returned cursor.
     """
     try:
         if not mission_yaml.strip():
@@ -230,6 +242,7 @@ async def submit_and_wait(
             mission_yaml,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
+            cursor=cursor,
         )
         return {"ok": True, **result}
     except Exception as exc:

@@ -227,14 +227,28 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         namespace="mission",
         downstream_service="mission_control",
         downstream_tool="wait_for_run",
-        description="Wait for a Mission Control run to reach a terminal status.",
+        description=(
+            "Wait for a Mission Control run to reach a terminal status "
+            "(completed, failed, timed_out, or cancelled) or "
+            "timeout_seconds. Forwards Phase 2B monitoring fields "
+            "(heartbeat_health, stale_heartbeat, monitoring_history, cursor, "
+            "stale_threshold_seconds) unchanged from Mission Control. "
+            "Optional cursor resumes bounded history after wait_expired; "
+            "omit for legacy callers. Wait expiry never mutates or cancels "
+            "the run."
+        ),
     ),
     ToolBinding(
         gateway_tool="mission.submit_and_wait",
         namespace="mission",
         downstream_service="mission_control",
         downstream_tool="submit_and_wait",
-        description="Submit exact mission YAML and wait for a terminal run state.",
+        description=(
+            "Submit exact mission YAML and wait for a terminal run state. "
+            "Returns Phase 2B monitoring fields from Mission Control. When "
+            "wait_expired is true, resume with mission.wait using the same "
+            "run_id and returned cursor."
+        ),
     ),
     ToolBinding(
         gateway_tool="mission.run_repository_command",
@@ -691,38 +705,63 @@ def register_forwarding_tools(
     async def mission_status(run_id: str) -> dict[str, Any]:
         return await _forward("mission.status", {"run_id": run_id})
 
-    @mcp.tool(name="mission.wait", description=by_name["mission.wait"].description)
+    @mcp.tool(
+        name="mission.wait",
+        description=(
+            by_name["mission.wait"].description
+            or (
+                "Wait for a Mission Control run to reach a terminal status "
+                "(completed, failed, timed_out, or cancelled) or "
+                "timeout_seconds. Forwards Phase 2B monitoring fields "
+                "(heartbeat_health, stale_heartbeat, monitoring_history, "
+                "cursor, stale_threshold_seconds) unchanged from Mission "
+                "Control. Optional cursor resumes bounded history after "
+                "wait_expired; omit for legacy callers. Wait expiry never "
+                "mutates or cancels the run."
+            )
+        ),
+    )
     async def mission_wait(
         run_id: str,
         timeout_seconds: float = 20.0,
         poll_interval_seconds: float = 2.0,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        return await _forward(
-            "mission.wait",
-            {
-                "run_id": run_id,
-                "timeout_seconds": timeout_seconds,
-                "poll_interval_seconds": poll_interval_seconds,
-            },
-        )
+        args: dict[str, Any] = {
+            "run_id": run_id,
+            "timeout_seconds": timeout_seconds,
+            "poll_interval_seconds": poll_interval_seconds,
+        }
+        if cursor is not None:
+            args["cursor"] = cursor
+        return await _forward("mission.wait", args)
 
     @mcp.tool(
         name="mission.submit_and_wait",
-        description=by_name["mission.submit_and_wait"].description,
+        description=(
+            by_name["mission.submit_and_wait"].description
+            or (
+                "Submit exact mission YAML and wait for a terminal run state. "
+                "Returns Phase 2B monitoring fields from Mission Control. "
+                "When wait_expired is true, resume with mission.wait using "
+                "the same run_id and returned cursor."
+            )
+        ),
     )
     async def mission_submit_and_wait(
         mission_yaml: str,
         timeout_seconds: float = 20.0,
         poll_interval_seconds: float = 2.0,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        return await _forward(
-            "mission.submit_and_wait",
-            {
-                "mission_yaml": mission_yaml,
-                "timeout_seconds": timeout_seconds,
-                "poll_interval_seconds": poll_interval_seconds,
-            },
-        )
+        args: dict[str, Any] = {
+            "mission_yaml": mission_yaml,
+            "timeout_seconds": timeout_seconds,
+            "poll_interval_seconds": poll_interval_seconds,
+        }
+        if cursor is not None:
+            args["cursor"] = cursor
+        return await _forward("mission.submit_and_wait", args)
 
     @mcp.tool(
         name="mission.run_repository_command",

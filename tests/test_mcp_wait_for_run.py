@@ -1,4 +1,4 @@
-"""Focused tests for the MCP wait_for_run tool and client polling."""
+"""Focused tests for the MCP wait_for_run tool and Phase 2B wait forwarding."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from mcp_connector.client import (
     MCP_WAIT_MIN_POLL_INTERVAL_SECONDS,
     MCP_WAIT_MIN_TIMEOUT_SECONDS,
     MissionControlClient,
+    normalize_mcp_wait_cursor,
     normalize_mcp_wait_poll_interval,
     normalize_mcp_wait_timeout,
 )
@@ -112,6 +113,16 @@ class TestNormalizeMcpWaitBounds(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     normalize_mcp_wait_poll_interval(value)
                 self.assertIn("poll_interval_seconds", str(ctx.exception))
+
+    def test_normalize_cursor_bounds(self) -> None:
+        from mission_control.monitoring import MONITOR_CURSOR_MAX_CHARS
+
+        self.assertIsNone(normalize_mcp_wait_cursor(None))
+        self.assertIsNone(normalize_mcp_wait_cursor("  "))
+        self.assertEqual(normalize_mcp_wait_cursor(" abc "), "abc")
+        with self.assertRaises(ValueError) as ctx:
+            normalize_mcp_wait_cursor("x" * (MONITOR_CURSOR_MAX_CHARS + 1))
+        self.assertIn("cursor", str(ctx.exception))
 
 
 class TestSubmitStructuredRunClient(unittest.IsolatedAsyncioTestCase):
@@ -232,170 +243,230 @@ class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.client = MissionControlClient(_settings())
 
-    async def test_already_terminal_returns_immediately(self) -> None:
-        payload = _run_payload("run-1", "completed", stdout="done", commit_sha="abc")
+    def _phase2b_payload(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        wait_expired: bool,
+        cursor: str = "cursor-abc",
+        **extra: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            **_run_payload(run_id, status, **extra),
+            "wait_expired": wait_expired,
+            "reached_terminal": not wait_expired,
+            "timeout_seconds": 5.0,
+            "heartbeat_health": "terminal" if not wait_expired else "healthy",
+            "stale_heartbeat": False,
+            "monitoring_history": [
+                {
+                    "at": "2026-08-13T00:00:00+00:00",
+                    "status": status,
+                    "phase": "agent_execution",
+                    "progress": {"step": "agent_execution", "detail": "ok"},
+                    "heartbeat_health": (
+                        "terminal" if not wait_expired else "healthy"
+                    ),
+                }
+            ],
+            "cursor": cursor,
+            "stale_threshold_seconds": 30.0,
+        }
+        return payload
+
+    async def test_forwards_to_server_wait_and_preserves_monitoring(
+        self,
+    ) -> None:
+        payload = self._phase2b_payload(
+            "run-1",
+            "completed",
+            wait_expired=False,
+            stdout="done",
+            commit_sha="abc",
+        )
         with patch.object(
             self.client,
-            "get_run",
+            "_request",
             new=AsyncMock(return_value=payload),
-        ) as get_run:
-            with patch("mcp_connector.client.asyncio.sleep", new=AsyncMock()) as sleep:
-                result = await self.client.wait_for_run(
-                    "run-1",
-                    timeout_seconds=5.0,
-                    poll_interval_seconds=0.1,
-                )
+        ) as request:
+            result = await self.client.wait_for_run(
+                "run-1",
+                timeout_seconds=5.0,
+                poll_interval_seconds=0.1,
+            )
 
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["run_id"], "run-1")
-        self.assertEqual(result["stdout"], "done")
-        self.assertEqual(result["commit_sha"], "abc")
-        self.assertFalse(result["wait_expired"])
-        self.assertTrue(result["reached_terminal"])
-        self.assertEqual(result["timeout_seconds"], 5.0)
-        get_run.assert_awaited_once_with("run-1")
-        sleep.assert_not_awaited()
-
-    async def test_transitions_from_nonterminal_to_terminal(self) -> None:
-        running = _run_payload("run-2", "running")
-        completed = _run_payload("run-2", "completed", stdout="finished")
-        with patch.object(
-            self.client,
-            "get_run",
-            new=AsyncMock(side_effect=[running, completed]),
-        ) as get_run:
-            with patch(
-                "mcp_connector.client.asyncio.sleep",
-                new=AsyncMock(),
-            ) as sleep:
-                result = await self.client.wait_for_run(
-                    "run-2",
-                    timeout_seconds=5.0,
-                    poll_interval_seconds=0.05,
-                )
-
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["stdout"], "finished")
-        self.assertFalse(result["wait_expired"])
-        self.assertTrue(result["reached_terminal"])
-        self.assertEqual(get_run.await_count, 2)
-        sleep.assert_awaited()
-
-    async def test_wait_window_expiry_returns_structured_payload(self) -> None:
-        running = _run_payload("run-3", "running", stdout="still going")
-        with patch.object(
-            self.client,
-            "get_run",
-            new=AsyncMock(return_value=running),
+        self.assertEqual(result, payload)
+        request.assert_awaited_once_with(
+            "POST",
+            "/runs/run-1/wait",
+            json={
+                "timeout_seconds": 5.0,
+                "poll_interval_seconds": 0.1,
+            },
+            timeout=60.0,
+        )
+        for field in (
+            "heartbeat_health",
+            "stale_heartbeat",
+            "monitoring_history",
+            "cursor",
+            "stale_threshold_seconds",
         ):
-            with patch(
-                "mcp_connector.client.asyncio.sleep",
-                new=AsyncMock(),
-            ):
-                result = await self.client.wait_for_run(
-                    "run-3",
-                    timeout_seconds=0.15,
-                    poll_interval_seconds=0.05,
-                )
+            self.assertIn(field, result)
 
-        self.assertEqual(result["run_id"], "run-3")
-        self.assertEqual(result["status"], "running")
-        self.assertEqual(result["stdout"], "still going")
+    async def test_wait_expired_cursor_output_forwarded_unchanged(self) -> None:
+        payload = self._phase2b_payload(
+            "run-3",
+            "running",
+            wait_expired=True,
+            cursor="resume-me",
+            stdout="still going",
+        )
+        payload["timeout_seconds"] = 0.15
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value=payload),
+        ) as request:
+            result = await self.client.wait_for_run(
+                "run-3",
+                timeout_seconds=0.15,
+                poll_interval_seconds=0.05,
+            )
+
         self.assertTrue(result["wait_expired"])
         self.assertFalse(result["reached_terminal"])
-        self.assertEqual(result["timeout_seconds"], 0.15)
+        self.assertEqual(result["cursor"], "resume-me")
+        self.assertEqual(result["heartbeat_health"], "healthy")
+        self.assertEqual(result["monitoring_history"], payload["monitoring_history"])
+        self.assertEqual(
+            request.await_args.kwargs["json"]["timeout_seconds"],
+            0.15,
+        )
 
-    async def test_default_timeout_used_when_omitted(self) -> None:
-        running = _run_payload("run-default", "queued")
+    async def test_cursor_input_resume_forwarded(self) -> None:
+        payload = self._phase2b_payload(
+            "run-2",
+            "completed",
+            wait_expired=False,
+            cursor="next-cursor",
+        )
         with patch.object(
             self.client,
-            "get_run",
-            new=AsyncMock(return_value=running),
-        ):
-            with patch(
-                "mcp_connector.client.asyncio.sleep",
-                new=AsyncMock(),
-            ):
-                with patch(
-                    "mcp_connector.client.time.monotonic",
-                    side_effect=[0.0, 0.0, MCP_WAIT_DEFAULT_TIMEOUT_SECONDS + 0.1],
-                ):
-                    result = await self.client.wait_for_run("run-default")
+            "_request",
+            new=AsyncMock(return_value=payload),
+        ) as request:
+            result = await self.client.wait_for_run(
+                "run-2",
+                timeout_seconds=5.0,
+                poll_interval_seconds=0.05,
+                cursor="  prior-cursor  ",
+            )
+
+        self.assertEqual(result["cursor"], "next-cursor")
+        self.assertEqual(
+            request.await_args.kwargs["json"],
+            {
+                "timeout_seconds": 5.0,
+                "poll_interval_seconds": 0.05,
+                "cursor": "prior-cursor",
+            },
+        )
+
+    async def test_legacy_caller_without_cursor_omits_cursor_field(self) -> None:
+        payload = self._phase2b_payload(
+            "run-legacy",
+            "completed",
+            wait_expired=False,
+        )
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value=payload),
+        ) as request:
+            await self.client.wait_for_run(
+                "run-legacy",
+                timeout_seconds=5.0,
+                poll_interval_seconds=0.1,
+            )
+        self.assertNotIn("cursor", request.await_args.kwargs["json"])
+
+    async def test_default_timeout_used_when_omitted(self) -> None:
+        payload = self._phase2b_payload(
+            "run-default",
+            "queued",
+            wait_expired=True,
+        )
+        payload["timeout_seconds"] = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value=payload),
+        ) as request:
+            result = await self.client.wait_for_run("run-default")
 
         self.assertTrue(result["wait_expired"])
         self.assertEqual(
-            result["timeout_seconds"],
+            request.await_args.kwargs["json"]["timeout_seconds"],
             MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            request.await_args.kwargs["timeout"],
+            60.0,
         )
 
     async def test_timeout_above_former_25s_cap_is_honored(self) -> None:
-        """Requested budgets like 900s must not stop at the old ~25s cutoff.
-
-        Simulated elapsed time crosses 25s while the run is still non-terminal;
-        polling continues and a later terminal result is returned.
-        """
-        running = _run_payload("run-long", "running")
-        completed = _run_payload(
+        """Requested budgets like 900s must not stop at the old ~25s cutoff."""
+        payload = self._phase2b_payload(
             "run-long",
             "completed",
+            wait_expired=False,
             stdout="finished-after-25s",
         )
-        # monotonic: deadline start; after poll1 (t=10); after poll2 (t=26 > 25)
-        monotonic_values = iter([0.0, 10.0, 26.0])
+        payload["timeout_seconds"] = 900.0
         with patch.object(
             self.client,
-            "get_run",
-            new=AsyncMock(side_effect=[running, running, completed]),
-        ) as get_run:
-            with patch(
-                "mcp_connector.client.asyncio.sleep",
-                new=AsyncMock(),
-            ) as sleep:
-                with patch(
-                    "mcp_connector.client.time.monotonic",
-                    side_effect=lambda: next(monotonic_values),
-                ):
-                    result = await self.client.wait_for_run(
-                        "run-long",
-                        timeout_seconds=900.0,
-                        poll_interval_seconds=0.1,
-                    )
+            "_request",
+            new=AsyncMock(return_value=payload),
+        ) as request:
+            result = await self.client.wait_for_run(
+                "run-long",
+                timeout_seconds=900.0,
+                poll_interval_seconds=0.1,
+            )
 
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["stdout"], "finished-after-25s")
-        self.assertFalse(result["wait_expired"])
-        self.assertTrue(result["reached_terminal"])
         self.assertEqual(result["timeout_seconds"], 900.0)
-        self.assertEqual(get_run.await_count, 3)
-        self.assertGreaterEqual(sleep.await_count, 2)
+        self.assertEqual(
+            request.await_args.kwargs["json"]["timeout_seconds"],
+            900.0,
+        )
+        self.assertEqual(request.await_args.kwargs["timeout"], 930.0)
 
     async def test_oversized_timeout_is_capped_to_max(self) -> None:
-        running = _run_payload("run-cap", "running")
+        payload = self._phase2b_payload(
+            "run-cap",
+            "running",
+            wait_expired=True,
+        )
+        payload["timeout_seconds"] = MCP_WAIT_MAX_TIMEOUT_SECONDS
         with patch.object(
             self.client,
-            "get_run",
-            new=AsyncMock(return_value=running),
-        ):
-            with patch(
-                "mcp_connector.client.asyncio.sleep",
-                new=AsyncMock(),
-            ):
-                with patch(
-                    "mcp_connector.client.time.monotonic",
-                    side_effect=[
-                        0.0,
-                        0.0,
-                        MCP_WAIT_MAX_TIMEOUT_SECONDS + 0.1,
-                    ],
-                ):
-                    result = await self.client.wait_for_run(
-                        "run-cap",
-                        timeout_seconds=MCP_WAIT_MAX_TIMEOUT_SECONDS + 100.0,
-                        poll_interval_seconds=0.1,
-                    )
+            "_request",
+            new=AsyncMock(return_value=payload),
+        ) as request:
+            result = await self.client.wait_for_run(
+                "run-cap",
+                timeout_seconds=MCP_WAIT_MAX_TIMEOUT_SECONDS + 100.0,
+                poll_interval_seconds=0.1,
+            )
 
         self.assertTrue(result["wait_expired"])
-        self.assertEqual(result["timeout_seconds"], MCP_WAIT_MAX_TIMEOUT_SECONDS)
+        self.assertEqual(
+            request.await_args.kwargs["json"]["timeout_seconds"],
+            MCP_WAIT_MAX_TIMEOUT_SECONDS,
+        )
 
     async def test_invalid_timeout_seconds_rejected(self) -> None:
         for value in (0, -1, -0.5):
@@ -419,42 +490,37 @@ class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertIn("poll_interval_seconds", str(ctx.exception))
 
-    async def test_transient_polling_failure_then_success(self) -> None:
-        completed = _run_payload("run-4", "completed", stdout="recovered")
-        transient = MissionControlError(
-            "Mission Control did not respond before the timeout"
-        )
+    async def test_oversized_cursor_rejected_before_forward(self) -> None:
+        from mission_control.monitoring import MONITOR_CURSOR_MAX_CHARS
+
         with patch.object(
             self.client,
-            "get_run",
-            new=AsyncMock(side_effect=[transient, completed]),
-        ) as get_run:
-            with patch(
-                "mcp_connector.client.asyncio.sleep",
-                new=AsyncMock(),
-            ) as sleep:
-                result = await self.client.wait_for_run(
-                    "run-4",
-                    timeout_seconds=5.0,
-                    poll_interval_seconds=0.05,
+            "_request",
+            new=AsyncMock(),
+        ) as request:
+            with self.assertRaises(ValueError) as ctx:
+                await self.client.wait_for_run(
+                    "run-x",
+                    timeout_seconds=10.0,
+                    poll_interval_seconds=1.0,
+                    cursor="x" * (MONITOR_CURSOR_MAX_CHARS + 1),
                 )
-
-        self.assertEqual(result["status"], "completed")
-        self.assertFalse(result["wait_expired"])
-        self.assertEqual(get_run.await_count, 2)
-        sleep.assert_awaited()
+        self.assertIn("cursor", str(ctx.exception))
+        request.assert_not_awaited()
 
     async def test_final_terminal_payload_includes_wait_metadata(self) -> None:
-        payload = _run_payload(
+        payload = self._phase2b_payload(
             "run-5",
             "failed",
+            wait_expired=False,
             stdout="partial",
         )
         payload["error"] = "boom"
         payload["return_code"] = 1
+        payload["timeout_seconds"] = 1.0
         with patch.object(
             self.client,
-            "get_run",
+            "_request",
             new=AsyncMock(return_value=payload),
         ):
             waited = await self.client.wait_for_run(
@@ -462,13 +528,12 @@ class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
                 timeout_seconds=1.0,
                 poll_interval_seconds=0.1,
             )
-            fetched = await self.client.get_run("run-5")
 
-        for key, value in fetched.items():
-            self.assertEqual(waited[key], value)
         self.assertFalse(waited["wait_expired"])
         self.assertTrue(waited["reached_terminal"])
         self.assertEqual(waited["timeout_seconds"], 1.0)
+        self.assertEqual(waited["heartbeat_health"], "terminal")
+        self.assertEqual(waited["cursor"], "cursor-abc")
 
 
 class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
@@ -501,16 +566,22 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
             "wait_expired": True,
             "timeout_seconds": 1.0,
             "reached_terminal": False,
+            "heartbeat_health": "healthy",
+            "stale_heartbeat": False,
+            "monitoring_history": [],
+            "cursor": "cursor-1",
+            "stale_threshold_seconds": 30.0,
         }
         with patch.object(
             mcp_server.client,
             "wait_for_run",
             new=AsyncMock(return_value=payload),
-        ):
+        ) as wait_for_run:
             result = await mcp_server.wait_for_run(
                 "run-t",
                 timeout_seconds=1.0,
                 poll_interval_seconds=0.1,
+                cursor="cursor-0",
             )
 
         self.assertTrue(result["ok"])
@@ -518,6 +589,26 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "running")
         self.assertTrue(result["wait_expired"])
         self.assertEqual(result["timeout_seconds"], 1.0)
+        self.assertEqual(result["cursor"], "cursor-1")
+        self.assertEqual(result["heartbeat_health"], "healthy")
+        wait_for_run.assert_awaited_once_with(
+            "run-t",
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.1,
+            cursor="cursor-0",
+        )
+
+    async def test_tool_rejects_oversized_cursor_via_client(self) -> None:
+        from mission_control.monitoring import MONITOR_CURSOR_MAX_CHARS
+
+        result = await mcp_server.wait_for_run(
+            "run-t",
+            timeout_seconds=10.0,
+            poll_interval_seconds=1.0,
+            cursor="x" * (MONITOR_CURSOR_MAX_CHARS + 1),
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("cursor", result["error"]["message"])
 
     async def test_tool_rejects_invalid_timeout_via_client(self) -> None:
         result = await mcp_server.wait_for_run(
@@ -562,10 +653,14 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
             props["poll_interval_seconds"]["default"],
             MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
         )
+        self.assertIn("cursor", props)
         self.assertEqual(wait_tool.parameters["required"], ["run_id"])
         description = wait_tool.description or ""
-        self.assertIn("get_run", description.lower())
+        self.assertIn("POST /runs/{run_id}/wait", description)
         self.assertIn("wait_expired", description)
+        self.assertIn("cursor", description)
+        self.assertIn("heartbeat_health", description)
+        self.assertIn("cancelled", description)
         self.assertIn("3600", description)
 
         structured = next(
@@ -638,10 +733,12 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
             saw_props["poll_interval_seconds"]["default"],
             MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
         )
+        self.assertIn("cursor", saw_props)
         saw_description = submit_and_wait.description or ""
         self.assertIn("submit_run", saw_description)
         self.assertIn("wait_for_run", saw_description)
         self.assertIn("wait_expired", saw_description)
+        self.assertIn("cursor", saw_description)
 
 
 class TestSubmitAndWaitClient(unittest.IsolatedAsyncioTestCase):
@@ -683,6 +780,7 @@ class TestSubmitAndWaitClient(unittest.IsolatedAsyncioTestCase):
             "run-saw-1",
             timeout_seconds=5.0,
             poll_interval_seconds=0.1,
+            cursor=None,
         )
 
     async def test_submission_failure_skips_wait(self) -> None:

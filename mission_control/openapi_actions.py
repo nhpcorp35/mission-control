@@ -37,10 +37,10 @@ _ACTIONS_OPERATION_DESCRIPTIONS: dict[str, str] = {
         "restarts."
     ),
     "submit_and_wait": (
-        "Queue Mission Control YAML via the same pipeline as POST /runs, then "
-        "wait until terminal status or timeout_seconds. Returns the final run "
-        "payload. Validation/submission failures return immediately. Preferred "
-        "Custom GPT flow when exact YAML is available."
+        "Queue YAML then wait until terminal (completed/failed/timed_out/"
+        "cancelled) or timeout. Returns monitoring fields and resumable "
+        "cursor. Wait expiry does not mutate the run. Resume with "
+        "wait_for_run + cursor."
     ),
     "get_run": (
         "Return status, output, error, commit SHA, summary, and structured "
@@ -56,10 +56,9 @@ _ACTIONS_OPERATION_DESCRIPTIONS: dict[str, str] = {
         "return 409."
     ),
     "wait_for_run": (
-        "Poll until the run reaches completed, failed, or timed_out, or "
-        "timeout_seconds elapses. Returns immediately if already terminal. "
-        "Does not mutate run state. Flow: submit_run, wait_for_run, then "
-        "inspect results. For one-shot YAML, use submit_and_wait."
+        "Wait until completed/failed/timed_out/cancelled or timeout_seconds. "
+        "Returns heartbeat_health, monitoring_history, and resumable cursor. "
+        "Optional cursor resumes history. Does not mutate run state."
     ),
     "run_repository_command": (
         "Run an allowlisted repository command in an ephemeral checkout. "

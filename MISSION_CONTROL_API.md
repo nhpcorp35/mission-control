@@ -437,10 +437,10 @@ Requires authentication.
 
 Bounded server-side wait for an asynchronous run (Phase 2B monitoring contract). Polls the existing run lookup path (`GET /runs/{run_id}` / registry `get_run`) until the run reaches a terminal status or `timeout_seconds` elapses. Returns immediately when the run is already terminal. Uses Phase 2A `phase`, `heartbeat_at`, and `progress` fields to build a bounded, deduplicated `monitoring_history`. Does **not** mutate, fail, or cancel the run when the wait expires (a caller/edge wait timeout is distinct from mission execution status `timed_out`).
 
-HTTP clients and Custom GPT Actions use this endpoint for a server-side wait.
-The MCP `wait_for_run` tool instead polls `GET /runs/{run_id}` on the connector
-side (see **MCP tools** below) and remains compatible; enriched monitoring fields
-are returned by this REST wait path.
+HTTP clients, Custom GPT Actions, MCP `wait_for_run`, and Unified
+`mission.wait` all use this server-side wait path. Phase 2B monitoring fields
+are authored only by Mission Control and forwarded unchanged through MCP /
+gateway wrappers.
 
 **Intended HAL / Custom GPT flow**
 
@@ -454,7 +454,7 @@ are returned by this REST wait path.
 | --- | --- | --- | --- | --- |
 | `timeout_seconds` | number | `300` | `0.1` … `3600` | Maximum time to wait for a terminal status (caller/edge budget only) |
 | `poll_interval_seconds` | number | `25` | `0.05` … `60` | Delay between registry lookups while the run is non-terminal |
-| `cursor` | string or null | `null` | opaque | Resumable monitor cursor from a prior `wait_expired` response; preserves bounded `monitoring_history` across waits |
+| `cursor` | string or null | `null` | opaque, max `16384` chars | Resumable monitor cursor from a prior `wait_expired` response; preserves bounded `monitoring_history` across waits. Oversized cursors are rejected before decode. |
 
 Out-of-bounds values return `422 Unprocessable Entity`.
 
@@ -608,85 +608,90 @@ bash scripts/railway-start.sh
 
 #### `wait_for_run`
 
-Polls the authenticated `GET /runs/{run_id}` path on the connector side until
-the run is terminal or the caller-requested `timeout_seconds` elapses. Returns
-immediately when already terminal. Requested budgets such as `900` seconds are
-honored end-to-end (no artificial ~25s connector cutoff).
+Forwards to authenticated `POST /runs/{run_id}/wait`. Mission Control is the
+source of truth for Phase 2B monitoring; the connector validates bounds then
+returns the wait payload unchanged (does not fabricate monitoring fields).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `run_id` | string | yes | — | Run identifier returned by `submit_run` / `submit_structured_run` / `submit_and_wait` |
 | `timeout_seconds` | number | no | `20` | Maximum time to wait for this call; must be `>= 0.1`. Values above `3600` are capped to `3600` (same upper bound as `POST /runs/{run_id}/wait`). Zero/negative values are rejected. |
-| `poll_interval_seconds` | number | no | `2` | Delay between `get_run` polls; must be `>= 0.05`. Values above `10` are capped to `10`. Zero/negative values are rejected. |
+| `poll_interval_seconds` | number | no | `2` | Delay between registry lookups on the server; must be `>= 0.05`. Values above `10` are capped to `10`. Zero/negative values are rejected. |
+| `cursor` | string or null | no | `null` | Opaque resumable monitor cursor from a prior `wait_expired` response (max `16384` chars). Omit for legacy callers. Oversized values are rejected before forwarding. |
 
-**Intended HAL loop.** Prefer `submit_and_wait` when you already have exact
+**Intended HAL / Unified loop.** Prefer `submit_and_wait` when you already have exact
 mission YAML and want one tool call end-to-end. Prefer `submit_structured_run`
 for routine execute missions (or `submit_run` with exact YAML when needed) →
-`wait_for_run` with an appropriate `timeout_seconds` until `wait_expired` is
-`false` and `status` is terminal (retry the same `run_id` when `wait_expired`
-is `true`) → inspect `summary` / `result.persistence` / `commit_sha` /
+`wait_for_run` / `mission.wait` with an appropriate `timeout_seconds` until `wait_expired` is
+`false` and `status` is terminal (retry the same `run_id` and returned `cursor` when `wait_expired`
+is `true`) → inspect `heartbeat_health` / `monitoring_history` / `summary` / `result.persistence` / `commit_sha` /
 `result`, then diagnostic `stdout` / `stderr` / `error`. Prefer `summary` over
 agent stdout for persistence claims (platform persistence runs after the agent
 completes).
 
-**Terminal behavior.** Reuses Mission Control terminal statuses (`completed`,
-`failed`, `timed_out`) via `is_terminal_status`. Returns immediately when the
-run is already terminal. Payload shape: `{"ok": true, ...}` with the same run
-fields as `get_run`, plus `wait_expired: false`, `reached_terminal: true`, and
-`timeout_seconds` (effective value after any cap).
+**Terminal behavior.** Terminal statuses are `completed`, `failed`, `timed_out`,
+and `cancelled`. Returns immediately when the run is already terminal. Payload
+shape: `{"ok": true, ...}` with the authoritative wait fields from Mission
+Control, including `wait_expired: false`, `reached_terminal: true`,
+`timeout_seconds`, `heartbeat_health`, `stale_heartbeat`, `monitoring_history`,
+`cursor`, and `stale_threshold_seconds`.
 
-**Wait-window expiry.** Uses a monotonic clock and sleeps between polls (no
-busy-wait). When the wait window expires while the run is still non-terminal,
+**Wait-window expiry.** When the wait window expires while the run is still non-terminal,
 the tool returns a **normal usable payload** (not a transport/tool error):
 
 | Field | Value |
 | --- | --- |
 | `ok` | `true` |
-| `run_id` / `status` / other run fields | Latest successful `get_run` payload |
+| `run_id` / `status` / other run fields | Latest run payload from Mission Control |
 | `wait_expired` | `true` |
 | `reached_terminal` | `false` |
 | `timeout_seconds` | Effective wait window used for this call |
+| `cursor` / monitoring fields | Resumable Phase 2B monitoring from Mission Control |
 
-HAL should treat `wait_expired: true` as “call `wait_for_run` again,” not as
-failure. A single transient polling failure does not end the wait while time
-remains; `404` (unknown `run_id`) is fatal immediately.
+HAL / Unified should treat `wait_expired: true` as “call `wait_for_run` /
+`mission.wait` again with the same `run_id` and `cursor`,” not as failure.
+Unknown `run_id` (`404`) is fatal immediately. Wait expiry never mutates or
+cancels the run.
 
 **Timeout layers (connector vs platform).** Application bounds above are the
-only connector-imposed wait limits. Each individual `get_run` HTTP call still
-uses `MISSION_CONTROL_TIMEOUT_SECONDS` (default `30`) as the per-request httpx
-timeout — that does **not** truncate the overall wait loop. Railway’s public
+only connector-imposed wait limits. The connector sets the httpx timeout above
+the caller-selected wait budget so Mission Control can return `wait_expired`
+within that duration. Railway’s public
 edge proxy closes HTTP requests after **5 minutes with no data transferred**,
 or after **15 minutes** even with keep-alive traffic
 ([Railway public networking specs](https://docs.railway.com/networking/public-networking/specs-and-limits)).
 A single Streamable HTTP MCP tool response that stays silent for the whole wait
 can therefore be cut by the platform before a 900s application budget finishes;
 when that happens, treat it like a transport interrupt and call `wait_for_run`
-again with the same `run_id`. Upstream MCP clients may also impose their own
+again with the same `run_id` and last `cursor`. Upstream MCP clients may also impose their own
 tool-call deadlines independent of these connector bounds.
 
 #### `submit_and_wait`
 
 Submits an exact Mission Control YAML document via the authenticated
-`submit_run` path, then waits via the same `wait_for_run` poll loop — one MCP
-tool call for end-to-end execution. Does not duplicate submit or wait logic.
+`submit_run` path, then waits via the same `wait_for_run` forwarder to
+`POST /runs/{run_id}/wait` — one MCP tool call for end-to-end execution. Does
+not duplicate submit or wait logic.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `mission_yaml` | string | yes | — | Exact mission YAML document (same as `submit_run`) |
 | `timeout_seconds` | number | no | `20` | Same validation and limits as `wait_for_run` (must be `>= 0.1`; values above `3600` capped to `3600`; zero/negative rejected). Validated **before** submission so an invalid timeout never queues a run. |
 | `poll_interval_seconds` | number | no | `2` | Same validation and limits as `wait_for_run` |
+| `cursor` | string or null | no | `null` | Same optional cursor validation as `wait_for_run` (normally unused on first submit) |
 
 **Success.** Returns `{"ok": true, ...}` with the accepted `run_id` and the
-final authoritative run payload from `wait_for_run` (including
-`wait_expired`, `reached_terminal`, and `timeout_seconds`).
+final authoritative wait payload from Mission Control (including
+`wait_expired`, `reached_terminal`, `timeout_seconds`, and Phase 2B
+monitoring fields).
 
 **Submission failure.** If `submit_run` returns the existing structured
 rejection (`ok: false`, no `run_id`), that payload is returned immediately
 without entering the wait loop.
 
 **Wait-window expiry.** Same structured `wait_expired: true` payload as
-`wait_for_run` (latest successful run fields when available). Resume with
-`wait_for_run` using the returned `run_id`.
+`wait_for_run` (latest run fields plus resumable `cursor`). Resume with
+`wait_for_run` using the returned `run_id` and `cursor`.
 
 Authentication and run isolation match `submit_run` / `wait_for_run` (server-side
 API key; isolated run workspaces).

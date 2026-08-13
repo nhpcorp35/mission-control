@@ -26,6 +26,7 @@ from mission_control.run_queue import RunQueue
 from mission_control.monitoring import (
     DEFAULT_MONITOR_POLL_INTERVAL_SECONDS,
     HEARTBEAT_STALE_THRESHOLD_SECONDS,
+    MONITOR_CURSOR_MAX_CHARS,
     HeartbeatHealth,
     decode_monitor_cursor,
     encode_monitor_cursor,
@@ -392,9 +393,11 @@ class WaitForRunRequest(BaseModel):
     )
     cursor: str | None = Field(
         default=None,
+        max_length=MONITOR_CURSOR_MAX_CHARS,
         description=(
             "Opaque resumable monitor cursor from a prior wait_expired "
-            "response. Preserves bounded monitoring history across waits."
+            "response. Preserves bounded monitoring history across waits. "
+            f"Maximum length {MONITOR_CURSOR_MAX_CHARS} characters."
         ),
     )
 
@@ -415,7 +418,11 @@ class SubmitAndWaitRequest(BaseModel):
     )
     cursor: str | None = Field(
         default=None,
-        description="Optional monitor cursor (normally unused on first submit).",
+        max_length=MONITOR_CURSOR_MAX_CHARS,
+        description=(
+            "Optional monitor cursor (normally unused on first submit). "
+            f"Maximum length {MONITOR_CURSOR_MAX_CHARS} characters."
+        ),
     )
 
 

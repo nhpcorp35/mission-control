@@ -72,23 +72,28 @@ ambiguity requires user input.
 ## Waiting for async runs
 
 - Prefer `submit_and_wait` (`POST /runs/submit-and-wait` or MCP) for exact YAML
-  when a single call should cover submit + wait; resume with `wait_for_run` on
-  `wait_expired`.
+  when a single call should cover submit + wait; resume with `wait_for_run` /
+  `mission.wait` on `wait_expired` using the same `run_id` and returned `cursor`.
 - REST `POST /runs/{run_id}/wait` (OpenAPI operation ID `wait_for_run`) performs
   a server-side wait and returns `run_id`, `timeout_seconds`, `wait_expired`,
-  `reached_terminal`, and the latest successful run payload.
+  `reached_terminal`, Phase 2B monitoring fields (`heartbeat_health`,
+  `stale_heartbeat`, `monitoring_history`, `cursor`, `stale_threshold_seconds`),
+  and the latest run payload. Wait expiry never mutates or cancels the run.
+- MCP `wait_for_run` / Unified `mission.wait` forward to that REST wait path
+  (Mission Control remains the monitoring source of truth). Optional `cursor`
+  is accepted; oversized cursors are rejected before forward.
 - MCP `wait_for_run` (and `submit_and_wait`) honor the requested
   `timeout_seconds` up to **3600** (aligned with `POST /runs/{run_id}/wait`).
   There is no artificial ~25s connector cutoff.
 - Default wait window is **20s** for MCP tools and **300s** for REST wait
   endpoints; pass a larger budget (for example `900`) when a single call should
   stay active until terminal or that budget expires.
-- When `wait_expired` is `true`, call `wait_for_run` again with the same
-  `run_id` (do not treat expiry as run failure).
+- When `wait_expired` is `true`, call `wait_for_run` / `mission.wait` again with
+  the same `run_id` and `cursor` (do not treat expiry as run failure).
 - Railway’s edge proxy may still close a silent HTTP/MCP tool response after
   **5 minutes idle** or **15 minutes** absolute — see `MISSION_CONTROL_API.md`
   (`wait_for_run` timeout layers). On a transport interrupt, resume with the
-  same `run_id`.
+  same `run_id` and last `cursor`.
 
 ## Local repository auto-sync (macOS)
 

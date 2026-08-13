@@ -33,6 +33,10 @@ HEARTBEAT_STALE_THRESHOLD_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 6.0  # 30s
 # Bound monitoring payload size (events are already redacted/sanitized).
 MONITORING_HISTORY_MAX_EVENTS = 32
 
+# Opaque resumable cursor is base64url(json). A full 32-event history stays
+# well under this; reject larger inputs before decode/forward (DoS hardening).
+MONITOR_CURSOR_MAX_CHARS = 16_384
+
 # Monitoring treats cancelled as terminal even if the registry enum lacks it yet.
 MONITORING_TERMINAL_STATUSES = frozenset(
     {
@@ -47,6 +51,21 @@ _CURSOR_VERSION = 1
 _EVENT_ALLOWED_KEYS = frozenset(
     {"at", "status", "phase", "progress", "heartbeat_health"}
 )
+
+
+def normalize_monitor_cursor(cursor: str | None) -> str | None:
+    """Return a stripped cursor or ``None``; reject oversized inputs."""
+    if cursor is None:
+        return None
+    text = str(cursor).strip()
+    if not text:
+        return None
+    if len(text) > MONITOR_CURSOR_MAX_CHARS:
+        raise ValueError(
+            "cursor exceeds maximum length of "
+            f"{MONITOR_CURSOR_MAX_CHARS} characters"
+        )
+    return text
 
 
 class HeartbeatHealth(str, Enum):
@@ -247,11 +266,12 @@ def encode_monitor_cursor(history: list[dict[str, Any]]) -> str:
 
 
 def decode_monitor_cursor(cursor: str | None) -> list[dict[str, Any]]:
-    """Decode a monitor cursor; invalid/empty cursors resume with no history."""
-    if cursor is None:
-        return []
-    text = str(cursor).strip()
-    if not text:
+    """Decode a monitor cursor; invalid/empty cursors resume with no history.
+
+    Oversized cursors raise ``ValueError`` before any decode work (DoS bound).
+    """
+    text = normalize_monitor_cursor(cursor)
+    if text is None:
         return []
     pad = "=" * (-len(text) % 4)
     try:

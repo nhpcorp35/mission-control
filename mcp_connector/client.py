@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import asyncio
-import time
 from typing import Any
 
 import httpx
 
 from mcp_connector.config import Settings
 from mcp_connector.errors import MissionControlError
-from mission_control.run_registry import is_terminal_status
+from mission_control.monitoring import (
+    MONITOR_CURSOR_MAX_CHARS,
+    normalize_monitor_cursor,
+)
 
 # Honor caller-requested wait budgets end-to-end (aligned with
 # POST /runs/{run_id}/wait). Default stays short for interactive clients;
@@ -21,6 +22,8 @@ MCP_WAIT_MAX_TIMEOUT_SECONDS = 3600.0
 MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 MCP_WAIT_MIN_POLL_INTERVAL_SECONDS = 0.05
 MCP_WAIT_MAX_POLL_INTERVAL_SECONDS = 10.0
+# Re-export for connector/gateway callers and tests.
+MCP_MONITOR_CURSOR_MAX_CHARS = MONITOR_CURSOR_MAX_CHARS
 
 
 def normalize_mcp_wait_timeout(timeout_seconds: float) -> float:
@@ -59,6 +62,10 @@ def normalize_mcp_wait_poll_interval(poll_interval_seconds: float) -> float:
         return MCP_WAIT_MAX_POLL_INTERVAL_SECONDS
     return value
 
+
+def normalize_mcp_wait_cursor(cursor: str | None) -> str | None:
+    """Validate optional wait cursor size before forwarding to Mission Control."""
+    return normalize_monitor_cursor(cursor)
 
 class MissionControlClient:
     """Thin asynchronous client for the Mission Control REST API."""
@@ -221,6 +228,7 @@ class MissionControlClient:
         *,
         timeout_seconds: float = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
         poll_interval_seconds: float = MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """Submit exact mission YAML, then wait via ``wait_for_run``.
 
@@ -231,14 +239,15 @@ class MissionControlClient:
         On structured submission failure (``ok: false``, no ``run_id``),
         returns that payload without entering the wait loop. On success,
         returns the ``wait_for_run`` payload (accepted ``run_id`` plus the
-        final authoritative run fields, including ``wait_expired`` when the
-        caller-requested wait window expires).
+        final authoritative run fields, including Phase 2B monitoring fields
+        and ``wait_expired`` when the caller-requested wait window expires).
         """
         # Validate wait bounds before submit so bad timeouts never queue a run.
         effective_timeout = normalize_mcp_wait_timeout(timeout_seconds)
         effective_poll = normalize_mcp_wait_poll_interval(
             poll_interval_seconds
         )
+        effective_cursor = normalize_mcp_wait_cursor(cursor)
 
         submitted = await self.submit_run(mission_yaml)
         run_id = submitted.get("run_id")
@@ -249,6 +258,7 @@ class MissionControlClient:
             str(run_id),
             timeout_seconds=effective_timeout,
             poll_interval_seconds=effective_poll,
+            cursor=effective_cursor,
         )
 
     async def wait_for_run(
@@ -257,98 +267,39 @@ class MissionControlClient:
         *,
         timeout_seconds: float = MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
         poll_interval_seconds: float = MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        """Poll ``get_run`` until the run is terminal or the wait window ends.
+        """Forward to Mission Control ``POST /runs/{run_id}/wait``.
 
-        Uses the same Mission Control URL, API key, and request path as
-        ``get_run``. Sleeps between polls with a monotonic deadline.
+        Mission Control is the source of truth for Phase 2B monitoring fields
+        (``heartbeat_health``, ``stale_heartbeat``, ``monitoring_history``,
+        ``cursor``, ``stale_threshold_seconds``). This client does not
+        fabricate monitoring fields; it validates bounds then returns the
+        authoritative wait payload unchanged.
 
-        When the wait window expires while the run is still non-terminal,
-        returns a normal structured payload (does not raise) with
-        ``wait_expired=True`` plus the latest run fields so MCP clients can
-        call again. Terminal runs return the run payload with
-        ``wait_expired=False``.
+        Optional ``cursor`` resumes bounded history after ``wait_expired``.
+        Oversized cursors are rejected before the request is sent. Wait
+        expiry never mutates or cancels the run.
         """
         effective_timeout = normalize_mcp_wait_timeout(timeout_seconds)
         effective_poll = normalize_mcp_wait_poll_interval(
             poll_interval_seconds
         )
+        effective_cursor = normalize_mcp_wait_cursor(cursor)
 
-        deadline = time.monotonic() + effective_timeout
-        latest: dict[str, Any] | None = None
-        last_error: MissionControlError | None = None
-
-        while True:
-            try:
-                payload = await self.get_run(run_id)
-            except MissionControlError as exc:
-                # Unknown run cannot become available later.
-                if exc.status_code == 404:
-                    raise
-                last_error = exc
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    if latest is not None:
-                        return self._wait_expired_payload(
-                            latest,
-                            timeout_seconds=effective_timeout,
-                        )
-                    raise MissionControlError(
-                        (
-                            f"Timed out waiting for run {run_id} after "
-                            f"{effective_timeout} seconds"
-                        ),
-                        details={
-                            "run_id": run_id,
-                            "timeout_seconds": effective_timeout,
-                            "wait_expired": True,
-                            "latest": latest,
-                            "last_error": last_error.as_dict()["error"],
-                        },
-                    ) from last_error
-                await asyncio.sleep(min(effective_poll, remaining))
-                continue
-
-            latest = payload
-            last_error = None
-            status = payload.get("status")
-            if status is not None and is_terminal_status(str(status)):
-                return self._wait_terminal_payload(
-                    payload,
-                    timeout_seconds=effective_timeout,
-                )
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return self._wait_expired_payload(
-                    latest,
-                    timeout_seconds=effective_timeout,
-                )
-
-            await asyncio.sleep(min(effective_poll, remaining))
-
-    @staticmethod
-    def _wait_terminal_payload(
-        payload: dict[str, Any],
-        *,
-        timeout_seconds: float,
-    ) -> dict[str, Any]:
-        return {
-            **payload,
-            "wait_expired": False,
-            "timeout_seconds": timeout_seconds,
-            "reached_terminal": True,
+        body: dict[str, Any] = {
+            "timeout_seconds": effective_timeout,
+            "poll_interval_seconds": effective_poll,
         }
+        if effective_cursor is not None:
+            body["cursor"] = effective_cursor
 
-    @staticmethod
-    def _wait_expired_payload(
-        latest: dict[str, Any],
-        *,
-        timeout_seconds: float,
-    ) -> dict[str, Any]:
-        return {
-            **latest,
-            "wait_expired": True,
-            "timeout_seconds": timeout_seconds,
-            "reached_terminal": False,
-        }
+        # Bound httpx timeout above the wait budget so Mission Control can
+        # return wait_expired within the caller-selected duration.
+        request_timeout = max(effective_timeout + 30.0, 60.0)
+        return await self._request(
+            "POST",
+            f"/runs/{run_id}/wait",
+            json=body,
+            timeout=request_timeout,
+        )
