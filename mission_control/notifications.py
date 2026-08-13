@@ -1,7 +1,8 @@
-"""Phase 2C durable mission notification outbox and webhook delivery.
+"""Phase 2C/2D durable mission notification outbox and delivery backends.
 
-Opt-in generic webhook notifications for phase_change, stale, recovery, and
-terminal events only (never heartbeats). Failures never mutate mission status.
+Opt-in generic HMAC webhook and native Pushover delivery for phase_change,
+stale, recovery, and terminal events only (never heartbeats). Failures never
+mutate mission status. Network delivery stays off request/wait/status paths.
 """
 
 from __future__ import annotations
@@ -56,6 +57,11 @@ NOTIFICATION_INSPECT_MAX_EVENTS = 64
 # Opt-in configuration (safe no-config: disabled when unset).
 WEBHOOK_URL_ENV = "MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL"
 WEBHOOK_SECRET_ENV = "MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET"
+PUSHOVER_USER_KEY_ENV = "MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_USER_KEY"
+PUSHOVER_APP_TOKEN_ENV = "MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_APP_TOKEN"
+PUSHOVER_DEVICE_ENV = "MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_DEVICE"
+PUSHOVER_PRIORITY_ENV = "MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_PRIORITY"
+PUSHOVER_SOUND_ENV = "MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND"
 ENABLED_ENV = "MISSION_CONTROL_NOTIFICATIONS_ENABLED"
 TIMEOUT_ENV = "MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS"
 MAX_ATTEMPTS_ENV = "MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS"
@@ -69,6 +75,23 @@ SIGNATURE_HEADER = "X-Mission-Control-Signature"
 TIMESTAMP_HEADER = "X-Mission-Control-Timestamp"
 EVENT_ID_HEADER = "X-Mission-Control-Event-Id"
 EVENT_KIND_HEADER = "X-Mission-Control-Event-Kind"
+
+# Fixed official Pushover Messages API (no user-configurable endpoint).
+PUSHOVER_API_HOST = "api.pushover.net"
+PUSHOVER_MESSAGES_PATH = "/1/messages.json"
+PUSHOVER_API_URL = f"https://{PUSHOVER_API_HOST}{PUSHOVER_MESSAGES_PATH}"
+DEFAULT_PUSHOVER_PRIORITY = 0
+# Emergency priority (2) requires retry/expire and is rejected for safety.
+ALLOWED_PUSHOVER_PRIORITIES = frozenset({-2, -1, 0, 1})
+PUSHOVER_TITLE_MAX_CHARS = 100
+PUSHOVER_MESSAGE_MAX_CHARS = 400
+PUSHOVER_DEVICE_MAX_CHARS = 64
+PUSHOVER_SOUND_MAX_CHARS = 32
+
+# Active delivery backend when notifications are opted in.
+BACKEND_NONE = "none"
+BACKEND_WEBHOOK = "webhook"
+BACKEND_PUSHOVER = "pushover"
 
 # Payload / inspection allowlists (never stdout/stderr/secrets/mission YAML).
 _PAYLOAD_ALLOWED_KEYS = frozenset(
@@ -141,7 +164,7 @@ EMITTED_EVENT_KINDS = frozenset(kind.value for kind in NotificationEventKind)
 
 @dataclass(frozen=True)
 class NotificationConfig:
-    """Resolved opt-in webhook configuration (secrets never stringified)."""
+    """Resolved opt-in notification configuration (secrets never stringified)."""
 
     enabled: bool
     webhook_url: str | None
@@ -153,14 +176,43 @@ class NotificationConfig:
     allow_http: bool
     worker_poll_seconds: float
     _secret: str | None
+    _pushover_user_key: str | None = None
+    _pushover_app_token: str | None = None
+    pushover_device: str | None = None
+    pushover_priority: int = DEFAULT_PUSHOVER_PRIORITY
+    pushover_sound: str | None = None
 
     @property
     def has_secret(self) -> bool:
         return bool(self._secret)
 
+    @property
+    def has_pushover_user_key(self) -> bool:
+        return bool(self._pushover_user_key)
+
+    @property
+    def has_pushover_app_token(self) -> bool:
+        return bool(self._pushover_app_token)
+
+    @property
+    def webhook_ready(self) -> bool:
+        return bool(self.webhook_url and self.has_secret)
+
+    @property
+    def pushover_ready(self) -> bool:
+        return bool(self.has_pushover_user_key and self.has_pushover_app_token)
+
     def secret_for_signing(self) -> str | None:
         """Return the webhook secret for HMAC only (callers must not log)."""
         return self._secret
+
+    def pushover_credentials(self) -> tuple[str, str] | None:
+        """Return ``(user_key, app_token)`` for Pushover HTTP only (never log)."""
+        if not self.pushover_ready:
+            return None
+        assert self._pushover_user_key is not None
+        assert self._pushover_app_token is not None
+        return self._pushover_user_key, self._pushover_app_token
 
     def effective_claim_lease_seconds(self) -> float:
         """Lease must outlive a single HTTP attempt so active claims survive."""
@@ -174,6 +226,11 @@ class NotificationConfig:
             f"enabled={self.enabled!r}, "
             f"webhook_url={'set' if self.webhook_url else None}, "
             f"has_secret={self.has_secret}, "
+            f"pushover_user_key={'set' if self.has_pushover_user_key else None}, "
+            f"pushover_app_token={'set' if self.has_pushover_app_token else None}, "
+            f"pushover_device={'set' if self.pushover_device else None}, "
+            f"pushover_priority={self.pushover_priority!r}, "
+            f"pushover_sound={'set' if self.pushover_sound else None}, "
             f"timeout_seconds={self.timeout_seconds!r}, "
             f"max_attempts={self.max_attempts!r}, "
             f"allow_http={self.allow_http!r})"
@@ -231,21 +288,71 @@ def _env_flag(name: str, *, environ: Mapping[str, str] | None = None) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_optional_str(
+    name: str,
+    *,
+    environ: Mapping[str, str],
+    max_chars: int,
+) -> str | None:
+    raw = (environ.get(name) or "").strip()
+    if not raw:
+        return None
+    return raw[:max_chars]
+
+
+def parse_pushover_priority(raw: str | None) -> int:
+    """Parse Pushover priority; reject emergency (2) and unknown values."""
+    if raw is None or not str(raw).strip():
+        return DEFAULT_PUSHOVER_PRIORITY
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError("pushover priority must be an integer") from exc
+    if value == 2:
+        raise ValueError(
+            "pushover emergency priority is not supported; use -2..1"
+        )
+    if value not in ALLOWED_PUSHOVER_PRIORITIES:
+        raise ValueError("pushover priority must be one of -2, -1, 0, 1")
+    return value
+
+
 def load_notification_config(
     environ: Mapping[str, str] | None = None,
 ) -> NotificationConfig:
-    """Load opt-in notification settings. Unset URL/secret → disabled."""
+    """Load opt-in notification settings. Unset backends → disabled."""
     env = os.environ if environ is None else environ
     url = (env.get(WEBHOOK_URL_ENV) or "").strip() or None
     secret = (env.get(WEBHOOK_SECRET_ENV) or "").strip() or None
+    pushover_user = _env_optional_str(
+        PUSHOVER_USER_KEY_ENV, environ=env, max_chars=128
+    )
+    pushover_token = _env_optional_str(
+        PUSHOVER_APP_TOKEN_ENV, environ=env, max_chars=128
+    )
+    pushover_device = _env_optional_str(
+        PUSHOVER_DEVICE_ENV, environ=env, max_chars=PUSHOVER_DEVICE_MAX_CHARS
+    )
+    pushover_sound = _env_optional_str(
+        PUSHOVER_SOUND_ENV, environ=env, max_chars=PUSHOVER_SOUND_MAX_CHARS
+    )
+    try:
+        pushover_priority = parse_pushover_priority(
+            env.get(PUSHOVER_PRIORITY_ENV)
+        )
+    except ValueError:
+        pushover_priority = DEFAULT_PUSHOVER_PRIORITY
+
+    webhook_ready = bool(url and secret)
+    pushover_ready = bool(pushover_user and pushover_token)
     enabled_raw = (env.get(ENABLED_ENV) or "").strip().lower()
     if enabled_raw in {"0", "false", "no", "off"}:
         enabled = False
     elif enabled_raw in {"1", "true", "yes", "on"}:
-        enabled = bool(url and secret)
+        enabled = webhook_ready or pushover_ready
     else:
-        # Safe default: enable only when both URL and secret are configured.
-        enabled = bool(url and secret)
+        # Safe default: enable when either backend is fully configured.
+        enabled = webhook_ready or pushover_ready
 
     return NotificationConfig(
         enabled=enabled,
@@ -268,15 +375,77 @@ def load_notification_config(
             WORKER_POLL_ENV, DEFAULT_WORKER_POLL_SECONDS
         ),
         _secret=secret,
+        _pushover_user_key=pushover_user,
+        _pushover_app_token=pushover_token,
+        pushover_device=pushover_device,
+        pushover_priority=pushover_priority,
+        pushover_sound=pushover_sound,
     )
+
+
+def resolve_delivery_backend(
+    config: NotificationConfig | None = None,
+) -> str:
+    """Return the active delivery backend (never both).
+
+    Dual-config policy: when webhook and Pushover are both fully configured,
+    prefer the existing HMAC webhook backend so operators who already rely on
+    webhooks are unchanged and users do not receive duplicate alerts. To use
+    Pushover only, leave webhook URL/secret unset.
+    """
+    cfg = config if config is not None else load_notification_config()
+    if not cfg.enabled:
+        return BACKEND_NONE
+    if cfg.webhook_ready:
+        return BACKEND_WEBHOOK
+    if cfg.pushover_ready:
+        return BACKEND_PUSHOVER
+    return BACKEND_NONE
+
+
+def is_webhook_configured(
+    config: NotificationConfig | None = None,
+) -> bool:
+    """Return True when the HMAC webhook backend is opted in and ready."""
+    cfg = config if config is not None else load_notification_config()
+    return bool(cfg.enabled and cfg.webhook_ready)
+
+
+def is_pushover_configured(
+    config: NotificationConfig | None = None,
+) -> bool:
+    """Return True when the Pushover backend is opted in and ready."""
+    cfg = config if config is not None else load_notification_config()
+    return bool(cfg.enabled and cfg.pushover_ready)
 
 
 def is_notifications_configured(
     config: NotificationConfig | None = None,
 ) -> bool:
-    """Return True when webhook delivery is opted in and fully configured."""
+    """Return True when any delivery backend is opted in and fully configured."""
+    return resolve_delivery_backend(config) != BACKEND_NONE
+
+
+def notification_backend_health(
+    config: NotificationConfig | None = None,
+) -> dict[str, Any]:
+    """Bounded redacted backend-health metadata for inspection.
+
+    Never reveals whether secret values match, never echoes credentials, and
+    never includes webhook URL, user key, or app token material.
+    """
     cfg = config if config is not None else load_notification_config()
-    return bool(cfg.enabled and cfg.webhook_url and cfg.has_secret)
+    backend = resolve_delivery_backend(cfg)
+    return {
+        "notifications_enabled": backend != BACKEND_NONE,
+        "active_backend": backend,
+        "webhook_configured": bool(cfg.webhook_ready),
+        "pushover_configured": bool(cfg.pushover_ready),
+        "pushover_device_set": bool(cfg.pushover_device),
+        "pushover_sound_set": bool(cfg.pushover_sound),
+        "pushover_priority": int(cfg.pushover_priority),
+        "dual_backend_policy": "prefer_webhook",
+    }
 
 
 def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -406,18 +575,166 @@ def post_webhook_ssrf_safe(
     merged["Host"] = host if parsed.port is None else f"{host}:{parsed.port}"
 
     owns_client = client is None
+    timeout = _bounded_httpx_timeout(timeout_seconds)
     if client is None:
-        client = httpx.Client(timeout=timeout_seconds, follow_redirects=False)
+        client = httpx.Client(timeout=timeout, follow_redirects=False)
     try:
         request = client.build_request(
             "POST",
             pinned_url,
             content=content,
             headers=merged,
-            timeout=timeout_seconds,
+            timeout=timeout,
         )
         # Pin TLS SNI / cert verification to the original hostname.
         request.extensions["sni_hostname"] = host
+        return client.send(request, follow_redirects=False)
+    finally:
+        if owns_client:
+            client.close()
+
+
+def _bounded_httpx_timeout(timeout_seconds: float) -> httpx.Timeout:
+    bound = float(max(0.1, timeout_seconds))
+    return httpx.Timeout(
+        connect=bound,
+        read=bound,
+        write=bound,
+        pool=bound,
+    )
+
+
+def format_pushover_title(event_kind: str) -> str:
+    """Concise title identifying Mission Control and severity."""
+    kind = str(event_kind or "event").strip().lower() or "event"
+    if kind == NotificationEventKind.TERMINAL.value:
+        severity = "terminal"
+    elif kind == NotificationEventKind.STALE.value:
+        severity = "stale"
+    elif kind == NotificationEventKind.RECOVERY.value:
+        severity = "recovery"
+    elif kind == NotificationEventKind.PHASE_CHANGE.value:
+        severity = "phase_change"
+    else:
+        severity = kind[:32]
+    return f"Mission Control · {severity}"[:PUSHOVER_TITLE_MAX_CHARS]
+
+
+def format_pushover_message(payload: Mapping[str, Any]) -> str:
+    """Concise body with run identity, phase/status, and safe progress only."""
+    clean = sanitize_notification_payload(payload)
+    parts = [
+        f"run={clean.get('run_id') or 'unknown'}",
+        f"kind={clean.get('event_kind') or 'event'}",
+        f"status={clean.get('status') or 'unknown'}",
+        f"phase={clean.get('phase') or 'unknown'}",
+    ]
+    progress = clean.get("progress")
+    if isinstance(progress, Mapping):
+        step = str(progress.get("step") or "").strip()
+        detail = str(progress.get("detail") or "").strip()
+        if step:
+            parts.append(f"step={step[:64]}")
+        if detail:
+            parts.append(f"detail={detail[:120]}")
+    return "; ".join(parts)[:PUSHOVER_MESSAGE_MAX_CHARS]
+
+
+def build_pushover_form(
+    *,
+    user_key: str,
+    app_token: str,
+    title: str,
+    message: str,
+    priority: int,
+    device: str | None = None,
+    sound: str | None = None,
+) -> dict[str, str]:
+    """Build official Messages API form fields (never log the result)."""
+    if priority not in ALLOWED_PUSHOVER_PRIORITIES:
+        raise ValueError("unsupported pushover priority")
+    form: dict[str, str] = {
+        "token": app_token,
+        "user": user_key,
+        "title": title[:PUSHOVER_TITLE_MAX_CHARS],
+        "message": message[:PUSHOVER_MESSAGE_MAX_CHARS],
+        "priority": str(int(priority)),
+    }
+    if device:
+        form["device"] = str(device)[:PUSHOVER_DEVICE_MAX_CHARS]
+    if sound:
+        form["sound"] = str(sound)[:PUSHOVER_SOUND_MAX_CHARS]
+    return form
+
+
+def is_pushover_success_response(response: httpx.Response) -> bool:
+    """Treat only HTTP 2xx with JSON ``status == 1`` as delivered."""
+    if not (200 <= response.status_code < 300):
+        return False
+    try:
+        body = response.json()
+    except (ValueError, json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(body, Mapping):
+        return False
+    try:
+        return int(body.get("status", 0)) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def classify_pushover_http_failure(status_code: int) -> tuple[str, bool]:
+    """Return ``(error_code, retryable)`` for a non-success Pushover response.
+
+    Invalid credentials and other 4xx (except 429) are permanent. Timeouts are
+    handled separately. 429 and 5xx are retryable.
+    """
+    if status_code == 429:
+        return "pushover_rate_limited", True
+    if 500 <= status_code <= 599:
+        return f"pushover_http_{status_code}", True
+    if status_code in {400, 401, 403}:
+        return "pushover_invalid_credentials_or_request", False
+    if 400 <= status_code <= 499:
+        return f"pushover_http_{status_code}", False
+    return f"pushover_http_{status_code}", True
+
+
+def post_pushover_message(
+    *,
+    form: Mapping[str, str],
+    timeout_seconds: float,
+    client: httpx.Client | None = None,
+) -> httpx.Response:
+    """POST to the fixed official Pushover HTTPS API with IP pinning.
+
+    Destination host is always ``api.pushover.net``. Redirects are disabled.
+    """
+    # Reuse webhook SSRF/DNS helpers against the fixed official host only.
+    validate_webhook_url(PUSHOVER_API_URL, allow_http=False)
+    targets = resolve_webhook_ip_targets(PUSHOVER_API_HOST, 443)
+    _family, ip_text = targets[0]
+    host_for_url = f"[{ip_text}]" if ":" in ip_text else ip_text
+    pinned_url = f"https://{host_for_url}:443{PUSHOVER_MESSAGES_PATH}"
+    timeout = _bounded_httpx_timeout(timeout_seconds)
+    headers = {
+        "Host": PUSHOVER_API_HOST,
+        "User-Agent": "mission-control-notifications/2d-pushover",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    owns_client = client is None
+    if client is None:
+        client = httpx.Client(timeout=timeout, follow_redirects=False)
+    try:
+        request = client.build_request(
+            "POST",
+            pinned_url,
+            data=dict(form),
+            headers=headers,
+            timeout=timeout,
+        )
+        request.extensions["sni_hostname"] = PUSHOVER_API_HOST
         return client.send(request, follow_redirects=False)
     finally:
         if owns_client:
@@ -507,7 +824,14 @@ def redact_notification_error(message: str | None) -> str | None:
         "bearer",
         "api_key",
         "api-key",
+        "user_key",
+        "user key",
+        "app_token",
+        "app token",
         WEBHOOK_SECRET_ENV.lower(),
+        WEBHOOK_URL_ENV.lower(),
+        PUSHOVER_USER_KEY_ENV.lower(),
+        PUSHOVER_APP_TOKEN_ENV.lower(),
     ):
         if needle in lowered:
             text = "[redacted]"
@@ -1213,8 +1537,9 @@ class NotificationOutbox:
         )
 
     def _deliver_one(self, row: sqlite3.Row, config: NotificationConfig) -> None:
-        """Attempt one webhook delivery. Never mutates mission/run status."""
-        if not is_notifications_configured(config):
+        """Attempt one backend delivery. Never mutates mission/run status."""
+        backend = resolve_delivery_backend(config)
+        if backend == BACKEND_NONE:
             # Opt-in off: leave pending so inspection still works; do not HTTP.
             self._clear_claim_fields(
                 row["event_id"],
@@ -1223,6 +1548,16 @@ class NotificationOutbox:
             )
             return
 
+        if backend == BACKEND_PUSHOVER:
+            self._deliver_pushover(row, config)
+            return
+
+        self._deliver_webhook(row, config)
+
+    def _deliver_webhook(
+        self, row: sqlite3.Row, config: NotificationConfig
+    ) -> None:
+        """HMAC webhook delivery path (unchanged semantics)."""
         assert config.webhook_url is not None
         secret = config.secret_for_signing()
         assert secret is not None
@@ -1273,8 +1608,8 @@ class NotificationOutbox:
             if 200 <= response.status_code < 300:
                 self._mark_delivered(row["event_id"])
                 logger.info(
-                    "notification delivered event_id=%s run_id=%s "
-                    "event_kind=%s status_code=%s",
+                    "notification delivered backend=webhook event_id=%s "
+                    "run_id=%s event_kind=%s status_code=%s",
                     row["event_id"],
                     row["run_id"],
                     row["event_kind"],
@@ -1295,8 +1630,8 @@ class NotificationOutbox:
                 backoff_max_seconds=config.backoff_max_seconds,
             )
             logger.warning(
-                "notification permanent failure event_id=%s run_id=%s "
-                "event_kind=%s reason=invalid_target",
+                "notification permanent failure backend=webhook event_id=%s "
+                "run_id=%s event_kind=%s reason=invalid_target",
                 row["event_id"],
                 row["run_id"],
                 row["event_kind"],
@@ -1316,8 +1651,126 @@ class NotificationOutbox:
             backoff_max_seconds=config.backoff_max_seconds,
         )
         logger.warning(
-            "notification delivery failed event_id=%s run_id=%s "
-            "event_kind=%s attempt=%s",
+            "notification delivery failed backend=webhook event_id=%s "
+            "run_id=%s event_kind=%s attempt=%s",
+            row["event_id"],
+            row["run_id"],
+            row["event_kind"],
+            attempt_count,
+        )
+
+    def _deliver_pushover(
+        self, row: sqlite3.Row, config: NotificationConfig
+    ) -> None:
+        """Native Pushover Messages API delivery (fixed official host)."""
+        credentials = config.pushover_credentials()
+        assert credentials is not None
+        user_key, app_token = credentials
+
+        attempt_count = int(row["attempt_count"]) + 1
+        try:
+            payload = sanitize_notification_payload(
+                json.loads(row["payload_json"])
+            )
+            title = format_pushover_title(str(row["event_kind"]))
+            message = format_pushover_message(payload)
+            form = build_pushover_form(
+                user_key=user_key,
+                app_token=app_token,
+                title=title,
+                message=message,
+                priority=config.pushover_priority,
+                device=config.pushover_device,
+                sound=config.pushover_sound,
+            )
+            if self._http_client is not None:
+                validate_webhook_url(PUSHOVER_API_URL, allow_http=False)
+                response = self._http_client.post(
+                    PUSHOVER_API_URL,
+                    data=form,
+                    headers={
+                        "User-Agent": (
+                            "mission-control-notifications/2d-pushover"
+                        ),
+                    },
+                    timeout=_bounded_httpx_timeout(config.timeout_seconds),
+                    follow_redirects=False,
+                )
+            else:
+                response = post_pushover_message(
+                    form=form,
+                    timeout_seconds=config.timeout_seconds,
+                )
+
+            if is_pushover_success_response(response):
+                self._mark_delivered(row["event_id"])
+                logger.info(
+                    "notification delivered backend=pushover event_id=%s "
+                    "run_id=%s event_kind=%s status_code=%s",
+                    row["event_id"],
+                    row["run_id"],
+                    row["event_kind"],
+                    response.status_code,
+                )
+                return
+
+            error, retryable = classify_pushover_http_failure(
+                int(response.status_code)
+            )
+            if not retryable:
+                self._mark_retry_or_dead(
+                    row["event_id"],
+                    attempt_count=config.max_attempts,
+                    error=error,
+                    max_attempts=config.max_attempts,
+                    backoff_base_seconds=config.backoff_base_seconds,
+                    backoff_max_seconds=config.backoff_max_seconds,
+                )
+                logger.warning(
+                    "notification permanent failure backend=pushover "
+                    "event_id=%s run_id=%s event_kind=%s reason=%s",
+                    row["event_id"],
+                    row["run_id"],
+                    row["event_kind"],
+                    error,
+                )
+                return
+        except ValueError as exc:
+            error = (
+                redact_notification_error(str(exc)) or "invalid_pushover_config"
+            )
+            self._mark_retry_or_dead(
+                row["event_id"],
+                attempt_count=config.max_attempts,
+                error=error,
+                max_attempts=config.max_attempts,
+                backoff_base_seconds=config.backoff_base_seconds,
+                backoff_max_seconds=config.backoff_max_seconds,
+            )
+            logger.warning(
+                "notification permanent failure backend=pushover event_id=%s "
+                "run_id=%s event_kind=%s reason=invalid_config",
+                row["event_id"],
+                row["run_id"],
+                row["event_kind"],
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — durable retry path
+            error = redact_notification_error(f"{type(exc).__name__}") or (
+                "delivery_error"
+            )
+
+        self._mark_retry_or_dead(
+            row["event_id"],
+            attempt_count=attempt_count,
+            error=error,
+            max_attempts=config.max_attempts,
+            backoff_base_seconds=config.backoff_base_seconds,
+            backoff_max_seconds=config.backoff_max_seconds,
+        )
+        logger.warning(
+            "notification delivery failed backend=pushover event_id=%s "
+            "run_id=%s event_kind=%s attempt=%s",
             row["event_id"],
             row["run_id"],
             row["event_kind"],

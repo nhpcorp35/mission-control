@@ -95,29 +95,66 @@ ambiguity requires user input.
   (`wait_for_run` timeout layers). On a transport interrupt, resume with the
   same `run_id` and last `cursor`.
 
-## Phase 2C durable notifications (opt-in webhooks)
+## Phase 2C/2D durable notifications (opt-in webhooks + Pushover)
 
-Opt-in generic webhooks for `phase_change`, `stale`, `recovery`, and `terminal`
+Opt-in delivery for `phase_change`, `stale`, `recovery`, and `terminal`
 events only (never heartbeats). Delivery failures never mutate mission/run
-status. With URL or secret unset, notifications stay disabled (safe default).
+status. With no backend fully configured, notifications stay disabled (safe
+default). Supported backends:
+
+1. **HMAC webhook** — generic HTTPS receiver (`WEBHOOK_URL` + `WEBHOOK_SECRET`)
+2. **Native Pushover** — official `https://api.pushover.net/1/messages.json`
+   (`PUSHOVER_USER_KEY` + `PUSHOVER_APP_TOKEN`)
+
+**Dual-backend policy:** when both backends are fully configured, Mission
+Control delivers via the **webhook only** (no duplicate user alerts). To use
+Pushover exclusively, leave webhook URL/secret unset.
 
 ### Environment variables
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL` | for delivery | HTTPS webhook endpoint (HTTP only when `ALLOW_HTTP` is explicitly true). |
-| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET` | for delivery | Shared HMAC secret. Never log or commit the value. |
-| `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable flag; delivery still requires URL **and** secret. |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL` | for webhook delivery | HTTPS webhook endpoint (HTTP only when `ALLOW_HTTP` is explicitly true). |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET` | for webhook delivery | Shared HMAC secret. Never log or commit the value. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_USER_KEY` | for Pushover delivery | Pushover user/group key from the Pushover dashboard. Placeholder: `YOUR_PUSHOVER_USER_KEY`. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_APP_TOKEN` | for Pushover delivery | Application API token from a Pushover application. Placeholder: `YOUR_PUSHOVER_APP_TOKEN`. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_DEVICE` | no | Optional device name filter. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_PRIORITY` | no | `-2`..`1` (default `0`). Emergency priority `2` is rejected. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` | no | Optional Pushover sound name. |
+| `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable flag; delivery still requires a fully configured backend. |
 | `MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS` | no | Per-attempt HTTP timeout (default 5s). |
 | `MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS` | no | Attempts before `dead` (default 8). |
 | `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_BASE_SECONDS` | no | Exponential backoff base (default 1s). |
 | `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_MAX_SECONDS` | no | Backoff cap (default 300s). |
 | `MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP` | no | When true, permits `http://` webhook URLs (dev only). |
 
-**Production:** set HTTPS URL + strong secret; leave `ALLOW_HTTP` unset/false;
-rotate by deploying a new secret to receivers first, then updating Mission
-Control, then disabling the old secret. To disable: clear URL and/or secret (or
-set enabled false) — pending rows remain durable but delivery stops safely.
+### Pushover setup (Railway)
+
+1. Create a Pushover application at https://pushover.net/apps/build and copy the
+   **API token** (use placeholder `YOUR_PUSHOVER_APP_TOKEN` in docs/examples).
+2. Copy your **user key** from the Pushover dashboard
+   (`YOUR_PUSHOVER_USER_KEY`).
+3. In the Railway service **Variables** tab, set:
+   - `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_USER_KEY=YOUR_PUSHOVER_USER_KEY`
+   - `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_APP_TOKEN=YOUR_PUSHOVER_APP_TOKEN`
+   - Optional: `…_DEVICE`, `…_PRIORITY` (`0` or `1`), `…_SOUND`
+4. Redeploy / restart so the worker picks up env. Leave webhook URL/secret
+   unset unless you intentionally want webhook delivery (webhook wins if both
+   are set).
+5. **Test:** enqueue a terminal/stale event (complete or stale a run) and confirm
+   a Pushover notification arrives. Inspect
+   `GET /runs/{run_id}/notifications` for `delivery_state=delivered`.
+6. **Rotate:** create a new app token (or regenerate), update Railway variables,
+   restart, then revoke the old token in Pushover.
+7. **Disable:** clear user key and/or app token (or set
+   `MISSION_CONTROL_NOTIFICATIONS_ENABLED=false`). Pending outbox rows remain
+   durable; HTTP delivery stops.
+
+**Privacy:** titles/bodies include only Mission Control identity, event
+severity, run id, phase/status, and bounded progress step/detail. Never
+stdout/stderr, mission instructions, secrets, webhook URLs, repository
+credentials, or raw exception bodies. Credentials must never appear in logs,
+API, MCP, Unified, or database inspection payloads.
 
 ### HMAC and retry semantics
 
@@ -126,7 +163,10 @@ set enabled false) — pending rows remain durable but delivery stops safely.
 - Also sent: `X-Mission-Control-Timestamp`, `X-Mission-Control-Event-Id`,
   `X-Mission-Control-Event-Kind`.
 - Transient failures retry with exponential backoff up to max attempts, then
-  `dead`. Permanent URL validation failures mark `dead` without mutating runs.
+  `dead`. Permanent URL/credential validation failures mark `dead` without
+  mutating runs.
+- Pushover success requires HTTP 2xx **and** JSON `status: 1`. Invalid
+  credentials / other 4xx (except 429) are permanent; 429/5xx/timeouts retry.
 
 ### Inspection workflow (redacted)
 
@@ -136,7 +176,11 @@ set enabled false) — pending rows remain durable but delivery stops safely.
 - Unified / Unified1: `mission.list_notifications` → same downstream tool.
 - Responses include only allowlisted fields (`event_id`, `event_kind`,
   `delivery_state`, redacted `last_error`, etc.). Never webhook URL/secret,
-  claim owner, raw request headers/body, mission YAML, or raw stdout/stderr.
+  Pushover user key/app token, claim owner, raw request headers/body, mission
+  YAML, or raw stdout/stderr.
+- Backend health helper `notification_backend_health()` reports
+  `active_backend`, booleans for webhook/pushover configured, and option
+  flags — never whether secret values match.
 
 ## Local repository auto-sync (macOS)
 

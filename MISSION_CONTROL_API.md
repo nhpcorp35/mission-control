@@ -407,9 +407,10 @@ Requires authentication.
 
 **OpenAPI operation ID:** `list_run_notifications`
 
-Bounded, redacted Phase 2C durable notification inspection for a run
-(`phase_change`, `stale`, `recovery`, `terminal`). Opt-in webhook delivery is
-independent: inspection works even when webhooks are disabled.
+Bounded, redacted Phase 2C/2D durable notification inspection for a run
+(`phase_change`, `stale`, `recovery`, `terminal`). Opt-in delivery (HMAC
+webhook and/or native Pushover) is independent: inspection works even when
+delivery backends are disabled.
 
 | Query | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -417,8 +418,8 @@ independent: inspection works even when webhooks are disabled.
 
 **Response** `200 OK` fields: `run_id`, `notifications_enabled`, `events[]`
 (allowlisted inspection fields only, with redacted `last_error`), `truncated`,
-`max_events`. Never returns webhook URL/secret, claim owner, raw request
-headers/body, mission YAML, or raw stdout/stderr.
+`max_events`. Never returns webhook URL/secret, Pushover user key/app token,
+claim owner, raw request headers/body, mission YAML, or raw stdout/stderr.
 
 MCP `list_run_notifications` and Unified/Unified1 `mission.list_notifications`
 forward to this endpoint with the same allowlist and limit bounds.
@@ -856,25 +857,37 @@ Execution preflight fails with `PYTHON_UNAVAILABLE` when no Python 3 interpreter
 
 Set `MISSION_CONTROL_API_KEY` and `CURSOR_API_KEY` in the Railway service **Variables** tab. Use secret/reference variables, not hardcoded values in the repo.
 
-### Optional Phase 2C notification environment variables
+### Optional Phase 2C/2D notification environment variables
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL` | for delivery | HTTPS webhook URL (default). HTTP only when `MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP` is true. |
-| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET` | for delivery | HMAC shared secret. Never commit or log. |
-| `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable; delivery still needs URL and secret. |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL` | for webhook delivery | HTTPS webhook URL (default). HTTP only when `MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP` is true. |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET` | for webhook delivery | HMAC shared secret. Never commit or log. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_USER_KEY` | for Pushover delivery | Pushover user/group key. Placeholder: `YOUR_PUSHOVER_USER_KEY`. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_APP_TOKEN` | for Pushover delivery | Pushover application API token. Placeholder: `YOUR_PUSHOVER_APP_TOKEN`. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_DEVICE` | no | Optional device name filter. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_PRIORITY` | no | `-2`..`1` (default `0`). Emergency `2` is rejected. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` | no | Optional Pushover sound name. |
+| `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable; delivery still needs a fully configured backend. |
 | `MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS` | no | Per-attempt timeout (default `5`). |
 | `MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS` | no | Attempts before `dead` (default `8`). |
 | `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_BASE_SECONDS` | no | Backoff base (default `1`). |
 | `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_MAX_SECONDS` | no | Backoff cap (default `300`). |
 | `MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP` | no | Dev-only HTTP webhook allow. Leave unset/false in production. |
 
+Delivery enables when **either** webhook (URL+secret) **or** Pushover
+(user key+app token) is fully configured. If **both** are configured, the
+HMAC webhook backend is used exclusively (no duplicate alerts). Pushover posts
+only to the fixed official host `api.pushover.net` over HTTPS.
+
 Webhook HMAC header `X-Mission-Control-Signature` uses `t=<unix>,v1=<hex>` over
 `{timestamp}.{body}` (HMAC-SHA256). Retries use exponential backoff; exhausted
 attempts become `dead` without changing mission status. Inspect with
 `GET /runs/{run_id}/notifications`, MCP `list_run_notifications`, or Unified
 `mission.list_notifications`. Rotate secrets by updating receivers first, then
-Mission Control; disable by clearing URL/secret. See `docs/HAL_OPERATOR.md`.
+Mission Control; disable by clearing URL/secret and/or Pushover credentials.
+See `docs/HAL_OPERATOR.md` for Pushover Railway setup, rotation, test
+procedure, and privacy notes.
 
 ### Build and start commands
 
