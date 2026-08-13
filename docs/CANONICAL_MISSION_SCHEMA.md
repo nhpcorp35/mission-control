@@ -672,6 +672,7 @@ permissions:
   push: false
 persistence:
   mode: push
+  target_branch: mission/test-safe-push
 instructions: |
   Create docs/example-push.txt with one line of text.
   Update docs/HAL_OPERATOR_LOG.md with verified results.
@@ -706,6 +707,8 @@ approval:
 | Forbidden execute permission | `Permission not allowed for execute: delete_files` | Keep `delete_files: false`; use `persistence.mode` for platform Git |
 | Execute without file perms (non-push, not read-only) | `Execute requires at least one of: create_files or modify_files` | Enable create and/or modify, use the read-only permission set, or use approved `persistence.mode: push` |
 | Push without platform approval | `PLATFORM_PUSH_APPROVAL_REQUIRED: …` | Set `approval.platform_push_approved: true` or `allow_automatic_platform_push: true` |
+| Push without target branch | `PLATFORM_TARGET_BRANCH_REQUIRED: …` | Set explicit `persistence.target_branch` (never infer from prose/`base_branch`) |
+| Main/master push without ack | `PLATFORM_MAIN_WRITE_ACK_REQUIRED: …` | Set `approval.platform_main_write_acknowledged: true` in addition to platform-push approval |
 | Missing/invalid repo path | `repository.path must be a non-empty string` / `does not exist` / `not a directory` | Point `repository.path` at an existing directory |
 | Top level not a mapping | `Mission must be a YAML mapping at the top level` | Root document must be a YAML object |
 

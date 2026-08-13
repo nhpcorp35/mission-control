@@ -276,6 +276,14 @@ class TestPersistenceOwnershipPhase1(unittest.TestCase):
                 ["git", "-C", str(source), "branch", "-M", "main"],
                 ["git", "-C", str(source), "remote", "add", "origin", str(bare)],
                 ["git", "-C", str(source), "push", "-u", "origin", "main"],
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "push",
+                    "origin",
+                    "main:mission/test-safe-push",
+                ],
             ):
                 subprocess.run(args, check=True, capture_output=True, text=True)
 
@@ -285,7 +293,10 @@ class TestPersistenceOwnershipPhase1(unittest.TestCase):
                     "path": str(source),
                     "base_branch": "main",
                 },
-                "persistence": {"mode": "push"},
+                "persistence": {
+                    "mode": "push",
+                    "target_branch": "mission/test-safe-push",
+                },
                 "approval": {
                     "platform_push_approved": True,
                     "allow_automatic_platform_push": True,
@@ -331,12 +342,25 @@ class TestPersistenceOwnershipPhase1(unittest.TestCase):
                         AGENT_GIT_PUSH_DISABLED_URL,
                     )
                     remote_sha = subprocess.run(
-                        ["git", "--git-dir", str(bare), "rev-parse", "main"],
+                        [
+                            "git",
+                            "--git-dir",
+                            str(bare),
+                            "rev-parse",
+                            "mission/test-safe-push",
+                        ],
                         capture_output=True,
                         text=True,
                         check=True,
                     ).stdout.strip()
                     self.assertEqual(remote_sha, result.commit_sha)
+                    main_sha = subprocess.run(
+                        ["git", "--git-dir", str(bare), "rev-parse", "main"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout.strip()
+                    self.assertNotEqual(main_sha, result.commit_sha)
                 finally:
                     cleanup_workspace(prep.workspace_path)
         finally:

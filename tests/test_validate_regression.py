@@ -11,10 +11,15 @@ from mission_control.validator import (
     validate_mission_file,
     validate_mission_for_execute,
 )
-from mission_control.workspace import PLATFORM_PUSH_APPROVAL_REQUIRED
+from mission_control.workspace import (
+    PLATFORM_MAIN_WRITE_ACK_REQUIRED,
+    PLATFORM_PUSH_APPROVAL_REQUIRED,
+    PLATFORM_TARGET_BRANCH_REQUIRED,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFERENCE = REPO_ROOT / "missions" / "reference"
+TEST_SAFE_PUSH_TARGET = "mission/test-safe-push"
 
 
 def _executable_mission(
@@ -22,6 +27,9 @@ def _executable_mission(
     persistence_mode: str | None = None,
     platform_push_approved: bool | None = None,
     allow_automatic_platform_push: bool | None = None,
+    platform_main_write_acknowledged: bool | None = None,
+    target_branch: str | None = None,
+    include_default_push_target: bool = True,
     permissions_push: bool = False,
     stage_changes: bool = False,
     commit: bool = False,
@@ -63,12 +71,23 @@ def _executable_mission(
         },
     }
     if persistence_mode is not None:
-        mission["persistence"] = {"mode": persistence_mode}
+        persistence: dict[str, str] = {"mode": persistence_mode}
+        if persistence_mode == "push" and include_default_push_target:
+            persistence["target_branch"] = (
+                TEST_SAFE_PUSH_TARGET if target_branch is None else target_branch
+            )
+        elif target_branch is not None:
+            persistence["target_branch"] = target_branch
+        mission["persistence"] = persistence
     if platform_push_approved is not None:
         mission["approval"]["platform_push_approved"] = platform_push_approved
     if allow_automatic_platform_push is not None:
         mission["approval"]["allow_automatic_platform_push"] = (
             allow_automatic_platform_push
+        )
+    if platform_main_write_acknowledged is not None:
+        mission["approval"]["platform_main_write_acknowledged"] = (
+            platform_main_write_acknowledged
         )
     return mission
 
@@ -435,6 +454,39 @@ class TestPlatformPushApprovalForExecute(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
+
+    def test_execute_rejects_push_without_target_branch(self) -> None:
+        mission = _executable_mission(
+            persistence_mode="push",
+            platform_push_approved=True,
+            include_default_push_target=False,
+        )
+        self.assertNotIn("target_branch", mission.get("persistence", {}))
+        result = validate_mission_for_execute(mission)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, PLATFORM_TARGET_BRANCH_REQUIRED)
+
+    def test_execute_rejects_main_target_without_main_write_ack(self) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                target_branch="main",
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, PLATFORM_MAIN_WRITE_ACK_REQUIRED)
+
+    def test_execute_accepts_main_target_with_main_write_ack(self) -> None:
+        result = validate_mission_for_execute(
+            _executable_mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                target_branch="main",
+                platform_main_write_acknowledged=True,
+            )
+        )
+        self.assertTrue(result.ok, result.error)
 
 
 class TestValidateCli(unittest.TestCase):

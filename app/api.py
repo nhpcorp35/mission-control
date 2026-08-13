@@ -41,6 +41,7 @@ from mission_control.command_runner import (
 from mission_control.mission_builder import (
     DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH,
     DEFAULT_BASE_BRANCH,
+    DEFAULT_PLATFORM_MAIN_WRITE_ACKNOWLEDGED,
     DEFAULT_PLATFORM_PUSH_APPROVED,
     DEFAULT_REPOSITORY_NAME,
     DEFAULT_REPOSITORY_PATH,
@@ -175,6 +176,7 @@ class StructuredApproval(BaseModel):
     """Canonical nested approval fields for structured submission."""
 
     platform_push_approved: bool | None = None
+    platform_main_write_acknowledged: bool | None = None
 
 
 class StructuredRunRequest(BaseModel):
@@ -189,6 +191,8 @@ class StructuredRunRequest(BaseModel):
     # None → mission builder infers push for create/modify, else none.
     # Explicit values (including "none") are never overridden.
     persistence_mode: str | None = None
+    # Push destination is never inferred; callers must supply for mode=push.
+    target_branch: str | None = None
     repository_name: str = DEFAULT_REPOSITORY_NAME
     repository_path: str = DEFAULT_REPOSITORY_PATH
     base_branch: str = DEFAULT_BASE_BRANCH
@@ -197,6 +201,9 @@ class StructuredRunRequest(BaseModel):
     approval: StructuredApproval | None = None
     allow_automatic_platform_push: bool = (
         DEFAULT_ALLOW_AUTOMATIC_PLATFORM_PUSH
+    )
+    platform_main_write_acknowledged: bool = (
+        DEFAULT_PLATFORM_MAIN_WRITE_ACKNOWLEDGED
     )
 
     @model_validator(mode="after")
@@ -225,12 +232,35 @@ class StructuredRunRequest(BaseModel):
                     "does not match "
                     f"approval.platform_push_approved={nested_value!r}"
                 )
-            return self
-
-        if nested_provided and not flat_provided:
+        elif nested_provided and not flat_provided:
             # Honor nested-only approval; do not silently drop it.
             self.platform_push_approved = bool(nested_value)
-            return self
+
+        flat_main_ack = "platform_main_write_acknowledged" in self.model_fields_set
+        nested_main_ack = False
+        nested_main_value: bool | None = None
+        if self.approval is not None:
+            nested_main_ack = (
+                "platform_main_write_acknowledged"
+                in self.approval.model_fields_set
+            )
+            if nested_main_ack:
+                nested_main_value = self.approval.platform_main_write_acknowledged
+                if nested_main_value is None:
+                    raise ValueError(
+                        "approval.platform_main_write_acknowledged must be a "
+                        "boolean when provided"
+                    )
+
+        if flat_main_ack and nested_main_ack:
+            if self.platform_main_write_acknowledged != nested_main_value:
+                raise ValueError(
+                    "Conflicting platform_main_write_acknowledged values: "
+                    f"flat={self.platform_main_write_acknowledged!r} does not "
+                    f"match nested={nested_main_value!r}"
+                )
+        elif nested_main_ack and not flat_main_ack:
+            self.platform_main_write_acknowledged = bool(nested_main_value)
 
         return self
 
@@ -776,6 +806,7 @@ def submit_structured_run_endpoint(
         create_files=request.create_files,
         modify_files=request.modify_files,
         persistence_mode=request.persistence_mode,
+        target_branch=request.target_branch,
         repository_name=request.repository_name,
         repository_path=request.repository_path,
         base_branch=request.base_branch,
@@ -783,6 +814,9 @@ def submit_structured_run_endpoint(
         platform_push_approved=request.platform_push_approved,
         allow_automatic_platform_push=(
             request.allow_automatic_platform_push
+        ),
+        platform_main_write_acknowledged=(
+            request.platform_main_write_acknowledged
         ),
     )
     return _accept_async_run(mission_yaml)

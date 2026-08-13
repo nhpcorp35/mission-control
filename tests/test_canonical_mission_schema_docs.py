@@ -78,6 +78,10 @@ class TestCanonicalMissionSchemaExamples(unittest.TestCase):
                     self.assertTrue(
                         mission["approval"].get("platform_push_approved")
                     )
+                    self.assertEqual(
+                        mission["persistence"].get("target_branch"),
+                        "mission/test-safe-push",
+                    )
 
     def test_examples_are_parseable_mappings(self) -> None:
         for heading in _EXAMPLE_HEADINGS:

@@ -13,7 +13,11 @@ from fastapi.testclient import TestClient
 import app.api as api_module
 from app.api import app
 from mission_control.run_registry import RunRegistry
-from mission_control.workspace import PLATFORM_PUSH_APPROVAL_REQUIRED
+from mission_control.workspace import (
+    PLATFORM_MAIN_WRITE_ACK_REQUIRED,
+    PLATFORM_PUSH_APPROVAL_REQUIRED,
+    PLATFORM_TARGET_BRANCH_REQUIRED,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_API_KEY = "mc_test_authentication_key"
@@ -21,6 +25,7 @@ AUTH_HEADERS = {
     "Authorization": f"Bearer {TEST_API_KEY}",
 }
 os.environ["MISSION_CONTROL_API_KEY"] = TEST_API_KEY
+TEST_SAFE_PUSH_TARGET = "mission/test-safe-push"
 
 
 def _structured_payload(**overrides: object) -> dict:
@@ -32,6 +37,8 @@ def _structured_payload(**overrides: object) -> dict:
         "create_files": True,
         "modify_files": False,
         "repository_path": str(REPO_ROOT),
+        # Positive push fixtures use an explicit synthetic non-main target.
+        "target_branch": TEST_SAFE_PUSH_TARGET,
     }
     payload.update(overrides)
     return payload
@@ -80,6 +87,7 @@ class TestStructuredRunsApi(unittest.TestCase):
         self.assertIn("mission_id: 2026-07-24-structured", mission_yaml)
         self.assertIn("mode: execute", mission_yaml)
         self.assertIn("mode: push", mission_yaml)
+        self.assertIn(f"target_branch: {TEST_SAFE_PUSH_TARGET}", mission_yaml)
         record = api_module.run_registry.get_run(body["run_id"])
         assert record is not None
         self.assertEqual(record.mission_yaml, mission_yaml)
@@ -234,6 +242,7 @@ class TestStructuredRunsApi(unittest.TestCase):
             mission_yaml,
             r"persistence:\s*\n\s*mode:\s*push\b",
         )
+        self.assertIn(f"target_branch: {TEST_SAFE_PUSH_TARGET}", mission_yaml)
 
     @patch("app.api.preflight_for_execution", return_value=None)
     def test_inferred_push_without_approval_rejected(
@@ -316,6 +325,45 @@ class TestStructuredRunsApi(unittest.TestCase):
         self.assertEqual(api_module.run_registry.count_runs(), 0)
 
     @patch("app.api.preflight_for_execution", return_value=None)
+    def test_push_without_target_branch_rejected(
+        self,
+        _mock_preflight,
+    ) -> None:
+        response = self.client.post(
+            "/runs/structured",
+            json=_structured_payload(
+                persistence_mode="push",
+                platform_push_approved=True,
+                target_branch=None,
+            ),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"], PLATFORM_TARGET_BRANCH_REQUIRED)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
+    def test_main_target_without_main_write_ack_rejected(
+        self,
+        _mock_preflight,
+    ) -> None:
+        response = self.client.post(
+            "/runs/structured",
+            json=_structured_payload(
+                persistence_mode="push",
+                platform_push_approved=True,
+                target_branch="main",
+                platform_main_write_acknowledged=False,
+            ),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"], PLATFORM_MAIN_WRITE_ACK_REQUIRED)
+        self.assertEqual(api_module.run_registry.count_runs(), 0)
+
+    @patch("app.api.preflight_for_execution", return_value=None)
     def test_flat_platform_push_approved_accepted(
         self,
         _mock_preflight,
@@ -335,6 +383,7 @@ class TestStructuredRunsApi(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         mission_yaml = accept_mock.call_args.args[0]
         self.assertIn("platform_push_approved: true", mission_yaml)
+        self.assertIn(f"target_branch: {TEST_SAFE_PUSH_TARGET}", mission_yaml)
 
     @patch("app.api.preflight_for_execution", return_value=None)
     def test_nested_approval_platform_push_approved_accepted(
