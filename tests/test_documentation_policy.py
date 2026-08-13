@@ -368,6 +368,17 @@ class TestDocumentationStructuredResult(unittest.TestCase):
 
 
 class TestDocumentationInRegisteredRun(SqliteRegistryTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Temp mocked workspaces are not git repos; skip push-deny config
+        # that now runs before mocked persistence.
+        self._disable_push_patcher = patch(
+            "mission_control.workspace.disable_agent_git_push",
+            return_value=None,
+        )
+        self._disable_push_patcher.start()
+        self.addCleanup(self._disable_push_patcher.stop)
+
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
     @patch("mission_control.workspace.collect_changed_files")
