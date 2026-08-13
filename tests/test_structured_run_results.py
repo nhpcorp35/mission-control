@@ -309,6 +309,14 @@ class TestExecuteRegisteredRunStructuredResult(unittest.TestCase):
         self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(self._db_fd)
         self.registry = RunRegistry(self._db_path)
+        # Temp mocked workspaces are not git repos; skip push-deny config
+        # that now runs before mocked persistence.
+        self._disable_push_patcher = patch(
+            "mission_control.workspace.disable_agent_git_push",
+            return_value=None,
+        )
+        self._disable_push_patcher.start()
+        self.addCleanup(self._disable_push_patcher.stop)
 
     def tearDown(self) -> None:
         self.registry.close()
@@ -862,6 +870,14 @@ class TestStructuredResultApi(unittest.TestCase):
         api_module.run_queue = RunQueue()
         api_module.run_queue.configure(api_module._execute_queued_run)
         self.client = TestClient(app, headers=AUTH_HEADERS)
+        # Temp mocked workspaces are not git repos; skip push-deny config
+        # that now runs before mocked persistence.
+        self._disable_push_patcher = patch(
+            "mission_control.workspace.disable_agent_git_push",
+            return_value=None,
+        )
+        self._disable_push_patcher.start()
+        self.addCleanup(self._disable_push_patcher.stop)
 
     def tearDown(self) -> None:
         api_module.run_registry.close()
