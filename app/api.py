@@ -323,13 +323,25 @@ class StructuredRunResultModel(BaseModel):
     summary: str | None = None
 
 
+class RunProgressModel(BaseModel):
+    """Platform-authored live progress (bounded; never raw agent output)."""
+
+    step: str
+    detail: str
+
+
 class RunStatusResponse(BaseModel):
     run_id: str
     status: str
     created_at: datetime
+    queued_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
     elapsed_seconds: float | None = None
+    phase: str
+    phase_started_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    progress: RunProgressModel | None = None
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
@@ -439,13 +451,24 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
     summary = None
     if structured is not None and structured.summary is not None:
         summary = structured.summary
+    progress = None
+    if record.progress is not None:
+        progress = RunProgressModel(
+            step=record.progress.get("step", record.phase.value),
+            detail=record.progress.get("detail", ""),
+        )
     return RunStatusResponse(
         run_id=record.run_id,
         status=record.status.value,
         created_at=record.created_at,
+        queued_at=record.queued_at,
         started_at=record.started_at,
         completed_at=record.completed_at,
         elapsed_seconds=record.elapsed_seconds,
+        phase=record.phase.value,
+        phase_started_at=record.phase_started_at,
+        heartbeat_at=record.heartbeat_at,
+        progress=progress,
         stdout=record.stdout,
         stderr=record.stderr,
         error=record.error,
@@ -922,9 +945,17 @@ def submit_and_wait_endpoint(
                                 "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                                 "status": "completed",
                                 "created_at": "2026-07-23T17:00:00+00:00",
+                                "queued_at": "2026-07-23T17:00:00+00:00",
                                 "started_at": "2026-07-23T17:00:01+00:00",
                                 "completed_at": "2026-07-23T17:01:30+00:00",
                                 "elapsed_seconds": 89.0,
+                                "phase": "completed",
+                                "phase_started_at": "2026-07-23T17:01:30+00:00",
+                                "heartbeat_at": "2026-07-23T17:01:30+00:00",
+                                "progress": {
+                                    "step": "completed",
+                                    "detail": "Run completed",
+                                },
                                 "stdout": "Agent prose summary (diagnostic only)\n",
                                 "stderr": "",
                                 "error": None,

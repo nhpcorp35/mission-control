@@ -13,9 +13,16 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 
 from mission_control.executor import execute_cursor_agent
-from mission_control.run_registry import RunRegistry, RunStatus
+from mission_control.run_registry import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    RunPhase,
+    RunRegistry,
+    RunStatus,
+    platform_progress,
+)
 from mission_control.run_result import (
     DeliverableEvidence,
     PersistenceEvidence,
@@ -1962,8 +1969,17 @@ def execute_registered_run(
         keys,
     )
     registry.update_status(run_id, RunStatus.RUNNING)
+    registry.set_phase(
+        run_id,
+        RunPhase.WORKSPACE_PREPARATION,
+        progress=platform_progress(
+            step=RunPhase.WORKSPACE_PREPARATION.value,
+            detail="Preparing isolated workspace",
+        ),
+    )
     workspace_path: str | None = None
     structured = empty_structured_result()
+    final_status: RunStatus | None = None
 
     def _attach_documentation(*, handling_completed: bool) -> None:
         structured.documentation = build_documentation_evidence(
@@ -1971,6 +1987,27 @@ def execute_registered_run(
             files_changed=structured.files_changed,
             handling_completed=handling_completed,
         )
+
+    def _finish(
+        status: RunStatus,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        error: str | None = None,
+        return_code: int | None = None,
+        commit_sha: str | None = None,
+    ) -> None:
+        nonlocal final_status
+        registry.store_result(
+            run_id,
+            stdout=stdout,
+            stderr=stderr,
+            error=error,
+            return_code=return_code,
+            commit_sha=commit_sha,
+            result=structured,
+        )
+        final_status = status
 
     try:
         prep = prepare_isolated_workspace(mission)
@@ -1988,12 +2025,7 @@ def execute_registered_run(
             )
             _attach_documentation(handling_completed=False)
             finalize_structured_summary(structured, error=prep.error)
-            registry.store_result(
-                run_id,
-                error=prep.error,
-                result=structured,
-            )
-            registry.update_status(run_id, RunStatus.FAILED)
+            _finish(RunStatus.FAILED, error=prep.error)
             return
 
         # realpath: same absolute checkout for agent --workspace and persistence.
@@ -2023,12 +2055,7 @@ def execute_registered_run(
             )
             _attach_documentation(handling_completed=False)
             finalize_structured_summary(structured, error=path_error)
-            registry.store_result(
-                run_id,
-                error=path_error,
-                result=structured,
-            )
-            registry.update_status(run_id, RunStatus.FAILED)
+            _finish(RunStatus.FAILED, error=path_error)
             return
 
         isolated_mission = copy.deepcopy(mission)
@@ -2053,18 +2080,38 @@ def execute_registered_run(
             )
             _attach_documentation(handling_completed=False)
             finalize_structured_summary(structured, error=push_deny_error)
-            registry.store_result(
-                run_id,
-                error=push_deny_error,
-                result=structured,
-            )
-            registry.update_status(run_id, RunStatus.FAILED)
+            _finish(RunStatus.FAILED, error=push_deny_error)
             return
 
-        execution_result = execute_cursor_agent(
-            isolated_mission,
-            run_id=run_id,
+        registry.set_phase(
+            run_id,
+            RunPhase.AGENT_EXECUTION,
+            progress=platform_progress(
+                step=RunPhase.AGENT_EXECUTION.value,
+                detail="Cursor agent subprocess running",
+            ),
         )
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat_loop() -> None:
+            while not stop_heartbeat.wait(HEARTBEAT_INTERVAL_SECONDS):
+                registry.touch_heartbeat(run_id)
+
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_loop,
+            name=f"mc-heartbeat-{run_id[:8]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        try:
+            execution_result = execute_cursor_agent(
+                isolated_mission,
+                run_id=run_id,
+            )
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=1.0)
+
         structured.commands = [
             command_evidence_from_execution(execution_result),
         ]
@@ -2090,15 +2137,13 @@ def execute_registered_run(
             )
             _attach_documentation(handling_completed=False)
             finalize_structured_summary(structured, error=contamination)
-            registry.store_result(
-                run_id,
+            _finish(
+                RunStatus.FAILED,
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=contamination,
                 return_code=execution_result.return_code,
-                result=structured,
             )
-            registry.update_status(run_id, RunStatus.FAILED)
             return
 
         if not execution_result.ok:
@@ -2118,23 +2163,26 @@ def execute_registered_run(
                 structured,
                 error=execution_result.error,
             )
-            registry.store_result(
-                run_id,
-                stdout=execution_result.stdout,
-                stderr=execution_result.stderr,
-                error=execution_result.error,
-                return_code=execution_result.return_code,
-                result=structured,
-            )
-            registry.update_status(
-                run_id,
+            _finish(
                 _execution_run_status(
                     execution_result.ok,
                     execution_result.error,
                 ),
+                stdout=execution_result.stdout,
+                stderr=execution_result.stderr,
+                error=execution_result.error,
+                return_code=execution_result.return_code,
             )
             return
 
+        registry.set_phase(
+            run_id,
+            RunPhase.VERIFICATION,
+            progress=platform_progress(
+                step=RunPhase.VERIFICATION.value,
+                detail="Verifying declared deliverables",
+            ),
+        )
         deliverable_evidence = collect_deliverable_evidence(
             mission,
             workspace_path,
@@ -2168,15 +2216,13 @@ def execute_registered_run(
             # Agent completed; documentation status uses files_changed.
             _attach_documentation(handling_completed=True)
             finalize_structured_summary(structured, error=deliverable_error)
-            registry.store_result(
-                run_id,
+            _finish(
+                RunStatus.FAILED,
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=deliverable_error,
                 return_code=execution_result.return_code,
-                result=structured,
             )
-            registry.update_status(run_id, RunStatus.FAILED)
             return
 
         temp_path_error = persistence_temp_path_guard_error(
@@ -2191,17 +2237,23 @@ def execute_registered_run(
             )
             _attach_documentation(handling_completed=True)
             finalize_structured_summary(structured, error=temp_path_error)
-            registry.store_result(
-                run_id,
+            _finish(
+                RunStatus.FAILED,
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=temp_path_error,
                 return_code=execution_result.return_code,
-                result=structured,
             )
-            registry.update_status(run_id, RunStatus.FAILED)
             return
 
+        registry.set_phase(
+            run_id,
+            RunPhase.PERSISTENCE,
+            progress=platform_progress(
+                step=RunPhase.PERSISTENCE.value,
+                detail="Applying platform persistence",
+            ),
+        )
         persistence_result = persist_workspace_changes(
             run_id,
             mission,
@@ -2245,28 +2297,24 @@ def execute_registered_run(
                 structured,
                 error=persistence_result.error,
             )
-            registry.store_result(
-                run_id,
+            _finish(
+                RunStatus.FAILED,
                 stdout=execution_result.stdout,
                 stderr=execution_result.stderr,
                 error=persistence_result.error,
                 return_code=execution_result.return_code,
-                result=structured,
             )
-            registry.update_status(run_id, RunStatus.FAILED)
             return
 
         _attach_documentation(handling_completed=True)
         finalize_structured_summary(structured)
-        registry.store_result(
-            run_id,
+        _finish(
+            RunStatus.COMPLETED,
             stdout=execution_result.stdout,
             stderr=execution_result.stderr,
             return_code=execution_result.return_code,
             commit_sha=persistence_result.commit_sha,
-            result=structured,
         )
-        registry.update_status(run_id, RunStatus.COMPLETED)
     except Exception as exc:
         logger.exception(
             (
@@ -2287,14 +2335,17 @@ def execute_registered_run(
         if structured.documentation is None:
             _attach_documentation(handling_completed=False)
         finalize_structured_summary(structured, error=str(exc))
-        registry.store_result(
-            run_id,
-            error=str(exc),
-            result=structured,
-        )
-        registry.update_status(run_id, RunStatus.FAILED)
+        _finish(RunStatus.FAILED, error=str(exc))
     finally:
         if workspace_path is not None:
+            registry.set_phase(
+                run_id,
+                RunPhase.CLEANUP,
+                progress=platform_progress(
+                    step=RunPhase.CLEANUP.value,
+                    detail="Cleaning isolated workspace",
+                ),
+            )
             try:
                 cleanup_workspace(workspace_path)
             except Exception:
@@ -2303,3 +2354,22 @@ def execute_registered_run(
                     run_id,
                     workspace_path,
                 )
+        if final_status is not None:
+            terminal_phase = (
+                RunPhase.COMPLETED
+                if final_status is RunStatus.COMPLETED
+                else RunPhase.FAILED
+            )
+            registry.set_phase(
+                run_id,
+                terminal_phase,
+                progress=platform_progress(
+                    step=terminal_phase.value,
+                    detail=(
+                        "Run completed"
+                        if terminal_phase is RunPhase.COMPLETED
+                        else "Run failed"
+                    ),
+                ),
+            )
+            registry.update_status(run_id, final_status)

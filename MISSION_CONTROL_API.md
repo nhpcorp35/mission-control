@@ -288,10 +288,15 @@ Return lifecycle status and retained output for a previously accepted run.
 | --- | --- | --- |
 | `run_id` | string | Run identifier |
 | `status` | string | `queued`, `running`, `completed`, `failed`, or `timed_out` |
-| `created_at` | string | ISO timestamp |
+| `created_at` | string | ISO timestamp when the run was accepted (queue time) |
+| `queued_at` | string | Same instant as `created_at` (explicit queue-time alias; backward compatible) |
 | `started_at` | string or null | Set when execution begins |
 | `completed_at` | string or null | Set when the run reaches a terminal status |
 | `elapsed_seconds` | number or null | Duration from start to completion |
+| `phase` | string | Authoritative platform phase: `queued`, `workspace_preparation`, `agent_execution`, `verification`, `persistence`, `cleanup`, `completed`, or `failed` |
+| `phase_started_at` | string or null | ISO timestamp when the current `phase` began |
+| `heartbeat_at` | string or null | ISO timestamp refreshed periodically while long agent execution is active; also updated on phase transitions |
+| `progress` | object or null | Small platform-authored progress object with `step` and `detail` only (bounded/redacted; never secrets, prompts, command payloads, or raw agent output) |
 | `stdout` | string | Agent stdout when available (diagnostic; not verified evidence) |
 | `stderr` | string | Agent stderr when available (diagnostic; not verified evidence) |
 | `error` | string or null | Failure detail when unsuccessful |
@@ -300,6 +305,8 @@ Return lifecycle status and retained output for a previously accepted run.
 | `result` | object or null | Structured objective evidence collected by Mission Control (see below). Null for non-terminal runs that have not stored evidence yet; present on terminal runs when Mission Control recorded evidence |
 | `summary` | string or null | Authoritative Mission Control-authored run summary, aligned with platform persistence outcome. Prefer this over agent `stdout` for persistence claims. Mirrors `result.summary` when present; null when no structured evidence has been stored yet |
 | `retried_from` | string or null | Source `run_id` when this run was created via `POST /runs/{run_id}/retry`; otherwise null |
+
+Live `phase` / `heartbeat_at` / `progress` describe what the platform is doing without relying on empty stdout or agent prose. Terminal `status` and terminal `phase` values are monotonic: a completed/failed/timed_out run cannot regress to a running phase, and a stale worker cannot overwrite a newer terminal state. `stdout` / `stderr` semantics are unchanged.
 
 #### Trust boundary: `summary` / `result` vs `stdout` / `stderr`
 
@@ -327,9 +334,17 @@ Failed and timed-out runs retain any partial evidence Mission Control actually c
   "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "completed",
   "created_at": "2026-07-23T17:00:00+00:00",
+  "queued_at": "2026-07-23T17:00:00+00:00",
   "started_at": "2026-07-23T17:00:01+00:00",
   "completed_at": "2026-07-23T17:01:30+00:00",
   "elapsed_seconds": 89.0,
+  "phase": "completed",
+  "phase_started_at": "2026-07-23T17:01:30+00:00",
+  "heartbeat_at": "2026-07-23T17:01:30+00:00",
+  "progress": {
+    "step": "completed",
+    "detail": "Run completed"
+  },
   "stdout": "Agent prose summary (diagnostic only)\n",
   "stderr": "",
   "error": null,
