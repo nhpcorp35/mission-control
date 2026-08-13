@@ -39,6 +39,11 @@ from mission_control.run_registry import (
     RunStatus,
     is_terminal_status,
 )
+from mission_control.notifications import (
+    NOTIFICATION_INSPECT_MAX_EVENTS,
+    is_notifications_configured,
+    load_notification_config,
+)
 from mission_control.run_result import StructuredRunResult
 from mission_control.workspace import execute_registered_run
 from mission_control.command_runner import (
@@ -67,6 +72,8 @@ from mission_control.validator import (
 logger = logging.getLogger(__name__)
 run_registry = RunRegistry()
 run_queue = RunQueue()
+# Phase 2C durable notifications share the run registry SQLite database.
+notification_outbox = run_registry._get_notification_outbox()
 
 # Bounds for POST /runs/{run_id}/wait (and the MCP wait_for_run tool).
 WAIT_MIN_TIMEOUT_SECONDS = 0.1
@@ -76,6 +83,26 @@ WAIT_MAX_POLL_INTERVAL_SECONDS = 60.0
 WAIT_DEFAULT_TIMEOUT_SECONDS = 300.0
 # Phase 2B: default ~25s so HAL can wait server-side without chat polling.
 WAIT_DEFAULT_POLL_INTERVAL_SECONDS = DEFAULT_MONITOR_POLL_INTERVAL_SECONDS
+
+
+def _kick_notification_delivery() -> None:
+    """Best-effort process due webhook deliveries (never alters run status)."""
+    try:
+        notification_outbox.process_due_deliveries()
+    except Exception:  # noqa: BLE001 — delivery must not break API paths
+        logger.exception("notification delivery kick failed")
+
+
+def _observe_notifications(record: RunRecord) -> None:
+    """Enqueue stale (if applicable) and kick delivery without mutating runs."""
+    try:
+        notification_outbox.maybe_enqueue_stale(record)
+        _kick_notification_delivery()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "notification observe failed run_id=%s",
+            record.run_id,
+        )
 
 
 def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> None:
@@ -167,6 +194,14 @@ async def lifespan(_: FastAPI):
         logger.info(
             "Marked %s interrupted run(s) failed on startup",
             recovered,
+        )
+    # Phase 2C: drain any due notification deliveries after recovery enqueue.
+    _kick_notification_delivery()
+    if is_notifications_configured(load_notification_config()):
+        logger.info("Phase 2C notifications: webhook delivery enabled")
+    else:
+        logger.info(
+            "Phase 2C notifications: disabled (opt-in; no webhook configured)"
         )
     yield
 PRODUCTION_SERVER_URL = (
@@ -488,6 +523,40 @@ class WaitForRunResponse(RunStatusResponse):
     stale_threshold_seconds: float = HEARTBEAT_STALE_THRESHOLD_SECONDS
 
 
+class NotificationProgressModel(BaseModel):
+    step: str
+    detail: str
+
+
+class NotificationEventModel(BaseModel):
+    """Redacted durable notification outbox row (no secrets / raw logs)."""
+
+    event_id: str
+    run_id: str
+    event_kind: str
+    status: str | None = None
+    phase: str | None = None
+    progress: NotificationProgressModel | None = None
+    heartbeat_health: str | None = None
+    occurred_at: str | None = None
+    delivery_state: str
+    attempt_count: int = 0
+    next_attempt_at: str | None = None
+    last_error: str | None = None
+    delivered_at: str | None = None
+    created_at: str | None = None
+
+
+class RunNotificationsResponse(BaseModel):
+    """Bounded redacted notification inspection for a run."""
+
+    run_id: str
+    notifications_enabled: bool
+    events: list[NotificationEventModel] = Field(default_factory=list)
+    truncated: bool = False
+    max_events: int = NOTIFICATION_INSPECT_MAX_EVENTS
+
+
 def _structured_result_model(
     result: StructuredRunResult | None,
 ) -> StructuredRunResultModel | None:
@@ -607,6 +676,7 @@ def _wait_for_run(
             )
 
         history, heartbeat_health, _event = observe_run(record, history)
+        _observe_notifications(record)
 
         if is_monitoring_terminal(record.status):
             logger.info(
@@ -1176,6 +1246,79 @@ def get_run_endpoint(
         record.status.value,
     )
     return _run_status_response(record)
+
+
+def _notification_event_models(
+    events: list[dict],
+) -> list[NotificationEventModel]:
+    models: list[NotificationEventModel] = []
+    for item in events:
+        progress = item.get("progress")
+        progress_model = None
+        if isinstance(progress, dict):
+            progress_model = NotificationProgressModel(
+                step=str(progress.get("step", "")),
+                detail=str(progress.get("detail", "")),
+            )
+        models.append(
+            NotificationEventModel(
+                event_id=str(item.get("event_id", "")),
+                run_id=str(item.get("run_id", "")),
+                event_kind=str(item.get("event_kind", "")),
+                status=item.get("status"),
+                phase=item.get("phase"),
+                progress=progress_model,
+                heartbeat_health=item.get("heartbeat_health"),
+                occurred_at=item.get("occurred_at"),
+                delivery_state=str(item.get("delivery_state", "")),
+                attempt_count=int(item.get("attempt_count") or 0),
+                next_attempt_at=item.get("next_attempt_at"),
+                last_error=item.get("last_error"),
+                delivered_at=item.get("delivered_at"),
+                created_at=item.get("created_at"),
+            )
+        )
+    return models
+
+
+@app.get(
+    "/runs/{run_id}/notifications",
+    response_model=RunNotificationsResponse,
+    operation_id="list_run_notifications",
+    summary="List durable notifications for a run",
+    description=(
+        "Return a bounded, redacted view of Phase 2C durable notification "
+        "outbox events for a run (phase_change, stale, recovery, terminal). "
+        "Never includes webhook secrets, raw stdout/stderr, or mission YAML. "
+        "Delivery failures never alter mission status. Opt-in webhook delivery "
+        "remains disabled until URL and secret are configured."
+    ),
+    responses={
+        200: {"description": "Redacted notification events for the run."},
+        404: {"description": "Unknown run_id."},
+    },
+)
+def list_run_notifications_endpoint(
+    run_id: str,
+    _auth: None = Depends(require_api_key),
+) -> RunNotificationsResponse:
+    record = run_registry.get_run(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    # Observe stale without mutating run status; kick optional delivery.
+    _observe_notifications(record)
+    events = notification_outbox.list_for_run(
+        run_id, limit=NOTIFICATION_INSPECT_MAX_EVENTS
+    )
+    return RunNotificationsResponse(
+        run_id=run_id,
+        notifications_enabled=is_notifications_configured(
+            notification_outbox.config
+        ),
+        events=_notification_event_models(events),
+        truncated=len(events) >= NOTIFICATION_INSPECT_MAX_EVENTS,
+        max_events=NOTIFICATION_INSPECT_MAX_EVENTS,
+    )
 
 
 @app.post(

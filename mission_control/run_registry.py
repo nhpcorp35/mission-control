@@ -312,10 +312,21 @@ class RunRegistry:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
         self._ensure_schema()
+        # Phase 2C: durable notification outbox shares this registry DB.
+        # Imported lazily to avoid import cycles at module load.
+        self._notification_outbox = None
 
     @property
     def db_path(self) -> str:
         return self._db_path
+
+    def _get_notification_outbox(self):
+        """Return the Phase 2C outbox bound to this registry DB."""
+        if self._notification_outbox is None:
+            from mission_control.notifications import NotificationOutbox
+
+            self._notification_outbox = NotificationOutbox(self._db_path)
+        return self._notification_outbox
 
     def _ensure_schema(self) -> None:
         with self._lock:
@@ -481,10 +492,14 @@ class RunRegistry:
                 exc,
             )
 
-    def _recover_interrupted_runs_unlocked(self) -> int:
-        """Mark queued/running runs failed. Caller must hold ``self._lock``."""
+    def _recover_interrupted_runs_unlocked(self) -> tuple[int, list[str]]:
+        """Mark queued/running runs failed. Caller must hold ``self._lock``.
+
+        Returns ``(recovered_count, recovered_run_ids)``.
+        """
         now = _utc_now()
         recovered = 0
+        recovered_ids: list[str] = []
         rows = self._conn.execute(
             f"""
             SELECT run_id, started_at
@@ -535,6 +550,7 @@ class RunRegistry:
                 ),
             )
             recovered += 1
+            recovered_ids.append(row["run_id"])
 
         if recovered:
             self._conn.commit()
@@ -544,7 +560,7 @@ class RunRegistry:
                 self._db_path,
             )
 
-        return recovered
+        return recovered, recovered_ids
 
     def recover_interrupted_runs(self) -> int:
         """Mark queued or running runs failed after a service restart.
@@ -554,6 +570,7 @@ class RunRegistry:
         time-bounded lease ensures a crashed owner cannot block recovery
         permanently.
         """
+        recovered_ids: list[str] = []
         with self._lock:
             owner_token = self._try_acquire_startup_recovery_lease_unlocked()
             if owner_token is None:
@@ -567,9 +584,24 @@ class RunRegistry:
                 return 0
 
             try:
-                return self._recover_interrupted_runs_unlocked()
+                recovered, recovered_ids = (
+                    self._recover_interrupted_runs_unlocked()
+                )
             finally:
                 self._release_startup_recovery_lease_unlocked(owner_token)
+
+        # Phase 2C: emit recovery/terminal after releasing the registry lock
+        # so the outbox connection never contends with an open write txn.
+        if recovered_ids:
+            outbox = self._get_notification_outbox()
+            for run_id in recovered_ids:
+                record = self.get_run(run_id)
+                if record is None:
+                    continue
+                outbox.maybe_enqueue_recovery(record)
+                outbox.maybe_enqueue_terminal(record)
+
+        return len(recovered_ids)
 
     def count_runs(self) -> int:
         """Return the number of persisted run records."""
@@ -723,6 +755,8 @@ class RunRegistry:
         timed_out, later workers cannot regress it to a running status or
         overwrite it with a different terminal status.
         """
+        notify_phase_previous: str | None = None
+        notify_terminal = False
         with self._lock:
             row = self._fetch_row(run_id)
             if row is None:
@@ -732,6 +766,7 @@ class RunRegistry:
             if is_terminal_status(record.status):
                 return record
 
+            previous_phase = record.phase.value
             now = _utc_now()
             record.status = status
 
@@ -755,6 +790,7 @@ class RunRegistry:
                     else RunPhase.FAILED
                 )
                 if record.phase is not terminal_phase:
+                    notify_phase_previous = previous_phase
                     record.phase = terminal_phase
                     record.phase_started_at = now
                 record.heartbeat_at = now
@@ -770,10 +806,21 @@ class RunRegistry:
                         step=terminal_phase.value,
                         detail=detail,
                     )
+                notify_terminal = True
 
             self._persist_record(record)
             keys = self._list_run_ids_unlocked()
             count = len(keys)
+            snapshot = record
+
+        # Phase 2C notifications outside the registry write lock.
+        outbox = self._get_notification_outbox()
+        if notify_phase_previous is not None:
+            outbox.maybe_enqueue_phase_change(
+                snapshot, previous_phase=notify_phase_previous
+            )
+        if notify_terminal:
+            outbox.maybe_enqueue_terminal(snapshot)
 
         event = (
             "final_status_update"
@@ -788,13 +835,13 @@ class RunRegistry:
             run_id,
             event,
             status.value,
-            record.phase.value,
+            snapshot.phase.value,
             os.getpid(),
             id(self),
             count,
             keys,
         )
-        return record
+        return snapshot
 
     def set_phase(
         self,
@@ -807,6 +854,8 @@ class RunRegistry:
 
         Terminal phases and terminal statuses cannot regress to active phases.
         """
+        phase_changed = False
+        previous_phase: str | None = None
         with self._lock:
             row = self._fetch_row(run_id)
             if row is None:
@@ -821,7 +870,9 @@ class RunRegistry:
 
             if phase.value in _ACTIVE_PHASES or phase.value in TERMINAL_PHASES:
                 now = _utc_now()
+                previous_phase = record.phase.value
                 if record.phase is not phase:
+                    phase_changed = True
                     record.phase = phase
                     record.phase_started_at = now
                 record.heartbeat_at = now
@@ -834,15 +885,25 @@ class RunRegistry:
                     )
                 self._persist_record(record)
 
+            snapshot = record
+
+        if phase_changed:
+            self._get_notification_outbox().maybe_enqueue_phase_change(
+                snapshot, previous_phase=previous_phase
+            )
+
         logger.info(
             "lifecycle run_id=%s event=phase_update phase=%s",
             run_id,
             phase.value,
         )
-        return record
+        return snapshot
 
     def touch_heartbeat(self, run_id: str) -> RunRecord | None:
-        """Refresh ``heartbeat_at`` while a non-terminal run is active."""
+        """Refresh ``heartbeat_at`` while a non-terminal run is active.
+
+        Heartbeat refreshes never enqueue notification events.
+        """
         with self._lock:
             row = self._fetch_row(run_id)
             if row is None:
@@ -890,4 +951,10 @@ class RunRegistry:
     def close(self) -> None:
         """Close the underlying SQLite connection."""
         with self._lock:
+            if self._notification_outbox is not None:
+                try:
+                    self._notification_outbox.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._notification_outbox = None
             self._conn.close()
