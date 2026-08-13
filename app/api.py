@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 import time
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from app.auth import require_api_key
@@ -1342,6 +1342,15 @@ def _notification_event_models(
 )
 def list_run_notifications_endpoint(
     run_id: str,
+    limit: int = Query(
+        default=NOTIFICATION_INSPECT_MAX_EVENTS,
+        ge=1,
+        le=NOTIFICATION_INSPECT_MAX_EVENTS,
+        description=(
+            "Maximum notification events to return (1–"
+            f"{NOTIFICATION_INSPECT_MAX_EVENTS})."
+        ),
+    ),
     _auth: None = Depends(require_api_key),
 ) -> RunNotificationsResponse:
     record = run_registry.get_run(run_id)
@@ -1349,17 +1358,16 @@ def list_run_notifications_endpoint(
         raise HTTPException(status_code=404, detail="Run not found")
     # Observe stale without mutating run status; kick optional delivery.
     _observe_notifications(record)
-    events = notification_outbox.list_for_run(
-        run_id, limit=NOTIFICATION_INSPECT_MAX_EVENTS
-    )
+    bound = max(1, min(int(limit), NOTIFICATION_INSPECT_MAX_EVENTS))
+    events = notification_outbox.list_for_run(run_id, limit=bound)
     return RunNotificationsResponse(
         run_id=run_id,
         notifications_enabled=is_notifications_configured(
             notification_outbox.config
         ),
         events=_notification_event_models(events),
-        truncated=len(events) >= NOTIFICATION_INSPECT_MAX_EVENTS,
-        max_events=NOTIFICATION_INSPECT_MAX_EVENTS,
+        truncated=len(events) >= bound,
+        max_events=bound,
     )
 
 

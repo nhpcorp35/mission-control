@@ -1,5 +1,51 @@
 # HAL Operator Log
 
+## 2026-08-13 — Phase 2C MCP / Unified notification inspection
+
+### Objective
+
+Expose bounded, authenticated, redacted run-notification inspection through
+Mission Control MCP and forward it through HAL LegalAI Gateway Unified /
+Unified1 with schema parity, plus operator/env documentation.
+
+### Change summary
+
+- MCP `list_run_notifications(run_id, limit)` → `GET /runs/{run_id}/notifications`
+  with clamped `limit`, allowlisted fields, and forbidden-field stripping.
+- Unified/Unified1 `mission.list_notifications` registry + forwarder parity
+  (same gateway code path for both ChatGPT connections).
+- API accepts bounded `limit` query parameter.
+- Operator docs / env reference for notification webhook settings (HTTPS
+  default, HMAC format, retry/dead, inspection, rotation/disable).
+- Focused adversarial forwarding/redaction tests; wait/cursor schemas unchanged.
+
+### Tests executed
+
+```text
+PYTHONPATH=. MISSION_CONTROL_URL=https://mission.example \
+  MISSION_CONTROL_API_KEY=test-key python -m unittest \
+  tests.test_phase2c_mcp_unified_notifications \
+  tests.test_phase2c_notifications \
+  tests.test_phase2b_unified_forwarding \
+  tests.test_mcp_wait_for_run \
+  tests.test_mcp_fastmcp_compat \
+  tests.test_mcp_transport_discovery \
+  -v
+# Ran 98 tests — OK
+
+PYTHONPATH=. MISSION_CONTROL_URL=https://mission.example \
+  MISSION_CONTROL_API_KEY=test-key python -m unittest discover -s tests -v
+# Run 1: Ran 711 tests in 22.545s — OK
+# Run 2: Ran 711 tests in 22.763s — OK
+```
+
+Commit/push left to Mission Control platform persistence (mission forbids Git).
+
+### Next Objective
+
+Deploy/verify notification inspection on Unified and Unified1 against a
+non-production webhook sink; confirm rotation/disable procedure.
+
 ## 2026-08-11 — Platform-only persistence canary
 
 Platform-only persistence canary executed after commit

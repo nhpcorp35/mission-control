@@ -401,6 +401,28 @@ Failed and timed-out runs retain any partial evidence Mission Control actually c
 
 **Response** `404 Not Found` only when the `run_id` was never accepted by this process. Completed and failed runs are retained and keep returning `200` with their terminal status and failure details.
 
+### GET /runs/{run_id}/notifications
+
+Requires authentication.
+
+**OpenAPI operation ID:** `list_run_notifications`
+
+Bounded, redacted Phase 2C durable notification inspection for a run
+(`phase_change`, `stale`, `recovery`, `terminal`). Opt-in webhook delivery is
+independent: inspection works even when webhooks are disabled.
+
+| Query | Type | Default | Description |
+| --- | --- | --- | --- |
+| `limit` | integer | `64` | Max events to return; clamped to `1..64` |
+
+**Response** `200 OK` fields: `run_id`, `notifications_enabled`, `events[]`
+(allowlisted inspection fields only, with redacted `last_error`), `truncated`,
+`max_events`. Never returns webhook URL/secret, claim owner, raw request
+headers/body, mission YAML, or raw stdout/stderr.
+
+MCP `list_run_notifications` and Unified/Unified1 `mission.list_notifications`
+forward to this endpoint with the same allowlist and limit bounds.
+
 ### POST /runs/{run_id}/retry
 
 Requires authentication.
@@ -579,6 +601,7 @@ The Mission Control MCP connector exposes exactly these run-operation tools:
 | `submit_run` | Submit mission YAML (`POST /runs`) |
 | `submit_structured_run` | Submit structured mission fields (`POST /runs/structured`); prefer for routine execute missions |
 | `get_run` | Fetch current run status (`GET /runs/{run_id}`) |
+| `list_run_notifications` | Bounded redacted Phase 2C notification inspection (`GET /runs/{run_id}/notifications`) |
 | `wait_for_run` | Poll `get_run` until terminal or caller-requested wait window expires (REST equivalent: `POST /runs/{run_id}/wait`) |
 | `submit_and_wait` | Submit exact mission YAML then wait in one call (`submit_run` + `wait_for_run`; REST equivalent: `POST /runs/submit-and-wait`) |
 | `run_repository_command` | Run allowlisted repository command in ephemeral checkout (`POST /repository-commands`) |
@@ -832,6 +855,26 @@ Execution preflight fails with `PYTHON_UNAVAILABLE` when no Python 3 interpreter
 | `PORT` | yes | Provided automatically by Railway. |
 
 Set `MISSION_CONTROL_API_KEY` and `CURSOR_API_KEY` in the Railway service **Variables** tab. Use secret/reference variables, not hardcoded values in the repo.
+
+### Optional Phase 2C notification environment variables
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL` | for delivery | HTTPS webhook URL (default). HTTP only when `MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP` is true. |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET` | for delivery | HMAC shared secret. Never commit or log. |
+| `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable; delivery still needs URL and secret. |
+| `MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS` | no | Per-attempt timeout (default `5`). |
+| `MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS` | no | Attempts before `dead` (default `8`). |
+| `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_BASE_SECONDS` | no | Backoff base (default `1`). |
+| `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_MAX_SECONDS` | no | Backoff cap (default `300`). |
+| `MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP` | no | Dev-only HTTP webhook allow. Leave unset/false in production. |
+
+Webhook HMAC header `X-Mission-Control-Signature` uses `t=<unix>,v1=<hex>` over
+`{timestamp}.{body}` (HMAC-SHA256). Retries use exponential backoff; exhausted
+attempts become `dead` without changing mission status. Inspect with
+`GET /runs/{run_id}/notifications`, MCP `list_run_notifications`, or Unified
+`mission.list_notifications`. Rotate secrets by updating receivers first, then
+Mission Control; disable by clearing URL/secret. See `docs/HAL_OPERATOR.md`.
 
 ### Build and start commands
 

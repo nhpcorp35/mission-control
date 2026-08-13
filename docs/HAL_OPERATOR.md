@@ -95,6 +95,49 @@ ambiguity requires user input.
   (`wait_for_run` timeout layers). On a transport interrupt, resume with the
   same `run_id` and last `cursor`.
 
+## Phase 2C durable notifications (opt-in webhooks)
+
+Opt-in generic webhooks for `phase_change`, `stale`, `recovery`, and `terminal`
+events only (never heartbeats). Delivery failures never mutate mission/run
+status. With URL or secret unset, notifications stay disabled (safe default).
+
+### Environment variables
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL` | for delivery | HTTPS webhook endpoint (HTTP only when `ALLOW_HTTP` is explicitly true). |
+| `MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET` | for delivery | Shared HMAC secret. Never log or commit the value. |
+| `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable flag; delivery still requires URL **and** secret. |
+| `MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS` | no | Per-attempt HTTP timeout (default 5s). |
+| `MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS` | no | Attempts before `dead` (default 8). |
+| `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_BASE_SECONDS` | no | Exponential backoff base (default 1s). |
+| `MISSION_CONTROL_NOTIFICATIONS_BACKOFF_MAX_SECONDS` | no | Backoff cap (default 300s). |
+| `MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP` | no | When true, permits `http://` webhook URLs (dev only). |
+
+**Production:** set HTTPS URL + strong secret; leave `ALLOW_HTTP` unset/false;
+rotate by deploying a new secret to receivers first, then updating Mission
+Control, then disabling the old secret. To disable: clear URL and/or secret (or
+set enabled false) — pending rows remain durable but delivery stops safely.
+
+### HMAC and retry semantics
+
+- Signature header `X-Mission-Control-Signature`: `t=<unix>,v1=<hex>` over
+  `{timestamp}.{body}` with HMAC-SHA256.
+- Also sent: `X-Mission-Control-Timestamp`, `X-Mission-Control-Event-Id`,
+  `X-Mission-Control-Event-Kind`.
+- Transient failures retry with exponential backoff up to max attempts, then
+  `dead`. Permanent URL validation failures mark `dead` without mutating runs.
+
+### Inspection workflow (redacted)
+
+- REST: `GET /runs/{run_id}/notifications?limit=N` (auth required; `limit`
+  clamped to 1–64).
+- MCP: `list_run_notifications(run_id, limit=…)`.
+- Unified / Unified1: `mission.list_notifications` → same downstream tool.
+- Responses include only allowlisted fields (`event_id`, `event_kind`,
+  `delivery_state`, redacted `last_error`, etc.). Never webhook URL/secret,
+  claim owner, raw request headers/body, mission YAML, or raw stdout/stderr.
+
 ## Local repository auto-sync (macOS)
 
 Allen’s Mac can keep explicitly configured clones on `main` fast-forwarded from

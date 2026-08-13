@@ -637,6 +637,7 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
                 "submit_run",
                 "submit_structured_run",
                 "get_run",
+                "list_run_notifications",
                 "wait_for_run",
                 "submit_and_wait",
                 "run_repository_command",

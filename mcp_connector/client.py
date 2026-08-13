@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
@@ -9,6 +9,10 @@ from mcp_connector.errors import MissionControlError
 from mission_control.monitoring import (
     MONITOR_CURSOR_MAX_CHARS,
     normalize_monitor_cursor,
+)
+from mission_control.notifications import (
+    NOTIFICATION_INSPECT_MAX_EVENTS,
+    redact_notification_error,
 )
 
 # Honor caller-requested wait budgets end-to-end (aligned with
@@ -24,6 +28,173 @@ MCP_WAIT_MIN_POLL_INTERVAL_SECONDS = 0.05
 MCP_WAIT_MAX_POLL_INTERVAL_SECONDS = 10.0
 # Re-export for connector/gateway callers and tests.
 MCP_MONITOR_CURSOR_MAX_CHARS = MONITOR_CURSOR_MAX_CHARS
+
+# Phase 2C notification inspection (GET /runs/{run_id}/notifications).
+MCP_NOTIFICATION_DEFAULT_LIMIT = NOTIFICATION_INSPECT_MAX_EVENTS
+MCP_NOTIFICATION_MAX_LIMIT = NOTIFICATION_INSPECT_MAX_EVENTS
+MCP_NOTIFICATION_MAX_RUN_ID_CHARS = 128
+_NOTIFICATION_RESPONSE_ALLOWED_KEYS = frozenset(
+    {
+        "run_id",
+        "notifications_enabled",
+        "events",
+        "truncated",
+        "max_events",
+    }
+)
+_NOTIFICATION_EVENT_ALLOWED_KEYS = frozenset(
+    {
+        "event_id",
+        "run_id",
+        "event_kind",
+        "status",
+        "phase",
+        "progress",
+        "heartbeat_health",
+        "occurred_at",
+        "delivery_state",
+        "attempt_count",
+        "next_attempt_at",
+        "last_error",
+        "delivered_at",
+        "created_at",
+    }
+)
+_NOTIFICATION_PROGRESS_ALLOWED_KEYS = frozenset({"step", "detail"})
+# Strip if a misbehaving downstream ever echoes these.
+_NOTIFICATION_FORBIDDEN_KEYS = frozenset(
+    {
+        "webhook_url",
+        "webhook_secret",
+        "secret",
+        "claim_owner",
+        "payload_json",
+        "headers",
+        "raw_headers",
+        "request_headers",
+        "raw_body",
+        "request_body",
+        "body",
+        "authorization",
+        "signature",
+        "hmac",
+        "MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_URL",
+        "MISSION_CONTROL_NOTIFICATIONS_WEBHOOK_SECRET",
+    }
+)
+
+
+def normalize_mcp_notification_run_id(run_id: str) -> str:
+    """Validate ``run_id`` before notification inspection requests."""
+    value = str(run_id).strip()
+    if not value:
+        raise ValueError("run_id must not be empty")
+    if len(value) > MCP_NOTIFICATION_MAX_RUN_ID_CHARS:
+        raise ValueError(
+            "run_id must be at most "
+            f"{MCP_NOTIFICATION_MAX_RUN_ID_CHARS} characters"
+        )
+    if any(ch in value for ch in ("/", "?", "#", "\n", "\r", "\0")):
+        raise ValueError("run_id contains invalid characters")
+    return value
+
+
+def normalize_mcp_notification_limit(limit: int | float | None) -> int:
+    """Validate and clamp notification inspection ``limit``.
+
+    Values at or below zero are rejected. Values above
+    ``MCP_NOTIFICATION_MAX_LIMIT`` are capped (not rejected).
+    """
+    if limit is None:
+        return MCP_NOTIFICATION_DEFAULT_LIMIT
+    try:
+        value = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    if value <= 0:
+        raise ValueError("limit must be a positive integer")
+    if value > MCP_NOTIFICATION_MAX_LIMIT:
+        return MCP_NOTIFICATION_MAX_LIMIT
+    return value
+
+
+def project_notification_inspection(
+    body: Mapping[str, Any],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    """Allowlist/redact notification inspection payloads and apply ``limit``.
+
+    Never returns webhook URL/secret, claim owner, raw request material, or
+    non-allowlisted event fields even if a downstream payload includes them.
+    """
+    bound = normalize_mcp_notification_limit(limit)
+    raw_events = body.get("events") if isinstance(body, Mapping) else None
+    events_in = raw_events if isinstance(raw_events, list) else []
+    projected_events: list[dict[str, Any]] = []
+    for item in events_in:
+        if not isinstance(item, Mapping):
+            continue
+        event: dict[str, Any] = {}
+        for key in _NOTIFICATION_EVENT_ALLOWED_KEYS:
+            if key not in item or key in _NOTIFICATION_FORBIDDEN_KEYS:
+                continue
+            if key == "progress":
+                progress = item.get("progress")
+                if isinstance(progress, Mapping):
+                    event["progress"] = {
+                        pk: str(progress.get(pk, ""))[:160]
+                        for pk in _NOTIFICATION_PROGRESS_ALLOWED_KEYS
+                        if pk in progress
+                    }
+                elif progress is None:
+                    event["progress"] = None
+                continue
+            if key == "last_error":
+                event["last_error"] = redact_notification_error(
+                    None if item.get("last_error") is None else str(item.get("last_error"))
+                )
+                continue
+            if key == "attempt_count":
+                try:
+                    event["attempt_count"] = int(item.get("attempt_count") or 0)
+                except (TypeError, ValueError):
+                    event["attempt_count"] = 0
+                continue
+            raw = item.get(key)
+            event[key] = None if raw is None else str(raw)[:160]
+        projected_events.append(event)
+
+    truncated_upstream = bool(body.get("truncated")) if isinstance(body, Mapping) else False
+    limited_events = projected_events[:bound]
+    truncated = truncated_upstream or len(projected_events) > bound
+
+    max_events = bound
+    if isinstance(body, Mapping) and body.get("max_events") is not None:
+        try:
+            max_events = min(bound, int(body["max_events"]))
+        except (TypeError, ValueError):
+            max_events = bound
+
+    run_id = ""
+    enabled = False
+    if isinstance(body, Mapping):
+        run_id = str(body.get("run_id") or "")[: MCP_NOTIFICATION_MAX_RUN_ID_CHARS]
+        enabled = bool(body.get("notifications_enabled"))
+
+    projected: dict[str, Any] = {
+        "run_id": run_id,
+        "notifications_enabled": enabled,
+        "events": limited_events,
+        "truncated": truncated,
+        "max_events": max_events,
+    }
+    # Drop any accidental non-allowlisted keys; never pass forbidden through.
+    return {
+        key: projected[key]
+        for key in _NOTIFICATION_RESPONSE_ALLOWED_KEYS
+        if key in projected
+    }
 
 
 def normalize_mcp_wait_timeout(timeout_seconds: float) -> float:
@@ -88,6 +259,7 @@ class MissionControlClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
         request_timeout = (
@@ -105,6 +277,7 @@ class MissionControlClient:
                     method,
                     path,
                     json=json,
+                    params=params,
                 )
         except httpx.TimeoutException as exc:
             raise MissionControlError(
@@ -194,6 +367,32 @@ class MissionControlClient:
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/runs/{run_id}")
+
+    async def list_run_notifications(
+        self,
+        run_id: str,
+        *,
+        limit: int | float | None = None,
+    ) -> dict[str, Any]:
+        """Fetch bounded, redacted notification inspection for a run.
+
+        Forwards to authenticated ``GET /runs/{run_id}/notifications``.
+        Applies a safely bounded ``limit``, allowlists response fields, and
+        strips webhook/secret/claim/raw-request material even if present
+        downstream. Does not change mission wait/cursor behavior.
+        """
+        safe_run_id = normalize_mcp_notification_run_id(run_id)
+        bound = normalize_mcp_notification_limit(limit)
+        body = await self._request(
+            "GET",
+            f"/runs/{safe_run_id}/notifications",
+            params={"limit": bound},
+        )
+        projected = project_notification_inspection(body, limit=bound)
+        # Prefer the validated run_id we requested when upstream omits it.
+        if not projected.get("run_id"):
+            projected["run_id"] = safe_run_id
+        return projected
 
     async def run_repository_command(
         self,

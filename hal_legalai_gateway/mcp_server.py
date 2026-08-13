@@ -223,6 +223,19 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="Retrieve the current state of a Mission Control run.",
     ),
     ToolBinding(
+        gateway_tool="mission.list_notifications",
+        namespace="mission",
+        downstream_service="mission_control",
+        downstream_tool="list_run_notifications",
+        description=(
+            "List bounded, redacted Phase 2C durable notifications for a "
+            "Mission Control run_id. Optional limit is safely clamped. Returns "
+            "only allowlisted inspection fields; never webhook URL/secret, "
+            "claim owner, raw request headers/body, or sensitive error "
+            "contents. Does not mutate runs or change mission.wait/cursor."
+        ),
+    ),
+    ToolBinding(
         gateway_tool="mission.wait",
         namespace="mission",
         downstream_service="mission_control",
@@ -704,6 +717,29 @@ def register_forwarding_tools(
     @mcp.tool(name="mission.status", description=by_name["mission.status"].description)
     async def mission_status(run_id: str) -> dict[str, Any]:
         return await _forward("mission.status", {"run_id": run_id})
+
+    @mcp.tool(
+        name="mission.list_notifications",
+        description=(
+            by_name["mission.list_notifications"].description
+            or (
+                "List bounded, redacted Phase 2C durable notifications for a "
+                "Mission Control run_id. Optional limit is safely clamped. "
+                "Returns only allowlisted inspection fields; never webhook "
+                "URL/secret, claim owner, raw request headers/body, or "
+                "sensitive error contents. Does not mutate runs or change "
+                "mission.wait/cursor."
+            )
+        ),
+    )
+    async def mission_list_notifications(
+        run_id: str,
+        limit: int = 64,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "mission.list_notifications",
+            {"run_id": run_id, "limit": limit},
+        )
 
     @mcp.tool(
         name="mission.wait",

@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 
 from mcp_connector.client import (
+    MCP_NOTIFICATION_DEFAULT_LIMIT,
     MCP_WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
     MCP_WAIT_DEFAULT_TIMEOUT_SECONDS,
     MCP_WAIT_MAX_TIMEOUT_SECONDS,
@@ -22,6 +23,7 @@ EXPECTED_TOOL_NAMES = (
     "submit_run",
     "submit_structured_run",
     "get_run",
+    "list_run_notifications",
     "wait_for_run",
     "submit_and_wait",
     "run_repository_command",
@@ -55,6 +57,8 @@ mcp = FastMCP(
         "commit_sha, and Phase 2B monitoring fields. Prefer summary / "
         "result.persistence / commit_sha over agent stdout for persistence "
         "claims (platform persistence runs after the agent completes). "
+        "Use list_run_notifications for bounded Phase 2C durable notification "
+        "inspection (redacted; no webhook secrets). "
         "wait_for_run / submit_and_wait default timeout is "
         f"{MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s; requested timeouts are "
         f"honored up to {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s and never "
@@ -167,6 +171,27 @@ async def get_run(run_id: str) -> dict[str, Any]:
             raise ValueError("run_id must not be empty")
 
         result = await client.get_run(run_id)
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def list_run_notifications(
+    run_id: str,
+    limit: int = MCP_NOTIFICATION_DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """List bounded, redacted durable notifications for a run.
+
+    Forwards to authenticated GET /runs/{run_id}/notifications. Returns only
+    allowlisted inspection fields (event kind, delivery state, redacted
+    last_error, etc.). Never exposes webhook URL/secret, claim owner, raw
+    request headers/body, or sensitive error contents. limit is clamped to
+    a safe maximum (default matches Mission Control inspection cap). Does
+    not mutate runs or change wait/cursor behavior.
+    """
+    try:
+        result = await client.list_run_notifications(run_id, limit=limit)
         return {"ok": True, **result}
     except Exception as exc:
         return _tool_error(exc)

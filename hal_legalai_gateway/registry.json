@@ -74,6 +74,7 @@
         "mission.submit",
         "mission.submit_structured",
         "mission.status",
+        "mission.list_notifications",
         "mission.wait",
         "mission.submit_and_wait",
         "mission.run_repository_command"
@@ -240,6 +241,13 @@
       "namespace": "mission",
       "downstream_service": "mission_control",
       "downstream_tool": "get_run"
+    },
+    {
+      "tool": "mission.list_notifications",
+      "namespace": "mission",
+      "downstream_service": "mission_control",
+      "downstream_tool": "list_run_notifications",
+      "description": "List bounded, redacted Phase 2C durable notifications for a Mission Control run_id. Optional limit is safely clamped. Returns only allowlisted inspection fields; never webhook URL/secret, claim owner, raw request headers/body, or sensitive error contents. Does not mutate runs or change mission.wait/cursor."
     },
     {
       "tool": "mission.wait",

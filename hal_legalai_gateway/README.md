@@ -37,7 +37,7 @@ Also exposed: Case-00 lifecycle (`case.submit_case00_q1`, `case.get_case00_q1_ru
 `case.cancel_case00_q1_run`, `case.get_case00_q1_artifacts`, `case.get_artifacts`),
 `storage.list_inventory`, `storage.list_acceptance_contracts`, and mission helpers
 (`mission.submit_structured`,
-`mission.wait`, `mission.submit_and_wait`, `mission.run_repository_command`).
+`mission.wait`, `mission.list_notifications`, `mission.submit_and_wait`, `mission.run_repository_command`).
 
 ## Authentication and forwarding
 
