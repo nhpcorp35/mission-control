@@ -69,6 +69,25 @@ def _run_git(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
     )
 
 
+def _cleanup_mocked_workspaces(mock_cleanup) -> None:
+    """Run real cleanup for paths observed while cleanup_workspace was mocked.
+
+    Handoff tests mock cleanup so post-run filesystem assertions can inspect the
+    isolated checkout. Without a follow-up real cleanup, ``mkdtemp`` workspaces
+    leak across the suite and amplify process/file pressure under low NPROC.
+    """
+    seen: set[str] = set()
+    for call in mock_cleanup.call_args_list:
+        path = call.args[0] if call.args else call.kwargs.get("workspace_path")
+        if not isinstance(path, str) or not path or path in seen:
+            continue
+        # Fully mocked execute paths use a sentinel that is not a real checkout.
+        if path == "/tmp/workspace":
+            continue
+        seen.add(path)
+        cleanup_workspace(path)
+
+
 class GitRepoFixture:
     """Create a source repo and bare remote for workspace tests."""
 
@@ -1430,40 +1449,43 @@ class TestPersistenceHandoff(unittest.TestCase):
     @patch("mission_control.workspace.cleanup_workspace")
     def test_agent_modifications_are_committed_on_same_workspace(
         self,
-        _mock_cleanup,
+        mock_cleanup,
     ) -> None:
         seen: dict[str, str] = {}
         mission = self.fixture.mission(persistence_mode="commit")
         mission["deliverables"] = ["agent_created.txt"]
 
-        with patch(
-            "mission_control.workspace.execute_cursor_agent",
-            side_effect=self._fake_agent_write(seen),
-        ):
-            record = self.registry.create_run()
-            execute_registered_run(record.run_id, mission, self.registry)
+        try:
+            with patch(
+                "mission_control.workspace.execute_cursor_agent",
+                side_effect=self._fake_agent_write(seen),
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
 
-        updated = self.registry.get_run(record.run_id)
-        assert updated is not None
-        self.assertEqual(updated.status, RunStatus.COMPLETED)
-        self.assertIsNotNone(updated.commit_sha)
-        assert updated.result is not None
-        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
-        assert updated.result.persistence is not None
-        self.assertTrue(updated.result.persistence.attempted)
-        self.assertTrue(updated.result.persistence.ok)
-        self.assertEqual(updated.result.persistence.mode, "commit")
-        self.assertFalse(updated.result.persistence.pushed)
-        self.assertEqual(
-            updated.result.persistence.commit_sha,
-            updated.commit_sha,
-        )
-        self.assertIn("agent_workspace", seen)
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.COMPLETED)
+            self.assertIsNotNone(updated.commit_sha)
+            assert updated.result is not None
+            self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+            assert updated.result.persistence is not None
+            self.assertTrue(updated.result.persistence.attempted)
+            self.assertTrue(updated.result.persistence.ok)
+            self.assertEqual(updated.result.persistence.mode, "commit")
+            self.assertFalse(updated.result.persistence.pushed)
+            self.assertEqual(
+                updated.result.persistence.commit_sha,
+                updated.commit_sha,
+            )
+            self.assertIn("agent_workspace", seen)
+        finally:
+            _cleanup_mocked_workspaces(mock_cleanup)
 
     @patch("mission_control.workspace.cleanup_workspace")
     def test_cross_repository_name_writes_stay_in_isolated_workspace(
         self,
-        _mock_cleanup,
+        mock_cleanup,
     ) -> None:
         """repository.name selects clone URL; agent edits stay in isolated path."""
         other = GitRepoFixture()
@@ -1517,13 +1539,14 @@ class TestPersistenceHandoff(unittest.TestCase):
                 os.path.realpath(other.source_repo),
             )
         finally:
+            _cleanup_mocked_workspaces(mock_cleanup)
             os.environ.pop(REPOSITORY_URL_MAP_ENV, None)
             other.cleanup()
 
     @patch("mission_control.workspace.cleanup_workspace")
     def test_approved_push_handoff_records_pushed_true(
         self,
-        _mock_cleanup,
+        mock_cleanup,
     ) -> None:
         seen: dict[str, str] = {}
         mission = self.fixture.mission(
@@ -1533,37 +1556,40 @@ class TestPersistenceHandoff(unittest.TestCase):
         )
         mission["deliverables"] = ["agent_created.txt"]
 
-        with patch(
-            "mission_control.workspace.execute_cursor_agent",
-            side_effect=self._fake_agent_write(seen),
-        ), patch(
-            "mission_control.workspace._github_push_environment",
-            return_value=(os.environ.copy(), None),
-        ):
-            record = self.registry.create_run()
-            execute_registered_run(record.run_id, mission, self.registry)
+        try:
+            with patch(
+                "mission_control.workspace.execute_cursor_agent",
+                side_effect=self._fake_agent_write(seen),
+            ), patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
 
-        updated = self.registry.get_run(record.run_id)
-        assert updated is not None
-        self.assertEqual(updated.status, RunStatus.COMPLETED, updated.error)
-        self.assertIsNotNone(updated.commit_sha)
-        assert updated.result is not None
-        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
-        assert updated.result.persistence is not None
-        self.assertTrue(updated.result.persistence.ok)
-        self.assertEqual(updated.result.persistence.mode, "push")
-        self.assertTrue(updated.result.persistence.pushed)
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.COMPLETED, updated.error)
+            self.assertIsNotNone(updated.commit_sha)
+            assert updated.result is not None
+            self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+            assert updated.result.persistence is not None
+            self.assertTrue(updated.result.persistence.ok)
+            self.assertEqual(updated.result.persistence.mode, "push")
+            self.assertTrue(updated.result.persistence.pushed)
 
-        # Bare remote received the commit.
-        remote_sha = _run_git(
-            ["--git-dir", str(self.fixture.bare_remote), "rev-parse", "main"]
-        ).stdout.strip()
-        self.assertEqual(remote_sha, updated.commit_sha)
+            # Bare remote received the commit.
+            remote_sha = _run_git(
+                ["--git-dir", str(self.fixture.bare_remote), "rev-parse", "main"]
+            ).stdout.strip()
+            self.assertEqual(remote_sha, updated.commit_sha)
+        finally:
+            _cleanup_mocked_workspaces(mock_cleanup)
 
     @patch("mission_control.workspace.cleanup_workspace")
     def test_unapproved_push_handoff_is_rejected(
         self,
-        _mock_cleanup,
+        mock_cleanup,
     ) -> None:
         seen: dict[str, str] = {}
         mission = self.fixture.mission(
@@ -1573,24 +1599,27 @@ class TestPersistenceHandoff(unittest.TestCase):
         )
         mission["deliverables"] = ["agent_created.txt"]
 
-        with patch(
-            "mission_control.workspace.execute_cursor_agent",
-            side_effect=self._fake_agent_write(seen),
-        ):
-            record = self.registry.create_run()
-            execute_registered_run(record.run_id, mission, self.registry)
+        try:
+            with patch(
+                "mission_control.workspace.execute_cursor_agent",
+                side_effect=self._fake_agent_write(seen),
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
 
-        updated = self.registry.get_run(record.run_id)
-        assert updated is not None
-        self.assertEqual(updated.status, RunStatus.FAILED)
-        self.assertEqual(updated.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
-        assert updated.result is not None
-        # Agent edits were detected even though push was rejected.
-        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
-        assert updated.result.persistence is not None
-        self.assertTrue(updated.result.persistence.attempted)
-        self.assertFalse(updated.result.persistence.ok)
-        self.assertFalse(updated.result.persistence.pushed)
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.FAILED)
+            self.assertEqual(updated.error, PLATFORM_PUSH_APPROVAL_REQUIRED)
+            assert updated.result is not None
+            # Agent edits were detected even though push was rejected.
+            self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+            assert updated.result.persistence is not None
+            self.assertTrue(updated.result.persistence.attempted)
+            self.assertFalse(updated.result.persistence.ok)
+            self.assertFalse(updated.result.persistence.pushed)
+        finally:
+            _cleanup_mocked_workspaces(mock_cleanup)
 
     def test_prepare_clones_mapped_url_for_mission_control_name(self) -> None:
         """Mission Control names must not silently clone the Legal AI env URL."""
@@ -1699,7 +1728,7 @@ class TestExplicitLegalAiRepositoryRouting(unittest.TestCase):
     @patch("mission_control.workspace.cleanup_workspace")
     def test_execute_binds_agent_to_legal_ai_checkout_root(
         self,
-        _mock_cleanup,
+        mock_cleanup,
     ) -> None:
         seen: dict[str, str] = {}
         mission = self._legal_mission()
@@ -1719,32 +1748,35 @@ class TestExplicitLegalAiRepositoryRouting(unittest.TestCase):
                 command=["cursor-agent", "--workspace", workspace],
             )
 
-        with patch(
-            "mission_control.workspace.execute_cursor_agent",
-            side_effect=fake_agent,
-        ):
-            record = self.registry.create_run()
-            execute_registered_run(record.run_id, mission, self.registry)
+        try:
+            with patch(
+                "mission_control.workspace.execute_cursor_agent",
+                side_effect=fake_agent,
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
 
-        updated = self.registry.get_run(record.run_id)
-        assert updated is not None
-        self.assertEqual(updated.status, RunStatus.COMPLETED, updated.error)
-        self.assertEqual(
-            normalize_remote_url_identity(seen["origin"]),
-            normalize_remote_url_identity(str(self.legal.bare_remote)),
-        )
-        self.assertNotEqual(
-            normalize_remote_url_identity(seen["origin"]),
-            normalize_remote_url_identity(str(self.mc.bare_remote)),
-        )
-        assert updated.result is not None
-        self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
-        self.assertFalse(
-            any(
-                ".legalai_work" in path
-                for path in updated.result.files_changed
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.COMPLETED, updated.error)
+            self.assertEqual(
+                normalize_remote_url_identity(seen["origin"]),
+                normalize_remote_url_identity(str(self.legal.bare_remote)),
             )
-        )
+            self.assertNotEqual(
+                normalize_remote_url_identity(seen["origin"]),
+                normalize_remote_url_identity(str(self.mc.bare_remote)),
+            )
+            assert updated.result is not None
+            self.assertEqual(updated.result.files_changed, ["agent_created.txt"])
+            self.assertFalse(
+                any(
+                    ".legalai_work" in path
+                    for path in updated.result.files_changed
+                )
+            )
+        finally:
+            _cleanup_mocked_workspaces(mock_cleanup)
 
     def test_origin_mismatch_fails_closed_before_persist(self) -> None:
         mission = self._legal_mission(persistence_mode="commit")
@@ -1801,7 +1833,7 @@ class TestExplicitLegalAiRepositoryRouting(unittest.TestCase):
     @patch("mission_control.workspace.cleanup_workspace")
     def test_nested_legalai_work_changes_cannot_persist_to_mission_control(
         self,
-        _mock_cleanup,
+        mock_cleanup,
     ) -> None:
         """Edits under .legalai_work must not legitimize MC persistence."""
         mission = {
@@ -1835,24 +1867,27 @@ class TestExplicitLegalAiRepositoryRouting(unittest.TestCase):
                 command=["cursor-agent", "--workspace", workspace],
             )
 
-        with patch(
-            "mission_control.workspace.execute_cursor_agent",
-            side_effect=fake_agent,
-        ):
-            record = self.registry.create_run()
-            execute_registered_run(record.run_id, mission, self.registry)
+        try:
+            with patch(
+                "mission_control.workspace.execute_cursor_agent",
+                side_effect=fake_agent,
+            ):
+                record = self.registry.create_run()
+                execute_registered_run(record.run_id, mission, self.registry)
 
-        updated = self.registry.get_run(record.run_id)
-        assert updated is not None
-        self.assertEqual(updated.status, RunStatus.FAILED)
-        self.assertTrue(
-            (updated.error or "").startswith(NESTED_WORKSPACE_CONTAMINATION_PREFIX),
-            updated.error,
-        )
-        self.assertIsNone(updated.commit_sha)
-        assert updated.result is not None
-        assert updated.result.persistence is not None
-        self.assertFalse(updated.result.persistence.attempted)
+            updated = self.registry.get_run(record.run_id)
+            assert updated is not None
+            self.assertEqual(updated.status, RunStatus.FAILED)
+            self.assertTrue(
+                (updated.error or "").startswith(NESTED_WORKSPACE_CONTAMINATION_PREFIX),
+                updated.error,
+            )
+            self.assertIsNone(updated.commit_sha)
+            assert updated.result is not None
+            assert updated.result.persistence is not None
+            self.assertFalse(updated.result.persistence.attempted)
+        finally:
+            _cleanup_mocked_workspaces(mock_cleanup)
 
     def test_nested_contamination_helper_detects_legalai_work(self) -> None:
         error = nested_workspace_contamination_error(

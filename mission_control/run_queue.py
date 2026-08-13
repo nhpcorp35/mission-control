@@ -97,10 +97,27 @@ class RunQueue:
 
     def reset(self) -> None:
         """Drop pending work and clear active state (for tests)."""
+        self.stop()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the worker thread and drop pending work.
+
+        Used by tests (and optional process shutdown) so queue workers do not
+        linger and consume RLIMIT_NPROC / thread slots across the suite.
+        """
         with self._cond:
+            self._stopped = True
             self._pending.clear()
             self._active_run_id = None
+            worker = self._worker
             self._cond.notify_all()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=timeout)
+        with self._cond:
+            if self._worker is worker:
+                self._worker = None
+            # Allow a later enqueue() on the same instance to start a new worker.
+            self._stopped = False
 
     @property
     def active_run_id(self) -> str | None:
@@ -130,13 +147,25 @@ class RunQueue:
         self._worker.start()
         return True
 
+    def _release_worker_if_current_locked(self) -> None:
+        """Clear ``_worker`` under the condition lock when this thread exits.
+
+        Must run while holding ``_cond`` so a concurrent ``enqueue()`` either
+        still sees a live worker (and leaves work in ``_pending``) or sees
+        ``None`` and starts a replacement — never drops a queued run.
+        """
+        if self._worker is threading.current_thread():
+            self._worker = None
+
     def _worker_loop(self) -> None:
         while True:
             with self._cond:
                 while not self._pending and not self._stopped:
                     self._cond.wait()
-                if self._stopped and not self._pending:
+                if not self._pending:
+                    # Stopped, or idle after notify with an empty queue.
                     self._active_run_id = None
+                    self._release_worker_if_current_locked()
                     return
                 run_id, mission, registry = self._pending.popleft()
                 self._active_run_id = run_id
@@ -184,4 +213,11 @@ class RunQueue:
             finally:
                 with self._cond:
                     self._active_run_id = None
-                    self._cond.notify_all()
+                    if self._pending and not self._stopped:
+                        self._cond.notify_all()
+                    else:
+                        # Exit when idle so tests/full suites do not accumulate
+                        # daemon worker threads (each counts toward NPROC).
+                        self._release_worker_if_current_locked()
+                        self._cond.notify_all()
+                        return
