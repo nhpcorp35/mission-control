@@ -2,6 +2,7 @@ fastapi
 uvicorn
 PyYAML
 mcp==1.29.0
+fastmcp>=2.11,<3
 httpx
 pypdf
 pytesseract
