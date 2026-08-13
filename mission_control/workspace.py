@@ -2337,15 +2337,24 @@ def execute_registered_run(
         finalize_structured_summary(structured, error=str(exc))
         _finish(RunStatus.FAILED, error=str(exc))
     finally:
+        # Cleanup observability and teardown are best-effort. Exceptions here
+        # must not skip or rewrite the intended terminal outcome: authoritative
+        # status is applied via update_status, which also sets terminal phase.
         if workspace_path is not None:
-            registry.set_phase(
-                run_id,
-                RunPhase.CLEANUP,
-                progress=platform_progress(
-                    step=RunPhase.CLEANUP.value,
-                    detail="Cleaning isolated workspace",
-                ),
-            )
+            try:
+                registry.set_phase(
+                    run_id,
+                    RunPhase.CLEANUP,
+                    progress=platform_progress(
+                        step=RunPhase.CLEANUP.value,
+                        detail="Cleaning isolated workspace",
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to set cleanup phase: run_id=%s",
+                    run_id,
+                )
             try:
                 cleanup_workspace(workspace_path)
             except Exception:
@@ -2355,21 +2364,4 @@ def execute_registered_run(
                     workspace_path,
                 )
         if final_status is not None:
-            terminal_phase = (
-                RunPhase.COMPLETED
-                if final_status is RunStatus.COMPLETED
-                else RunPhase.FAILED
-            )
-            registry.set_phase(
-                run_id,
-                terminal_phase,
-                progress=platform_progress(
-                    step=terminal_phase.value,
-                    detail=(
-                        "Run completed"
-                        if terminal_phase is RunPhase.COMPLETED
-                        else "Run failed"
-                    ),
-                ),
-            )
             registry.update_status(run_id, final_status)

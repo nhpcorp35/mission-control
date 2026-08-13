@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
+from typing import Iterator
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -74,6 +77,107 @@ def _mission(*, repository_path: str = ".") -> dict:
             "push_requires_approval": True,
         },
     }
+
+
+@contextmanager
+def _patched_successful_workspace_run(
+    workspace: str,
+    *,
+    execution_result: ExecutionResult | None = None,
+    cleanup_side_effect: BaseException | None = None,
+    extra_patches: tuple = (),
+) -> Iterator[None]:
+    """Patch workspace execution dependencies for an agent path with cleanup."""
+    result = execution_result or ExecutionResult(
+        ok=True,
+        stdout="agent ok",
+        stderr="",
+        return_code=0,
+    )
+    cleanup_kwargs: dict = {}
+    if cleanup_side_effect is not None:
+        cleanup_kwargs["side_effect"] = cleanup_side_effect
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.prepare_isolated_workspace",
+                return_value=WorkspacePrepResult(
+                    ok=True,
+                    workspace_path=workspace,
+                    baseline_sha="abc123",
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.resolve_agent_workspace_path",
+                return_value=(workspace, None),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.disable_agent_git_push",
+                return_value=None,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.execute_cursor_agent",
+                return_value=result,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.collect_changed_files",
+                return_value=([], None),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.collect_deliverable_evidence",
+                return_value=DeliverableEvidence(
+                    verified=True,
+                    passed=True,
+                    checked_paths=[],
+                    missing=[],
+                    outside_workspace=[],
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.persistence_temp_path_guard_error",
+                return_value=None,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.persist_workspace_changes",
+                return_value=PersistenceResult(
+                    ok=True,
+                    mode="none",
+                    commit_sha=None,
+                    pushed=False,
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mission_control.workspace.cleanup_workspace",
+                **cleanup_kwargs,
+            )
+        )
+        for patcher in extra_patches:
+            stack.enter_context(patcher)
+        yield
+
+
+def _heartbeat_thread_names() -> list[str]:
+    return [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("mc-heartbeat-")
+    ]
 
 
 class TestPlatformProgressRedaction(unittest.TestCase):
@@ -322,61 +426,7 @@ class TestWorkspacePhaseLifecycle(SqliteRegistryTestCase):
         try:
             with (
                 patch.object(self.registry, "set_phase", side_effect=_track),
-                patch(
-                    "mission_control.workspace.prepare_isolated_workspace",
-                    return_value=WorkspacePrepResult(
-                        ok=True,
-                        workspace_path=workspace,
-                        baseline_sha="abc123",
-                    ),
-                ),
-                patch(
-                    "mission_control.workspace.resolve_agent_workspace_path",
-                    return_value=(workspace, None),
-                ),
-                patch(
-                    "mission_control.workspace.disable_agent_git_push",
-                    return_value=None,
-                ),
-                patch(
-                    "mission_control.workspace.execute_cursor_agent",
-                    return_value=ExecutionResult(
-                        ok=True,
-                        stdout="agent ok",
-                        stderr="",
-                        return_code=0,
-                    ),
-                ),
-                patch(
-                    "mission_control.workspace.collect_changed_files",
-                    return_value=([], None),
-                ),
-                patch(
-                    "mission_control.workspace.collect_deliverable_evidence",
-                    return_value=DeliverableEvidence(
-                        verified=True,
-                        passed=True,
-                        checked_paths=[],
-                        missing=[],
-                        outside_workspace=[],
-                    ),
-                ),
-                patch(
-                    "mission_control.workspace.persistence_temp_path_guard_error",
-                    return_value=None,
-                ),
-                patch(
-                    "mission_control.workspace.persist_workspace_changes",
-                    return_value=PersistenceResult(
-                        ok=True,
-                        mode="none",
-                        commit_sha=None,
-                        pushed=False,
-                    ),
-                ),
-                patch(
-                    "mission_control.workspace.cleanup_workspace",
-                ),
+                _patched_successful_workspace_run(workspace),
             ):
                 execute_registered_run(
                     record.run_id, _mission(), self.registry
@@ -396,8 +446,215 @@ class TestWorkspacePhaseLifecycle(SqliteRegistryTestCase):
         self.assertIn("verification", seen)
         self.assertIn("persistence", seen)
         self.assertIn("cleanup", seen)
-        self.assertIn("completed", seen)
+        # Terminal phase is applied by update_status, not a separate set_phase.
+        self.assertNotIn("completed", seen)
+        self.assertEqual(fetched.progress["step"], "completed")
         self.assertEqual(fetched.stdout, "agent ok")
+
+    def test_cleanup_workspace_exception_preserves_completed_result(
+        self,
+    ) -> None:
+        record = self.registry.create_run()
+        workspace = tempfile.mkdtemp(prefix="mc-live-status-")
+        try:
+            with _patched_successful_workspace_run(
+                workspace,
+                cleanup_side_effect=RuntimeError("cleanup boom"),
+            ):
+                execute_registered_run(
+                    record.run_id, _mission(), self.registry
+                )
+        finally:
+            try:
+                os.rmdir(workspace)
+            except OSError:
+                pass
+
+        fetched = self.registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.status, RunStatus.COMPLETED)
+        self.assertEqual(fetched.phase, RunPhase.COMPLETED)
+        self.assertEqual(fetched.stdout, "agent ok")
+        self.assertIsNone(fetched.error)
+
+    def test_cleanup_phase_update_exception_still_terminalizes(
+        self,
+    ) -> None:
+        record = self.registry.create_run()
+        original_set_phase = self.registry.set_phase
+
+        def _fail_cleanup(run_id: str, phase: RunPhase, **kwargs):
+            if phase is RunPhase.CLEANUP:
+                raise RuntimeError("cleanup phase boom")
+            return original_set_phase(run_id, phase, **kwargs)
+
+        workspace = tempfile.mkdtemp(prefix="mc-live-status-")
+        try:
+            with (
+                patch.object(
+                    self.registry, "set_phase", side_effect=_fail_cleanup
+                ),
+                _patched_successful_workspace_run(workspace),
+            ):
+                execute_registered_run(
+                    record.run_id, _mission(), self.registry
+                )
+        finally:
+            try:
+                os.rmdir(workspace)
+            except OSError:
+                pass
+
+        fetched = self.registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.status, RunStatus.COMPLETED)
+        self.assertEqual(fetched.phase, RunPhase.COMPLETED)
+
+    def test_terminal_phase_update_exception_still_terminalizes(
+        self,
+    ) -> None:
+        """Authoritative status must not depend on a terminal set_phase write."""
+        record = self.registry.create_run()
+        original_set_phase = self.registry.set_phase
+
+        def _fail_terminal(run_id: str, phase: RunPhase, **kwargs):
+            if phase in (RunPhase.COMPLETED, RunPhase.FAILED):
+                raise RuntimeError("terminal phase boom")
+            return original_set_phase(run_id, phase, **kwargs)
+
+        workspace = tempfile.mkdtemp(prefix="mc-live-status-")
+        try:
+            with (
+                patch.object(
+                    self.registry, "set_phase", side_effect=_fail_terminal
+                ),
+                _patched_successful_workspace_run(workspace),
+            ):
+                execute_registered_run(
+                    record.run_id, _mission(), self.registry
+                )
+        finally:
+            try:
+                os.rmdir(workspace)
+            except OSError:
+                pass
+
+        fetched = self.registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.status, RunStatus.COMPLETED)
+        self.assertEqual(fetched.phase, RunPhase.COMPLETED)
+
+    def test_failure_and_timed_out_paths_remain_truthful(self) -> None:
+        failed_record = self.registry.create_run()
+        with patch(
+            "mission_control.workspace.prepare_isolated_workspace",
+            return_value=WorkspacePrepResult(
+                ok=False,
+                error="clone failed",
+            ),
+        ):
+            execute_registered_run(
+                failed_record.run_id, _mission(), self.registry
+            )
+        failed = self.registry.get_run(failed_record.run_id)
+        assert failed is not None
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertEqual(failed.phase, RunPhase.FAILED)
+        self.assertEqual(failed.error, "clone failed")
+
+        timed_record = self.registry.create_run()
+        workspace = tempfile.mkdtemp(prefix="mc-live-status-")
+        try:
+            with _patched_successful_workspace_run(
+                workspace,
+                execution_result=ExecutionResult(
+                    ok=False,
+                    stdout="",
+                    stderr="agent timed out waiting",
+                    return_code=-1,
+                    error="Cursor agent timed out after 1s",
+                ),
+            ):
+                execute_registered_run(
+                    timed_record.run_id, _mission(), self.registry
+                )
+        finally:
+            try:
+                os.rmdir(workspace)
+            except OSError:
+                pass
+
+        timed = self.registry.get_run(timed_record.run_id)
+        assert timed is not None
+        self.assertEqual(timed.status, RunStatus.TIMED_OUT)
+        self.assertEqual(timed.phase, RunPhase.FAILED)
+        self.assertIn("timed out", timed.error or "")
+
+    def test_stale_worker_cannot_regress_terminal_after_success(
+        self,
+    ) -> None:
+        record = self.registry.create_run()
+        workspace = tempfile.mkdtemp(prefix="mc-live-status-")
+        try:
+            with _patched_successful_workspace_run(workspace):
+                execute_registered_run(
+                    record.run_id, _mission(), self.registry
+                )
+        finally:
+            try:
+                os.rmdir(workspace)
+            except OSError:
+                pass
+
+        completed = self.registry.get_run(record.run_id)
+        assert completed is not None
+        completed_at = completed.completed_at
+
+        regress_status = self.registry.update_status(
+            record.run_id, RunStatus.RUNNING
+        )
+        assert regress_status is not None
+        self.assertEqual(regress_status.status, RunStatus.COMPLETED)
+        self.assertEqual(regress_status.completed_at, completed_at)
+
+        regress_phase = self.registry.set_phase(
+            record.run_id,
+            RunPhase.CLEANUP,
+            progress=platform_progress(
+                step="cleanup",
+                detail="stale cleanup",
+            ),
+        )
+        assert regress_phase is not None
+        self.assertEqual(regress_phase.status, RunStatus.COMPLETED)
+        self.assertEqual(regress_phase.phase, RunPhase.COMPLETED)
+
+        other_terminal = self.registry.update_status(
+            record.run_id, RunStatus.FAILED
+        )
+        assert other_terminal is not None
+        self.assertEqual(other_terminal.status, RunStatus.COMPLETED)
+
+    def test_successful_path_does_not_leak_heartbeat_thread(self) -> None:
+        record = self.registry.create_run()
+        workspace = tempfile.mkdtemp(prefix="mc-live-status-")
+        before = set(_heartbeat_thread_names())
+        try:
+            with _patched_successful_workspace_run(workspace):
+                execute_registered_run(
+                    record.run_id, _mission(), self.registry
+                )
+        finally:
+            try:
+                os.rmdir(workspace)
+            except OSError:
+                pass
+
+        after = set(_heartbeat_thread_names())
+        self.assertEqual(after - before, set())
+        fetched = self.registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.status, RunStatus.COMPLETED)
 
 
 class TestLiveStatusApiSerialization(unittest.TestCase):
