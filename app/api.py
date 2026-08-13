@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import logging
 import os
+import sqlite3
 import time
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -41,6 +42,7 @@ from mission_control.run_registry import (
 )
 from mission_control.notifications import (
     NOTIFICATION_INSPECT_MAX_EVENTS,
+    NotificationDeliveryWorker,
     is_notifications_configured,
     load_notification_config,
 )
@@ -74,6 +76,7 @@ run_registry = RunRegistry()
 run_queue = RunQueue()
 # Phase 2C durable notifications share the run registry SQLite database.
 notification_outbox = run_registry._get_notification_outbox()
+notification_delivery_worker = NotificationDeliveryWorker(notification_outbox)
 
 # Bounds for POST /runs/{run_id}/wait (and the MCP wait_for_run tool).
 WAIT_MIN_TIMEOUT_SECONDS = 0.1
@@ -86,15 +89,15 @@ WAIT_DEFAULT_POLL_INTERVAL_SECONDS = DEFAULT_MONITOR_POLL_INTERVAL_SECONDS
 
 
 def _kick_notification_delivery() -> None:
-    """Best-effort process due webhook deliveries (never alters run status)."""
+    """Wake durable background delivery (never blocks on webhook HTTP)."""
     try:
-        notification_outbox.process_due_deliveries()
+        notification_delivery_worker.kick()
     except Exception:  # noqa: BLE001 — delivery must not break API paths
         logger.exception("notification delivery kick failed")
 
 
 def _observe_notifications(record: RunRecord) -> None:
-    """Enqueue stale (if applicable) and kick delivery without mutating runs."""
+    """Enqueue stale (if applicable) without synchronous webhook HTTP."""
     try:
         notification_outbox.maybe_enqueue_stale(record)
         _kick_notification_delivery()
@@ -136,7 +139,24 @@ def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> No
             # re-raising: an uncaught exception must not leave the run stuck
             # in queued/running with empty stdout/stderr/summary.
         finally:
-            record = registry.get_run(run_id)
+            try:
+                record = registry.get_run(run_id)
+            except sqlite3.ProgrammingError:
+                # Test teardown (or process shutdown) may close the registry
+                # after terminal persistence is already visible to observers.
+                # Lifecycle instrumentation for terminal status was emitted in
+                # update_status under the write lock before persist.
+                logger.warning(
+                    (
+                        "lifecycle run_id=%s event=finished status=unknown "
+                        "has_error=unknown api_pid=%s registry_id=%s "
+                        "stage=registry_closed_before_finally"
+                    ),
+                    run_id,
+                    os.getpid(),
+                    id(registry),
+                )
+                return
             if record is not None and not is_terminal_status(record.status):
                 error = record.error or (
                     "Run worker exited without reaching a terminal status."
@@ -145,6 +165,19 @@ def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> No
                     registry.store_result(run_id, error=error)
                     registry.update_status(run_id, RunStatus.FAILED)
                     record = registry.get_run(run_id)
+                except sqlite3.ProgrammingError:
+                    logger.warning(
+                        (
+                            "lifecycle run_id=%s event=finished "
+                            "status=unknown has_error=true api_pid=%s "
+                            "registry_id=%s "
+                            "stage=registry_closed_during_guarantee"
+                        ),
+                        run_id,
+                        os.getpid(),
+                        id(registry),
+                    )
+                    return
                 except Exception:
                     logger.exception(
                         (
@@ -158,7 +191,10 @@ def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> No
                     )
             status = record.status.value if record is not None else "unknown"
             error = record.error if record is not None else None
-            count, keys = registry.diagnostic_state()
+            try:
+                count, keys = registry.diagnostic_state()
+            except sqlite3.ProgrammingError:
+                count, keys = -1, []
             # Log failure presence without dumping full stderr/YAML secrets.
             logger.info(
                 (
@@ -195,7 +231,8 @@ async def lifespan(_: FastAPI):
             "Marked %s interrupted run(s) failed on startup",
             recovered,
         )
-    # Phase 2C: drain any due notification deliveries after recovery enqueue.
+    # Phase 2C: background delivery drains due/retry work off request paths.
+    notification_delivery_worker.start()
     _kick_notification_delivery()
     if is_notifications_configured(load_notification_config()):
         logger.info("Phase 2C notifications: webhook delivery enabled")
@@ -203,7 +240,12 @@ async def lifespan(_: FastAPI):
         logger.info(
             "Phase 2C notifications: disabled (opt-in; no webhook configured)"
         )
-    yield
+    try:
+        yield
+    finally:
+        notification_delivery_worker.stop()
+
+
 PRODUCTION_SERVER_URL = (
     "https://mission-control-production-76ff.up.railway.app"
 )

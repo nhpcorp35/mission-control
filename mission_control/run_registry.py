@@ -808,10 +808,48 @@ class RunRegistry:
                     )
                 notify_terminal = True
 
-            self._persist_record(record)
             keys = self._list_run_ids_unlocked()
             count = len(keys)
             snapshot = record
+            event = (
+                "final_status_update"
+                if status.value in _TERMINAL_STATUSES
+                else "status_update"
+            )
+            # Emit lifecycle instrumentation under the write lock before
+            # persistence makes the status visible and before durable
+            # notification enqueue (which may be delayed) can race observers.
+            logger.info(
+                (
+                    "lifecycle run_id=%s event=%s status=%s phase=%s "
+                    "api_pid=%s registry_id=%s registry_count=%s "
+                    "registry_keys=%s"
+                ),
+                run_id,
+                event,
+                status.value,
+                snapshot.phase.value,
+                os.getpid(),
+                id(self),
+                count,
+                keys,
+            )
+            if status.value in _TERMINAL_STATUSES:
+                logger.info(
+                    (
+                        "lifecycle run_id=%s event=finished status=%s "
+                        "has_error=%s api_pid=%s registry_id=%s "
+                        "registry_count=%s registry_keys=%s"
+                    ),
+                    run_id,
+                    status.value,
+                    bool(snapshot.error),
+                    os.getpid(),
+                    id(self),
+                    count,
+                    keys,
+                )
+            self._persist_record(record)
 
         # Phase 2C notifications outside the registry write lock.
         outbox = self._get_notification_outbox()
@@ -822,25 +860,6 @@ class RunRegistry:
         if notify_terminal:
             outbox.maybe_enqueue_terminal(snapshot)
 
-        event = (
-            "final_status_update"
-            if status.value in _TERMINAL_STATUSES
-            else "status_update"
-        )
-        logger.info(
-            (
-                "lifecycle run_id=%s event=%s status=%s phase=%s "
-                "api_pid=%s registry_id=%s registry_count=%s registry_keys=%s"
-            ),
-            run_id,
-            event,
-            status.value,
-            snapshot.phase.value,
-            os.getpid(),
-            id(self),
-            count,
-            keys,
-        )
         return snapshot
 
     def set_phase(

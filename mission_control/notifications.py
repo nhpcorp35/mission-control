@@ -49,6 +49,8 @@ DEFAULT_WEBHOOK_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_BACKOFF_BASE_SECONDS = 1.0
 DEFAULT_BACKOFF_MAX_SECONDS = 300.0
+DEFAULT_CLAIM_LEASE_SECONDS = 30.0
+DEFAULT_WORKER_POLL_SECONDS = 1.0
 NOTIFICATION_INSPECT_MAX_EVENTS = 64
 
 # Opt-in configuration (safe no-config: disabled when unset).
@@ -59,6 +61,9 @@ TIMEOUT_ENV = "MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS"
 MAX_ATTEMPTS_ENV = "MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS"
 BACKOFF_BASE_ENV = "MISSION_CONTROL_NOTIFICATIONS_BACKOFF_BASE_SECONDS"
 BACKOFF_MAX_ENV = "MISSION_CONTROL_NOTIFICATIONS_BACKOFF_MAX_SECONDS"
+CLAIM_LEASE_ENV = "MISSION_CONTROL_NOTIFICATIONS_CLAIM_LEASE_SECONDS"
+ALLOW_HTTP_ENV = "MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP"
+WORKER_POLL_ENV = "MISSION_CONTROL_NOTIFICATIONS_WORKER_POLL_SECONDS"
 
 SIGNATURE_HEADER = "X-Mission-Control-Signature"
 TIMESTAMP_HEADER = "X-Mission-Control-Timestamp"
@@ -144,6 +149,9 @@ class NotificationConfig:
     max_attempts: int
     backoff_base_seconds: float
     backoff_max_seconds: float
+    claim_lease_seconds: float
+    allow_http: bool
+    worker_poll_seconds: float
     _secret: str | None
 
     @property
@@ -154,6 +162,12 @@ class NotificationConfig:
         """Return the webhook secret for HMAC only (callers must not log)."""
         return self._secret
 
+    def effective_claim_lease_seconds(self) -> float:
+        """Lease must outlive a single HTTP attempt so active claims survive."""
+        return float(
+            max(self.claim_lease_seconds, self.timeout_seconds + 5.0)
+        )
+
     def __repr__(self) -> str:
         return (
             "NotificationConfig("
@@ -161,7 +175,8 @@ class NotificationConfig:
             f"webhook_url={'set' if self.webhook_url else None}, "
             f"has_secret={self.has_secret}, "
             f"timeout_seconds={self.timeout_seconds!r}, "
-            f"max_attempts={self.max_attempts!r})"
+            f"max_attempts={self.max_attempts!r}, "
+            f"allow_http={self.allow_http!r})"
         )
 
 
@@ -210,6 +225,12 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
+def _env_flag(name: str, *, environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    raw = (env.get(name) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def load_notification_config(
     environ: Mapping[str, str] | None = None,
 ) -> NotificationConfig:
@@ -239,6 +260,13 @@ def load_notification_config(
         backoff_max_seconds=_env_float(
             BACKOFF_MAX_ENV, DEFAULT_BACKOFF_MAX_SECONDS
         ),
+        claim_lease_seconds=_env_float(
+            CLAIM_LEASE_ENV, DEFAULT_CLAIM_LEASE_SECONDS
+        ),
+        allow_http=_env_flag(ALLOW_HTTP_ENV, environ=env),
+        worker_poll_seconds=_env_float(
+            WORKER_POLL_ENV, DEFAULT_WORKER_POLL_SECONDS
+        ),
         _secret=secret,
     )
 
@@ -251,18 +279,85 @@ def is_notifications_configured(
     return bool(cfg.enabled and cfg.webhook_url and cfg.has_secret)
 
 
-def validate_webhook_url(url: str) -> str:
+def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if any(ip in network for network in _PRIVATE_NETWORKS):
+        return True
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def resolve_webhook_ip_targets(
+    host: str,
+    port: int,
+) -> list[tuple[int, str]]:
+    """Resolve host to public IP targets ``(family, ip_text)``.
+
+    Raises ValueError when resolution fails or any address is blocked.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError("webhook URL host could not be resolved") from exc
+
+    if not infos:
+        raise ValueError("webhook URL host could not be resolved")
+
+    targets: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for info in infos:
+        family = info[0]
+        sockaddr = info[4]
+        ip_text = sockaddr[0]
+        if ip_text in seen:
+            continue
+        seen.add(ip_text)
+        try:
+            ip = ipaddress.ip_address(ip_text)
+        except ValueError as exc:
+            raise ValueError("webhook URL resolved to an invalid address") from exc
+        if _ip_is_blocked(ip):
+            raise ValueError("webhook URL resolves to a blocked address")
+        targets.append((family, ip_text))
+    if not targets:
+        raise ValueError("webhook URL host could not be resolved")
+    return targets
+
+
+def validate_webhook_url(
+    url: str,
+    *,
+    allow_http: bool | None = None,
+) -> str:
     """Validate webhook URL and reject SSRF-prone targets.
 
-    Requires http/https with a public resolvable host. Raises ValueError on
-    rejection (message never includes secrets).
+    Production default is HTTPS-only. HTTP is permitted only when
+    ``allow_http`` is true (explicit arg or ``MISSION_CONTROL_NOTIFICATIONS_ALLOW_HTTP``).
+    Resolves DNS and rejects private/loopback/link-local answers. Raises
+    ValueError on rejection (message never includes secrets).
     """
     text = (url or "").strip()
     if not text:
         raise ValueError("webhook URL is empty")
     parsed = urlparse(text)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("webhook URL scheme must be http or https")
+    http_ok = (
+        bool(allow_http)
+        if allow_http is not None
+        else _env_flag(ALLOW_HTTP_ENV)
+    )
+    if parsed.scheme == "https":
+        pass
+    elif parsed.scheme == "http" and http_ok:
+        pass
+    elif parsed.scheme == "http":
+        raise ValueError("webhook URL scheme must be https")
+    else:
+        raise ValueError("webhook URL scheme must be https")
     if not parsed.hostname:
         raise ValueError("webhook URL host is required")
     if parsed.username or parsed.password:
@@ -271,27 +366,62 @@ def validate_webhook_url(url: str) -> str:
     if host.lower() in {"localhost", "metadata.google.internal"}:
         raise ValueError("webhook URL host is not allowed")
 
-    try:
-        infos = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise ValueError("webhook URL host could not be resolved") from exc
-
-    if not infos:
-        raise ValueError("webhook URL host could not be resolved")
-
-    for info in infos:
-        sockaddr = info[4]
-        ip_text = sockaddr[0]
-        try:
-            ip = ipaddress.ip_address(ip_text)
-        except ValueError as exc:
-            raise ValueError("webhook URL resolved to an invalid address") from exc
-        if any(ip in network for network in _PRIVATE_NETWORKS):
-            raise ValueError("webhook URL resolves to a blocked address")
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise ValueError("webhook URL resolves to a blocked address")
-
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    resolve_webhook_ip_targets(host, port)
     return text
+
+
+def post_webhook_ssrf_safe(
+    url: str,
+    *,
+    content: bytes,
+    headers: Mapping[str, str],
+    timeout_seconds: float,
+    allow_http: bool = False,
+    client: httpx.Client | None = None,
+) -> httpx.Response:
+    """POST webhook using validate-then-connect IP pinning (no redirects).
+
+    DNS is resolved once; the TCP/TLS connection uses a validated public IP
+    while preserving Host/SNI for the original hostname. This closes the
+    classic validate-then-re-resolve rebinding window for this hop. Redirects
+    are disabled so a later Location cannot pivot to a private target.
+    """
+    validated = validate_webhook_url(url, allow_http=allow_http)
+    parsed = urlparse(validated)
+    assert parsed.hostname is not None
+    host = parsed.hostname
+    scheme = parsed.scheme
+    port = parsed.port or (443 if scheme == "https" else 80)
+    targets = resolve_webhook_ip_targets(host, port)
+    _family, ip_text = targets[0]
+    # Bracket IPv6 literals for URL embedding.
+    host_for_url = f"[{ip_text}]" if ":" in ip_text else ip_text
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    pinned_url = f"{scheme}://{host_for_url}:{port}{path}"
+
+    merged = {str(k): str(v) for k, v in headers.items()}
+    merged["Host"] = host if parsed.port is None else f"{host}:{parsed.port}"
+
+    owns_client = client is None
+    if client is None:
+        client = httpx.Client(timeout=timeout_seconds, follow_redirects=False)
+    try:
+        request = client.build_request(
+            "POST",
+            pinned_url,
+            content=content,
+            headers=merged,
+            timeout=timeout_seconds,
+        )
+        # Pin TLS SNI / cert verification to the original hostname.
+        request.extensions["sni_hostname"] = host
+        return client.send(request, follow_redirects=False)
+    finally:
+        if owns_client:
+            client.close()
 
 
 def compute_backoff_seconds(
@@ -515,6 +645,7 @@ class NotificationOutbox:
         self._lock = threading.RLock()
         self._config = config
         self._http_client = http_client
+        self._owner_token = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
         parent = os.path.dirname(self._db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -529,6 +660,10 @@ class NotificationOutbox:
     @property
     def db_path(self) -> str:
         return self._db_path
+
+    @property
+    def owner_token(self) -> str:
+        return self._owner_token
 
     def reload_config(self) -> NotificationConfig:
         """Refresh configuration from the environment."""
@@ -558,10 +693,27 @@ class NotificationOutbox:
                     delivered_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    claim_owner TEXT,
+                    claim_expires_at TEXT,
                     UNIQUE (run_id, event_kind, dedupe_key)
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    f"PRAGMA table_info({_OUTBOX_TABLE})"
+                ).fetchall()
+            }
+            if "claim_owner" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {_OUTBOX_TABLE} ADD COLUMN claim_owner TEXT"
+                )
+            if "claim_expires_at" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {_OUTBOX_TABLE} "
+                    "ADD COLUMN claim_expires_at TEXT"
+                )
             self._conn.execute(
                 f"""
                 CREATE INDEX IF NOT EXISTS idx_notification_outbox_delivery
@@ -572,6 +724,12 @@ class NotificationOutbox:
                 f"""
                 CREATE INDEX IF NOT EXISTS idx_notification_outbox_run
                 ON {_OUTBOX_TABLE} (run_id, created_at)
+                """
+            )
+            self._conn.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_notification_outbox_claim
+                ON {_OUTBOX_TABLE} (delivery_state, claim_expires_at)
                 """
             )
             self._conn.commit()
@@ -678,6 +836,7 @@ class NotificationOutbox:
             kind,
             event_id,
         )
+        wake_notification_delivery()
         return EnqueueResult(created=True, event_id=event_id)
 
     def enqueue_for_record(
@@ -838,12 +997,89 @@ class NotificationOutbox:
             ).fetchone()
             return int(row["count"])
 
+    def reclaim_stale_claims(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Return stale ``in_flight`` rows to ``pending`` for retry.
+
+        Only reclaim claims whose lease has expired (or legacy rows with no
+        lease). Active leases are left untouched so concurrent workers cannot
+        steal in-progress deliveries.
+        """
+        clock = now or _utc_now()
+        now_s = _format_dt(clock)
+        assert now_s is not None
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE {_OUTBOX_TABLE}
+                SET delivery_state = ?,
+                    claim_owner = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = ?,
+                    next_attempt_at = COALESCE(next_attempt_at, ?)
+                WHERE delivery_state = ?
+                  AND (
+                    claim_expires_at IS NULL
+                    OR claim_expires_at <= ?
+                  )
+                """,
+                (
+                    DeliveryState.PENDING.value,
+                    now_s,
+                    now_s,
+                    DeliveryState.IN_FLIGHT.value,
+                    now_s,
+                ),
+            )
+            self._conn.commit()
+            reclaimed = int(cursor.rowcount or 0)
+        if reclaimed:
+            logger.info(
+                "notification reclaimed stale in_flight count=%s",
+                reclaimed,
+            )
+        return reclaimed
+
     def _claim_due_events(self, *, limit: int = 16) -> list[sqlite3.Row]:
+        config = self.config
+        lease_seconds = config.effective_claim_lease_seconds()
         now = _utc_now()
         now_s = _format_dt(now)
         assert now_s is not None
+        expires_s = _format_dt(
+            datetime.fromtimestamp(
+                now.timestamp() + lease_seconds, tz=timezone.utc
+            )
+        )
+        owner = self._owner_token
         claimed: list[sqlite3.Row] = []
         with self._lock:
+            # Crash recovery: free expired leases before selecting due work.
+            self._conn.execute(
+                f"""
+                UPDATE {_OUTBOX_TABLE}
+                SET delivery_state = ?,
+                    claim_owner = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = ?,
+                    next_attempt_at = COALESCE(next_attempt_at, ?)
+                WHERE delivery_state = ?
+                  AND (
+                    claim_expires_at IS NULL
+                    OR claim_expires_at <= ?
+                  )
+                """,
+                (
+                    DeliveryState.PENDING.value,
+                    now_s,
+                    now_s,
+                    DeliveryState.IN_FLIGHT.value,
+                    now_s,
+                ),
+            )
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM {_OUTBOX_TABLE}
@@ -858,17 +1094,28 @@ class NotificationOutbox:
                 cursor = self._conn.execute(
                     f"""
                     UPDATE {_OUTBOX_TABLE}
-                    SET delivery_state = ?, updated_at = ?
+                    SET delivery_state = ?,
+                        claim_owner = ?,
+                        claim_expires_at = ?,
+                        updated_at = ?
                     WHERE event_id = ?
                       AND delivery_state = ?
                       AND attempt_count = ?
+                      AND (
+                        claim_owner IS NULL
+                        OR claim_expires_at IS NULL
+                        OR claim_expires_at <= ?
+                      )
                     """,
                     (
                         DeliveryState.IN_FLIGHT.value,
+                        owner,
+                        expires_s,
                         now_s,
                         row["event_id"],
                         DeliveryState.PENDING.value,
                         row["attempt_count"],
+                        now_s,
                     ),
                 )
                 if cursor.rowcount == 1:
@@ -876,27 +1123,59 @@ class NotificationOutbox:
             self._conn.commit()
         return claimed
 
-    def _mark_delivered(self, event_id: str) -> None:
+    def _clear_claim_fields(
+        self,
+        event_id: str,
+        *,
+        delivery_state: str,
+        attempt_count: int | None = None,
+        next_attempt_at: str | None = None,
+        last_error: str | None = None,
+        delivered_at: str | None = None,
+        clear_error: bool = False,
+    ) -> None:
         now_s = _format_dt(_utc_now())
         with self._lock:
+            sets = [
+                "delivery_state = ?",
+                "claim_owner = NULL",
+                "claim_expires_at = NULL",
+                "updated_at = ?",
+                "next_attempt_at = ?",
+            ]
+            params: list[Any] = [
+                delivery_state,
+                now_s,
+                next_attempt_at,
+            ]
+            if attempt_count is not None:
+                sets.append("attempt_count = ?")
+                params.append(attempt_count)
+            if clear_error:
+                sets.append("last_error = NULL")
+            elif last_error is not None:
+                sets.append("last_error = ?")
+                params.append(last_error)
+            if delivered_at is not None:
+                sets.append("delivered_at = ?")
+                params.append(delivered_at)
+            params.append(event_id)
             self._conn.execute(
-                f"""
-                UPDATE {_OUTBOX_TABLE}
-                SET delivery_state = ?,
-                    delivered_at = ?,
-                    last_error = NULL,
-                    updated_at = ?,
-                    next_attempt_at = NULL
-                WHERE event_id = ?
-                """,
-                (
-                    DeliveryState.DELIVERED.value,
-                    now_s,
-                    now_s,
-                    event_id,
-                ),
+                f"UPDATE {_OUTBOX_TABLE} SET {', '.join(sets)} WHERE event_id = ?",
+                tuple(params),
             )
             self._conn.commit()
+
+    def _mark_delivered(self, event_id: str) -> None:
+        now_s = _format_dt(_utc_now())
+        assert now_s is not None
+        self._clear_claim_fields(
+            event_id,
+            delivery_state=DeliveryState.DELIVERED.value,
+            next_attempt_at=None,
+            delivered_at=now_s,
+            clear_error=True,
+        )
 
     def _mark_retry_or_dead(
         self,
@@ -925,48 +1204,23 @@ class NotificationOutbox:
             next_at = _format_dt(
                 datetime.fromtimestamp(now.timestamp() + delay, tz=timezone.utc)
             )
-        with self._lock:
-            self._conn.execute(
-                f"""
-                UPDATE {_OUTBOX_TABLE}
-                SET delivery_state = ?,
-                    attempt_count = ?,
-                    next_attempt_at = ?,
-                    last_error = ?,
-                    updated_at = ?
-                WHERE event_id = ?
-                """,
-                (
-                    state,
-                    attempt_count,
-                    next_at,
-                    safe_error,
-                    now_s,
-                    event_id,
-                ),
-            )
-            self._conn.commit()
+        self._clear_claim_fields(
+            event_id,
+            delivery_state=state,
+            attempt_count=attempt_count,
+            next_attempt_at=next_at,
+            last_error=safe_error,
+        )
 
     def _deliver_one(self, row: sqlite3.Row, config: NotificationConfig) -> None:
         """Attempt one webhook delivery. Never mutates mission/run status."""
         if not is_notifications_configured(config):
             # Opt-in off: leave pending so inspection still works; do not HTTP.
-            now_s = _format_dt(_utc_now())
-            with self._lock:
-                self._conn.execute(
-                    f"""
-                    UPDATE {_OUTBOX_TABLE}
-                    SET delivery_state = ?, updated_at = ?
-                    WHERE event_id = ? AND delivery_state = ?
-                    """,
-                    (
-                        DeliveryState.PENDING.value,
-                        now_s,
-                        row["event_id"],
-                        DeliveryState.IN_FLIGHT.value,
-                    ),
-                )
-                self._conn.commit()
+            self._clear_claim_fields(
+                row["event_id"],
+                delivery_state=DeliveryState.PENDING.value,
+                next_attempt_at=_format_dt(_utc_now()),
+            )
             return
 
         assert config.webhook_url is not None
@@ -975,7 +1229,6 @@ class NotificationOutbox:
 
         attempt_count = int(row["attempt_count"]) + 1
         try:
-            validate_webhook_url(config.webhook_url)
             body_obj = {
                 "event_id": row["event_id"],
                 "run_id": row["run_id"],
@@ -996,21 +1249,26 @@ class NotificationOutbox:
                 EVENT_KIND_HEADER: row["event_kind"],
                 "User-Agent": "mission-control-notifications/2c",
             }
-            client = self._http_client
-            owns_client = False
-            if client is None:
-                client = httpx.Client(timeout=config.timeout_seconds)
-                owns_client = True
-            try:
-                response = client.post(
+            if self._http_client is not None:
+                # Test/injected transport: still disable redirects and re-validate.
+                validate_webhook_url(
+                    config.webhook_url, allow_http=config.allow_http
+                )
+                response = self._http_client.post(
                     config.webhook_url,
                     content=body,
                     headers=headers,
                     timeout=config.timeout_seconds,
+                    follow_redirects=False,
                 )
-            finally:
-                if owns_client:
-                    client.close()
+            else:
+                response = post_webhook_ssrf_safe(
+                    config.webhook_url,
+                    content=body,
+                    headers=headers,
+                    timeout_seconds=config.timeout_seconds,
+                    allow_http=config.allow_http,
+                )
 
             if 200 <= response.status_code < 300:
                 self._mark_delivered(row["event_id"])
@@ -1075,13 +1333,64 @@ class NotificationOutbox:
         config = self.config
         claimed = self._claim_due_events(limit=limit)
         for row in claimed:
-            self._deliver_one(row, config)
+            try:
+                self._deliver_one(row, config)
+            except Exception:  # noqa: BLE001 — worker must keep draining
+                logger.exception(
+                    "notification delivery crashed event_id=%s run_id=%s",
+                    row["event_id"],
+                    row["run_id"],
+                )
+                try:
+                    self._mark_retry_or_dead(
+                        row["event_id"],
+                        attempt_count=int(row["attempt_count"]) + 1,
+                        error="delivery_exception",
+                        max_attempts=config.max_attempts,
+                        backoff_base_seconds=config.backoff_base_seconds,
+                        backoff_max_seconds=config.backoff_max_seconds,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "notification failed to record delivery exception "
+                        "event_id=%s",
+                        row["event_id"],
+                    )
         return len(claimed)
 
 
 # Process-local outbox singleton (same DB path as the default run registry).
 _default_outbox: NotificationOutbox | None = None
 _default_outbox_lock = threading.Lock()
+
+# Best-effort wake hook for the durable background delivery worker.
+_delivery_wake_callbacks: list[Any] = []
+_delivery_wake_lock = threading.Lock()
+
+
+def register_delivery_wake_callback(callback: Any) -> None:
+    """Register a no-arg callback invoked after durable enqueue."""
+    with _delivery_wake_lock:
+        if callback not in _delivery_wake_callbacks:
+            _delivery_wake_callbacks.append(callback)
+
+
+def unregister_delivery_wake_callback(callback: Any) -> None:
+    with _delivery_wake_lock:
+        _delivery_wake_callbacks[:] = [
+            item for item in _delivery_wake_callbacks if item is not callback
+        ]
+
+
+def wake_notification_delivery() -> None:
+    """Wake background delivery without performing synchronous HTTP."""
+    with _delivery_wake_lock:
+        callbacks = list(_delivery_wake_callbacks)
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 — wake must never break enqueue
+            logger.exception("notification delivery wake callback failed")
 
 
 def get_notification_outbox(
@@ -1107,3 +1416,98 @@ def reset_notification_outbox_for_tests() -> None:
             except Exception:  # noqa: BLE001
                 pass
             _default_outbox = None
+
+
+class NotificationDeliveryWorker:
+    """Single background drainer: wake-on-enqueue + periodic due retries.
+
+    Never mutates mission/run status. Tolerates delivery exceptions and
+    refuses to start a second concurrent worker thread for the same instance.
+    """
+
+    def __init__(
+        self,
+        outbox: NotificationOutbox,
+        *,
+        poll_seconds: float | None = None,
+        name: str = "notification-delivery-worker",
+    ) -> None:
+        self._outbox = outbox
+        self._poll_seconds = (
+            float(poll_seconds)
+            if poll_seconds is not None
+            else float(outbox.config.worker_poll_seconds)
+        )
+        self._name = name
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+
+    @property
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def kick(self) -> None:
+        """Signal that due work may exist (non-blocking, no HTTP)."""
+        self._wake.set()
+
+    def start(self) -> bool:
+        """Start the worker thread. Returns False if already running."""
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._stop.clear()
+            self._wake.set()
+            thread = threading.Thread(
+                target=self._run,
+                name=self._name,
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+            register_delivery_wake_callback(self.kick)
+            return True
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        """Stop the worker cleanly and unregister wake callbacks."""
+        with self._lifecycle_lock:
+            unregister_delivery_wake_callback(self.kick)
+            self._stop.set()
+            self._wake.set()
+            thread = self._thread
+            self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+
+    def drain_once(self, *, limit: int = 16) -> int:
+        """Reclaim stale leases and process due rows (serialized)."""
+        with self._drain_lock:
+            try:
+                self._outbox.reclaim_stale_claims()
+            except sqlite3.ProgrammingError:
+                logger.warning(
+                    "notification reclaim skipped; outbox database closed"
+                )
+                return 0
+            except Exception:  # noqa: BLE001
+                logger.exception("notification reclaim failed")
+            try:
+                return self._outbox.process_due_deliveries(limit=limit)
+            except sqlite3.ProgrammingError:
+                logger.warning(
+                    "notification drain skipped; outbox database closed"
+                )
+                return 0
+            except Exception:  # noqa: BLE001
+                logger.exception("notification drain failed")
+                return 0
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.drain_once()
+            self._wake.clear()
+            # Wait for enqueue wake or periodic retry poll.
+            self._wake.wait(timeout=self._poll_seconds)
