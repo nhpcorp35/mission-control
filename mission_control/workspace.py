@@ -64,6 +64,8 @@ PLATFORM_MAIN_WRITE_ACK_REQUIRED = (
 
 # Protected default-branch names for main-write acknowledgement.
 PROTECTED_DEFAULT_BRANCH_NAMES = frozenset({"main", "master"})
+# Leading ref qualification stripped only when recognizing protected defaults.
+_REFS_HEADS_PREFIX = "refs/heads/"
 
 # Post-push tip must equal local HEAD before pushed=true.
 POST_PUSH_RECONCILIATION_FAILURE_STAGE = "post_push_reconciliation"
@@ -251,9 +253,31 @@ def resolve_persistence_target_branch(mission: dict) -> str | None:
     return target
 
 
+def _normalize_branch_for_default_protection(branch: str) -> str:
+    """Normalize a branch spelling for protected-default recognition.
+
+    Strips a leading ``refs/heads/`` prefix (any casing) and casefolds.
+    Recognition only — never rewrite push refspec destinations with this
+    value; callers must keep the original ``persistence.target_branch``.
+    """
+    name = str(branch).strip()
+    folded = name.casefold()
+    if folded.startswith(_REFS_HEADS_PREFIX):
+        name = name[len(_REFS_HEADS_PREFIX) :]
+        folded = name.casefold()
+    return folded
+
+
 def is_protected_default_branch(branch: str) -> bool:
-    """Return whether ``branch`` is a protected default-branch name."""
-    return str(branch).strip() in PROTECTED_DEFAULT_BRANCH_NAMES
+    """Return whether ``branch`` is a protected default-branch name.
+
+    Recognizes exact names, ``refs/heads/``-qualified forms, and case
+    variants such as ``Main``, ``MASTER``, and ``refs/heads/main``.
+    """
+    return (
+        _normalize_branch_for_default_protection(branch)
+        in PROTECTED_DEFAULT_BRANCH_NAMES
+    )
 
 
 def is_platform_main_write_acknowledged(mission: dict) -> bool:

@@ -2415,6 +2415,153 @@ class TestSafePushTarget(unittest.TestCase):
         finally:
             cleanup_workspace(workspace_path)
 
+    def test_protected_default_branch_recognizes_exact_qualified_and_case(
+        self,
+    ) -> None:
+        protected = (
+            "main",
+            "master",
+            "Main",
+            "MASTER",
+            "Master",
+            "refs/heads/main",
+            "refs/heads/master",
+            "refs/heads/Main",
+            "refs/HEADS/MASTER",
+            "  main  ",
+            " refs/heads/master ",
+        )
+        for name in protected:
+            self.assertTrue(is_protected_default_branch(name), name)
+
+        unaffected = (
+            "mission/safe-target",
+            "feature",
+            "maintenance",
+            "mainline",
+            "mastermind",
+            "refs/heads/mission/safe-target",
+            "heads/main",
+            "refs/main",
+        )
+        for name in unaffected:
+            self.assertFalse(is_protected_default_branch(name), name)
+
+    def test_protected_default_bypass_spellings_require_main_write_ack(
+        self,
+    ) -> None:
+        bypass_spellings = (
+            "refs/heads/main",
+            "refs/heads/master",
+            "Main",
+            "MASTER",
+            "refs/heads/Main",
+        )
+        for target in bypass_spellings:
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                platform_main_write_acknowledged=False,
+                target_branch=target,
+            )
+            mission["approval"]["platform_main_write_acknowledged"] = False
+            self.assertEqual(
+                resolve_persistence_target_branch(mission),
+                target,
+            )
+            self.assertEqual(
+                require_persistence_push_target(mission),
+                PLATFORM_MAIN_WRITE_ACK_REQUIRED,
+                target,
+            )
+
+    def test_protected_default_bypass_spellings_accepted_with_ack(self) -> None:
+        bypass_spellings = (
+            "refs/heads/main",
+            "refs/heads/master",
+            "Main",
+            "MASTER",
+            "refs/heads/Main",
+        )
+        for target in bypass_spellings:
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                platform_main_write_acknowledged=True,
+                target_branch=target,
+            )
+            self.assertEqual(
+                resolve_persistence_target_branch(mission),
+                target,
+            )
+            self.assertIsNone(
+                require_persistence_push_target(mission),
+                target,
+            )
+            # Normalization must not rewrite the push destination spelling.
+            resolved = resolve_persistence_target_branch(mission)
+            self.assertEqual(resolved, target)
+            self.assertEqual(f"HEAD:{resolved}", f"HEAD:{target}")
+            self.assertNotEqual(f"HEAD:{resolved}", "HEAD:main")
+
+    def test_qualified_target_push_refspec_preserves_original_spelling(
+        self,
+    ) -> None:
+        target = "refs/heads/main"
+        # Seed remote tip under the qualified ref so pre-push reconciliation
+        # sees an unchanged destination for the approved spelling.
+        _run_git(
+            [
+                "-C",
+                str(self.fixture.source_repo),
+                "push",
+                "origin",
+                f"{self.fixture.base_branch}:{target}",
+            ]
+        )
+        workspace_path = self._prepare()
+        try:
+            (Path(workspace_path) / "qualified.txt").write_text(
+                "qualified-main\n",
+                encoding="utf-8",
+            )
+            mission = self.fixture.mission(
+                persistence_mode="push",
+                platform_push_approved=True,
+                platform_main_write_acknowledged=True,
+                target_branch=target,
+            )
+            self.assertTrue(is_protected_default_branch(target))
+            self.assertEqual(resolve_persistence_target_branch(mission), target)
+            recorded: list[list[str]] = []
+            real_run_git = persist_workspace_changes.__globals__["_run_git"]
+
+            def _tracking_run_git(args, **kwargs):
+                recorded.append(list(args))
+                return real_run_git(args, **kwargs)
+
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ), patch(
+                "mission_control.workspace._run_git",
+                side_effect=_tracking_run_git,
+            ):
+                result = persist_workspace_changes(
+                    "run-qualified-main-refspec",
+                    mission,
+                    workspace_path,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertTrue(result.pushed)
+            self.assertEqual(result.target_branch, target)
+            push_args = [args for args in recorded if "push" in args]
+            self.assertTrue(push_args)
+            self.assertIn(f"HEAD:{target}", push_args[0])
+            self.assertNotIn("HEAD:main", push_args[0])
+        finally:
+            cleanup_workspace(workspace_path)
+
     def test_post_push_reconciliation_mismatch_keeps_pushed_false(self) -> None:
         workspace_path = self._prepare()
         try:
