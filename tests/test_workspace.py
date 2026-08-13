@@ -1652,6 +1652,7 @@ class TestPersistenceHandoff(unittest.TestCase):
             finally:
                 cleanup_workspace(prep.workspace_path)
         finally:
+            os.environ.pop(REPOSITORY_URL_MAP_ENV, None)
             other.cleanup()
 
 
