@@ -435,24 +435,26 @@ Requires authentication.
 
 **OpenAPI operation ID:** `wait_for_run`
 
-Bounded server-side wait for an asynchronous run. Polls the existing run lookup path (`GET /runs/{run_id}` / registry `get_run`) until the run reaches a terminal status or `timeout_seconds` elapses. Returns immediately when the run is already terminal. Does **not** mutate run state when the wait expires (a wait timeout is distinct from run status `timed_out`).
+Bounded server-side wait for an asynchronous run (Phase 2B monitoring contract). Polls the existing run lookup path (`GET /runs/{run_id}` / registry `get_run`) until the run reaches a terminal status or `timeout_seconds` elapses. Returns immediately when the run is already terminal. Uses Phase 2A `phase`, `heartbeat_at`, and `progress` fields to build a bounded, deduplicated `monitoring_history`. Does **not** mutate, fail, or cancel the run when the wait expires (a caller/edge wait timeout is distinct from mission execution status `timed_out`).
 
 HTTP clients and Custom GPT Actions use this endpoint for a server-side wait.
 The MCP `wait_for_run` tool instead polls `GET /runs/{run_id}` on the connector
-side (see **MCP tools** below).
+side (see **MCP tools** below) and remains compatible; enriched monitoring fields
+are returned by this REST wait path.
 
 **Intended HAL / Custom GPT flow**
 
 1. Prefer `submit_and_wait` (`POST /runs/submit-and-wait`, or the MCP tool) for exact YAML end-to-end in one call — or `submit_run` (`POST /runs`) then `wait_for_run`
-2. When using separate operations: `wait_for_run` (`POST /runs/{run_id}/wait` or MCP) — poll until terminal or wait budget exhausted; when `wait_expired` is true, call again with the same `run_id`
-3. Inspect `status`, authoritative `summary`, `result.persistence`, `commit_sha`, then diagnostic `stdout` / `stderr` / `error` (prefer `summary` over agent stdout for persistence claims)
+2. When using separate operations: `wait_for_run` (`POST /runs/{run_id}/wait` or MCP) — poll until terminal or wait budget exhausted; when `wait_expired` is true, call again with the same `run_id` and optional `cursor` from the prior response
+3. Inspect `status`, `heartbeat_health`, `monitoring_history`, authoritative `summary`, `result.persistence`, `commit_sha`, then diagnostic `stdout` / `stderr` / `error` (prefer `summary` over agent stdout for persistence claims; never treat monitoring events as raw agent I/O)
 
 **Request body** `application/json` (all fields optional; defaults shown)
 
 | Field | Type | Default | Bounds | Description |
 | --- | --- | --- | --- | --- |
-| `timeout_seconds` | number | `300` | `0.1` … `3600` | Maximum time to wait for a terminal status |
-| `poll_interval_seconds` | number | `1` | `0.05` … `60` | Delay between registry lookups while the run is non-terminal |
+| `timeout_seconds` | number | `300` | `0.1` … `3600` | Maximum time to wait for a terminal status (caller/edge budget only) |
+| `poll_interval_seconds` | number | `25` | `0.05` … `60` | Delay between registry lookups while the run is non-terminal |
+| `cursor` | string or null | `null` | opaque | Resumable monitor cursor from a prior `wait_expired` response; preserves bounded `monitoring_history` across waits |
 
 Out-of-bounds values return `422 Unprocessable Entity`.
 
@@ -462,16 +464,25 @@ Includes the same fields as `GET /runs/{run_id}`, plus:
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `reached_terminal` | boolean | `true` when the run status is terminal (`completed`, `failed`, or `timed_out`) |
-| `wait_expired` | boolean | `true` when the wait budget elapsed while the run was still `queued` or `running` |
+| `reached_terminal` | boolean | `true` when the run status is terminal (`completed`, `failed`, `timed_out`, or `cancelled`) |
+| `wait_expired` | boolean | `true` when the wait budget elapsed while the run was still non-terminal |
 | `timeout_seconds` | number | Effective wait budget used for this call |
+| `heartbeat_health` | string | `healthy`, `stale`, `absent`, `not_applicable`, or `terminal` |
+| `stale_heartbeat` | boolean | `true` when `heartbeat_health` is `stale` (reported only; does not cancel or mutate the run) |
+| `stale_threshold_seconds` | number | Documented stale threshold (`30`, six times the 5s heartbeat cadence) |
+| `monitoring_history` | array | Bounded (max 32) deduplicated phase/progress/health events; excludes prompts, commands, secrets, stdout, and stderr |
+| `cursor` | string | Opaque resumable cursor encoding the current bounded history |
 
 | Outcome | `reached_terminal` | `wait_expired` | Run state mutated? |
 | --- | --- | --- | --- |
 | Already terminal / becomes terminal during wait | `true` | `false` | No (wait only observes) |
-| Wait budget exhausted while non-terminal | `false` | `true` | No (latest successful run payload still returned) |
+| Wait budget exhausted while non-terminal | `false` | `true` | No (latest status + `cursor` / `run_id` returned; resume with the same `run_id`) |
 
-Terminal statuses are defined by a single helper (`is_terminal_status`) covering `completed`, `failed`, and `timed_out`.
+**Heartbeat health.** While a run is `queued`, health is `not_applicable` (agent heartbeat cadence is not active). Active non-terminal runs with a recent `heartbeat_at` are `healthy`; when `heartbeat_at` is older than `stale_threshold_seconds` the wait reports `stale` / `stale_heartbeat: true` without cancelling. Missing `heartbeat_at` on an active run is `absent`. Terminal statuses classify as `terminal`.
+
+**Monitoring history.** Events are appended only on meaningful `status` / `phase` / sanitized `progress` / `heartbeat_health` changes (repeated heartbeat refreshes alone do not duplicate events). Progress is platform-authored and redacted via the same sanitizer as live status.
+
+Terminal statuses for this wait contract include `completed`, `failed`, `timed_out`, and `cancelled` (monitoring recognizes `cancelled` even when older registry rows only use the first three).
 
 **Response** `404 Not Found` when the `run_id` is unknown.
 
@@ -490,14 +501,15 @@ Prefer this endpoint for Custom GPT Actions / HAL when exact YAML is already ava
 | Field | Type | Required | Default | Bounds | Description |
 | --- | --- | --- | --- | --- | --- |
 | `mission_yaml` | string | yes | — | non-empty | Exact mission YAML document (same as `POST /runs`) |
-| `timeout_seconds` | number | no | `300` | `0.1` … `3600` | Maximum time to wait after acceptance |
-| `poll_interval_seconds` | number | no | `1` | `0.05` … `60` | Delay between registry lookups while non-terminal |
+| `timeout_seconds` | number | no | `300` | `0.1` … `3600` | Maximum time to wait after acceptance (caller/edge budget; does not mark the mission `timed_out`) |
+| `poll_interval_seconds` | number | no | `25` | `0.05` … `60` | Delay between registry lookups while non-terminal |
+| `cursor` | string or null | no | `null` | opaque | Optional monitor cursor (normally unused on first submit) |
 
 Out-of-bounds wait values return `422 Unprocessable Entity` **before** submission (Pydantic validation), so an invalid timeout never queues a run.
 
 **Response** `200 OK` — wait finished
 
-Same shape as `POST /runs/{run_id}/wait` (`WaitForRunResponse`): run fields plus `reached_terminal`, `wait_expired`, and `timeout_seconds`.
+Same shape as `POST /runs/{run_id}/wait` (`WaitForRunResponse`): run fields plus `reached_terminal`, `wait_expired`, `timeout_seconds`, `heartbeat_health`, `stale_heartbeat`, `monitoring_history`, `cursor`, and `stale_threshold_seconds`.
 
 **Response** `200 OK` — submission / validation failure
 
@@ -505,7 +517,7 @@ Same `RunResponse` rejection shapes as `POST /runs` (`ok: false`, no `run_id`). 
 
 Recursive local submissions are rejected the same way as `POST /runs`.
 
-**Wait-window expiry.** When the wait budget expires while the run is still non-terminal, returns `wait_expired: true` with the accepted `run_id` and latest successful run fields. Resume with `POST /runs/{run_id}/wait` (`wait_for_run`) using that `run_id`.
+**Wait-window expiry.** When the wait budget expires while the run is still non-terminal, returns `wait_expired: true` with the accepted `run_id`, latest status fields, and a resumable `cursor`. Resume with `POST /runs/{run_id}/wait` (`wait_for_run`) using that `run_id` and `cursor`. Wait expiry never fails or cancels the mission.
 
 ### POST /repository-commands
 

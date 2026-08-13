@@ -23,6 +23,15 @@ from mission_control.recursion import (
     is_recursive_submission,
 )
 from mission_control.run_queue import RunQueue
+from mission_control.monitoring import (
+    DEFAULT_MONITOR_POLL_INTERVAL_SECONDS,
+    HEARTBEAT_STALE_THRESHOLD_SECONDS,
+    HeartbeatHealth,
+    decode_monitor_cursor,
+    encode_monitor_cursor,
+    is_monitoring_terminal,
+    observe_run,
+)
 from mission_control.run_registry import (
     RunRecord,
     RunRegistry,
@@ -64,7 +73,8 @@ WAIT_MAX_TIMEOUT_SECONDS = 3600.0
 WAIT_MIN_POLL_INTERVAL_SECONDS = 0.05
 WAIT_MAX_POLL_INTERVAL_SECONDS = 60.0
 WAIT_DEFAULT_TIMEOUT_SECONDS = 300.0
-WAIT_DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+# Phase 2B: default ~25s so HAL can wait server-side without chat polling.
+WAIT_DEFAULT_POLL_INTERVAL_SECONDS = DEFAULT_MONITOR_POLL_INTERVAL_SECONDS
 
 
 def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> None:
@@ -352,6 +362,23 @@ class RunStatusResponse(BaseModel):
     retried_from: str | None = None
 
 
+class MonitoringProgressModel(BaseModel):
+    """Safe progress snapshot inside monitoring history (never raw agent I/O)."""
+
+    step: str
+    detail: str
+
+
+class MonitoringEventModel(BaseModel):
+    """One deduplicated phase/progress/health observation."""
+
+    at: str
+    status: str
+    phase: str
+    progress: MonitoringProgressModel | None = None
+    heartbeat_health: str
+
+
 class WaitForRunRequest(BaseModel):
     timeout_seconds: float = Field(
         default=WAIT_DEFAULT_TIMEOUT_SECONDS,
@@ -362,6 +389,13 @@ class WaitForRunRequest(BaseModel):
         default=WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
         ge=WAIT_MIN_POLL_INTERVAL_SECONDS,
         le=WAIT_MAX_POLL_INTERVAL_SECONDS,
+    )
+    cursor: str | None = Field(
+        default=None,
+        description=(
+            "Opaque resumable monitor cursor from a prior wait_expired "
+            "response. Preserves bounded monitoring history across waits."
+        ),
     )
 
 
@@ -378,6 +412,10 @@ class SubmitAndWaitRequest(BaseModel):
         default=WAIT_DEFAULT_POLL_INTERVAL_SECONDS,
         ge=WAIT_MIN_POLL_INTERVAL_SECONDS,
         le=WAIT_MAX_POLL_INTERVAL_SECONDS,
+    )
+    cursor: str | None = Field(
+        default=None,
+        description="Optional monitor cursor (normally unused on first submit).",
     )
 
 
@@ -436,6 +474,11 @@ class WaitForRunResponse(RunStatusResponse):
     reached_terminal: bool
     wait_expired: bool
     timeout_seconds: float
+    heartbeat_health: str
+    stale_heartbeat: bool = False
+    monitoring_history: list[MonitoringEventModel] = Field(default_factory=list)
+    cursor: str | None = None
+    stale_threshold_seconds: float = HEARTBEAT_STALE_THRESHOLD_SECONDS
 
 
 def _structured_result_model(
@@ -480,12 +523,38 @@ def _run_status_response(record: RunRecord) -> RunStatusResponse:
     )
 
 
+def _monitoring_history_models(
+    history: list[dict],
+) -> list[MonitoringEventModel]:
+    events: list[MonitoringEventModel] = []
+    for item in history:
+        progress = item.get("progress")
+        progress_model = None
+        if isinstance(progress, dict):
+            progress_model = MonitoringProgressModel(
+                step=str(progress.get("step", "")),
+                detail=str(progress.get("detail", "")),
+            )
+        events.append(
+            MonitoringEventModel(
+                at=str(item.get("at", "")),
+                status=str(item.get("status", "")),
+                phase=str(item.get("phase", "")),
+                progress=progress_model,
+                heartbeat_health=str(item.get("heartbeat_health", "")),
+            )
+        )
+    return events
+
+
 def _wait_for_run_response(
     record: RunRecord,
     *,
     reached_terminal: bool,
     wait_expired: bool,
     timeout_seconds: float,
+    history: list[dict],
+    heartbeat_health: HeartbeatHealth,
 ) -> WaitForRunResponse:
     base = _run_status_response(record)
     return WaitForRunResponse(
@@ -493,6 +562,11 @@ def _wait_for_run_response(
         reached_terminal=reached_terminal,
         wait_expired=wait_expired,
         timeout_seconds=timeout_seconds,
+        heartbeat_health=heartbeat_health.value,
+        stale_heartbeat=heartbeat_health is HeartbeatHealth.STALE,
+        monitoring_history=_monitoring_history_models(history),
+        cursor=encode_monitor_cursor(history),
+        stale_threshold_seconds=HEARTBEAT_STALE_THRESHOLD_SECONDS,
     )
 
 
@@ -501,9 +575,15 @@ def _wait_for_run(
     *,
     timeout_seconds: float,
     poll_interval_seconds: float,
+    cursor: str | None = None,
 ) -> WaitForRunResponse:
-    """Poll registry get_run until terminal status or wait budget elapses."""
+    """Poll registry get_run until terminal status or wait budget elapses.
+
+    Caller/edge wait expiry returns latest status plus a resumable cursor and
+    never marks the mission failed, timed_out, or cancelled.
+    """
     deadline = time.monotonic() + timeout_seconds
+    history = decode_monitor_cursor(cursor)
 
     while True:
         # get_run acquires and releases the registry lock per lookup so the
@@ -519,31 +599,41 @@ def _wait_for_run(
                 detail="Run not found",
             )
 
-        if is_terminal_status(record.status):
+        history, heartbeat_health, _event = observe_run(record, history)
+
+        if is_monitoring_terminal(record.status):
             logger.info(
-                "lifecycle run_id=%s event=wait_terminal status=%s",
+                "lifecycle run_id=%s event=wait_terminal status=%s "
+                "heartbeat_health=%s",
                 run_id,
                 record.status.value,
+                heartbeat_health.value,
             )
             return _wait_for_run_response(
                 record,
                 reached_terminal=True,
                 wait_expired=False,
                 timeout_seconds=timeout_seconds,
+                history=history,
+                heartbeat_health=heartbeat_health,
             )
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             logger.info(
-                "lifecycle run_id=%s event=wait_expired status=%s",
+                "lifecycle run_id=%s event=wait_expired status=%s "
+                "heartbeat_health=%s",
                 run_id,
                 record.status.value,
+                heartbeat_health.value,
             )
             return _wait_for_run_response(
                 record,
                 reached_terminal=False,
                 wait_expired=True,
                 timeout_seconds=timeout_seconds,
+                history=history,
+                heartbeat_health=heartbeat_health,
             )
 
         time.sleep(min(poll_interval_seconds, remaining))
@@ -909,6 +999,7 @@ def submit_and_wait_endpoint(
         accepted.run_id,
         timeout_seconds=request.timeout_seconds,
         poll_interval_seconds=request.poll_interval_seconds,
+        cursor=request.cursor,
     )
 
 
@@ -1269,11 +1360,13 @@ def run_repository_command_endpoint(
     summary="Wait for an asynchronous run to reach a terminal status",
     description=(
         "Poll the existing run lookup path until the run reaches a terminal "
-        "status (completed, failed, or timed_out) or timeout_seconds elapses. "
-        "Returns immediately when the run is already terminal. Wait timeout "
-        "does not mutate run state. Intended HAL / Custom GPT flow: "
-        "submit_run, then wait_for_run, then inspect status/output/commit_sha. "
-        "For exact YAML end-to-end in one request, use submit_and_wait."
+        "status (completed, failed, timed_out, or cancelled) or "
+        "timeout_seconds elapses. Returns immediately when already terminal. "
+        "Exposes phase-aware monitoring_history, heartbeat_health, and a "
+        "resumable cursor. Wait timeout does not mutate or cancel the run. "
+        "Intended HAL flow: submit_run, wait_for_run (resume with cursor when "
+        "wait_expired), then inspect status/summary/commit_sha. For exact YAML "
+        "end-to-end in one request, use submit_and_wait."
     ),
 )
 def wait_for_run_endpoint(
@@ -1285,4 +1378,5 @@ def wait_for_run_endpoint(
         run_id,
         timeout_seconds=request.timeout_seconds,
         poll_interval_seconds=request.poll_interval_seconds,
+        cursor=request.cursor,
     )
