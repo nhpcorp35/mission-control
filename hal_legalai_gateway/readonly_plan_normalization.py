@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,21 @@ _REQUIRED_FALSE_PERMISSIONS: tuple[str, ...] = (
     "push",
 )
 
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+# Shared tool-doc fragment for mission.submit and mission.submit_and_wait so the
+# normalization contract cannot drift between those gateway tools.
+READONLY_PLAN_NORMALIZATION_CONTRACT = (
+    "Substantively read-only review missions may submit execution.mode=plan; "
+    "the gateway safely normalizes plan→execute only when create_files, "
+    "modify_files, delete_files, stage_changes, commit, and push are exactly "
+    "false, persistence.mode is none, and all gates are unambiguous "
+    "(including no duplicate mapping keys and no YAML merge keys). "
+    "Write-capable or ambiguous plan missions are forwarded unchanged and "
+    "rejected by Mission Control execute eligibility. ask and unknown modes "
+    "are never normalized."
+)
+
 
 @dataclass(frozen=True)
 class NormalizationResult:
@@ -35,6 +52,55 @@ class NormalizationResult:
     mission_yaml: str
     normalized: bool
     reason: str
+
+
+class _AmbiguousMappingError(yaml.YAMLError):
+    """Raised when mapping shape is too ambiguous to normalize safely."""
+
+    def __init__(self, reason: str, message: str = "") -> None:
+        super().__init__(message or reason)
+        self.reason = reason
+
+
+class _NormalizationSafeLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate keys and merge keys (fail closed).
+
+    Does not evaluate arbitrary constructors; only SafeLoader types plus an
+    explicit preflight over mapping nodes before values are accepted.
+    """
+
+    def construct_mapping(self, node: MappingNode, deep: bool = False) -> dict[Any, Any]:
+        if not isinstance(node, MappingNode):
+            raise ConstructorError(
+                None,
+                None,
+                f"expected a mapping node, but found {node.id}",
+                node.start_mark,
+            )
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            if key_node.tag == _YAML_MERGE_TAG:
+                raise _AmbiguousMappingError(
+                    "merge_key_ambiguous",
+                    "YAML merge keys are ambiguous for read-only plan normalization",
+                )
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                hash(key)
+            except TypeError as exc:
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found unhashable key ({exc})",
+                    key_node.start_mark,
+                ) from exc
+            if key in mapping:
+                raise _AmbiguousMappingError(
+                    "duplicate_mapping_key",
+                    f"found duplicate mapping key {key!r}",
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
 
 
 def _is_exact_false(value: Any) -> bool:
@@ -57,6 +123,8 @@ def _gates_allow_normalize(mission: dict[str, Any]) -> str | None:
     mode = execution.get("mode")
     if not isinstance(mode, str):
         return "mode_not_string"
+    if not mode.strip():
+        return "mode_blank"
     if mode != "plan":
         return "mode_not_plan"
 
@@ -93,10 +161,12 @@ def normalize_readonly_plan_mission_yaml(
 ) -> NormalizationResult:
     """Convert ``plan``→``execute`` only for demonstrably non-mutating missions.
 
-    Fail closed: missing, malformed, or ambiguous gates return the original YAML
-    unchanged. Never normalizes ``ask``, ``execute``, or unknown modes. Only
-    ``execution.mode`` is changed when normalization applies; serialization uses
-    ``yaml.safe_dump`` (no regex rewriting).
+    Fail closed: missing, malformed, or ambiguous gates (including duplicate
+    mapping keys and YAML merge keys) return the original YAML unchanged so
+    downstream Mission Control canonical validation retains authority. Never
+    normalizes ``ask``, ``execute``, or unknown modes. Only ``execution.mode``
+    is changed when normalization applies; serialization uses ``yaml.safe_dump``
+    (no regex rewriting).
     """
     if not isinstance(mission_yaml, str):
         return NormalizationResult(
@@ -113,7 +183,13 @@ def normalize_readonly_plan_mission_yaml(
         )
 
     try:
-        data = yaml.safe_load(mission_yaml)
+        data = yaml.load(mission_yaml, Loader=_NormalizationSafeLoader)
+    except _AmbiguousMappingError as exc:
+        return NormalizationResult(
+            mission_yaml=mission_yaml,
+            normalized=False,
+            reason=exc.reason,
+        )
     except yaml.YAMLError:
         return NormalizationResult(
             mission_yaml=mission_yaml,
@@ -137,6 +213,18 @@ def normalize_readonly_plan_mission_yaml(
         )
 
     mode = execution.get("mode")
+    if not isinstance(mode, str):
+        return NormalizationResult(
+            mission_yaml=mission_yaml,
+            normalized=False,
+            reason="mode_not_string",
+        )
+    if not mode.strip():
+        return NormalizationResult(
+            mission_yaml=mission_yaml,
+            normalized=False,
+            reason="mode_blank",
+        )
     if mode == "execute":
         return NormalizationResult(
             mission_yaml=mission_yaml,
@@ -149,7 +237,7 @@ def normalize_readonly_plan_mission_yaml(
             normalized=False,
             reason="ask_unchanged",
         )
-    if not isinstance(mode, str) or mode != "plan":
+    if mode != "plan":
         return NormalizationResult(
             mission_yaml=mission_yaml,
             normalized=False,

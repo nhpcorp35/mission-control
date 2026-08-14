@@ -20,6 +20,7 @@ from hal_legalai_gateway.forwarding import (
     resolve_authorization_for_service,
 )
 from hal_legalai_gateway.readonly_plan_normalization import (
+    READONLY_PLAN_NORMALIZATION_CONTRACT,
     normalize_readonly_plan_mission_yaml,
 )
 from hal_legalai_gateway.registry import GatewayRegistry
@@ -212,14 +213,8 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description=(
             "Submit an exact Mission Control YAML document to the async /runs "
             "path (downstream submit_run). Mutating missions must use "
-            "execution.mode=execute. Substantively read-only review missions "
-            "may submit execution.mode=plan; the gateway safely normalizes "
-            "plan→execute only when create_files, modify_files, delete_files, "
-            "stage_changes, commit, and push are exactly false, "
-            "persistence.mode is none, and all gates are unambiguous. "
-            "Write-capable or ambiguous plan missions are forwarded unchanged "
-            "and rejected by Mission Control execute eligibility. ask and "
-            "unknown modes are never normalized."
+            "execution.mode=execute. "
+            + READONLY_PLAN_NORMALIZATION_CONTRACT
         ),
     ),
     ToolBinding(
@@ -272,7 +267,8 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_tool="submit_and_wait",
         description=(
             "Submit exact mission YAML and wait for a terminal run state. "
-            "Returns Phase 2B monitoring fields from Mission Control. When "
+            + READONLY_PLAN_NORMALIZATION_CONTRACT
+            + " Returns Phase 2B monitoring fields from Mission Control. When "
             "wait_expired is true, resume with mission.wait using the same "
             "run_id and returned cursor."
         ),

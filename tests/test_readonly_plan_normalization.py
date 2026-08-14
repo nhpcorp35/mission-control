@@ -11,6 +11,7 @@ from unittest import mock
 import yaml
 
 from hal_legalai_gateway.readonly_plan_normalization import (
+    READONLY_PLAN_NORMALIZATION_CONTRACT,
     normalize_readonly_plan_mission_yaml,
 )
 from mission_control.validator import (
@@ -290,6 +291,258 @@ class ModePreservationTests(unittest.TestCase):
         self.assertEqual(result.reason, "mode_not_plan")
         self.assertEqual(_mode_from_yaml(result.mission_yaml), "draft")
 
+    def test_non_string_execution_mode_blocks(self) -> None:
+        raw = _safe_readonly_plan_yaml(execution={"mode": 1})
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, raw)
+        self.assertEqual(result.reason, "mode_not_string")
+
+    def test_null_execution_mode_blocks(self) -> None:
+        raw = _safe_readonly_plan_yaml(execution={"mode": None})
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, raw)
+        self.assertEqual(result.reason, "mode_not_string")
+
+    def test_blank_execution_mode_blocks(self) -> None:
+        raw = _safe_readonly_plan_yaml(execution={"mode": ""})
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, raw)
+        self.assertEqual(result.reason, "mode_blank")
+
+    def test_whitespace_execution_mode_blocks(self) -> None:
+        raw = _safe_readonly_plan_yaml(execution={"mode": "   "})
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, raw)
+        self.assertEqual(result.reason, "mode_blank")
+
+    def test_empty_input_forwarded_unchanged(self) -> None:
+        raw = "   \n"
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, raw)
+        self.assertEqual(result.reason, "empty_input")
+
+    def test_non_string_input_blocks(self) -> None:
+        result = normalize_readonly_plan_mission_yaml(None)  # type: ignore[arg-type]
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, "")
+        self.assertEqual(result.reason, "input_not_string")
+
+
+class DuplicateMappingKeyTests(unittest.TestCase):
+    """Duplicate keys are ambiguous; forward original YAML byte-for-byte."""
+
+    def _assert_duplicate_fail_closed(self, raw: str) -> None:
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, raw)
+        self.assertEqual(result.reason, "duplicate_mapping_key")
+
+    def test_direct_duplicate_top_level_key_blocks(self) -> None:
+        raw = _safe_readonly_plan_yaml() + "execution:\n  mode: execute\n"
+        self._assert_duplicate_fail_closed(raw)
+
+    def test_nested_duplicate_execution_mode_blocks(self) -> None:
+        raw = """
+version: "1.0"
+mission_id: dup-exec
+title: t
+repository:
+  name: Mission-Control
+  path: .
+  base_branch: main
+execution:
+  agent: cursor
+  mode: execute
+  mode: plan
+permissions:
+  read: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+persistence:
+  mode: none
+instructions: inspect
+deliverables:
+  - notes
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true
+"""
+        self._assert_duplicate_fail_closed(raw)
+        # Last value would look safe under silent overwrite.
+        overwritten = yaml.safe_load(raw)
+        self.assertEqual(overwritten["execution"]["mode"], "plan")
+
+    def test_nested_duplicate_permission_last_value_safe_still_blocks(self) -> None:
+        raw = """
+version: "1.0"
+mission_id: dup-perm
+title: t
+repository:
+  name: Mission-Control
+  path: .
+  base_branch: main
+execution:
+  agent: cursor
+  mode: plan
+permissions:
+  read: true
+  create_files: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+persistence:
+  mode: none
+instructions: inspect
+deliverables:
+  - notes
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true
+"""
+        self._assert_duplicate_fail_closed(raw)
+        overwritten = yaml.safe_load(raw)
+        self.assertIs(overwritten["permissions"]["create_files"], False)
+
+    def test_nested_duplicate_persistence_mode_blocks(self) -> None:
+        raw = """
+version: "1.0"
+mission_id: dup-persist
+title: t
+repository:
+  name: Mission-Control
+  path: .
+  base_branch: main
+execution:
+  agent: cursor
+  mode: plan
+permissions:
+  read: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+persistence:
+  mode: commit
+  mode: none
+instructions: inspect
+deliverables:
+  - notes
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true
+"""
+        self._assert_duplicate_fail_closed(raw)
+
+    def test_instruction_scalar_repeated_key_prose_still_normalizes(self) -> None:
+        raw = _safe_readonly_plan_yaml(
+            instructions=(
+                "Prose may repeat mapping-looking lines:\n"
+                "mode: plan\n"
+                "create_files: false\n"
+                "persistence:\n"
+                "  mode: none\n"
+            )
+        )
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertTrue(result.normalized)
+        loaded = yaml.safe_load(result.mission_yaml)
+        self.assertIn("mode: plan", loaded["instructions"])
+        self.assertIn("create_files: false", loaded["instructions"])
+
+    def test_merge_key_interaction_blocks(self) -> None:
+        raw = """
+version: "1.0"
+mission_id: merge-key
+title: t
+repository:
+  name: Mission-Control
+  path: .
+  base_branch: main
+_safe_perms: &safe_perms
+  read: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+execution:
+  agent: cursor
+  mode: plan
+permissions:
+  <<: *safe_perms
+persistence:
+  mode: none
+instructions: inspect
+deliverables:
+  - notes
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true
+"""
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertFalse(result.normalized)
+        self.assertEqual(result.mission_yaml, raw)
+        self.assertEqual(result.reason, "merge_key_ambiguous")
+
+    def test_anchor_alias_without_duplicate_still_normalizes(self) -> None:
+        raw = """
+version: "1.0"
+mission_id: anchor-ok
+title: t
+repository:
+  name: Mission-Control
+  path: .
+  base_branch: main
+execution:
+  agent: cursor
+  mode: plan
+permissions: &perms
+  read: true
+  create_files: false
+  modify_files: false
+  delete_files: false
+  run_commands: true
+  stage_changes: false
+  commit: false
+  push: false
+persistence:
+  mode: none
+instructions: inspect with anchors
+deliverables:
+  - notes
+approval:
+  execute_without_approval: true
+  commit_requires_approval: true
+  push_requires_approval: true
+extra_permissions_ref: *perms
+"""
+        result = normalize_readonly_plan_mission_yaml(raw)
+        self.assertTrue(result.normalized)
+        self.assertEqual(_mode_from_yaml(result.mission_yaml), "execute")
+
 
 class YamlShapeTests(unittest.TestCase):
     def test_comments_preserved_when_not_normalized(self) -> None:
@@ -420,31 +673,28 @@ class IntegrationNormalizationAndEligibilityTests(unittest.TestCase):
         self.assertFalse(eligibility.ok)
         self.assertIn("expected execute", eligibility.error or "")
 
-    def test_mission_submit_forwards_normalized_yaml(self) -> None:
-        """Gateway mission.submit applies adapter before async forward."""
+    def test_submit_tools_share_normalization_contract_description(self) -> None:
         from hal_legalai_gateway import mcp_server as gw_mcp
 
-        raw = _safe_readonly_plan_yaml()
+        by_name = {b.gateway_tool: b for b in gw_mcp.DEFAULT_TOOL_BINDINGS}
+        submit_desc = by_name["mission.submit"].description
+        saw_desc = by_name["mission.submit_and_wait"].description
+        self.assertIn(READONLY_PLAN_NORMALIZATION_CONTRACT, submit_desc)
+        self.assertIn(READONLY_PLAN_NORMALIZATION_CONTRACT, saw_desc)
+        self.assertIn("duplicate mapping keys", submit_desc)
+        self.assertIn("duplicate mapping keys", saw_desc)
 
-        binding = next(
-            b
-            for b in gw_mcp.DEFAULT_TOOL_BINDINGS
-            if b.gateway_tool == "mission.submit"
-        )
-        self.assertIn("read-only", binding.description.lower())
-        self.assertIn("normalize", binding.description.lower())
+    def _register_and_collect(self, gateway_tools: tuple[str, ...]) -> dict[str, Any]:
+        from hal_legalai_gateway import mcp_server as gw_mcp
 
-        class _Collector:
-            submit = None
-
-        collector = _Collector()
+        collector: dict[str, Any] = {}
 
         class _Mcp:
             def tool(self, *args: Any, **kwargs: Any):
                 def decorator(fn: Any) -> Any:
                     name = kwargs.get("name") or (args[0] if args else None)
-                    if name == "mission.submit":
-                        collector.submit = fn
+                    if name in gateway_tools:
+                        collector[name] = fn
                     return fn
 
                 return decorator
@@ -459,6 +709,26 @@ class IntegrationNormalizationAndEligibilityTests(unittest.TestCase):
         settings.bridge_authorization = None
         settings.secret_values_for_redaction.return_value = ()
 
+        gw_mcp.register_forwarding_tools(
+            _Mcp(),  # type: ignore[arg-type]
+            settings,
+            gw_mcp.DEFAULT_TOOL_BINDINGS,
+        )
+        return collector
+
+    def test_mission_submit_forwards_normalized_yaml(self) -> None:
+        """Gateway mission.submit applies adapter before async forward."""
+        from hal_legalai_gateway import mcp_server as gw_mcp
+
+        raw = _safe_readonly_plan_yaml()
+        binding = next(
+            b
+            for b in gw_mcp.DEFAULT_TOOL_BINDINGS
+            if b.gateway_tool == "mission.submit"
+        )
+        self.assertIn("read-only", binding.description.lower())
+        self.assertIn("normalize", binding.description.lower())
+
         with mock.patch(
             "hal_legalai_gateway.mcp_server._require_gateway_principal",
             return_value="tester",
@@ -467,18 +737,66 @@ class IntegrationNormalizationAndEligibilityTests(unittest.TestCase):
             new_callable=mock.AsyncMock,
             return_value={"ok": True},
         ) as forward_mock:
-            gw_mcp.register_forwarding_tools(
-                _Mcp(),  # type: ignore[arg-type]
-                settings,
-                gw_mcp.DEFAULT_TOOL_BINDINGS,
-            )
-            self.assertIsNotNone(collector.submit)
-            asyncio.run(collector.submit(raw))
+            collector = self._register_and_collect(("mission.submit",))
+            self.assertIn("mission.submit", collector)
+            asyncio.run(collector["mission.submit"](raw))
             forward_mock.assert_awaited()
             kwargs = forward_mock.await_args.kwargs
             forwarded_yaml = kwargs["arguments"]["mission_yaml"]
             self.assertEqual(_mode_from_yaml(forwarded_yaml), "execute")
             self.assertNotEqual(forwarded_yaml, raw)
+
+    def test_mission_submit_and_wait_forwards_normalized_yaml(self) -> None:
+        """Gateway mission.submit_and_wait shares the same adapter contract."""
+        from hal_legalai_gateway import mcp_server as gw_mcp
+
+        raw = _safe_readonly_plan_yaml()
+        binding = next(
+            b
+            for b in gw_mcp.DEFAULT_TOOL_BINDINGS
+            if b.gateway_tool == "mission.submit_and_wait"
+        )
+        self.assertIn(READONLY_PLAN_NORMALIZATION_CONTRACT, binding.description)
+
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="tester",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value={"ok": True},
+        ) as forward_mock:
+            collector = self._register_and_collect(("mission.submit_and_wait",))
+            self.assertIn("mission.submit_and_wait", collector)
+            asyncio.run(collector["mission.submit_and_wait"](raw))
+            forward_mock.assert_awaited()
+            kwargs = forward_mock.await_args.kwargs
+            forwarded_yaml = kwargs["arguments"]["mission_yaml"]
+            self.assertEqual(_mode_from_yaml(forwarded_yaml), "execute")
+            self.assertNotEqual(forwarded_yaml, raw)
+
+    def test_submit_tools_forward_write_capable_yaml_unchanged(self) -> None:
+        """Write-capable plan YAML is forwarded byte-for-byte on both tools."""
+        raw = _safe_readonly_plan_yaml(permissions={"create_files": True})
+
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="tester",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value={"ok": True},
+        ) as forward_mock:
+            collector = self._register_and_collect(
+                ("mission.submit", "mission.submit_and_wait")
+            )
+            asyncio.run(collector["mission.submit"](raw))
+            asyncio.run(collector["mission.submit_and_wait"](raw))
+            self.assertEqual(forward_mock.await_count, 2)
+            for call in forward_mock.await_args_list:
+                forwarded = call.kwargs["arguments"]["mission_yaml"]
+                self.assertEqual(forwarded, raw)
+                self.assertEqual(_mode_from_yaml(forwarded), "plan")
 
 
 if __name__ == "__main__":
