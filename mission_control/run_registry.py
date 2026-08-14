@@ -23,7 +23,10 @@ from mission_control.run_result import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "./data/mission-control.db"
+# Legacy message retained for API/compat imports. Startup recovery no longer
+# attributes owner-loss failures to a service restart.
 INTERRUPTED_RUN_ERROR = "Run interrupted by service restart."
+OWNER_LOST_RUN_ERROR = "Run execution owner lost; lease expired."
 
 _RUNS_TABLE = "runs"
 _STARTUP_RECOVERY_LEASE_TABLE = "startup_recovery_leases"
@@ -33,6 +36,9 @@ _SQLITE_BUSY_TIMEOUT_MS = 5000
 
 # Live observability: heartbeat cadence while agent execution is active.
 HEARTBEAT_INTERVAL_SECONDS = 5.0
+# Bounded grace after last heartbeat / claim before a running run may be
+# terminalized as owner-lost. Aligns with HEARTBEAT_STALE_THRESHOLD_SECONDS.
+EXECUTION_LEASE_GRACE_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 18.0  # 90s
 
 # Bounded platform-authored progress (never raw model output / secrets).
 _PROGRESS_ALLOWED_KEYS = frozenset({"step", "detail"})
@@ -212,6 +218,7 @@ class RunRecord:
     phase_started_at: datetime | None = None
     heartbeat_at: datetime | None = None
     progress: dict[str, str] | None = None
+    execution_owner: str | None = None
 
     @property
     def queued_at(self) -> datetime:
@@ -272,6 +279,9 @@ def _row_to_record(row: sqlite3.Row) -> RunRecord:
             step=phase.value,
             detail=f"Legacy run record in phase {phase.value}",
         )
+    execution_owner = (
+        row["execution_owner"] if "execution_owner" in keys else None
+    )
     return RunRecord(
         run_id=row["run_id"],
         status=status,
@@ -293,6 +303,7 @@ def _row_to_record(row: sqlite3.Row) -> RunRecord:
         phase_started_at=phase_started_at,
         heartbeat_at=heartbeat_at,
         progress=progress,
+        execution_owner=execution_owner,
     )
 
 
@@ -350,7 +361,8 @@ class RunRegistry:
                     phase TEXT,
                     phase_started_at TEXT,
                     heartbeat_at TEXT,
-                    progress_json TEXT
+                    progress_json TEXT,
+                    execution_owner TEXT
                 )
                 """
             )
@@ -402,7 +414,44 @@ class RunRegistry:
                 self._conn.execute(
                     f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN progress_json TEXT"
                 )
+            if "execution_owner" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN execution_owner TEXT"
+                )
             self._conn.commit()
+
+    def _execution_lease_age_seconds(
+        self,
+        record: RunRecord,
+        *,
+        now: datetime | None = None,
+    ) -> float | None:
+        """Seconds since last durable lease clock sample, or None if unknown."""
+        clock = now or _utc_now()
+        lease_at = record.heartbeat_at or record.started_at
+        if lease_at is None:
+            return None
+        return max(0.0, (clock - lease_at).total_seconds())
+
+    def _execution_lease_is_valid(
+        self,
+        record: RunRecord,
+        *,
+        now: datetime | None = None,
+        grace_seconds: float = EXECUTION_LEASE_GRACE_SECONDS,
+    ) -> bool:
+        """True when a running run's heartbeat/lease is within grace."""
+        if record.status is not RunStatus.RUNNING:
+            return False
+        age = self._execution_lease_age_seconds(record, now=now)
+        if age is None:
+            # Claim/running persistence never landed a lease clock: treat as
+            # expired so startup can terminalize the orphan safely.
+            return False
+        return age <= grace_seconds
+
+    def _new_execution_owner_token(self) -> str:
+        return f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
 
     def _try_acquire_startup_recovery_lease_unlocked(self) -> str | None:
         """Acquire the cross-process startup recovery lease, or return None."""
@@ -493,16 +542,19 @@ class RunRegistry:
             )
 
     def _recover_interrupted_runs_unlocked(self) -> tuple[int, list[str]]:
-        """Mark queued/running runs failed. Caller must hold ``self._lock``.
+        """Terminalize dead running owners only. Caller holds ``self._lock``.
 
-        Returns ``(recovered_count, recovered_run_ids)``.
+        Queued / unclaimed runs are left queued so they can be re-enqueued.
+        Running runs with a fresh execution lease/heartbeat are left alone so
+        another healthy replica is not interrupted. Returns
+        ``(terminalized_count, terminalized_run_ids)``.
         """
         now = _utc_now()
         recovered = 0
         recovered_ids: list[str] = []
         rows = self._conn.execute(
             f"""
-            SELECT run_id, started_at
+            SELECT *
             FROM {_RUNS_TABLE}
             WHERE status IN (?, ?)
             """,
@@ -510,7 +562,37 @@ class RunRegistry:
         ).fetchall()
 
         for row in rows:
-            started_at = _parse_dt(row["started_at"])
+            record = _row_to_record(row)
+            if record.status is RunStatus.QUEUED:
+                logger.info(
+                    (
+                        "startup_recovery decision=leave_queued run_id=%s "
+                        "status=%s execution_owner=%s"
+                    ),
+                    record.run_id,
+                    record.status.value,
+                    record.execution_owner,
+                )
+                continue
+
+            age = self._execution_lease_age_seconds(record, now=now)
+            lease_valid = self._execution_lease_is_valid(record, now=now)
+            if lease_valid:
+                logger.info(
+                    (
+                        "startup_recovery decision=leave_running_healthy "
+                        "run_id=%s status=%s execution_owner=%s "
+                        "lease_age_seconds=%s grace_seconds=%s"
+                    ),
+                    record.run_id,
+                    record.status.value,
+                    record.execution_owner,
+                    None if age is None else round(age, 3),
+                    EXECUTION_LEASE_GRACE_SECONDS,
+                )
+                continue
+
+            started_at = record.started_at
             elapsed_seconds = None
             if started_at is not None:
                 elapsed_seconds = (now - started_at).total_seconds()
@@ -518,10 +600,10 @@ class RunRegistry:
             progress = serialize_progress(
                 platform_progress(
                     step=RunPhase.FAILED.value,
-                    detail="Run interrupted by service restart",
+                    detail="Execution owner lost; lease expired",
                 )
             )
-            self._conn.execute(
+            cursor = self._conn.execute(
                 f"""
                 UPDATE {_RUNS_TABLE}
                 SET status = ?,
@@ -531,31 +613,55 @@ class RunRegistry:
                     phase = ?,
                     phase_started_at = ?,
                     heartbeat_at = ?,
-                    progress_json = ?
+                    progress_json = ?,
+                    execution_owner = NULL
                 WHERE run_id = ?
-                  AND status IN (?, ?)
+                  AND status = ?
                 """,
                 (
                     RunStatus.FAILED.value,
                     _format_dt(now),
                     elapsed_seconds,
-                    INTERRUPTED_RUN_ERROR,
+                    OWNER_LOST_RUN_ERROR,
                     RunPhase.FAILED.value,
                     _format_dt(now),
                     _format_dt(now),
                     progress,
-                    row["run_id"],
-                    RunStatus.QUEUED.value,
+                    record.run_id,
                     RunStatus.RUNNING.value,
                 ),
             )
+            if cursor.rowcount != 1:
+                logger.info(
+                    (
+                        "startup_recovery decision=skip_race run_id=%s "
+                        "status=%s execution_owner=%s"
+                    ),
+                    record.run_id,
+                    record.status.value,
+                    record.execution_owner,
+                )
+                continue
+
+            logger.info(
+                (
+                    "startup_recovery decision=terminalize_owner_lost "
+                    "run_id=%s status=%s execution_owner=%s "
+                    "lease_age_seconds=%s grace_seconds=%s"
+                ),
+                record.run_id,
+                record.status.value,
+                record.execution_owner,
+                None if age is None else round(age, 3),
+                EXECUTION_LEASE_GRACE_SECONDS,
+            )
             recovered += 1
-            recovered_ids.append(row["run_id"])
+            recovered_ids.append(record.run_id)
 
         if recovered:
             self._conn.commit()
             logger.info(
-                "Recovered %s interrupted run(s) from %s",
+                "Terminalized %s owner-lost run(s) from %s",
                 recovered,
                 self._db_path,
             )
@@ -563,12 +669,16 @@ class RunRegistry:
         return recovered, recovered_ids
 
     def recover_interrupted_runs(self) -> int:
-        """Mark queued or running runs failed after a service restart.
+        """Recover runs after process/replica startup.
 
         Exactly one process across replicas sharing this SQLite database
         performs recovery. Non-owners skip cleanly and return ``0``. A
         time-bounded lease ensures a crashed owner cannot block recovery
         permanently.
+
+        Queued/unclaimed runs are never failed by startup alone. Running
+        runs are terminalized only when the durable execution lease
+        (heartbeat) is expired beyond ``EXECUTION_LEASE_GRACE_SECONDS``.
         """
         recovered_ids: list[str] = []
         with self._lock:
@@ -602,6 +712,170 @@ class RunRegistry:
                 outbox.maybe_enqueue_terminal(record)
 
         return len(recovered_ids)
+
+    def list_requeueable_queued_runs(self) -> list[tuple[str, str]]:
+        """Return ``(run_id, mission_yaml)`` for queued runs that can execute.
+
+        Startup recovery leaves these rows queued; the local run queue must
+        re-enqueue them. Duplicate local enqueues are safe when paired with
+        ``try_claim_run`` (exactly-once execution).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT run_id, mission_yaml
+                FROM {_RUNS_TABLE}
+                WHERE status = ?
+                ORDER BY created_at ASC
+                """,
+                (RunStatus.QUEUED.value,),
+            ).fetchall()
+            candidates: list[tuple[str, str]] = []
+            for row in rows:
+                mission_yaml = row["mission_yaml"]
+                if not mission_yaml:
+                    logger.info(
+                        (
+                            "startup_recovery decision=skip_requeue_no_yaml "
+                            "run_id=%s"
+                        ),
+                        row["run_id"],
+                    )
+                    continue
+                candidates.append((row["run_id"], mission_yaml))
+            return candidates
+
+    def try_claim_run(
+        self,
+        run_id: str,
+        *,
+        owner_token: str | None = None,
+    ) -> RunRecord | None:
+        """Atomically claim a queued run for execution.
+
+        Returns the claimed ``running`` record, or ``None`` when another
+        owner holds a valid lease / the run is not claimable. Idempotent
+        when ``owner_token`` already owns the running row.
+        """
+        token = owner_token or self._new_execution_owner_token()
+        with self._lock:
+            now = _utc_now()
+            try:
+                self._conn.commit()
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                logger.debug(
+                    "try_claim_run begin failed run_id=%s: %s",
+                    run_id,
+                    exc,
+                )
+                return None
+
+            row = self._fetch_row(run_id)
+            if row is None:
+                self._conn.rollback()
+                return None
+
+            record = _row_to_record(row)
+            if is_terminal_status(record.status):
+                self._conn.rollback()
+                logger.info(
+                    (
+                        "startup_recovery decision=claim_rejected_terminal "
+                        "run_id=%s status=%s"
+                    ),
+                    run_id,
+                    record.status.value,
+                )
+                return None
+
+            if record.status is RunStatus.RUNNING:
+                if record.execution_owner == token or (
+                    record.execution_owner is None
+                    and self._execution_lease_is_valid(record, now=now)
+                ):
+                    if record.execution_owner is None:
+                        record.execution_owner = token
+                        self._persist_record(record)
+                    else:
+                        self._conn.commit()
+                    return record
+                if self._execution_lease_is_valid(record, now=now):
+                    self._conn.rollback()
+                    logger.info(
+                        (
+                            "startup_recovery decision=claim_rejected_leased "
+                            "run_id=%s execution_owner=%s"
+                        ),
+                        run_id,
+                        record.execution_owner,
+                    )
+                    return None
+                self._conn.rollback()
+                logger.info(
+                    (
+                        "startup_recovery decision=claim_rejected_expired "
+                        "run_id=%s execution_owner=%s"
+                    ),
+                    run_id,
+                    record.execution_owner,
+                )
+                return None
+
+            if record.status is not RunStatus.QUEUED:
+                self._conn.rollback()
+                return None
+
+            cursor = self._conn.execute(
+                f"""
+                UPDATE {_RUNS_TABLE}
+                SET status = ?,
+                    started_at = COALESCE(started_at, ?),
+                    heartbeat_at = ?,
+                    execution_owner = ?
+                WHERE run_id = ?
+                  AND status = ?
+                """,
+                (
+                    RunStatus.RUNNING.value,
+                    _format_dt(now),
+                    _format_dt(now),
+                    token,
+                    run_id,
+                    RunStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                logger.info(
+                    (
+                        "startup_recovery decision=claim_rejected_race "
+                        "run_id=%s"
+                    ),
+                    run_id,
+                )
+                return None
+            self._conn.commit()
+            row = self._fetch_row(run_id)
+            if row is None:
+                return None
+            snapshot = _row_to_record(row)
+
+        logger.info(
+            (
+                "lifecycle run_id=%s event=claimed status=%s "
+                "execution_owner=%s api_pid=%s"
+            ),
+            run_id,
+            snapshot.status.value,
+            snapshot.execution_owner,
+            os.getpid(),
+        )
+        return snapshot
 
     def count_runs(self) -> int:
         """Return the number of persisted run records."""
@@ -650,8 +924,9 @@ class RunRegistry:
                 phase,
                 phase_started_at,
                 heartbeat_at,
-                progress_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                progress_json,
+                execution_owner
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 status = excluded.status,
                 created_at = excluded.created_at,
@@ -669,7 +944,8 @@ class RunRegistry:
                 phase = excluded.phase,
                 phase_started_at = excluded.phase_started_at,
                 heartbeat_at = excluded.heartbeat_at,
-                progress_json = excluded.progress_json
+                progress_json = excluded.progress_json,
+                execution_owner = excluded.execution_owner
             """,
             (
                 record.run_id,
@@ -690,6 +966,7 @@ class RunRegistry:
                 _format_dt(record.phase_started_at),
                 _format_dt(record.heartbeat_at),
                 serialize_progress(record.progress),
+                record.execution_owner,
             ),
         )
         self._conn.commit()
@@ -773,6 +1050,8 @@ class RunRegistry:
             if status is RunStatus.RUNNING and record.started_at is None:
                 record.started_at = now
                 record.heartbeat_at = now
+                if record.execution_owner is None:
+                    record.execution_owner = self._new_execution_owner_token()
 
             if status in (
                 RunStatus.COMPLETED,
@@ -794,6 +1073,7 @@ class RunRegistry:
                     record.phase = terminal_phase
                     record.phase_started_at = now
                 record.heartbeat_at = now
+                record.execution_owner = None
                 if record.progress is None or record.progress.get("step") != (
                     terminal_phase.value
                 ):

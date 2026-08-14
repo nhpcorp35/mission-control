@@ -533,7 +533,27 @@ class TestStartupRecovery(unittest.TestCase):
         client.get("/health")
 
     def test_lifespan_startup_recovers_interrupted_runs_once(self) -> None:
-        from mission_control.run_registry import INTERRUPTED_RUN_ERROR
+        from datetime import datetime, timedelta, timezone
+        import sqlite3
+
+        from mission_control.run_registry import (
+            EXECUTION_LEASE_GRACE_SECONDS,
+            OWNER_LOST_RUN_ERROR,
+        )
+
+        stale_at = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=EXECUTION_LEASE_GRACE_SECONDS + 5)
+        )
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
+                (stale_at.isoformat(), self._running.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
         with patch.object(
             api_module.run_registry,
@@ -546,10 +566,10 @@ class TestStartupRecovery(unittest.TestCase):
                 running = api_module.run_registry.get_run(self._running.run_id)
                 assert queued is not None
                 assert running is not None
-                self.assertEqual(queued.status, RunStatus.FAILED)
+                self.assertEqual(queued.status, RunStatus.QUEUED)
+                self.assertIsNone(queued.error)
                 self.assertEqual(running.status, RunStatus.FAILED)
-                self.assertEqual(queued.error, INTERRUPTED_RUN_ERROR)
-                self.assertEqual(running.error, INTERRUPTED_RUN_ERROR)
+                self.assertEqual(running.error, OWNER_LOST_RUN_ERROR)
 
 
 if __name__ == "__main__":

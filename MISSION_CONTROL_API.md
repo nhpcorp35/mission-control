@@ -946,6 +946,15 @@ Cursor CLI startup check: installed=<true|false> authenticated=<true|false> bina
 
 `authenticated` means `CURSOR_API_KEY` is configured. It does not call Cursor's servers during startup.
 
+### Startup run recovery
+
+On lifespan startup, Mission Control recovers durable run state from SQLite:
+
+1. **Queued / unclaimed runs** are never failed because a process or replica started. They remain `queued` and are re-enqueued into the local execution queue (idempotent; `try_claim_run` ensures exactly-one execution across replicas).
+2. **Running runs** are terminalized only when the durable execution lease (last `heartbeat_at`, renewed while the owner is alive) is older than the bounded grace period (`EXECUTION_LEASE_GRACE_SECONDS`, 90s). Healthy work owned by another replica is left alone.
+3. The user-facing failure reason for that case is owner/lease loss (`Run execution owner lost; lease expired.`), not a blanket "service restart".
+4. Recovery is gated by a cross-process startup lease so concurrent replicas do not duplicate terminalization. Terminal / timed-out rows are unchanged.
+
 ### Smoke test on Railway
 
 Use the Railway reference mission, which points at the deployed repo root:
