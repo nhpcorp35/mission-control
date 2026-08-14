@@ -38,7 +38,14 @@ _SQLITE_BUSY_TIMEOUT_MS = 5000
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 # Bounded grace after last heartbeat / claim before a running run may be
 # terminalized as owner-lost. Aligns with HEARTBEAT_STALE_THRESHOLD_SECONDS.
+# Must stay strictly greater than HEARTBEAT_INTERVAL_SECONDS so a healthy
+# owner refreshing on the normal cadence is never owner-lost by recovery.
 EXECUTION_LEASE_GRACE_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 18.0  # 90s
+# Mild replica/NTP skew: heartbeats up to this far in the future normalize to
+# "fresh" (age 0). Beyond this, the clock is fail-safe rejected so corrupt
+# far-future values cannot pin dead work indefinitely, while small skew cannot
+# false-terminalize a healthy owner.
+EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS = 30.0
 
 # Bounded platform-authored progress (never raw model output / secrets).
 _PROGRESS_ALLOWED_KEYS = frozenset({"step", "detail"})
@@ -242,12 +249,50 @@ def _format_dt(value: datetime | None) -> str | None:
 
 
 def _parse_dt(value: str | None) -> datetime | None:
+    """Parse a persisted UTC timestamp.
+
+    Malformed values return ``None`` (never raise) so one corrupt row cannot
+    abort registry reads or a startup recovery pass.
+    """
     if value is None:
         return None
-    parsed = datetime.fromisoformat(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _dt_raw_is_malformed(raw: object | None) -> bool:
+    """True when a persisted timestamp is present but not parseable as datetime."""
+    if raw is None:
+        return False
+    if not isinstance(raw, str):
+        return True
+    if raw.strip() == "":
+        return False
+    return _parse_dt(raw) is None
+
+
+def _authoritative_lease_raw_malformed(
+    raw_heartbeat: object | None,
+    raw_started: object | None,
+) -> bool:
+    """Fail-safe: corrupt authoritative lease clock is not a valid lease.
+
+    Heartbeat is authoritative when present (non-empty). Otherwise started_at
+    is the claim/lease fallback. A malformed authoritative clock must not be
+    treated as healthy and must not abort sibling-row recovery.
+    """
+    if raw_heartbeat is not None and not (
+        isinstance(raw_heartbeat, str) and raw_heartbeat.strip() == ""
+    ):
+        return _dt_raw_is_malformed(raw_heartbeat)
+    return _dt_raw_is_malformed(raw_started)
 
 
 def _ensure_db_parent(db_path: str) -> None:
@@ -426,12 +471,31 @@ class RunRegistry:
         *,
         now: datetime | None = None,
     ) -> float | None:
-        """Seconds since last durable lease clock sample, or None if unknown."""
+        """Seconds since last durable lease clock sample, or None if unknown.
+
+        Future clocks within ``EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS``
+        normalize to age ``0.0``. Further-future values return ``None`` so
+        callers treat them as an invalid/expired lease (fail-safe: do not pin
+        dead work). All comparisons use UTC-aware datetimes.
+        """
         clock = now or _utc_now()
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=timezone.utc)
+        else:
+            clock = clock.astimezone(timezone.utc)
         lease_at = record.heartbeat_at or record.started_at
         if lease_at is None:
             return None
-        return max(0.0, (clock - lease_at).total_seconds())
+        if lease_at.tzinfo is None:
+            lease_at = lease_at.replace(tzinfo=timezone.utc)
+        else:
+            lease_at = lease_at.astimezone(timezone.utc)
+        age = (clock - lease_at).total_seconds()
+        if age >= 0.0:
+            return age
+        if -age <= EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS:
+            return 0.0
+        return None
 
     def _execution_lease_is_valid(
         self,
@@ -445,8 +509,8 @@ class RunRegistry:
             return False
         age = self._execution_lease_age_seconds(record, now=now)
         if age is None:
-            # Claim/running persistence never landed a lease clock: treat as
-            # expired so startup can terminalize the orphan safely.
+            # Absent lease clock, unparseable/rejected future clock, or
+            # claim/running persistence never landed a sample: not valid.
             return False
         return age <= grace_seconds
 
@@ -548,6 +612,11 @@ class RunRegistry:
         Running runs with a fresh execution lease/heartbeat are left alone so
         another healthy replica is not interrupted. Returns
         ``(terminalized_count, terminalized_run_ids)``.
+
+        Terminalizing UPDATE uses a heartbeat/started CAS against the exact
+        observed lease clock values so a late owner heartbeat between read and
+        update cannot false-fail the run. Malformed lease timestamps are
+        isolated per row (fail-safe expired) with secret-safe diagnostics.
         """
         now = _utc_now()
         recovered = 0
@@ -562,101 +631,171 @@ class RunRegistry:
         ).fetchall()
 
         for row in rows:
-            record = _row_to_record(row)
-            if record.status is RunStatus.QUEUED:
-                logger.info(
-                    (
-                        "startup_recovery decision=leave_queued run_id=%s "
-                        "status=%s execution_owner=%s"
-                    ),
-                    record.run_id,
-                    record.status.value,
-                    record.execution_owner,
+            run_id_for_log = "?"
+            try:
+                keys = row.keys()
+                run_id_for_log = str(row["run_id"])
+                raw_heartbeat = (
+                    row["heartbeat_at"] if "heartbeat_at" in keys else None
                 )
-                continue
+                raw_started = row["started_at"] if "started_at" in keys else None
+                record = _row_to_record(row)
+                if record.status is RunStatus.QUEUED:
+                    logger.info(
+                        (
+                            "startup_recovery decision=leave_queued run_id=%s "
+                            "status=%s execution_owner=%s"
+                        ),
+                        record.run_id,
+                        record.status.value,
+                        record.execution_owner,
+                    )
+                    continue
 
-            age = self._execution_lease_age_seconds(record, now=now)
-            lease_valid = self._execution_lease_is_valid(record, now=now)
-            if lease_valid:
+                heartbeat_malformed = _dt_raw_is_malformed(raw_heartbeat)
+                started_malformed = _dt_raw_is_malformed(raw_started)
+                lease_clock_malformed = _authoritative_lease_raw_malformed(
+                    raw_heartbeat,
+                    raw_started,
+                )
+
+                if lease_clock_malformed:
+                    age = None
+                    lease_valid = False
+                    logger.warning(
+                        (
+                            "startup_recovery decision=malformed_lease_clock "
+                            "run_id=%s status=%s heartbeat_malformed=%s "
+                            "started_malformed=%s policy=fail_safe_expired"
+                        ),
+                        record.run_id,
+                        record.status.value,
+                        heartbeat_malformed,
+                        started_malformed,
+                    )
+                else:
+                    age = self._execution_lease_age_seconds(record, now=now)
+                    lease_valid = self._execution_lease_is_valid(
+                        record, now=now
+                    )
+                    if (
+                        age is None
+                        and (record.heartbeat_at is not None
+                             or record.started_at is not None)
+                    ):
+                        # Parsed clock present but rejected (e.g. far-future).
+                        logger.warning(
+                            (
+                                "startup_recovery decision="
+                                "reject_future_lease_clock "
+                                "run_id=%s status=%s "
+                                "skew_tolerance_seconds=%s "
+                                "policy=fail_safe_expired"
+                            ),
+                            record.run_id,
+                            record.status.value,
+                            EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS,
+                        )
+
+                if lease_valid:
+                    logger.info(
+                        (
+                            "startup_recovery decision=leave_running_healthy "
+                            "run_id=%s status=%s execution_owner=%s "
+                            "lease_age_seconds=%s grace_seconds=%s"
+                        ),
+                        record.run_id,
+                        record.status.value,
+                        record.execution_owner,
+                        None if age is None else round(age, 3),
+                        EXECUTION_LEASE_GRACE_SECONDS,
+                    )
+                    continue
+
+                started_at = record.started_at
+                elapsed_seconds = None
+                if started_at is not None:
+                    elapsed_seconds = (now - started_at).total_seconds()
+
+                progress = serialize_progress(
+                    platform_progress(
+                        step=RunPhase.FAILED.value,
+                        detail="Execution owner lost; lease expired",
+                    )
+                )
+                # CAS on exact observed lease clocks: if the owner refreshes
+                # heartbeat (or repairs clocks) after this read, rowcount=0.
+                cursor = self._conn.execute(
+                    f"""
+                    UPDATE {_RUNS_TABLE}
+                    SET status = ?,
+                        completed_at = ?,
+                        elapsed_seconds = ?,
+                        error = ?,
+                        phase = ?,
+                        phase_started_at = ?,
+                        heartbeat_at = ?,
+                        progress_json = ?,
+                        execution_owner = NULL
+                    WHERE run_id = ?
+                      AND status = ?
+                      AND heartbeat_at IS ?
+                      AND started_at IS ?
+                    """,
+                    (
+                        RunStatus.FAILED.value,
+                        _format_dt(now),
+                        elapsed_seconds,
+                        OWNER_LOST_RUN_ERROR,
+                        RunPhase.FAILED.value,
+                        _format_dt(now),
+                        _format_dt(now),
+                        progress,
+                        record.run_id,
+                        RunStatus.RUNNING.value,
+                        raw_heartbeat,
+                        raw_started,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    logger.info(
+                        (
+                            "startup_recovery decision=skip_race run_id=%s "
+                            "status=%s execution_owner=%s"
+                        ),
+                        record.run_id,
+                        record.status.value,
+                        record.execution_owner,
+                    )
+                    continue
+
                 logger.info(
                     (
-                        "startup_recovery decision=leave_running_healthy "
+                        "startup_recovery decision=terminalize_owner_lost "
                         "run_id=%s status=%s execution_owner=%s "
-                        "lease_age_seconds=%s grace_seconds=%s"
+                        "lease_age_seconds=%s grace_seconds=%s "
+                        "lease_clock_malformed=%s"
                     ),
                     record.run_id,
                     record.status.value,
                     record.execution_owner,
                     None if age is None else round(age, 3),
                     EXECUTION_LEASE_GRACE_SECONDS,
+                    lease_clock_malformed,
                 )
-                continue
-
-            started_at = record.started_at
-            elapsed_seconds = None
-            if started_at is not None:
-                elapsed_seconds = (now - started_at).total_seconds()
-
-            progress = serialize_progress(
-                platform_progress(
-                    step=RunPhase.FAILED.value,
-                    detail="Execution owner lost; lease expired",
-                )
-            )
-            cursor = self._conn.execute(
-                f"""
-                UPDATE {_RUNS_TABLE}
-                SET status = ?,
-                    completed_at = ?,
-                    elapsed_seconds = ?,
-                    error = ?,
-                    phase = ?,
-                    phase_started_at = ?,
-                    heartbeat_at = ?,
-                    progress_json = ?,
-                    execution_owner = NULL
-                WHERE run_id = ?
-                  AND status = ?
-                """,
-                (
-                    RunStatus.FAILED.value,
-                    _format_dt(now),
-                    elapsed_seconds,
-                    OWNER_LOST_RUN_ERROR,
-                    RunPhase.FAILED.value,
-                    _format_dt(now),
-                    _format_dt(now),
-                    progress,
-                    record.run_id,
-                    RunStatus.RUNNING.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                logger.info(
+                recovered += 1
+                recovered_ids.append(record.run_id)
+            except Exception as exc:
+                # Isolate unexpected row failures; never abort the pass.
+                logger.warning(
                     (
-                        "startup_recovery decision=skip_race run_id=%s "
-                        "status=%s execution_owner=%s"
+                        "startup_recovery decision=skip_row_exception "
+                        "run_id=%s error_type=%s"
                     ),
-                    record.run_id,
-                    record.status.value,
-                    record.execution_owner,
+                    run_id_for_log,
+                    type(exc).__name__,
                 )
                 continue
-
-            logger.info(
-                (
-                    "startup_recovery decision=terminalize_owner_lost "
-                    "run_id=%s status=%s execution_owner=%s "
-                    "lease_age_seconds=%s grace_seconds=%s"
-                ),
-                record.run_id,
-                record.status.value,
-                record.execution_owner,
-                None if age is None else round(age, 3),
-                EXECUTION_LEASE_GRACE_SECONDS,
-            )
-            recovered += 1
-            recovered_ids.append(record.run_id)
 
         if recovered:
             self._conn.commit()
@@ -794,17 +933,12 @@ class RunRegistry:
                 return None
 
             if record.status is RunStatus.RUNNING:
-                if record.execution_owner == token or (
-                    record.execution_owner is None
-                    and self._execution_lease_is_valid(record, now=now)
-                ):
-                    if record.execution_owner is None:
-                        record.execution_owner = token
-                        self._persist_record(record)
-                    else:
-                        self._conn.commit()
+                if record.execution_owner == token:
+                    self._conn.commit()
                     return record
                 if self._execution_lease_is_valid(record, now=now):
+                    # Valid lease (including legacy owner-NULL rows) is not
+                    # stealable by an arbitrary claimer.
                     self._conn.rollback()
                     logger.info(
                         (

@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 from mission_control.run_queue import RunQueue
 from mission_control.run_registry import (
+    EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS,
     EXECUTION_LEASE_GRACE_SECONDS,
+    HEARTBEAT_INTERVAL_SECONDS,
     OWNER_LOST_RUN_ERROR,
     STARTUP_RECOVERY_LEASE_NAME,
     RunRegistry,
@@ -539,6 +541,263 @@ class TestStartupRecoveryOwnership(unittest.TestCase):
             )
         finally:
             registry.close()
+
+
+class TestLeaseRecoveryCasAndClockHardening(unittest.TestCase):
+    """Adversarial regressions for review lease-recovery findings."""
+
+    def setUp(self) -> None:
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        self.registry = RunRegistry(self._db_path)
+
+    def tearDown(self) -> None:
+        self.registry.close()
+        os.unlink(self._db_path)
+
+    def test_grace_exceeds_heartbeat_cadence(self) -> None:
+        self.assertGreater(
+            EXECUTION_LEASE_GRACE_SECONDS,
+            HEARTBEAT_INTERVAL_SECONDS,
+        )
+        self.assertEqual(EXECUTION_LEASE_GRACE_SECONDS, 90.0)
+        self.assertEqual(HEARTBEAT_INTERVAL_SECONDS, 5.0)
+
+    def test_late_heartbeat_between_read_and_update_does_not_false_kill(
+        self,
+    ) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        self.registry.close()
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=EXECUTION_LEASE_GRACE_SECONDS + 1,
+        )
+
+        owner = RunRegistry(self._db_path)
+        real_age = RunRegistry._execution_lease_age_seconds
+
+        def _age_then_refresh(self, record, *, now=None):
+            age = real_age(self, record, now=now)
+            owner.touch_heartbeat(running.run_id)
+            return age
+
+        RunRegistry._execution_lease_age_seconds = _age_then_refresh  # type: ignore[method-assign]
+        try:
+            successor = RunRegistry(self._db_path)
+            try:
+                recovered = successor.recover_interrupted_runs()
+                after = successor.get_run(running.run_id)
+            finally:
+                successor.close()
+        finally:
+            RunRegistry._execution_lease_age_seconds = real_age  # type: ignore[method-assign]
+            owner.close()
+
+        self.assertEqual(recovered, 0)
+        assert after is not None
+        self.assertEqual(after.status, RunStatus.RUNNING)
+        self.assertIsNone(after.error)
+
+    def test_malformed_row_isolated_sibling_still_recovers(self) -> None:
+        bad = self.registry.create_run()
+        good = self.registry.create_run()
+        self.registry.update_status(bad.run_id, RunStatus.RUNNING)
+        self.registry.update_status(good.run_id, RunStatus.RUNNING)
+        self.registry.close()
+
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=EXECUTION_LEASE_GRACE_SECONDS + 5
+        )
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                f"UPDATE {_RUNS_TABLE} SET heartbeat_at = ? WHERE run_id = ?",
+                ("not-a-timestamp", bad.run_id),
+            )
+            conn.execute(
+                f"UPDATE {_RUNS_TABLE} SET heartbeat_at = ? WHERE run_id = ?",
+                (stale.astimezone(timezone.utc).isoformat(), good.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        registry = RunRegistry(self._db_path)
+        try:
+            recovered = registry.recover_interrupted_runs()
+            self.assertEqual(recovered, 2)
+            bad_rec = registry.get_run(bad.run_id)
+            good_rec = registry.get_run(good.run_id)
+            assert bad_rec is not None and good_rec is not None
+            self.assertEqual(bad_rec.status, RunStatus.FAILED)
+            self.assertEqual(bad_rec.error, OWNER_LOST_RUN_ERROR)
+            self.assertEqual(good_rec.status, RunStatus.FAILED)
+            self.assertEqual(good_rec.error, OWNER_LOST_RUN_ERROR)
+        finally:
+            registry.close()
+
+    def test_ten_year_future_heartbeat_does_not_pin_dead_work(self) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        self.registry.close()
+        future = datetime.now(timezone.utc) + timedelta(days=3650)
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                f"UPDATE {_RUNS_TABLE} SET heartbeat_at = ? WHERE run_id = ?",
+                (future.isoformat(), running.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        registry = RunRegistry(self._db_path)
+        try:
+            self.assertEqual(registry.recover_interrupted_runs(), 1)
+            record = registry.get_run(running.run_id)
+            assert record is not None
+            self.assertEqual(record.status, RunStatus.FAILED)
+            self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
+        finally:
+            registry.close()
+
+    def test_future_skew_tolerance_boundaries(self) -> None:
+        now = datetime.now(timezone.utc)
+        at_tolerance = self.registry.create_run()
+        beyond = self.registry.create_run()
+        self.registry.update_status(at_tolerance.run_id, RunStatus.RUNNING)
+        self.registry.update_status(beyond.run_id, RunStatus.RUNNING)
+        self.registry.close()
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                f"UPDATE {_RUNS_TABLE} SET heartbeat_at = ? WHERE run_id = ?",
+                (
+                    (
+                        now
+                        + timedelta(
+                            seconds=EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS
+                        )
+                    ).isoformat(),
+                    at_tolerance.run_id,
+                ),
+            )
+            conn.execute(
+                f"UPDATE {_RUNS_TABLE} SET heartbeat_at = ? WHERE run_id = ?",
+                (
+                    (
+                        now
+                        + timedelta(
+                            seconds=EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS
+                            + 1
+                        )
+                    ).isoformat(),
+                    beyond.run_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        registry = RunRegistry(self._db_path)
+        try:
+            with patch(
+                "mission_control.run_registry._utc_now",
+                return_value=now,
+            ):
+                recovered = registry.recover_interrupted_runs()
+            self.assertEqual(recovered, 1)
+            kept = registry.get_run(at_tolerance.run_id)
+            killed = registry.get_run(beyond.run_id)
+            assert kept is not None and killed is not None
+            self.assertEqual(kept.status, RunStatus.RUNNING)
+            self.assertIsNone(kept.error)
+            self.assertEqual(killed.status, RunStatus.FAILED)
+            self.assertEqual(killed.error, OWNER_LOST_RUN_ERROR)
+        finally:
+            registry.close()
+
+    def test_legacy_null_owner_valid_lease_not_stealable(self) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        self.registry.close()
+        now = datetime.now(timezone.utc)
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                f"""
+                UPDATE {_RUNS_TABLE}
+                SET execution_owner = NULL, heartbeat_at = ?
+                WHERE run_id = ?
+                """,
+                (now.isoformat(), running.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        thief = RunRegistry(self._db_path)
+        try:
+            stolen = thief.try_claim_run(
+                running.run_id, owner_token="replica-b:thief"
+            )
+            self.assertIsNone(stolen)
+            record = thief.get_run(running.run_id)
+            assert record is not None
+            self.assertEqual(record.status, RunStatus.RUNNING)
+            self.assertIsNone(record.execution_owner)
+        finally:
+            thief.close()
+
+    def test_concurrent_replica_recovery_single_terminalize(self) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        self.registry.close()
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=EXECUTION_LEASE_GRACE_SECONDS + 5,
+        )
+
+        ctx = multiprocessing.get_context("spawn")
+        result_queue: multiprocessing.Queue = ctx.Queue()
+        start = ctx.Event()
+        ready_events = [ctx.Event() for _ in range(4)]
+        workers = [
+            ctx.Process(
+                target=_recover_worker,
+                args=(self._db_path, ready, start, result_queue),
+            )
+            for ready in ready_events
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            for ready in ready_events:
+                self.assertTrue(ready.wait(timeout=10))
+            start.set()
+            results = [result_queue.get(timeout=30) for _ in workers]
+        finally:
+            for worker in workers:
+                worker.join(timeout=30)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+
+        self.assertTrue(all(item[0] == "ok" for item in results), results)
+        recovered_counts = [int(item[1]) for item in results]
+        self.assertEqual(sum(recovered_counts), 1)
+        verify = RunRegistry(self._db_path)
+        try:
+            record = verify.get_run(running.run_id)
+            assert record is not None
+            self.assertEqual(record.status, RunStatus.FAILED)
+            self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
+        finally:
+            verify.close()
 
 
 class TestStartupRequeueApiHelpers(unittest.TestCase):
