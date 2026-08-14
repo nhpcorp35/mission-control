@@ -39,6 +39,27 @@ Also exposed: Case-00 lifecycle (`case.submit_case00_q1`, `case.get_case00_q1_ru
 (`mission.submit_structured`,
 `mission.wait`, `mission.list_notifications`, `mission.submit_and_wait`, `mission.run_repository_command`).
 
+### Read-only `plan` normalization (`mission.submit`)
+
+Mission Control async `/runs` requires `execution.mode=execute`. For raw Mission
+Spec YAML on `mission.submit` / `mission.submit_and_wait`, the gateway applies a
+**fail-closed** adapter immediately before forward:
+
+- Normalize `execution.mode` from `plan` → `execute` **only** when
+  `permissions.create_files`, `modify_files`, `delete_files`, `stage_changes`,
+  `commit`, and `push` are each present and exactly boolean `false`,
+  `persistence.mode` is exactly `none`, and all required mappings are valid.
+- Never normalize when any write/persistence capability is true, missing,
+  malformed, or ambiguous; forward unchanged so Mission Control fails closed.
+- Never normalize `ask`, unknown modes, or alter missions already on `execute`.
+- Only the `execution.mode` field changes; YAML is parsed/serialized with
+  PyYAML `safe_load` / `safe_dump` (no regex rewriting).
+- Callers: use `plan` for safe read-only review (accepted via normalization);
+  mutations must use `execution.mode=execute`.
+
+Observability logs `readonly_plan_normalized` with gateway tool and mode
+transition only — never mission instructions or credentials.
+
 ## Authentication and forwarding
 
 **Inbound (required):** FastMCP `GitHubProvider` OAuth — the same ChatGPT Business

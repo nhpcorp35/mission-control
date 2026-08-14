@@ -19,6 +19,9 @@ from hal_legalai_gateway.forwarding import (
     forward_mcp_tool,
     resolve_authorization_for_service,
 )
+from hal_legalai_gateway.readonly_plan_normalization import (
+    normalize_readonly_plan_mission_yaml,
+)
 from hal_legalai_gateway.registry import GatewayRegistry
 
 logger = logging.getLogger(__name__)
@@ -206,7 +209,18 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         namespace="mission",
         downstream_service="mission_control",
         downstream_tool="submit_run",
-        description="Submit an exact Mission Control YAML document.",
+        description=(
+            "Submit an exact Mission Control YAML document to the async /runs "
+            "path (downstream submit_run). Mutating missions must use "
+            "execution.mode=execute. Substantively read-only review missions "
+            "may submit execution.mode=plan; the gateway safely normalizes "
+            "plan→execute only when create_files, modify_files, delete_files, "
+            "stage_changes, commit, and push are exactly false, "
+            "persistence.mode is none, and all gates are unambiguous. "
+            "Write-capable or ambiguous plan missions are forwarded unchanged "
+            "and rejected by Mission Control execute eligibility. ask and "
+            "unknown modes are never normalized."
+        ),
     ),
     ToolBinding(
         gateway_tool="mission.submit_structured",
@@ -274,10 +288,28 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
 
 
 def bindings_from_registry(registry: GatewayRegistry) -> tuple[ToolBinding, ...]:
-    """Prefer registry tool_bindings when present; else built-in settled defaults."""
-    if registry.tool_bindings:
-        return registry.tool_bindings
-    return DEFAULT_TOOL_BINDINGS
+    """Prefer registry tool_bindings when present; else built-in settled defaults.
+
+    Empty registry descriptions fall back to ``DEFAULT_TOOL_BINDINGS`` so callers
+    still see the settled tool docs (including read-only plan normalization).
+    """
+    if not registry.tool_bindings:
+        return DEFAULT_TOOL_BINDINGS
+    defaults = {binding.gateway_tool: binding for binding in DEFAULT_TOOL_BINDINGS}
+    merged: list[ToolBinding] = []
+    for binding in registry.tool_bindings:
+        default = defaults.get(binding.gateway_tool)
+        if default is not None and not (binding.description or "").strip():
+            binding = ToolBinding(
+                gateway_tool=binding.gateway_tool,
+                namespace=binding.namespace,
+                downstream_service=binding.downstream_service,
+                downstream_tool=binding.downstream_tool,
+                description=default.description,
+                notes=binding.notes or default.notes,
+            )
+        merged.append(binding)
+    return tuple(merged)
 
 
 def build_inbound_auth_provider(settings: GatewaySettings) -> AuthProvider:
@@ -671,7 +703,14 @@ def register_forwarding_tools(
     # --- mission ---
     @mcp.tool(name="mission.submit", description=by_name["mission.submit"].description)
     async def mission_submit(mission_yaml: str) -> dict[str, Any]:
-        return await _forward("mission.submit", {"mission_yaml": mission_yaml})
+        normalized = normalize_readonly_plan_mission_yaml(
+            mission_yaml,
+            gateway_tool="mission.submit",
+        )
+        return await _forward(
+            "mission.submit",
+            {"mission_yaml": normalized.mission_yaml},
+        )
 
     @mcp.tool(
         name="mission.submit_structured",
@@ -790,8 +829,12 @@ def register_forwarding_tools(
         poll_interval_seconds: float = 2.0,
         cursor: str | None = None,
     ) -> dict[str, Any]:
+        normalized = normalize_readonly_plan_mission_yaml(
+            mission_yaml,
+            gateway_tool="mission.submit_and_wait",
+        )
         args: dict[str, Any] = {
-            "mission_yaml": mission_yaml,
+            "mission_yaml": normalized.mission_yaml,
             "timeout_seconds": timeout_seconds,
             "poll_interval_seconds": poll_interval_seconds,
         }
