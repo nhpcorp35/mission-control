@@ -20,7 +20,6 @@ from app.api import app
 from mission_control.executor import ExecutionResult
 from mission_control.run_queue import RunQueue
 from mission_control.run_registry import (
-    INTERRUPTED_RUN_ERROR,
     RunPhase,
     RunRegistry,
     RunStatus,
@@ -321,22 +320,43 @@ class TestTerminalMonotonicity(SqliteRegistryTestCase):
 
 class TestStartupRecoveryObservability(SqliteRegistryTestCase):
     def test_recover_interrupted_runs_marks_failed_phase(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from mission_control.run_registry import (
+            EXECUTION_LEASE_GRACE_SECONDS,
+            OWNER_LOST_RUN_ERROR,
+        )
+
         queued = self.registry.create_run()
         running = self.registry.create_run()
         self.registry.update_status(running.run_id, RunStatus.RUNNING)
         self.registry.set_phase(running.run_id, RunPhase.AGENT_EXECUTION)
 
-        recovered = self.registry.recover_interrupted_runs()
-        self.assertEqual(recovered, 2)
+        stale_at = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=EXECUTION_LEASE_GRACE_SECONDS + 5)
+        )
+        with self.registry._lock:
+            self.registry._conn.execute(
+                "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
+                (stale_at.isoformat(), running.run_id),
+            )
+            self.registry._conn.commit()
 
-        for run_id in (queued.run_id, running.run_id):
-            fetched = self.registry.get_run(run_id)
-            assert fetched is not None
-            self.assertEqual(fetched.status, RunStatus.FAILED)
-            self.assertEqual(fetched.phase, RunPhase.FAILED)
-            self.assertEqual(fetched.error, INTERRUPTED_RUN_ERROR)
-            assert fetched.progress is not None
-            self.assertEqual(fetched.progress["step"], "failed")
+        recovered = self.registry.recover_interrupted_runs()
+        self.assertEqual(recovered, 1)
+
+        queued_fetched = self.registry.get_run(queued.run_id)
+        assert queued_fetched is not None
+        self.assertEqual(queued_fetched.status, RunStatus.QUEUED)
+
+        fetched = self.registry.get_run(running.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.status, RunStatus.FAILED)
+        self.assertEqual(fetched.phase, RunPhase.FAILED)
+        self.assertEqual(fetched.error, OWNER_LOST_RUN_ERROR)
+        assert fetched.progress is not None
+        self.assertEqual(fetched.progress["step"], "failed")
 
 
 class TestLegacySchemaMigration(unittest.TestCase):

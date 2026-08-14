@@ -122,6 +122,18 @@ def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> No
         count,
         keys,
     )
+    claimed = registry.try_claim_run(run_id)
+    if claimed is None:
+        logger.info(
+            (
+                "lifecycle run_id=%s event=claim_lost api_pid=%s "
+                "registry_id=%s"
+            ),
+            run_id,
+            os.getpid(),
+            id(registry),
+        )
+        return
     with execution_scope():
         try:
             execute_registered_run(run_id, mission, registry)
@@ -212,6 +224,29 @@ def _execute_queued_run(run_id: str, mission: dict, registry: RunRegistry) -> No
             )
 
 
+def _requeue_persisted_queued_runs() -> int:
+    """Re-enqueue durable queued runs after startup (idempotent, secret-safe)."""
+    requeued = 0
+    for run_id, mission_yaml in run_registry.list_requeueable_queued_runs():
+        structural_result, mission = load_mission_yaml(mission_yaml)
+        if not structural_result.ok or mission is None:
+            logger.info(
+                (
+                    "startup_recovery decision=skip_requeue_invalid_yaml "
+                    "run_id=%s"
+                ),
+                run_id,
+            )
+            continue
+        if run_queue.enqueue(run_id, mission, run_registry):
+            requeued += 1
+            logger.info(
+                "startup_recovery decision=requeued run_id=%s",
+                run_id,
+            )
+    return requeued
+
+
 run_queue.configure(_execute_queued_run)
 
 
@@ -225,11 +260,17 @@ async def lifespan(_: FastAPI):
         status.authenticated,
         status.binary_path or "not found",
     )
-    recovered = run_registry.recover_interrupted_runs()
-    if recovered:
+    terminalized = run_registry.recover_interrupted_runs()
+    if terminalized:
         logger.info(
-            "Marked %s interrupted run(s) failed on startup",
-            recovered,
+            "Terminalized %s owner-lost run(s) on startup",
+            terminalized,
+        )
+    requeued = _requeue_persisted_queued_runs()
+    if requeued:
+        logger.info(
+            "Requeued %s persisted queued run(s) on startup",
+            requeued,
         )
     # Suppress pre-deploy stale/recovery backlog before the worker can drain.
     # Failure rolls back and aborts startup so legacy rows are not delivered.

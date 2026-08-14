@@ -8,7 +8,6 @@ import unittest
 from unittest.mock import patch
 
 from mission_control.run_registry import (
-    INTERRUPTED_RUN_ERROR,
     RunRegistry,
     RunStatus,
     resolve_db_path,
@@ -69,28 +68,48 @@ class TestRegistryPersistenceAcrossInstances(SqliteRegistryTestCase):
 
 class TestInterruptedRunRecovery(SqliteRegistryTestCase):
     def test_unfinished_runs_are_marked_failed_on_recovery(self) -> None:
+        from mission_control.run_registry import (
+            EXECUTION_LEASE_GRACE_SECONDS,
+            OWNER_LOST_RUN_ERROR,
+        )
+        from datetime import datetime, timedelta, timezone
+        import sqlite3
+
         queued = self.registry.create_run()
         running = self.registry.create_run()
         self.registry.update_status(running.run_id, RunStatus.RUNNING)
         self.registry.close()
 
+        stale_at = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=EXECUTION_LEASE_GRACE_SECONDS + 5)
+        )
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
+                (stale_at.isoformat(), running.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
         recovered_registry = RunRegistry(self._db_path)
         try:
             recovered = recovered_registry.recover_interrupted_runs()
-            self.assertEqual(recovered, 2)
+            self.assertEqual(recovered, 1)
 
             queued_record = recovered_registry.get_run(queued.run_id)
             running_record = recovered_registry.get_run(running.run_id)
             assert queued_record is not None
             assert running_record is not None
 
-            self.assertEqual(queued_record.status, RunStatus.FAILED)
-            self.assertEqual(queued_record.error, INTERRUPTED_RUN_ERROR)
-            self.assertIsNotNone(queued_record.completed_at)
-            self.assertIsNone(queued_record.elapsed_seconds)
+            self.assertEqual(queued_record.status, RunStatus.QUEUED)
+            self.assertIsNone(queued_record.error)
+            self.assertIsNone(queued_record.completed_at)
 
             self.assertEqual(running_record.status, RunStatus.FAILED)
-            self.assertEqual(running_record.error, INTERRUPTED_RUN_ERROR)
+            self.assertEqual(running_record.error, OWNER_LOST_RUN_ERROR)
             self.assertIsNotNone(running_record.completed_at)
             self.assertIsNotNone(running_record.elapsed_seconds)
         finally:

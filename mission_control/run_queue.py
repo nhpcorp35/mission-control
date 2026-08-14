@@ -49,16 +49,39 @@ class RunQueue:
         with self._lock:
             self._execute_fn = execute_fn
 
-    def enqueue(self, run_id: str, mission: dict, registry: Any) -> None:
+    def enqueue(self, run_id: str, mission: dict, registry: Any) -> bool:
         """Accept a run for FIFO execution.
 
         Does not start Cursor immediately when another run is already active.
         ``registry`` is captured at enqueue time so workers stay isolated from
         later process-global registry replacements (e.g. in tests).
+
+        Returns ``True`` when newly queued, ``False`` when ``run_id`` is
+        already pending or active (idempotent requeue after restart).
         """
         with self._cond:
             if self._execute_fn is None:
                 raise RuntimeError("RunQueue.configure() must be called first")
+            if self._active_run_id == run_id:
+                logger.info(
+                    (
+                        "lifecycle run_id=%s event=enqueue_deduped "
+                        "reason=active api_pid=%s"
+                    ),
+                    run_id,
+                    os.getpid(),
+                )
+                return False
+            if any(pending_id == run_id for pending_id, _, _ in self._pending):
+                logger.info(
+                    (
+                        "lifecycle run_id=%s event=enqueue_deduped "
+                        "reason=pending api_pid=%s"
+                    ),
+                    run_id,
+                    os.getpid(),
+                )
+                return False
             self._pending.append((run_id, mission, registry))
             depth = len(self._pending)
             active = self._active_run_id
@@ -94,6 +117,7 @@ class RunQueue:
                 registry_count,
             )
             self._cond.notify()
+            return True
 
     def reset(self) -> None:
         """Drop pending work and clear active state (for tests)."""

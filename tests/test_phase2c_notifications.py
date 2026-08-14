@@ -246,8 +246,19 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
         self.assertNotIn("recovery", kinds)
 
         # Interrupted-run startup recovery path (distinct from heartbeat pair).
+        from mission_control.run_registry import EXECUTION_LEASE_GRACE_SECONDS
+
         interrupted = self.registry.create_run()
         self.registry.update_status(interrupted.run_id, RunStatus.RUNNING)
+        stale_at = datetime.now(timezone.utc) - timedelta(
+            seconds=EXECUTION_LEASE_GRACE_SECONDS + 30
+        )
+        with self.registry._lock:
+            self.registry._conn.execute(
+                "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
+                (stale_at.isoformat(), interrupted.run_id),
+            )
+            self.registry._conn.commit()
         recovered = self.registry.recover_interrupted_runs()
         self.assertGreaterEqual(recovered, 1)
         rec_kinds = {
