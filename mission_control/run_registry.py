@@ -12,7 +12,10 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
+from typing import Any
 import uuid
+
+import yaml
 
 from mission_control.run_result import (
     StructuredRunResult,
@@ -217,6 +220,143 @@ class RunRecord:
     def queued_at(self) -> datetime:
         """Alias of ``created_at`` for callers expecting queue-time naming."""
         return self.created_at
+
+
+class ReservedRunOutcome(str, Enum):
+    """Deterministic outcomes for caller-reserved run ID materialization."""
+
+    CREATED = "created"
+    RECOVERED_IDEMPOTENTLY = "recovered_idempotently"
+    CONFLICT = "conflict"
+
+
+# Stable conflict classes for fail-closed reserved-id materialization.
+CONFLICT_INVALID_RUN_ID = "invalid_run_id"
+CONFLICT_NONCANONICAL_RUN_ID = "noncanonical_run_id"
+CONFLICT_MISSION_YAML_MISMATCH = "mission_yaml_mismatch"
+CONFLICT_PERMISSIONS_MISMATCH = "permissions_mismatch"
+CONFLICT_EXECUTION_MISMATCH = "execution_mismatch"
+CONFLICT_REPOSITORY_MISMATCH = "repository_mismatch"
+CONFLICT_OWNERSHIP_MISMATCH = "ownership_mismatch"
+CONFLICT_EXISTING_RUN_COLLISION = "existing_run_collision"
+
+
+@dataclass(frozen=True)
+class ReservedRunCreateResult:
+    """Result of creating or recovering a caller-reserved run ID.
+
+    ``outcome`` is one of :class:`ReservedRunOutcome`. On conflict,
+    ``record`` is the existing immutable row (when present) and
+    ``conflict_class`` names the fail-closed reason. Never log
+    ``mission_yaml`` from this object.
+    """
+
+    outcome: ReservedRunOutcome
+    record: RunRecord | None = None
+    conflict_class: str | None = None
+
+
+def require_canonical_run_uuid(run_id: str) -> str:
+    """Return ``run_id`` when it is a canonical hyphenated UUID string.
+
+    Raises ``ValueError`` with a stable conflict-class message for
+    malformed or non-canonical forms (uppercase, braces, URN, compact hex).
+    """
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError(CONFLICT_INVALID_RUN_ID)
+    try:
+        parsed = uuid.UUID(run_id)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(CONFLICT_INVALID_RUN_ID) from exc
+    canonical = str(parsed)
+    if run_id != canonical:
+        raise ValueError(CONFLICT_NONCANONICAL_RUN_ID)
+    return canonical
+
+
+def _mission_mapping(mission_yaml: str | None) -> dict[str, Any]:
+    """Best-effort parse of mission YAML for conflict classification only."""
+    if mission_yaml is None or str(mission_yaml).strip() == "":
+        return {}
+    try:
+        data = yaml.safe_load(mission_yaml)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _mapping_section(data: dict[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def reserved_run_identity_matches(
+    existing: RunRecord,
+    *,
+    mission_yaml: str | None,
+    retried_from: str | None,
+) -> bool:
+    """True when immutable mission identity + launch metadata match exactly."""
+    return (
+        existing.mission_yaml == mission_yaml
+        and existing.retried_from == retried_from
+    )
+
+
+def classify_reserved_run_conflict(
+    existing: RunRecord,
+    *,
+    mission_yaml: str | None,
+    retried_from: str | None,
+) -> str:
+    """Classify why a reserved-id create cannot recover idempotently.
+
+    Precedence favors ownership and launch-authority fields before a
+    generic mission YAML mismatch. Unrelated rows (e.g. default
+    ``create_run()`` allocations with no mission YAML) report
+    ``existing_run_collision``.
+    """
+    if reserved_run_identity_matches(
+        existing, mission_yaml=mission_yaml, retried_from=retried_from
+    ):
+        raise ValueError("identity matches; not a conflict")
+
+    existing_blank = existing.mission_yaml is None or str(
+        existing.mission_yaml
+    ).strip() == ""
+    expected_present = mission_yaml is not None and str(mission_yaml).strip() != ""
+    if existing_blank and expected_present:
+        return CONFLICT_EXISTING_RUN_COLLISION
+
+    if existing.retried_from != retried_from:
+        return CONFLICT_OWNERSHIP_MISMATCH
+
+    expected = _mission_mapping(mission_yaml)
+    observed = _mission_mapping(existing.mission_yaml)
+
+    exp_repo = _mapping_section(expected, "repository")
+    obs_repo = _mapping_section(observed, "repository")
+    if exp_repo.get("name") != obs_repo.get("name"):
+        return CONFLICT_REPOSITORY_MISMATCH
+
+    if expected.get("permissions") != observed.get("permissions"):
+        return CONFLICT_PERMISSIONS_MISMATCH
+
+    exp_exec = _mapping_section(expected, "execution")
+    obs_exec = _mapping_section(observed, "execution")
+    if exp_exec.get("agent") != obs_exec.get("agent") or exp_exec.get(
+        "mode"
+    ) != obs_exec.get("mode"):
+        return CONFLICT_EXECUTION_MISMATCH
+
+    if existing.mission_yaml != mission_yaml:
+        return CONFLICT_MISSION_YAML_MISMATCH
+
+    return CONFLICT_EXISTING_RUN_COLLISION
 
 
 def resolve_db_path() -> str:
@@ -694,16 +834,84 @@ class RunRegistry:
         )
         self._conn.commit()
 
-    def create_run(
+    def _insert_new_run_unlocked(self, record: RunRecord) -> bool:
+        """Insert ``record`` once. Return False on primary-key conflict.
+
+        Uses ``BEGIN IMMEDIATE`` so concurrent connections serialize the
+        create-or-observe path. Never updates or recycles an existing row.
+        """
+        try:
+            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                f"""
+                INSERT INTO {_RUNS_TABLE} (
+                    run_id,
+                    status,
+                    created_at,
+                    started_at,
+                    completed_at,
+                    elapsed_seconds,
+                    stdout,
+                    stderr,
+                    error,
+                    return_code,
+                    commit_sha,
+                    result_json,
+                    mission_yaml,
+                    retried_from,
+                    phase,
+                    phase_started_at,
+                    heartbeat_at,
+                    progress_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.run_id,
+                    record.status.value,
+                    _format_dt(record.created_at),
+                    _format_dt(record.started_at),
+                    _format_dt(record.completed_at),
+                    record.elapsed_seconds,
+                    record.stdout,
+                    record.stderr,
+                    record.error,
+                    record.return_code,
+                    record.commit_sha,
+                    serialize_structured_result(record.result),
+                    record.mission_yaml,
+                    record.retried_from,
+                    record.phase.value,
+                    _format_dt(record.phase_started_at),
+                    _format_dt(record.heartbeat_at),
+                    serialize_progress(record.progress),
+                ),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            return False
+        except sqlite3.Error:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _new_queued_record(
         self,
         *,
-        mission_yaml: str | None = None,
-        retried_from: str | None = None,
+        run_id: str,
+        mission_yaml: str | None,
+        retried_from: str | None,
     ) -> RunRecord:
-        """Create a new run in ``queued`` status with a UUID4 ``run_id``."""
         now = _utc_now()
-        record = RunRecord(
-            run_id=str(uuid.uuid4()),
+        return RunRecord(
+            run_id=run_id,
             status=RunStatus.QUEUED,
             created_at=now,
             mission_yaml=mission_yaml,
@@ -716,17 +924,19 @@ class RunRegistry:
                 detail="Waiting for execution slot",
             ),
         )
+
+    def _log_run_created(self, record: RunRecord, *, event: str) -> None:
         with self._lock:
-            self._persist_record(record)
             keys = self._list_run_ids_unlocked()
             count = len(keys)
         logger.info(
             (
-                "lifecycle run_id=%s event=run_record_created status=%s "
+                "lifecycle run_id=%s event=%s status=%s "
                 "phase=%s api_pid=%s registry_id=%s registry_count=%s "
                 "registry_keys=%s"
             ),
             record.run_id,
+            event,
             record.status.value,
             record.phase.value,
             os.getpid(),
@@ -734,6 +944,145 @@ class RunRegistry:
             count,
             keys,
         )
+
+    def _create_reserved_run(
+        self,
+        *,
+        run_id: str,
+        mission_yaml: str | None,
+        retried_from: str | None,
+    ) -> ReservedRunCreateResult:
+        """Materialize a caller-reserved UUID without mutating existing rows."""
+        try:
+            canonical_id = require_canonical_run_uuid(run_id)
+        except ValueError as exc:
+            conflict_class = str(exc) or CONFLICT_INVALID_RUN_ID
+            logger.info(
+                (
+                    "lifecycle run_id=%s event=reserved_run_conflict "
+                    "conflict_class=%s api_pid=%s registry_id=%s"
+                ),
+                run_id if isinstance(run_id, str) else "<invalid>",
+                conflict_class,
+                os.getpid(),
+                id(self),
+            )
+            return ReservedRunCreateResult(
+                outcome=ReservedRunOutcome.CONFLICT,
+                record=None,
+                conflict_class=conflict_class,
+            )
+
+        record = self._new_queued_record(
+            run_id=canonical_id,
+            mission_yaml=mission_yaml,
+            retried_from=retried_from,
+        )
+        with self._lock:
+            inserted = self._insert_new_run_unlocked(record)
+            if inserted:
+                existing = None
+            else:
+                row = self._fetch_row(canonical_id)
+                existing = _row_to_record(row) if row is not None else None
+
+        if inserted:
+            self._log_run_created(record, event="reserved_run_created")
+            return ReservedRunCreateResult(
+                outcome=ReservedRunOutcome.CREATED,
+                record=record,
+            )
+
+        if existing is None:
+            logger.info(
+                (
+                    "lifecycle run_id=%s event=reserved_run_conflict "
+                    "conflict_class=%s api_pid=%s registry_id=%s"
+                ),
+                canonical_id,
+                CONFLICT_EXISTING_RUN_COLLISION,
+                os.getpid(),
+                id(self),
+            )
+            return ReservedRunCreateResult(
+                outcome=ReservedRunOutcome.CONFLICT,
+                record=None,
+                conflict_class=CONFLICT_EXISTING_RUN_COLLISION,
+            )
+
+        if reserved_run_identity_matches(
+            existing,
+            mission_yaml=mission_yaml,
+            retried_from=retried_from,
+        ):
+            logger.info(
+                (
+                    "lifecycle run_id=%s event=reserved_run_recovered "
+                    "status=%s api_pid=%s registry_id=%s"
+                ),
+                existing.run_id,
+                existing.status.value,
+                os.getpid(),
+                id(self),
+            )
+            return ReservedRunCreateResult(
+                outcome=ReservedRunOutcome.RECOVERED_IDEMPOTENTLY,
+                record=existing,
+            )
+
+        conflict_class = classify_reserved_run_conflict(
+            existing,
+            mission_yaml=mission_yaml,
+            retried_from=retried_from,
+        )
+        logger.info(
+            (
+                "lifecycle run_id=%s event=reserved_run_conflict "
+                "conflict_class=%s api_pid=%s registry_id=%s"
+            ),
+            existing.run_id,
+            conflict_class,
+            os.getpid(),
+            id(self),
+        )
+        return ReservedRunCreateResult(
+            outcome=ReservedRunOutcome.CONFLICT,
+            record=existing,
+            conflict_class=conflict_class,
+        )
+
+    def create_run(
+        self,
+        *,
+        mission_yaml: str | None = None,
+        retried_from: str | None = None,
+        run_id: str | None = None,
+    ) -> RunRecord | ReservedRunCreateResult:
+        """Create a new run in ``queued`` status.
+
+        When ``run_id`` is omitted, allocates a fresh UUID4 and returns a
+        :class:`RunRecord` (existing callers unchanged).
+
+        When ``run_id`` is supplied, materializes that caller-reserved
+        canonical UUID and returns a :class:`ReservedRunCreateResult`
+        discriminating ``created``, ``recovered_idempotently``, or
+        ``conflict``. Existing rows are never overwritten or recycled.
+        """
+        if run_id is not None:
+            return self._create_reserved_run(
+                run_id=run_id,
+                mission_yaml=mission_yaml,
+                retried_from=retried_from,
+            )
+
+        record = self._new_queued_record(
+            run_id=str(uuid.uuid4()),
+            mission_yaml=mission_yaml,
+            retried_from=retried_from,
+        )
+        with self._lock:
+            self._persist_record(record)
+        self._log_run_created(record, event="run_record_created")
         return record
 
     def get_run(self, run_id: str) -> RunRecord | None:
