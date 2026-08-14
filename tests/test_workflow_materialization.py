@@ -296,7 +296,8 @@ class CreatedPathTests(MaterializeTestCase):
             latest.materialization_state, StepMaterializationState.MATERIALIZED
         )
         self.assertEqual(self.queue.calls[0][1]["mission_id"], "wf-materialize")
-        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        # Enqueue alone must not finalize; registry is still queued.
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
 
     def test_created_then_reconcile_sees_bound_step(self) -> None:
         wf, step = self._create_and_claim()
@@ -322,7 +323,7 @@ class IdempotentRecoveryTests(MaterializeTestCase):
         )
         self.assertFalse(second.enqueued)
         self._assert_one_row_at_most_one_enqueue(step.child_run_id)
-        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
 
     def test_recover_after_create_before_mark(self) -> None:
         wf, step = self._create_and_claim()
@@ -592,7 +593,7 @@ class CrashInjectionTests(MaterializeTestCase):
         self.assertTrue(result.enqueued)
         # At most one queued execution across the crash + retry.
         self._assert_one_row_at_most_one_enqueue(step.child_run_id)
-        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
 
 
 class RegistryRelatedTests(MaterializeTestCase):
@@ -612,18 +613,117 @@ class RegistryRelatedTests(MaterializeTestCase):
 
 
 class DurableDispatchTests(MaterializeTestCase):
-    def test_crash_after_enqueue_before_ack_then_retry(self) -> None:
+    def test_enqueue_success_then_process_death_before_running(self) -> None:
+        """Enqueue acked only by process-local queue must remain redrivable."""
+        wf, step = self._create_and_claim()
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.CREATED)
+        self.assertTrue(result.enqueued)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        self.assertEqual(record.status, RunStatus.QUEUED)
+
+        # Simulate process death: empty process-local queue, durable SQLite kept.
+        self.workflow_registry.close()
+        self.run_registry.close()
+        self.workflow_registry = WorkflowRegistry(self._wf_path)
+        self.run_registry = RunRegistry(self._run_path)
+        self.queue = RecordingQueue()
+
+        recovered = redrive_materialized_dispatch(
+            workflow_registry=self.workflow_registry,
+            run_registry=self.run_registry,
+            run_queue=self.queue,
+            workflow_id=wf.workflow_id,
+            step_id=step.step_id,
+            environ=_FEATURE_ON,
+            backoff_base_seconds=0.0,
+        )
+        self.assertEqual(recovered.outcome, MaterializeOutcome.REDRIVEN)
+        self.assertTrue(recovered.enqueued)
+        self.assertEqual(self.queue.run_ids, [step.child_run_id])
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
+        self.assertEqual(self.run_registry.count_runs(), 1)
+
+    def test_restart_queued_row_empty_queue_reenqueues(self) -> None:
+        wf, step = self._create_and_claim()
+        first = self._materialize(wf.workflow_id, step.step_id)
+        self.assertTrue(first.enqueued)
+        self.workflow_registry.close()
+        self.run_registry.close()
+        self.workflow_registry = WorkflowRegistry(self._wf_path)
+        self.run_registry = RunRegistry(self._run_path)
+        self.queue = RecordingQueue()
+        second = redrive_materialized_dispatch(
+            workflow_registry=self.workflow_registry,
+            run_registry=self.run_registry,
+            run_queue=self.queue,
+            workflow_id=wf.workflow_id,
+            step_id=step.step_id,
+            environ=_FEATURE_ON,
+            backoff_base_seconds=0.0,
+        )
+        self.assertTrue(second.enqueued)
+        self.assertEqual(len(self.queue.calls), 1)
+        queued = self.run_registry.get_run(step.child_run_id)
+        assert queued is not None
+        self.assertEqual(queued.status, RunStatus.QUEUED)
+
+    def test_same_process_queued_duplicate_suppressed(self) -> None:
+        wf, step = self._create_and_claim()
+        first = self._materialize(wf.workflow_id, step.step_id)
+        self.assertTrue(first.enqueued)
+        second = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(
+            second.outcome, MaterializeOutcome.ALREADY_MATERIALIZED
+        )
+        self.assertFalse(second.enqueued)
+        self.assertEqual(second.reason, "queue_already_pending")
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
+
+    def test_no_failure_attempt_inflation_while_queued(self) -> None:
+        wf, step = self._create_and_claim()
+        self._materialize(wf.workflow_id, step.step_id)
+        intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
+        assert intent is not None
+        self.assertEqual(intent.state, DispatchIntentState.PENDING)
+        self.assertEqual(intent.attempt_count, 0)
+        for _ in range(6):
+            again = self._materialize(wf.workflow_id, step.step_id)
+            self.assertFalse(again.enqueued)
+            self.assertEqual(
+                again.outcome, MaterializeOutcome.ALREADY_MATERIALIZED
+            )
+        intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
+        assert intent is not None
+        self.assertEqual(intent.state, DispatchIntentState.PENDING)
+        self.assertEqual(intent.attempt_count, 0)
+        self.assertIsNone(intent.next_attempt_at)
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
+
+    def test_crash_after_enqueue_before_execution_ack_then_retry(self) -> None:
         wf, step = self._create_and_claim()
 
         def boom() -> None:
             raise RuntimeError("crash_before_ack")
+
+        # Force the execution-observed ack path, then crash before finalize.
+        def after_enqueue() -> None:
+            self.run_registry.update_status(
+                step.child_run_id, RunStatus.RUNNING
+            )
 
         with self.assertRaises(RuntimeError):
             self._materialize(
                 wf.workflow_id,
                 step.step_id,
                 lease_seconds=0.05,
-                hooks=MaterializeCrashHooks(before_ack=boom),
+                hooks=MaterializeCrashHooks(
+                    after_enqueue=after_enqueue,
+                    before_ack=boom,
+                ),
             )
         self.assertEqual(len(self.queue.calls), 1)
         intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
@@ -659,7 +759,7 @@ class DurableDispatchTests(MaterializeTestCase):
         self.assertEqual(retried.outcome, MaterializeOutcome.REDRIVEN)
         self.assertTrue(retried.enqueued)
         self._assert_one_row_at_most_one_enqueue(step.child_run_id)
-        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
 
     def test_process_restart_with_pending_intent(self) -> None:
         wf, step = self._create_and_claim()
@@ -692,9 +792,9 @@ class DurableDispatchTests(MaterializeTestCase):
         self.assertEqual(result.outcome, MaterializeOutcome.REDRIVEN)
         self.assertTrue(result.enqueued)
         self._assert_one_row_at_most_one_enqueue(step.child_run_id)
-        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
 
-    def test_process_restart_with_leased_intent_after_expiry(self) -> None:
+    def test_lease_expiry_recovers_queued_work(self) -> None:
         wf, step = self._create_and_claim()
         with self.assertRaises(RuntimeError):
             self._materialize(
@@ -702,9 +802,57 @@ class DurableDispatchTests(MaterializeTestCase):
                 step.step_id,
                 lease_seconds=0.05,
                 hooks=MaterializeCrashHooks(
+                    before_enqueue=lambda: (_ for _ in ()).throw(
+                        RuntimeError("crash_leased_before_enqueue")
+                    )
+                ),
+            )
+        intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
+        assert intent is not None
+        self.assertEqual(intent.state, DispatchIntentState.LEASED)
+        self.assertEqual(self.queue.calls, [])
+
+        time.sleep(0.08)
+        self.workflow_registry.close()
+        self.run_registry.close()
+        self.workflow_registry = WorkflowRegistry(self._wf_path)
+        self.run_registry = RunRegistry(self._run_path)
+        self.queue = RecordingQueue()
+
+        result = redrive_materialized_dispatch(
+            workflow_registry=self.workflow_registry,
+            run_registry=self.run_registry,
+            run_queue=self.queue,
+            workflow_id=wf.workflow_id,
+            step_id=step.step_id,
+            environ=_FEATURE_ON,
+            backoff_base_seconds=0.0,
+        )
+        self.assertEqual(result.outcome, MaterializeOutcome.REDRIVEN)
+        self.assertTrue(result.enqueued)
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
+        due = self.workflow_registry.list_redrivable_dispatch_intents()
+        self.assertEqual(len(due), 1)
+
+    def test_process_restart_with_leased_intent_after_expiry(self) -> None:
+        wf, step = self._create_and_claim()
+
+        def after_enqueue() -> None:
+            self.run_registry.update_status(
+                step.child_run_id, RunStatus.RUNNING
+            )
+
+        with self.assertRaises(RuntimeError):
+            self._materialize(
+                wf.workflow_id,
+                step.step_id,
+                lease_seconds=0.05,
+                hooks=MaterializeCrashHooks(
+                    after_enqueue=after_enqueue,
                     before_ack=lambda: (_ for _ in ()).throw(
                         RuntimeError("crash_leased")
-                    )
+                    ),
                 ),
             )
         intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
@@ -717,7 +865,7 @@ class DurableDispatchTests(MaterializeTestCase):
         self.run_registry.close()
         self.workflow_registry = WorkflowRegistry(self._wf_path)
         self.run_registry = RunRegistry(self._run_path)
-        # Fresh process-local queue; registry still queued.
+        # Fresh process-local queue; registry already running.
         self.queue = RecordingQueue()
 
         result = redrive_materialized_dispatch(
@@ -736,8 +884,8 @@ class DurableDispatchTests(MaterializeTestCase):
                 MaterializeOutcome.ALREADY_MATERIALIZED,
             },
         )
-        self.assertTrue(result.enqueued)
-        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
+        self.assertFalse(result.enqueued)
+        self.assertEqual(self.queue.calls, [])
         self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
 
     def test_two_concurrent_dispatchers_at_most_one_enqueue(self) -> None:
@@ -788,7 +936,8 @@ class DurableDispatchTests(MaterializeTestCase):
         enqueued = [r for r in results if r.enqueued]
         self.assertEqual(len(enqueued), 1)
         self._assert_one_row_at_most_one_enqueue(step.child_run_id)
-        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        # Still queued in registry → intent remains recoverable, not acked.
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
 
     def test_retry_of_materialized_redrives_pending(self) -> None:
         wf, step = self._create_and_claim()
@@ -805,9 +954,9 @@ class DurableDispatchTests(MaterializeTestCase):
         result = self._materialize(wf.workflow_id, step.step_id)
         self.assertEqual(result.outcome, MaterializeOutcome.REDRIVEN)
         self.assertTrue(result.enqueued)
-        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.PENDING)
 
-    def test_worker_consumes_before_ack(self) -> None:
+    def test_worker_transitions_to_running_before_bookkeeping(self) -> None:
         wf, step = self._create_and_claim()
         executed = threading.Event()
         real_queue = RunQueue()
@@ -871,6 +1020,79 @@ class DurableDispatchTests(MaterializeTestCase):
         self.assertFalse(result.enqueued)
         self.assertEqual(fresh.calls, [])
         self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        self.assertEqual(self.run_registry.count_runs(), 1)
+        real_queue.stop()
+
+    def test_terminal_before_bookkeeping_acks_once(self) -> None:
+        wf, step = self._create_and_claim()
+        finished = threading.Event()
+        real_queue = RunQueue()
+
+        def execute(run_id: str, mission: dict, registry) -> None:
+            registry.update_status(run_id, RunStatus.RUNNING)
+            registry.update_status(run_id, RunStatus.COMPLETED)
+            finished.set()
+
+        real_queue.configure(execute)
+
+        def after_enqueue() -> None:
+            self.assertTrue(finished.wait(timeout=2.0))
+
+        with self.assertRaises(RuntimeError):
+            materialize_claimed_child(
+                workflow_registry=self.workflow_registry,
+                run_registry=self.run_registry,
+                run_queue=real_queue,
+                workflow_id=wf.workflow_id,
+                step_id=step.step_id,
+                environ=_FEATURE_ON,
+                lease_seconds=0.05,
+                backoff_base_seconds=0.0,
+                hooks=MaterializeCrashHooks(
+                    after_enqueue=after_enqueue,
+                    before_ack=lambda: (_ for _ in ()).throw(
+                        RuntimeError("crash_after_terminal")
+                    ),
+                ),
+            )
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        self.assertEqual(record.status, RunStatus.COMPLETED)
+        intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
+        assert intent is not None
+        self.assertEqual(intent.state, DispatchIntentState.LEASED)
+
+        time.sleep(0.08)
+        fresh = RecordingQueue()
+        result = redrive_materialized_dispatch(
+            workflow_registry=self.workflow_registry,
+            run_registry=self.run_registry,
+            run_queue=fresh,
+            workflow_id=wf.workflow_id,
+            step_id=step.step_id,
+            environ=_FEATURE_ON,
+            backoff_base_seconds=0.0,
+        )
+        self.assertEqual(
+            result.outcome, MaterializeOutcome.ALREADY_MATERIALIZED
+        )
+        self.assertFalse(result.enqueued)
+        self.assertEqual(fresh.calls, [])
+        self._assert_intent_state(step.child_run_id, DispatchIntentState.ACKED)
+        # Second finalize is a no-op.
+        again = redrive_materialized_dispatch(
+            workflow_registry=self.workflow_registry,
+            run_registry=self.run_registry,
+            run_queue=fresh,
+            workflow_id=wf.workflow_id,
+            step_id=step.step_id,
+            environ=_FEATURE_ON,
+            backoff_base_seconds=0.0,
+        )
+        self.assertEqual(
+            again.outcome, MaterializeOutcome.ALREADY_MATERIALIZED
+        )
+        self.assertEqual(again.reason, "dispatch_acked")
         self.assertEqual(self.run_registry.count_runs(), 1)
         real_queue.stop()
 

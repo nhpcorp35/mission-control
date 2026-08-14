@@ -214,8 +214,9 @@ persisted on the transition / `last_decision_json`.
    step YAML + reserved `child_run_id` + canonical `retried_from` ownership.
    Marks the step materialized only after `created` or
    `recovered_idempotently`, with CAS on both workflow version **and**
-   `materialization_state='claimed'`. Enqueues **once** when this attempt
-   wins the mark. Feature flag must be on for the call; default remains off.
+   `materialization_state='claimed'`. Process-local enqueue is idempotent;
+   durable dispatch ack waits for `RunRegistry` `running`/terminal. Feature
+   flag must be on for the call; default remains off.
 
 ## Claim-to-create crash contract
 
@@ -227,23 +228,36 @@ CLAIMED + exact mission_yaml + parent binding
   → final policy / ceiling / authority gates
   → RunRegistry.create_run(run_id=child_run_id, mission_yaml=exact,
                            retried_from=ownership)
-  → mark_step_materialized (CAS)
-  → RunQueue.enqueue exactly once (mark winner only)
+  → mark_step_materialized (CAS) + unique pending dispatch intent
+  → claim lease → RunQueue.enqueue (process-local; idempotent)
+  → if RunRegistry status still queued: release lease to pending
+       (no failure backoff / attempt burn; intent stays redrivable)
+  → durable ack only when RunRegistry status is running or terminal
 ```
+
+Authoritative execution-claim boundary: `RunRegistry` status `running` or
+terminal (`completed` / `failed` / `timed_out`). Process-local `RunQueue`
+acceptance alone must never finalize/ack dispatch — queue memory dies with
+the process while a queued registry row must remain redriveable.
 
 | Window | Retry behavior |
 | --- | --- |
 | Before create | Fresh `create_run` |
 | After create, before mark | `recovered_idempotently` → mark → enqueue |
-| After mark, before enqueue | `already_materialized`; **no** second enqueue |
+| After mark, before enqueue | Pending intent; redrive claims + enqueues |
+| After enqueue, registry still `queued` | Intent remains pending/redrivable; restart with empty process queue re-enqueues; same-process duplicate suppress is idempotent (no attempt burn) |
+| Worker reaches `running` / terminal before bookkeeping | Ack exactly once; registry suppress prevents duplicate execution |
 | Existing matching run | Idempotent recover |
 | Existing mismatch | Poison / fail closed (`conflict_class`, no secrets) |
 | Missing parent binding | Reject **before** create |
 | Final policy denial | Block workflow; no registry row |
+| Expired dispatch lease | Reclaim + redrive (leases must not strand queued work) |
 
-Concurrent materializers across two DB connections yield one registry row and
-at most one enqueue. Lifespan reconciler re-drive of the post-mark enqueue gap
-is deferred.
+Concurrent materializers / redrivers across two DB connections yield one
+registry row and at most one process-local enqueue per live queue. Durable
+redrive of post-enqueue process-death gaps is available via
+`redrive_materialized_dispatch` / `list_redrivable_dispatch_intents`; the
+lifespan reconciler worker hook remains a follow-up.
 
 ## Reserved RunRegistry IDs
 
@@ -302,6 +316,10 @@ Covered:
 - Crash-safe materialize: created, idempotent recover, mismatch poison,
   missing parent, final policy denial, concurrent materializers, injected
   crashes before/after create and before/after mark persistence
+- Execution-observed dispatch ack: enqueue-then-process-death before running,
+  restart with queued row + empty queue, same-process queued duplicate
+  suppress without attempt inflation, worker/terminal-before-bookkeeping,
+  lease expiry reclaim, concurrent redrivers
 - Duplicate `child_run_id` uniqueness; schema upgrade + newer-version reject
 - All budget boundaries (child, estimated credit, actual credit, wall-clock,
   fix-cycle) with off-by-one checks
@@ -310,9 +328,12 @@ Covered:
 
 ## Residual risks
 
-1. Materializer can insert reserved children into `runs` and enqueue once, but
-   the lifespan reconciler is not wired — post-mark enqueue gaps after hard
-   process death wait for the reconciler follow-up.
+1. Materializer inserts reserved children into `runs`, enqueues process-locally,
+   and keeps dispatch intents redrivable until `RunRegistry` observes
+   `running`/terminal — but the lifespan reconciler worker is not wired yet,
+   so automatic background redrive of pending intents after hard process death
+   waits for the reconciler follow-up (primitive
+   `redrive_materialized_dispatch` / `list_redrivable_dispatch_intents` exists).
 2. Notification suppression is decided in-process; outbox/Pushover not hooked.
 3. No HTTP/MCP surface yet — operators cannot submit via API.
 4. Auto-merge/deploy explicitly deferred; policy bits are recorded only.
@@ -326,7 +347,7 @@ Covered:
 
 1. **Merge this slice** (flag off) — hardened schema + library + materializer.
 2. **Mission B — lifespan reconciler:** worker hook behind the flag, structured
-   metrics logs, post-mark enqueue re-drive.
+   metrics logs, pending-intent redrive after process death.
 3. **Mission C — API + MCP:** submit/status/history/cancel + connector tools.
 4. **Mission D — notifications:** suppress workflow-managed child terminals;
    one actionable workflow alert.
@@ -337,7 +358,7 @@ Covered:
 Per split-run policy (≤4 files / one objective), do **not** expand this
 mission further. Recommended follow-ups:
 
-1. Lifespan reconciler hook + post-mark enqueue re-drive
+1. Lifespan reconciler hook + pending-intent redrive loop
 2. FastAPI + MCP submit/status/history/cancel
 3. Notification outbox suppression + workflow alert enqueue
 4. Staging enablement + operator runbook

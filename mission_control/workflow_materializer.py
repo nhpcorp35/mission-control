@@ -9,17 +9,28 @@ Claim-to-create protocol (deterministic; SQLite is the correctness boundary):
    ``retried_from`` ownership (created | recovered_idempotently | conflict).
 5. ``WorkflowRegistry.mark_step_materialized`` (CAS) after a matching create;
    the mark transaction also persists a unique pending dispatch intent.
-6. Claim/lease → idempotent ``RunQueue.enqueue`` → durable ack. Only the
-   lease holder performs handoff; process-local queue state is not durable.
+6. Claim/lease → idempotent ``RunQueue.enqueue`` (process-local only). Durable
+   dispatch ack is **execution-observed**: finalize only when authoritative
+   ``RunRegistry`` status is ``running`` or terminal. Enqueue acceptance alone
+   must never ack — process death would otherwise lose queue memory while the
+   intent is already finalized and no longer redrivable.
 
 Crash windows and recovery:
 
 - before create → retry creates
 - after create before mark → ``create_run`` recovers idempotently, then mark
 - after mark before enqueue → durable pending intent; retry/redrive handoff
-- after enqueue before ack → lease + idempotent enqueue; ack on retry
+- after enqueue while registry still ``queued`` → release lease to pending
+  (no failure backoff / attempt burn); redrive re-enqueues on empty process
+  queue after restart; same-process pending/active suppress is idempotent
+- worker reaches ``running`` / terminal before bookkeeping → ack exactly once
+  without a second execution (registry suppress + execution-observed ack)
 - enqueue exception → retryable intent with bounded backoff; poison at ceiling
 - mismatch / conflict → poison fail-closed with auditable non-secret reason
+
+Authoritative execution-claim boundary: ``RunRegistry`` status ``running`` or
+terminal (``completed`` / ``failed`` / ``timed_out``). There is no separate
+durable execution-claim state beyond that SQLite status.
 
 Process-local locks are not a correctness boundary. Feature flag remains
 off by default; materialization refuses when disabled.
@@ -309,6 +320,21 @@ def _ownership_for_step(step: WorkflowStepRecord) -> str | None:
         return None
 
 
+def _execution_observed(record: RunRecord | None) -> bool:
+    """True when authoritative RunRegistry proves execution started or ended.
+
+    Durable dispatch ack is allowed only for ``running`` or terminal statuses.
+    ``queued`` alone is not sufficient — process-local queue memory can die.
+    """
+    if record is None:
+        return False
+    if is_terminal_status(record.status):
+        return True
+    status = record.status
+    value = status.value if hasattr(status, "value") else str(status)
+    return value == "running"
+
+
 def _verify_existing_run(
     existing: RunRecord,
     *,
@@ -383,7 +409,7 @@ def _handoff_dispatch(
     backoff_base_seconds: float = DISPATCH_BACKOFF_BASE_SECONDS,
     backoff_max_seconds: float = DISPATCH_BACKOFF_MAX_SECONDS,
 ) -> MaterializeResult:
-    """Claim → enqueue → ack one materialized child dispatch intent."""
+    """Claim → enqueue → execution-observed ack for one dispatch intent."""
     assert step.child_run_id is not None
     child_run_id = step.child_run_id
     lease_owner = owner or f"materialize:{uuid.uuid4()}"
@@ -414,25 +440,49 @@ def _handoff_dispatch(
         )
 
     existing = run_registry.get_run(child_run_id)
-    if existing is not None and is_terminal_status(existing.status):
-        # Terminal run with stale intent: ack without executing again.
+    if _execution_observed(existing):
+        # Running/terminal with stale intent: ack once; never re-execute.
+        observed = (
+            "run_terminal"
+            if existing is not None and is_terminal_status(existing.status)
+            else "run_running"
+        )
         claim = workflow_registry.claim_dispatch_intent(
             child_run_id=child_run_id,
             owner=lease_owner,
             lease_seconds=lease_seconds,
         )
         if claim.ok:
-            workflow_registry.ack_dispatch_intent(
+            if not workflow_registry.ack_dispatch_intent(
                 child_run_id=child_run_id, owner=lease_owner
-            )
+            ):
+                return MaterializeResult(
+                    outcome=MaterializeOutcome.DISPATCH_DEFERRED,
+                    child_run_id=child_run_id,
+                    step_id=step.step_id,
+                    enqueued=False,
+                    reason="ack_failed",
+                    dispatch_state=DispatchIntentState.LEASED.value,
+                )
         elif claim.error == "already_acked":
             pass
+        else:
+            return MaterializeResult(
+                outcome=MaterializeOutcome.DISPATCH_DEFERRED,
+                child_run_id=child_run_id,
+                step_id=step.step_id,
+                enqueued=False,
+                reason=claim.error or "dispatch_deferred",
+                dispatch_state=(
+                    claim.intent.state.value if claim.intent is not None else None
+                ),
+            )
         return MaterializeResult(
             outcome=MaterializeOutcome.ALREADY_MATERIALIZED,
             child_run_id=child_run_id,
             step_id=step.step_id,
             enqueued=False,
-            reason="run_terminal",
+            reason=observed,
             dispatch_state=DispatchIntentState.ACKED.value,
         )
 
@@ -474,6 +524,19 @@ def _handoff_dispatch(
             dispatch_state=(
                 claim.intent.state.value if claim.intent is not None else None
             ),
+        )
+
+    # Re-check after winning the lease: worker may have started already.
+    existing = run_registry.get_run(child_run_id)
+    if _execution_observed(existing):
+        return _finalize_execution_observed_ack(
+            workflow_registry=workflow_registry,
+            child_run_id=child_run_id,
+            step_id=step.step_id,
+            lease_owner=lease_owner,
+            existing=existing,
+            newly_enqueued=False,
+            hooks=hooks,
         )
 
     if hooks and hooks.before_enqueue:
@@ -540,42 +603,99 @@ def _handoff_dispatch(
     if hooks and hooks.after_enqueue:
         hooks.after_enqueue()
 
-    if hooks and hooks.before_ack:
-        hooks.before_ack()
-
-    acked = workflow_registry.ack_dispatch_intent(
-        child_run_id=child_run_id, owner=lease_owner
-    )
-    if not acked:
-        # Enqueue (or suppress) already happened; leave leased intent for
-        # restart reclaim rather than double-executing.
-        logger.warning(
-            (
-                "workflow event=child_dispatch_ack_failed workflow_id=%s "
-                "step_id=%s child_run_id=%s"
-            ),
-            workflow.workflow_id,
-            step.step_id,
-            child_run_id,
-        )
-        return MaterializeResult(
-            outcome=MaterializeOutcome.DISPATCH_DEFERRED,
+    # Separate enqueue acknowledgment from durable execution acknowledgment.
+    post = run_registry.get_run(child_run_id)
+    if _execution_observed(post):
+        return _finalize_execution_observed_ack(
+            workflow_registry=workflow_registry,
             child_run_id=child_run_id,
             step_id=step.step_id,
-            enqueued=newly_enqueued,
-            reason="ack_failed",
-            dispatch_state=DispatchIntentState.LEASED.value,
+            lease_owner=lease_owner,
+            existing=post,
+            newly_enqueued=newly_enqueued,
+            hooks=hooks,
         )
 
-    if hooks and hooks.after_ack:
-        hooks.after_ack()
-
+    released = workflow_registry.release_dispatch_lease_for_queued_handoff(
+        child_run_id=child_run_id, owner=lease_owner
+    )
+    logger.info(
+        (
+            "workflow event=child_dispatch_enqueued_awaiting_execution "
+            "workflow_id=%s step_id=%s child_run_id=%s newly_enqueued=%s "
+            "dispatch_state=%s"
+        ),
+        workflow.workflow_id,
+        step.step_id,
+        child_run_id,
+        int(newly_enqueued),
+        released.state.value if released is not None else None,
+    )
     return MaterializeResult(
         outcome=MaterializeOutcome.REDRIVEN,
         child_run_id=child_run_id,
         step_id=step.step_id,
         enqueued=newly_enqueued,
-        reason="dispatch_acked" if not newly_enqueued else None,
+        reason=(
+            "awaiting_execution"
+            if newly_enqueued
+            else "queue_already_pending"
+        ),
+        dispatch_state=(
+            released.state.value
+            if released is not None
+            else DispatchIntentState.PENDING.value
+        ),
+    )
+
+
+def _finalize_execution_observed_ack(
+    *,
+    workflow_registry: WorkflowRegistry,
+    child_run_id: str,
+    step_id: str,
+    lease_owner: str,
+    existing: RunRecord | None,
+    newly_enqueued: bool,
+    hooks: MaterializeCrashHooks | None = None,
+) -> MaterializeResult:
+    """Ack exactly once after RunRegistry proves running or terminal."""
+    observed = (
+        "run_terminal"
+        if existing is not None and is_terminal_status(existing.status)
+        else "run_running"
+    )
+    if hooks and hooks.before_ack:
+        hooks.before_ack()
+    acked = workflow_registry.ack_dispatch_intent(
+        child_run_id=child_run_id, owner=lease_owner
+    )
+    if not acked:
+        logger.warning(
+            (
+                "workflow event=child_dispatch_ack_failed child_run_id=%s "
+                "step_id=%s reason=%s"
+            ),
+            child_run_id,
+            step_id,
+            observed,
+        )
+        return MaterializeResult(
+            outcome=MaterializeOutcome.DISPATCH_DEFERRED,
+            child_run_id=child_run_id,
+            step_id=step_id,
+            enqueued=newly_enqueued,
+            reason="ack_failed",
+            dispatch_state=DispatchIntentState.LEASED.value,
+        )
+    if hooks and hooks.after_ack:
+        hooks.after_ack()
+    return MaterializeResult(
+        outcome=MaterializeOutcome.REDRIVEN,
+        child_run_id=child_run_id,
+        step_id=step_id,
+        enqueued=newly_enqueued,
+        reason=observed if not newly_enqueued else None,
         dispatch_state=DispatchIntentState.ACKED.value,
     )
 

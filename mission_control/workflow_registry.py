@@ -1865,7 +1865,12 @@ class WorkflowRegistry:
         owner: str,
         now: datetime | None = None,
     ) -> bool:
-        """Acknowledge durable handoff after enqueue (or suppress-as-done)."""
+        """Acknowledge durable dispatch after execution is observed.
+
+        Callers must only ack when authoritative ``RunRegistry`` status is
+        ``running`` or terminal. Process-local ``RunQueue`` acceptance alone
+        must not finalize the intent.
+        """
         clock = now or _utc_now()
         now_s = _format_dt(clock)
         with self._lock:
@@ -1903,6 +1908,72 @@ class WorkflowRegistry:
                     )
                 self._conn.commit()
                 return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def release_dispatch_lease_for_queued_handoff(
+        self,
+        *,
+        child_run_id: str,
+        owner: str,
+        now: datetime | None = None,
+    ) -> DispatchIntentRecord | None:
+        """Release a lease after process-local enqueue while still queued.
+
+        Restores ``pending`` without backoff and undoes the claim attempt
+        increment so healthy queued handoff does not burn the attempt ceiling
+        or delay redrive. The intent remains recoverable after process death
+        loses in-memory ``RunQueue`` state.
+        """
+        clock = now or _utc_now()
+        now_s = _format_dt(clock)
+        assert now_s is not None
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                intent = self._fetch_dispatch_intent_unlocked(child_run_id)
+                if intent is None:
+                    self._conn.rollback()
+                    return None
+                if intent.state is DispatchIntentState.ACKED:
+                    self._conn.rollback()
+                    return intent
+                if intent.state is DispatchIntentState.POISONED:
+                    self._conn.rollback()
+                    return intent
+                if (
+                    intent.state is not DispatchIntentState.LEASED
+                    or intent.lease_owner != owner
+                ):
+                    self._conn.rollback()
+                    return intent
+                restored_attempts = max(0, int(intent.attempt_count) - 1)
+                self._conn.execute(
+                    f"""
+                    UPDATE {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+                    SET state = ?,
+                        attempt_count = ?,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        next_attempt_at = NULL,
+                        last_error = NULL,
+                        updated_at = ?
+                    WHERE child_run_id = ?
+                      AND state = ?
+                      AND lease_owner = ?
+                    """,
+                    (
+                        DispatchIntentState.PENDING.value,
+                        restored_attempts,
+                        now_s,
+                        child_run_id,
+                        DispatchIntentState.LEASED.value,
+                        owner,
+                    ),
+                )
+                self._conn.commit()
+                return self._fetch_dispatch_intent_unlocked(child_run_id)
             except Exception:
                 self._conn.rollback()
                 raise
