@@ -1,0 +1,1319 @@
+"""SQLite-backed durable workflow registry (orchestration v1).
+
+Stores immutable workflow identities, CAS-versioned state, step records,
+and auditable transition history. Child-run launch uses a durable
+idempotency key plus a pre-assigned ``child_run_id`` so reconciliation
+after restart cannot double-submit the same step.
+
+This module does not enqueue Cursor executions; callers materialize the
+reserved ``child_run_id`` into the existing run registry / queue.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+import json
+import logging
+import os
+from pathlib import Path
+import sqlite3
+import threading
+import uuid
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DB_PATH = "./data/mission-control.db"
+_SQLITE_BUSY_TIMEOUT_MS = 5000
+
+_WORKFLOWS_TABLE = "workflows"
+_WORKFLOW_STEPS_TABLE = "workflow_steps"
+_WORKFLOW_TRANSITIONS_TABLE = "workflow_transitions"
+
+# Environment flag — disabled by default (production must not enable yet).
+WORKFLOW_ORCHESTRATION_ENV = "MISSION_CONTROL_WORKFLOW_ORCHESTRATION"
+WORKFLOW_RECONCILE_INTERVAL_ENV = "MISSION_CONTROL_WORKFLOW_RECONCILE_INTERVAL_SECONDS"
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 5.0
+
+
+class WorkflowState(str, Enum):
+    """Lifecycle states for a durable workflow."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    NEEDS_APPROVAL = "needs_approval"
+    BLOCKED = "blocked"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_WORKFLOW_STATES = frozenset(
+    {
+        WorkflowState.COMPLETED.value,
+        WorkflowState.NEEDS_APPROVAL.value,
+        WorkflowState.BLOCKED.value,
+        WorkflowState.BUDGET_EXHAUSTED.value,
+        WorkflowState.FAILED.value,
+        WorkflowState.CANCELLED.value,
+    }
+)
+
+# Terminal states that should produce one actionable operator alert.
+ACTIONABLE_WORKFLOW_ALERT_STATES = frozenset(
+    {
+        WorkflowState.NEEDS_APPROVAL.value,
+        WorkflowState.COMPLETED.value,
+        WorkflowState.BLOCKED.value,
+        WorkflowState.BUDGET_EXHAUSTED.value,
+        WorkflowState.FAILED.value,
+    }
+)
+
+
+class StepType(str, Enum):
+    """Canonical v1 step kinds."""
+
+    IMPLEMENTATION = "implementation"
+    REVIEW = "review"
+    FIX = "fix"
+    RE_REVIEW = "re_review"
+
+
+class StepStatus(str, Enum):
+    """Per-step durable status."""
+
+    PENDING = "pending"
+    QUEUED = "queued"  # child_run_id reserved; awaiting / in run registry
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+
+class TransitionReason(str, Enum):
+    """Machine-readable reasons recorded on audit transitions."""
+
+    SUBMITTED = "submitted"
+    CHILD_LAUNCHED = "child_launched"
+    CHILD_BOUND = "child_bound"
+    CHILD_STATUS = "child_status"
+    POLICY_GATE = "policy_gate"
+    VERDICT = "verdict"
+    BUDGET = "budget"
+    CANCELLED = "cancelled"
+    RECONCILE = "reconcile"
+    INTERVENTION = "intervention"
+    ERROR = "error"
+
+
+def is_terminal_workflow_state(state: WorkflowState | str) -> bool:
+    if isinstance(state, WorkflowState):
+        return state.value in TERMINAL_WORKFLOW_STATES
+    return str(state) in TERMINAL_WORKFLOW_STATES
+
+
+def is_workflow_orchestration_enabled(
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Return True only when the feature flag is explicitly enabled."""
+    env = environ if environ is not None else os.environ
+    raw = str(env.get(WORKFLOW_ORCHESTRATION_ENV, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def resolve_reconcile_interval_seconds(
+    environ: dict[str, str] | None = None,
+) -> float:
+    env = environ if environ is not None else os.environ
+    raw = env.get(WORKFLOW_RECONCILE_INTERVAL_ENV)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_RECONCILE_INTERVAL_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_RECONCILE_INTERVAL_SECONDS
+    return max(0.5, value)
+
+
+def resolve_workflow_db_path() -> str:
+    return os.environ.get("MISSION_CONTROL_DB_PATH", DEFAULT_DB_PATH)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_dt(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _ensure_db_parent(db_path: str) -> None:
+    Path(db_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
+
+def _dumps(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _loads(raw: str | None, default: Any) -> Any:
+    if raw is None or raw == "":
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
+@dataclass(frozen=True)
+class WorkflowPolicySnapshot:
+    """Immutable authorization + ceiling snapshot captured at submit time.
+
+    Merge/deploy and other destructive authorities default to deny. Never
+    infer authority from mission prose — only these explicit fields.
+    """
+
+    repository_name: str
+    base_branch: str
+    target_branch: str
+    implementation_scope: tuple[str, ...]
+    allow_auto_merge: bool = False
+    allow_auto_deploy: bool = False
+    allow_destructive_actions: bool = False
+    allow_permission_expansion: bool = False
+    allow_database_migrations: bool = False
+    allow_secret_changes: bool = False
+    allow_scope_or_repo_changes: bool = False
+    max_fix_cycles: int = 2
+    max_child_runs: int = 8
+    max_wall_clock_seconds: int = 6 * 60 * 60
+    # Conservative unit counter until exact credits are available.
+    max_credit_units: int = 8
+    credit_unit_per_child_run: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repository_name": self.repository_name,
+            "base_branch": self.base_branch,
+            "target_branch": self.target_branch,
+            "implementation_scope": list(self.implementation_scope),
+            "allow_auto_merge": self.allow_auto_merge,
+            "allow_auto_deploy": self.allow_auto_deploy,
+            "allow_destructive_actions": self.allow_destructive_actions,
+            "allow_permission_expansion": self.allow_permission_expansion,
+            "allow_database_migrations": self.allow_database_migrations,
+            "allow_secret_changes": self.allow_secret_changes,
+            "allow_scope_or_repo_changes": self.allow_scope_or_repo_changes,
+            "max_fix_cycles": self.max_fix_cycles,
+            "max_child_runs": self.max_child_runs,
+            "max_wall_clock_seconds": self.max_wall_clock_seconds,
+            "max_credit_units": self.max_credit_units,
+            "credit_unit_per_child_run": self.credit_unit_per_child_run,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorkflowPolicySnapshot:
+        scope = data.get("implementation_scope") or []
+        if not isinstance(scope, list):
+            scope = []
+        return cls(
+            repository_name=str(data.get("repository_name") or ""),
+            base_branch=str(data.get("base_branch") or ""),
+            target_branch=str(data.get("target_branch") or ""),
+            implementation_scope=tuple(str(p) for p in scope),
+            allow_auto_merge=bool(data.get("allow_auto_merge", False)),
+            allow_auto_deploy=bool(data.get("allow_auto_deploy", False)),
+            allow_destructive_actions=bool(
+                data.get("allow_destructive_actions", False)
+            ),
+            allow_permission_expansion=bool(
+                data.get("allow_permission_expansion", False)
+            ),
+            allow_database_migrations=bool(
+                data.get("allow_database_migrations", False)
+            ),
+            allow_secret_changes=bool(data.get("allow_secret_changes", False)),
+            allow_scope_or_repo_changes=bool(
+                data.get("allow_scope_or_repo_changes", False)
+            ),
+            max_fix_cycles=int(data.get("max_fix_cycles", 2)),
+            max_child_runs=int(data.get("max_child_runs", 8)),
+            max_wall_clock_seconds=int(
+                data.get("max_wall_clock_seconds", 6 * 60 * 60)
+            ),
+            max_credit_units=int(data.get("max_credit_units", 8)),
+            credit_unit_per_child_run=int(
+                data.get("credit_unit_per_child_run", 1)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowStepSpec:
+    """Exact mission template for a step (no prose inference)."""
+
+    step_type: StepType
+    mission_yaml: str
+    # Optional machine label for audit / fingerprints.
+    label: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step_type": self.step_type.value,
+            "mission_yaml": self.mission_yaml,
+            "label": self.label,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorkflowStepSpec:
+        return cls(
+            step_type=StepType(str(data["step_type"])),
+            mission_yaml=str(data.get("mission_yaml") or ""),
+            label=(
+                str(data["label"])
+                if data.get("label") is not None
+                else None
+            ),
+        )
+
+
+@dataclass
+class WorkflowStepRecord:
+    """Durable workflow step row."""
+
+    step_id: str
+    workflow_id: str
+    step_type: StepType
+    status: StepStatus
+    attempt: int
+    cycle: int
+    idempotency_key: str | None
+    child_run_id: str | None
+    parent_run_id: str | None
+    mission_yaml: str
+    policy_snapshot: dict[str, Any]
+    last_decision: dict[str, Any] | None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    error: str | None = None
+    blocker_fingerprint: str | None = None
+
+
+@dataclass
+class WorkflowRecord:
+    """Durable workflow row."""
+
+    workflow_id: str
+    state: WorkflowState
+    version: int
+    policy_snapshot: WorkflowPolicySnapshot
+    step_specs: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    parent_run_id: str | None = None
+    current_step_id: str | None = None
+    fix_cycle_count: int = 0
+    child_run_count: int = 0
+    credit_units_used: int = 0
+    # Reserved for future exact usage metering.
+    credit_usage_actual: float | None = None
+    last_decision: dict[str, Any] | None = None
+    last_blocker_fingerprint: str | None = None
+    error: str | None = None
+    notification_emitted: bool = False
+
+
+@dataclass
+class WorkflowTransitionRecord:
+    """Auditable state / decision transition."""
+
+    transition_id: str
+    workflow_id: str
+    from_state: str
+    to_state: str
+    reason: str
+    detail: dict[str, Any]
+    created_at: datetime
+    step_id: str | None = None
+    child_run_id: str | None = None
+    version_after: int | None = None
+
+
+@dataclass
+class CasResult:
+    """Outcome of a compare-and-swap workflow mutation."""
+
+    ok: bool
+    workflow: WorkflowRecord | None
+    conflict: bool = False
+    error: str | None = None
+
+
+@dataclass
+class LaunchClaimResult:
+    """Result of an at-most-once child launch claim."""
+
+    ok: bool
+    already_claimed: bool
+    child_run_id: str | None
+    idempotency_key: str | None
+    workflow: WorkflowRecord | None
+    step: WorkflowStepRecord | None
+    conflict: bool = False
+    error: str | None = None
+
+
+def make_idempotency_key(
+    workflow_id: str,
+    step_type: StepType | str,
+    cycle: int,
+    attempt: int,
+) -> str:
+    kind = step_type.value if isinstance(step_type, StepType) else str(step_type)
+    return f"{workflow_id}:{kind}:c{cycle}:a{attempt}"
+
+
+class WorkflowRegistry:
+    """Thread-safe SQLite workflow registry with CAS and audit history."""
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self._db_path = os.path.abspath(
+            os.path.expanduser(db_path or resolve_workflow_db_path())
+        )
+        self._lock = threading.Lock()
+        _ensure_db_parent(self._db_path)
+        self._conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
+        self._ensure_schema()
+
+    @property
+    def db_path(self) -> str:
+        return self._db_path
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def _ensure_schema(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_WORKFLOWS_TABLE} (
+                    workflow_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    step_specs_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    parent_run_id TEXT,
+                    current_step_id TEXT,
+                    fix_cycle_count INTEGER NOT NULL DEFAULT 0,
+                    child_run_count INTEGER NOT NULL DEFAULT 0,
+                    credit_units_used INTEGER NOT NULL DEFAULT 0,
+                    credit_usage_actual REAL,
+                    last_decision_json TEXT,
+                    last_blocker_fingerprint TEXT,
+                    error TEXT,
+                    notification_emitted INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_WORKFLOW_STEPS_TABLE} (
+                    step_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    step_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    cycle INTEGER NOT NULL,
+                    idempotency_key TEXT,
+                    child_run_id TEXT,
+                    parent_run_id TEXT,
+                    mission_yaml TEXT NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    last_decision_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    error TEXT,
+                    blocker_fingerprint TEXT,
+                    UNIQUE (idempotency_key)
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow
+                ON {_WORKFLOW_STEPS_TABLE}(workflow_id)
+                """
+            )
+            self._conn.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_workflow_steps_child
+                ON {_WORKFLOW_STEPS_TABLE}(child_run_id)
+                """
+            )
+            self._conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_WORKFLOW_TRANSITIONS_TABLE} (
+                    transition_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    step_id TEXT,
+                    child_run_id TEXT,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    detail_json TEXT NOT NULL,
+                    version_after INTEGER,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_workflow_transitions_workflow
+                ON {_WORKFLOW_TRANSITIONS_TABLE}(workflow_id, created_at)
+                """
+            )
+            self._conn.commit()
+
+    def _row_to_workflow(self, row: sqlite3.Row) -> WorkflowRecord:
+        return WorkflowRecord(
+            workflow_id=row["workflow_id"],
+            state=WorkflowState(row["state"]),
+            version=int(row["version"]),
+            policy_snapshot=WorkflowPolicySnapshot.from_dict(
+                _loads(row["policy_json"], {})
+            ),
+            step_specs=_loads(row["step_specs_json"], {}),
+            created_at=_parse_dt(row["created_at"]) or _utc_now(),
+            updated_at=_parse_dt(row["updated_at"]) or _utc_now(),
+            started_at=_parse_dt(row["started_at"]),
+            completed_at=_parse_dt(row["completed_at"]),
+            parent_run_id=row["parent_run_id"],
+            current_step_id=row["current_step_id"],
+            fix_cycle_count=int(row["fix_cycle_count"] or 0),
+            child_run_count=int(row["child_run_count"] or 0),
+            credit_units_used=int(row["credit_units_used"] or 0),
+            credit_usage_actual=row["credit_usage_actual"],
+            last_decision=_loads(row["last_decision_json"], None),
+            last_blocker_fingerprint=row["last_blocker_fingerprint"],
+            error=row["error"],
+            notification_emitted=bool(row["notification_emitted"]),
+        )
+
+    def _row_to_step(self, row: sqlite3.Row) -> WorkflowStepRecord:
+        return WorkflowStepRecord(
+            step_id=row["step_id"],
+            workflow_id=row["workflow_id"],
+            step_type=StepType(row["step_type"]),
+            status=StepStatus(row["status"]),
+            attempt=int(row["attempt"]),
+            cycle=int(row["cycle"]),
+            idempotency_key=row["idempotency_key"],
+            child_run_id=row["child_run_id"],
+            parent_run_id=row["parent_run_id"],
+            mission_yaml=row["mission_yaml"] or "",
+            policy_snapshot=_loads(row["policy_json"], {}),
+            last_decision=_loads(row["last_decision_json"], None),
+            created_at=_parse_dt(row["created_at"]) or _utc_now(),
+            updated_at=_parse_dt(row["updated_at"]) or _utc_now(),
+            started_at=_parse_dt(row["started_at"]),
+            completed_at=_parse_dt(row["completed_at"]),
+            error=row["error"],
+            blocker_fingerprint=row["blocker_fingerprint"],
+        )
+
+    def _row_to_transition(
+        self, row: sqlite3.Row
+    ) -> WorkflowTransitionRecord:
+        return WorkflowTransitionRecord(
+            transition_id=row["transition_id"],
+            workflow_id=row["workflow_id"],
+            from_state=row["from_state"],
+            to_state=row["to_state"],
+            reason=row["reason"],
+            detail=_loads(row["detail_json"], {}),
+            created_at=_parse_dt(row["created_at"]) or _utc_now(),
+            step_id=row["step_id"],
+            child_run_id=row["child_run_id"],
+            version_after=(
+                int(row["version_after"])
+                if row["version_after"] is not None
+                else None
+            ),
+        )
+
+    def _fetch_workflow_unlocked(
+        self, workflow_id: str
+    ) -> WorkflowRecord | None:
+        row = self._conn.execute(
+            f"SELECT * FROM {_WORKFLOWS_TABLE} WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_workflow(row)
+
+    def _fetch_step_unlocked(self, step_id: str) -> WorkflowStepRecord | None:
+        row = self._conn.execute(
+            f"SELECT * FROM {_WORKFLOW_STEPS_TABLE} WHERE step_id = ?",
+            (step_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_step(row)
+
+    def _list_steps_unlocked(
+        self, workflow_id: str
+    ) -> list[WorkflowStepRecord]:
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM {_WORKFLOW_STEPS_TABLE}
+            WHERE workflow_id = ?
+            ORDER BY created_at ASC, step_id ASC
+            """,
+            (workflow_id,),
+        ).fetchall()
+        return [self._row_to_step(row) for row in rows]
+
+    def _append_transition_unlocked(
+        self,
+        *,
+        workflow_id: str,
+        from_state: str,
+        to_state: str,
+        reason: str,
+        detail: dict[str, Any],
+        version_after: int | None,
+        step_id: str | None = None,
+        child_run_id: str | None = None,
+    ) -> WorkflowTransitionRecord:
+        now = _utc_now()
+        record = WorkflowTransitionRecord(
+            transition_id=str(uuid.uuid4()),
+            workflow_id=workflow_id,
+            from_state=from_state,
+            to_state=to_state,
+            reason=reason,
+            detail=detail,
+            created_at=now,
+            step_id=step_id,
+            child_run_id=child_run_id,
+            version_after=version_after,
+        )
+        self._conn.execute(
+            f"""
+            INSERT INTO {_WORKFLOW_TRANSITIONS_TABLE} (
+                transition_id, workflow_id, step_id, child_run_id,
+                from_state, to_state, reason, detail_json,
+                version_after, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.transition_id,
+                record.workflow_id,
+                record.step_id,
+                record.child_run_id,
+                record.from_state,
+                record.to_state,
+                record.reason,
+                _dumps(record.detail),
+                record.version_after,
+                _format_dt(record.created_at),
+            ),
+        )
+        return record
+
+    def create_workflow(
+        self,
+        *,
+        policy: WorkflowPolicySnapshot,
+        implementation: WorkflowStepSpec,
+        review: WorkflowStepSpec,
+        fix: WorkflowStepSpec | None = None,
+        re_review: WorkflowStepSpec | None = None,
+        parent_run_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> WorkflowRecord:
+        """Create a workflow in ``pending`` with immutable policy + templates."""
+        if not policy.repository_name or not policy.target_branch:
+            raise ValueError(
+                "policy.repository_name and policy.target_branch are required"
+            )
+        if not implementation.mission_yaml.strip():
+            raise ValueError("implementation mission_yaml is required")
+        if not review.mission_yaml.strip():
+            raise ValueError("review mission_yaml is required")
+        if implementation.step_type is not StepType.IMPLEMENTATION:
+            raise ValueError("implementation spec must use step_type=implementation")
+        if review.step_type is not StepType.REVIEW:
+            raise ValueError("review spec must use step_type=review")
+
+        specs: dict[str, Any] = {
+            "implementation": implementation.to_dict(),
+            "review": review.to_dict(),
+        }
+        if fix is not None:
+            if fix.step_type is not StepType.FIX:
+                raise ValueError("fix spec must use step_type=fix")
+            specs["fix"] = fix.to_dict()
+        if re_review is not None:
+            if re_review.step_type is not StepType.RE_REVIEW:
+                raise ValueError("re_review spec must use step_type=re_review")
+            specs["re_review"] = re_review.to_dict()
+
+        now = _utc_now()
+        wid = workflow_id or str(uuid.uuid4())
+        record = WorkflowRecord(
+            workflow_id=wid,
+            state=WorkflowState.PENDING,
+            version=1,
+            policy_snapshot=policy,
+            step_specs=specs,
+            created_at=now,
+            updated_at=now,
+            parent_run_id=parent_run_id,
+            last_decision={"action": "submitted"},
+        )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {_WORKFLOWS_TABLE} (
+                        workflow_id, state, version, policy_json,
+                        step_specs_json, created_at, updated_at,
+                        started_at, completed_at, parent_run_id,
+                        current_step_id, fix_cycle_count, child_run_count,
+                        credit_units_used, credit_usage_actual,
+                        last_decision_json, last_blocker_fingerprint,
+                        error, notification_emitted
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL,
+                        0, 0, 0, NULL, ?, NULL, NULL, 0
+                    )
+                    """,
+                    (
+                        record.workflow_id,
+                        record.state.value,
+                        record.version,
+                        _dumps(policy.to_dict()),
+                        _dumps(specs),
+                        _format_dt(record.created_at),
+                        _format_dt(record.updated_at),
+                        parent_run_id,
+                        _dumps(record.last_decision),
+                    ),
+                )
+                self._append_transition_unlocked(
+                    workflow_id=wid,
+                    from_state=WorkflowState.PENDING.value,
+                    to_state=WorkflowState.PENDING.value,
+                    reason=TransitionReason.SUBMITTED.value,
+                    detail={"action": "submitted"},
+                    version_after=1,
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        logger.info(
+            "workflow event=created workflow_id=%s state=%s version=%s",
+            wid,
+            record.state.value,
+            record.version,
+        )
+        return record
+
+    def get_workflow(self, workflow_id: str) -> WorkflowRecord | None:
+        with self._lock:
+            return self._fetch_workflow_unlocked(workflow_id)
+
+    def list_steps(self, workflow_id: str) -> list[WorkflowStepRecord]:
+        with self._lock:
+            return self._list_steps_unlocked(workflow_id)
+
+    def get_step(self, step_id: str) -> WorkflowStepRecord | None:
+        with self._lock:
+            return self._fetch_step_unlocked(step_id)
+
+    def get_step_by_child_run(
+        self, child_run_id: str
+    ) -> WorkflowStepRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT * FROM {_WORKFLOW_STEPS_TABLE}
+                WHERE child_run_id = ?
+                """,
+                (child_run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_step(row)
+
+    def list_active_workflows(self) -> list[WorkflowRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM {_WORKFLOWS_TABLE}
+                WHERE state IN (?, ?)
+                ORDER BY created_at ASC
+                """,
+                (WorkflowState.PENDING.value, WorkflowState.RUNNING.value),
+            ).fetchall()
+            return [self._row_to_workflow(row) for row in rows]
+
+    def get_history(
+        self, workflow_id: str
+    ) -> list[WorkflowTransitionRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM {_WORKFLOW_TRANSITIONS_TABLE}
+                WHERE workflow_id = ?
+                ORDER BY created_at ASC, transition_id ASC
+                """,
+                (workflow_id,),
+            ).fetchall()
+            return [self._row_to_transition(row) for row in rows]
+
+    def claim_child_launch(
+        self,
+        *,
+        workflow_id: str,
+        expected_version: int,
+        step_type: StepType,
+        mission_yaml: str,
+        cycle: int,
+        attempt: int,
+        parent_run_id: str | None,
+        idempotency_key: str | None = None,
+        decision: dict[str, Any] | None = None,
+    ) -> LaunchClaimResult:
+        """Reserve a child run id under CAS + durable idempotency key.
+
+        Restart-safe: repeating the same key returns the same
+        ``child_run_id`` without creating another step.
+        """
+        key = idempotency_key or make_idempotency_key(
+            workflow_id, step_type, cycle, attempt
+        )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                workflow = self._fetch_workflow_unlocked(workflow_id)
+                if workflow is None:
+                    self._conn.rollback()
+                    return LaunchClaimResult(
+                        ok=False,
+                        already_claimed=False,
+                        child_run_id=None,
+                        idempotency_key=key,
+                        workflow=None,
+                        step=None,
+                        error="workflow_not_found",
+                    )
+                if is_terminal_workflow_state(workflow.state):
+                    self._conn.rollback()
+                    return LaunchClaimResult(
+                        ok=False,
+                        already_claimed=False,
+                        child_run_id=None,
+                        idempotency_key=key,
+                        workflow=workflow,
+                        step=None,
+                        error="workflow_terminal",
+                    )
+                if workflow.version != expected_version:
+                    self._conn.rollback()
+                    return LaunchClaimResult(
+                        ok=False,
+                        already_claimed=False,
+                        child_run_id=None,
+                        idempotency_key=key,
+                        workflow=workflow,
+                        step=None,
+                        conflict=True,
+                        error="version_conflict",
+                    )
+
+                existing = self._conn.execute(
+                    f"""
+                    SELECT * FROM {_WORKFLOW_STEPS_TABLE}
+                    WHERE idempotency_key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                if existing is not None:
+                    step = self._row_to_step(existing)
+                    self._conn.commit()
+                    return LaunchClaimResult(
+                        ok=True,
+                        already_claimed=True,
+                        child_run_id=step.child_run_id,
+                        idempotency_key=key,
+                        workflow=workflow,
+                        step=step,
+                    )
+
+                now = _utc_now()
+                step_id = str(uuid.uuid4())
+                child_run_id = str(uuid.uuid4())
+                policy_json = _dumps(workflow.policy_snapshot.to_dict())
+                decision_payload = decision or {
+                    "action": "launch_child",
+                    "step_type": step_type.value,
+                }
+                new_version = workflow.version + 1
+                credit_delta = int(
+                    workflow.policy_snapshot.credit_unit_per_child_run
+                )
+                new_child_count = workflow.child_run_count + 1
+                new_credits = workflow.credit_units_used + credit_delta
+                started_at = workflow.started_at or now
+                state = WorkflowState.RUNNING
+
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {_WORKFLOW_STEPS_TABLE} (
+                        step_id, workflow_id, step_type, status, attempt,
+                        cycle, idempotency_key, child_run_id, parent_run_id,
+                        mission_yaml, policy_json, last_decision_json,
+                        created_at, updated_at, started_at, completed_at,
+                        error, blocker_fingerprint
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL,
+                        NULL, NULL
+                    )
+                    """,
+                    (
+                        step_id,
+                        workflow_id,
+                        step_type.value,
+                        StepStatus.QUEUED.value,
+                        attempt,
+                        cycle,
+                        key,
+                        child_run_id,
+                        parent_run_id,
+                        mission_yaml,
+                        policy_json,
+                        _dumps(decision_payload),
+                        _format_dt(now),
+                        _format_dt(now),
+                        _format_dt(now),
+                    ),
+                )
+                self._conn.execute(
+                    f"""
+                    UPDATE {_WORKFLOWS_TABLE}
+                    SET state = ?,
+                        version = ?,
+                        updated_at = ?,
+                        started_at = ?,
+                        current_step_id = ?,
+                        child_run_count = ?,
+                        credit_units_used = ?,
+                        last_decision_json = ?
+                    WHERE workflow_id = ? AND version = ?
+                    """,
+                    (
+                        state.value,
+                        new_version,
+                        _format_dt(now),
+                        _format_dt(started_at),
+                        step_id,
+                        new_child_count,
+                        new_credits,
+                        _dumps(decision_payload),
+                        workflow_id,
+                        expected_version,
+                    ),
+                )
+                if self._conn.total_changes < 1:
+                    self._conn.rollback()
+                    latest = self._fetch_workflow_unlocked(workflow_id)
+                    return LaunchClaimResult(
+                        ok=False,
+                        already_claimed=False,
+                        child_run_id=None,
+                        idempotency_key=key,
+                        workflow=latest,
+                        step=None,
+                        conflict=True,
+                        error="version_conflict",
+                    )
+                self._append_transition_unlocked(
+                    workflow_id=workflow_id,
+                    from_state=workflow.state.value,
+                    to_state=state.value,
+                    reason=TransitionReason.CHILD_LAUNCHED.value,
+                    detail={
+                        "step_type": step_type.value,
+                        "idempotency_key": key,
+                        "child_run_id": child_run_id,
+                        "cycle": cycle,
+                        "attempt": attempt,
+                    },
+                    version_after=new_version,
+                    step_id=step_id,
+                    child_run_id=child_run_id,
+                )
+                self._conn.commit()
+                workflow = self._fetch_workflow_unlocked(workflow_id)
+                step = self._fetch_step_unlocked(step_id)
+                logger.info(
+                    (
+                        "workflow event=child_launch_claimed workflow_id=%s "
+                        "step_id=%s child_run_id=%s step_type=%s "
+                        "idempotency_key=%s version=%s"
+                    ),
+                    workflow_id,
+                    step_id,
+                    child_run_id,
+                    step_type.value,
+                    key,
+                    new_version,
+                )
+                return LaunchClaimResult(
+                    ok=True,
+                    already_claimed=False,
+                    child_run_id=child_run_id,
+                    idempotency_key=key,
+                    workflow=workflow,
+                    step=step,
+                )
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def apply_cas_transition(
+        self,
+        *,
+        workflow_id: str,
+        expected_version: int,
+        to_state: WorkflowState,
+        reason: TransitionReason | str,
+        detail: dict[str, Any] | None = None,
+        step_updates: dict[str, Any] | None = None,
+        workflow_updates: dict[str, Any] | None = None,
+        step_id: str | None = None,
+        child_run_id: str | None = None,
+    ) -> CasResult:
+        """Atomically advance workflow state when ``version`` matches."""
+        reason_value = (
+            reason.value if isinstance(reason, TransitionReason) else str(reason)
+        )
+        detail = detail or {}
+        workflow_updates = dict(workflow_updates or {})
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                workflow = self._fetch_workflow_unlocked(workflow_id)
+                if workflow is None:
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False, workflow=None, error="workflow_not_found"
+                    )
+                if workflow.version != expected_version:
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False,
+                        workflow=workflow,
+                        conflict=True,
+                        error="version_conflict",
+                    )
+                if (
+                    is_terminal_workflow_state(workflow.state)
+                    and to_state is not workflow.state
+                ):
+                    # Allow cancel only from non-terminal; reject other mutations.
+                    if workflow.state is not WorkflowState.CANCELLED:
+                        self._conn.rollback()
+                        return CasResult(
+                            ok=False,
+                            workflow=workflow,
+                            error="workflow_terminal",
+                        )
+
+                now = _utc_now()
+                new_version = workflow.version + 1
+                completed_at = workflow.completed_at
+                if is_terminal_workflow_state(to_state) and completed_at is None:
+                    completed_at = now
+
+                last_decision = workflow_updates.pop(
+                    "last_decision", detail or workflow.last_decision
+                )
+                error = workflow_updates.pop("error", workflow.error)
+                fix_cycle_count = workflow_updates.pop(
+                    "fix_cycle_count", workflow.fix_cycle_count
+                )
+                last_blocker = workflow_updates.pop(
+                    "last_blocker_fingerprint",
+                    workflow.last_blocker_fingerprint,
+                )
+                notification_emitted = workflow_updates.pop(
+                    "notification_emitted",
+                    workflow.notification_emitted,
+                )
+                current_step_id = workflow_updates.pop(
+                    "current_step_id", workflow.current_step_id
+                )
+
+                self._conn.execute(
+                    f"""
+                    UPDATE {_WORKFLOWS_TABLE}
+                    SET state = ?,
+                        version = ?,
+                        updated_at = ?,
+                        completed_at = ?,
+                        current_step_id = ?,
+                        fix_cycle_count = ?,
+                        last_decision_json = ?,
+                        last_blocker_fingerprint = ?,
+                        error = ?,
+                        notification_emitted = ?
+                    WHERE workflow_id = ? AND version = ?
+                    """,
+                    (
+                        to_state.value,
+                        new_version,
+                        _format_dt(now),
+                        _format_dt(completed_at),
+                        current_step_id,
+                        int(fix_cycle_count),
+                        _dumps(last_decision) if last_decision is not None else None,
+                        last_blocker,
+                        error,
+                        1 if notification_emitted else 0,
+                        workflow_id,
+                        expected_version,
+                    ),
+                )
+                if self._conn.total_changes < 1:
+                    self._conn.rollback()
+                    latest = self._fetch_workflow_unlocked(workflow_id)
+                    return CasResult(
+                        ok=False,
+                        workflow=latest,
+                        conflict=True,
+                        error="version_conflict",
+                    )
+
+                if step_id and step_updates:
+                    self._apply_step_updates_unlocked(
+                        step_id=step_id,
+                        updates=step_updates,
+                        now=now,
+                    )
+
+                self._append_transition_unlocked(
+                    workflow_id=workflow_id,
+                    from_state=workflow.state.value,
+                    to_state=to_state.value,
+                    reason=reason_value,
+                    detail=detail,
+                    version_after=new_version,
+                    step_id=step_id,
+                    child_run_id=child_run_id,
+                )
+                self._conn.commit()
+                updated = self._fetch_workflow_unlocked(workflow_id)
+                logger.info(
+                    (
+                        "workflow event=transition workflow_id=%s "
+                        "from=%s to=%s reason=%s version=%s"
+                    ),
+                    workflow_id,
+                    workflow.state.value,
+                    to_state.value,
+                    reason_value,
+                    new_version,
+                )
+                return CasResult(ok=True, workflow=updated)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _apply_step_updates_unlocked(
+        self,
+        *,
+        step_id: str,
+        updates: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        step = self._fetch_step_unlocked(step_id)
+        if step is None:
+            return
+        status = updates.get("status", step.status)
+        if isinstance(status, StepStatus):
+            status_value = status.value
+        else:
+            status_value = str(status)
+        error = updates.get("error", step.error)
+        last_decision = updates.get("last_decision", step.last_decision)
+        blocker = updates.get("blocker_fingerprint", step.blocker_fingerprint)
+        started_at = step.started_at
+        completed_at = step.completed_at
+        if status_value == StepStatus.RUNNING.value and started_at is None:
+            started_at = now
+        if status_value in {
+            StepStatus.COMPLETED.value,
+            StepStatus.FAILED.value,
+            StepStatus.TIMED_OUT.value,
+            StepStatus.CANCELLED.value,
+        }:
+            completed_at = completed_at or now
+        self._conn.execute(
+            f"""
+            UPDATE {_WORKFLOW_STEPS_TABLE}
+            SET status = ?,
+                updated_at = ?,
+                started_at = ?,
+                completed_at = ?,
+                error = ?,
+                last_decision_json = ?,
+                blocker_fingerprint = ?
+            WHERE step_id = ?
+            """,
+            (
+                status_value,
+                _format_dt(now),
+                _format_dt(started_at),
+                _format_dt(completed_at),
+                error,
+                _dumps(last_decision) if last_decision is not None else None,
+                blocker,
+                step_id,
+            ),
+        )
+
+    def sync_step_from_child_status(
+        self,
+        *,
+        workflow_id: str,
+        expected_version: int,
+        step_id: str,
+        child_status: str,
+        error: str | None = None,
+    ) -> CasResult:
+        """Mark a step running/terminal from child run status (CAS)."""
+        status_map = {
+            "queued": StepStatus.QUEUED,
+            "running": StepStatus.RUNNING,
+            "completed": StepStatus.COMPLETED,
+            "failed": StepStatus.FAILED,
+            "timed_out": StepStatus.TIMED_OUT,
+            "cancelled": StepStatus.CANCELLED,
+        }
+        step_status = status_map.get(child_status)
+        if step_status is None:
+            return CasResult(
+                ok=False,
+                workflow=self.get_workflow(workflow_id),
+                error="unknown_child_status",
+            )
+        workflow = self.get_workflow(workflow_id)
+        if workflow is None:
+            return CasResult(ok=False, workflow=None, error="workflow_not_found")
+        to_state = workflow.state
+        if to_state is WorkflowState.PENDING:
+            to_state = WorkflowState.RUNNING
+        return self.apply_cas_transition(
+            workflow_id=workflow_id,
+            expected_version=expected_version,
+            to_state=to_state,
+            reason=TransitionReason.CHILD_STATUS,
+            detail={"child_status": child_status},
+            step_id=step_id,
+            step_updates={
+                "status": step_status,
+                "error": error,
+                "last_decision": {"child_status": child_status},
+            },
+            child_run_id=None,
+        )
+
+    def cancel_workflow(
+        self,
+        workflow_id: str,
+        *,
+        expected_version: int | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> CasResult:
+        """Cancel a non-terminal workflow (CAS when version supplied)."""
+        with self._lock:
+            workflow = self._fetch_workflow_unlocked(workflow_id)
+        if workflow is None:
+            return CasResult(ok=False, workflow=None, error="workflow_not_found")
+        if is_terminal_workflow_state(workflow.state):
+            return CasResult(
+                ok=False, workflow=workflow, error="workflow_terminal"
+            )
+        version = (
+            expected_version
+            if expected_version is not None
+            else workflow.version
+        )
+        return self.apply_cas_transition(
+            workflow_id=workflow_id,
+            expected_version=version,
+            to_state=WorkflowState.CANCELLED,
+            reason=TransitionReason.CANCELLED,
+            detail=detail or {"action": "cancel"},
+            workflow_updates={
+                "last_decision": {"action": "cancel"},
+                "error": "cancelled_by_operator",
+            },
+        )
+
+    def mark_notification_emitted(
+        self,
+        workflow_id: str,
+        *,
+        expected_version: int,
+    ) -> CasResult:
+        """Record that the single actionable workflow alert was emitted."""
+        workflow = self.get_workflow(workflow_id)
+        if workflow is None:
+            return CasResult(ok=False, workflow=None, error="workflow_not_found")
+        return self.apply_cas_transition(
+            workflow_id=workflow_id,
+            expected_version=expected_version,
+            to_state=workflow.state,
+            reason=TransitionReason.RECONCILE,
+            detail={"notification_emitted": True},
+            workflow_updates={"notification_emitted": True},
+        )
