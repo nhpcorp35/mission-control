@@ -93,7 +93,7 @@ _URL_SECRET_QUERY_RE = re.compile(
     r"secret|token)=)([^&\s#]+)"
 )
 _BASIC_AUTH_HEADER_RE = re.compile(
-    r"(?i)(authorization:\s*basic\s+)([A-Za-z0-9+/=]+)"
+    r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?basic\s+)([^\s\"']+)"
 )
 _X_ACCESS_TOKEN_RE = re.compile(r"(?i)(x-access-token:)(\S+)")
 _SECRET_QUERY_PARAM_NAMES = frozenset(
@@ -895,20 +895,20 @@ def _redact_secret_text(message: str) -> str:
         redacted = redacted.replace(token, "***")
     redacted = _URL_USERINFO_RE.sub(r"\1***@", redacted)
     redacted = _URL_SECRET_QUERY_RE.sub(r"\1***", redacted)
-    # Bearer must run before generic Authorization= so "Authorization: Bearer
-    # <token>" does not treat the word Bearer as the secret value.
+    # Bearer/Basic must run before generic Authorization= so scheme words are
+    # not treated as the secret while the real credential suffix survives.
     redacted = re.sub(
         r"(?i)(Authorization:\s*Bearer\s+)\S+",
         r"\1***",
         redacted,
     )
     redacted = re.sub(r"(?i)(\bBearer\s+)\S+", r"\1***", redacted)
+    redacted = _BASIC_AUTH_HEADER_RE.sub(r"\1***", redacted)
     redacted = re.sub(
-        r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)(?!Bearer\b)([^\s\"']+)",
+        r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)(?!Bearer\b|Basic\b)([^\s\"']+)",
         r"\1***",
         redacted,
     )
-    redacted = _BASIC_AUTH_HEADER_RE.sub(r"\1***", redacted)
     redacted = _X_ACCESS_TOKEN_RE.sub(r"\1***", redacted)
     return redacted
 

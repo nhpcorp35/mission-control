@@ -839,6 +839,35 @@ class TestCloneErrorRedaction(unittest.TestCase):
         self.assertIn("access_token=***", redacted)
         self.assertIn("Bearer ***", redacted)
 
+    def test_redact_basic_authorization_credential(self) -> None:
+        """Basic must redact the credential, not only the scheme word."""
+        sentinel = "dXNlcjpTRU5USU5FTF9CQVNJQ19TRUNSRVQ="
+        cases = (
+            f"Authorization: Basic {sentinel}",
+            f"AUTHORIZATION: BASIC {sentinel}",
+            f"authorization = Basic  {sentinel}",
+            f"authorization:basic {sentinel}",
+            f'Authorization: "Basic {sentinel}"',
+            f"Authorization: Basic {sentinel}.",
+            f"Authorization: Basic {sentinel})",
+            f"Authorization:\nBasic\t{sentinel}",
+            f"Authorization: Basic {sentinel} and Authorization: Basic {sentinel}",
+            f"Authorization: Basic !!not-base64!!{sentinel}",
+            "Authorization: Basic",
+            "Authorization: Basic ",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                redacted = _redact_secret_text(raw)
+                self.assertNotIn(sentinel, redacted)
+                self.assertNotIn("SENTINEL_BASIC_SECRET", redacted)
+                if sentinel in raw or "!!not-base64!!" in raw:
+                    self.assertRegex(redacted, r"(?i)basic\s+\*\*\*")
+                    self.assertNotRegex(
+                        redacted,
+                        r"(?i)Authorization:\s*\*\*\*\s+\S+",
+                    )
+
     def test_argv_safe_url_strips_userinfo_and_secret_query(self) -> None:
         safe, userinfo = _argv_safe_repository_url(
             "https://x-access-token:ghs_SECRET@github.com/org/repo.git"
@@ -876,6 +905,7 @@ class TestCloneErrorRedaction(unittest.TestCase):
                 stderr=(
                     f"fatal: could not read Username for '{secret_url}': "
                     "Authorization: Bearer ghs_NESTED_SECRET "
+                    "Authorization: Basic dXNlcjpORVNURURfQkFTSUNfU0VDUkVU "
                     "x-access-token:ghs_NESTED_SECRET"
                 ),
             )
@@ -890,7 +920,10 @@ class TestCloneErrorRedaction(unittest.TestCase):
         self.assertNotIn("passw0rd_LEAK", error)
         self.assertNotIn("leak_token", error)
         self.assertNotIn("ghs_NESTED_SECRET", error)
+        self.assertNotIn("NESTED_BASIC_SECRET", error)
+        self.assertNotIn("dXNlcjpORVNURURfQkFTSUNfU0VDUkVU", error)
         self.assertIn("https://***@", error)
+        self.assertIn("Basic ***", error)
         for args in captured_argv:
             joined = " ".join(args)
             self.assertNotIn("passw0rd_LEAK", joined)
