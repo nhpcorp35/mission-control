@@ -165,8 +165,22 @@ API, MCP, Unified, or database inspection payloads.
 - Transient failures retry with exponential backoff up to max attempts, then
   `dead`. Permanent URL/credential validation failures mark `dead` without
   mutating runs.
-- Pushover success requires HTTP 2xx **and** JSON `status: 1`. Invalid
-  credentials / other 4xx (except 429) are permanent; 429/5xx/timeouts retry.
+- Pushover success requires HTTP 2xx **and** JSON integer `status: 1` only
+  (boolean `true`, string `"1"`, floats, missing status, lists, and
+  malformed/non-JSON bodies are never success).
+- Any syntactically valid Pushover JSON object whose integer `status` is not
+  `1` (including HTTP 2xx with `status: 0`) is a **permanent** delivery
+  failure: the outbox row goes `dead` immediately and is not retried.
+  Normalized `last_error` is `pushover_rejected` (provider error text that
+  mentions tokens/keys is redacted; response credential echoes are never
+  stored).
+- Ordinary non-retryable 4xx (for example 400/401/403) remain permanent;
+  transport exceptions, timeouts, HTTP 429, and HTTP 5xx remain retryable.
+- Malformed / empty / non-JSON HTTP 2xx bodies (acceptance uncertain) are
+  **retryable** up to max attempts, then `dead`. They are never marked
+  `delivered`.
+- Optional `PUSHOVER_DEVICE` / `PUSHOVER_SOUND` values that contain ASCII
+  control characters are rejected (option omitted) rather than forwarded.
 
 ### Inspection workflow (redacted)
 

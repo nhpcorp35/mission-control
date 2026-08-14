@@ -300,6 +300,31 @@ def _env_optional_str(
     return raw[:max_chars]
 
 
+def _has_ascii_control_chars(value: str) -> bool:
+    """True when ``value`` contains ASCII C0 controls or DEL."""
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def sanitize_pushover_device_or_sound(
+    raw: str | None,
+    *,
+    max_chars: int,
+) -> str | None:
+    """Reject optional device/sound values that contain control characters.
+
+    Control characters are omitted entirely (option unset) rather than stripped
+    into a different effective name. Printable text is length-bounded.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if _has_ascii_control_chars(text):
+        return None
+    return text[:max_chars]
+
+
 def parse_pushover_priority(raw: str | None) -> int:
     """Parse Pushover priority; reject emergency (2) and unknown values."""
     if raw is None or not str(raw).strip():
@@ -330,11 +355,17 @@ def load_notification_config(
     pushover_token = _env_optional_str(
         PUSHOVER_APP_TOKEN_ENV, environ=env, max_chars=128
     )
-    pushover_device = _env_optional_str(
-        PUSHOVER_DEVICE_ENV, environ=env, max_chars=PUSHOVER_DEVICE_MAX_CHARS
+    pushover_device = sanitize_pushover_device_or_sound(
+        _env_optional_str(
+            PUSHOVER_DEVICE_ENV, environ=env, max_chars=PUSHOVER_DEVICE_MAX_CHARS
+        ),
+        max_chars=PUSHOVER_DEVICE_MAX_CHARS,
     )
-    pushover_sound = _env_optional_str(
-        PUSHOVER_SOUND_ENV, environ=env, max_chars=PUSHOVER_SOUND_MAX_CHARS
+    pushover_sound = sanitize_pushover_device_or_sound(
+        _env_optional_str(
+            PUSHOVER_SOUND_ENV, environ=env, max_chars=PUSHOVER_SOUND_MAX_CHARS
+        ),
+        max_chars=PUSHOVER_SOUND_MAX_CHARS,
     )
     try:
         pushover_priority = parse_pushover_priority(
@@ -661,14 +692,32 @@ def build_pushover_form(
         "priority": str(int(priority)),
     }
     if device:
-        form["device"] = str(device)[:PUSHOVER_DEVICE_MAX_CHARS]
+        safe_device = sanitize_pushover_device_or_sound(
+            device, max_chars=PUSHOVER_DEVICE_MAX_CHARS
+        )
+        if safe_device:
+            form["device"] = safe_device
     if sound:
-        form["sound"] = str(sound)[:PUSHOVER_SOUND_MAX_CHARS]
+        safe_sound = sanitize_pushover_device_or_sound(
+            sound, max_chars=PUSHOVER_SOUND_MAX_CHARS
+        )
+        if safe_sound:
+            form["sound"] = safe_sound
     return form
 
 
+def _pushover_status_is_integer_one(status: Any) -> bool:
+    """True only for JSON integer ``1`` (not bool, str, float, or missing)."""
+    # bool is a subclass of int — reject True/False explicitly.
+    return isinstance(status, int) and not isinstance(status, bool) and status == 1
+
+
 def is_pushover_success_response(response: httpx.Response) -> bool:
-    """Treat only HTTP 2xx with JSON ``status == 1`` as delivered."""
+    """Treat only HTTP 2xx with JSON integer ``status == 1`` as delivered.
+
+    Boolean ``true``, string ``\"1\"``, floats, missing status, non-objects, and
+    malformed/non-JSON bodies are never success.
+    """
     if not (200 <= response.status_code < 300):
         return False
     try:
@@ -677,17 +726,15 @@ def is_pushover_success_response(response: httpx.Response) -> bool:
         return False
     if not isinstance(body, Mapping):
         return False
-    try:
-        return int(body.get("status", 0)) == 1
-    except (TypeError, ValueError):
-        return False
+    return _pushover_status_is_integer_one(body.get("status"))
 
 
 def classify_pushover_http_failure(status_code: int) -> tuple[str, bool]:
-    """Return ``(error_code, retryable)`` for a non-success Pushover response.
+    """Return ``(error_code, retryable)`` for a non-success Pushover HTTP code.
 
     Invalid credentials and other 4xx (except 429) are permanent. Timeouts are
-    handled separately. 429 and 5xx are retryable.
+    handled separately. 429 and 5xx are retryable. HTTP 2xx with a rejected or
+    malformed JSON body must use ``classify_pushover_response`` instead.
     """
     if status_code == 429:
         return "pushover_rate_limited", True
@@ -698,6 +745,58 @@ def classify_pushover_http_failure(status_code: int) -> tuple[str, bool]:
     if 400 <= status_code <= 499:
         return f"pushover_http_{status_code}", False
     return f"pushover_http_{status_code}", True
+
+
+def _normalize_pushover_rejection_error(body: Mapping[str, Any]) -> str:
+    """Stable permanent-failure code; never echo provider credential fields."""
+    errors = body.get("errors")
+    hint: str | None = None
+    if isinstance(errors, list) and errors:
+        hint = redact_notification_error(str(errors[0]))
+    elif isinstance(errors, str) and errors.strip():
+        hint = redact_notification_error(errors)
+    if hint and hint != "[redacted]":
+        return f"pushover_rejected:{hint}"
+    return "pushover_rejected"
+
+
+def classify_pushover_response(response: httpx.Response) -> tuple[str, bool]:
+    """Classify a non-success Pushover response for durable outbox semantics.
+
+    Policy:
+    - Syntactically valid JSON object whose ``status`` is an integer other than
+      ``1`` (including ``0``) is a **permanent** rejection, even on HTTP 2xx.
+    - Ordinary non-retryable 4xx stay permanent; 429 and 5xx stay retryable.
+    - Malformed / non-JSON / empty / non-object 2xx bodies, or 2xx bodies whose
+      ``status`` is missing or not an integer, are **retryable** (then ``dead``
+      after max attempts). They are never marked delivered: acceptance is
+      uncertain, so we prefer bounded retries over a false success or an
+      immediate permanent drop.
+    """
+    status_code = int(response.status_code)
+    if not (200 <= status_code < 300):
+        return classify_pushover_http_failure(status_code)
+
+    try:
+        body = response.json()
+    except (ValueError, json.JSONDecodeError, TypeError):
+        return "pushover_malformed_response", True
+
+    if not isinstance(body, Mapping):
+        return "pushover_malformed_response", True
+
+    if "status" not in body:
+        return "pushover_malformed_response", True
+
+    status = body.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        return "pushover_malformed_response", True
+
+    if status != 1:
+        return _normalize_pushover_rejection_error(body), False
+
+    # Integer status 1 but caller decided it was not success — treat as ambiguous.
+    return "pushover_malformed_response", True
 
 
 def post_pushover_message(
@@ -1714,9 +1813,7 @@ class NotificationOutbox:
                 )
                 return
 
-            error, retryable = classify_pushover_http_failure(
-                int(response.status_code)
-            )
+            error, retryable = classify_pushover_response(response)
             if not retryable:
                 self._mark_retry_or_dead(
                     row["event_id"],

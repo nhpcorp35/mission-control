@@ -36,6 +36,7 @@ from mission_control.notifications import (
     NotificationOutbox,
     build_pushover_form,
     classify_pushover_http_failure,
+    classify_pushover_response,
     format_pushover_message,
     format_pushover_title,
     is_notifications_configured,
@@ -45,6 +46,7 @@ from mission_control.notifications import (
     parse_pushover_priority,
     redact_notification_error,
     resolve_delivery_backend,
+    sanitize_pushover_device_or_sound,
 )
 from mission_control.run_registry import (
     RunRegistry,
@@ -175,6 +177,39 @@ class TestPushoverConfig(unittest.TestCase):
             }
         )
         self.assertEqual(cfg.pushover_priority, 0)
+
+    def test_device_and_sound_reject_control_characters(self) -> None:
+        self.assertIsNone(
+            sanitize_pushover_device_or_sound("phone\nname", max_chars=64)
+        )
+        self.assertIsNone(
+            sanitize_pushover_device_or_sound("cos\x00mic", max_chars=32)
+        )
+        self.assertEqual(
+            sanitize_pushover_device_or_sound("iphone", max_chars=64),
+            "iphone",
+        )
+        cfg = load_notification_config(
+            environ={
+                PUSHOVER_USER_KEY_ENV: _TEST_USER,
+                PUSHOVER_APP_TOKEN_ENV: _TEST_TOKEN,
+                PUSHOVER_DEVICE_ENV: "bad\tdevice",
+                PUSHOVER_SOUND_ENV: "good_sound",
+            }
+        )
+        self.assertIsNone(cfg.pushover_device)
+        self.assertEqual(cfg.pushover_sound, "good_sound")
+        form = build_pushover_form(
+            user_key=_TEST_USER,
+            app_token=_TEST_TOKEN,
+            title="t",
+            message="m",
+            priority=0,
+            device="ok\rdevice",
+            sound="pushover",
+        )
+        self.assertNotIn("device", form)
+        self.assertEqual(form["sound"], "pushover")
 
 
 class TestPushoverFormatting(unittest.TestCase):
@@ -330,6 +365,100 @@ class TestPushoverDelivery(unittest.TestCase):
         finally:
             outbox.close()
 
+    def test_http_200_status_zero_permanent_dead_once(self) -> None:
+        """HTTP 2xx + JSON status 0 must dead immediately (no retries)."""
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "status": 0,
+                    "errors": ["application token is invalid"],
+                    "token": _TEST_TOKEN,
+                    "user": _TEST_USER,
+                },
+            )
+
+        outbox = self._outbox(handler, max_attempts=5)
+        try:
+            record = _record(self.registry)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.TERMINAL,
+                    dedupe_key="terminal:status0",
+                )
+                outbox.process_due_deliveries()
+                # A second drain must not re-attempt a permanent dead row.
+                with outbox._lock:
+                    outbox._conn.execute(
+                        "UPDATE notification_outbox SET next_attempt_at = NULL"
+                    )
+                    outbox._conn.commit()
+                outbox.process_due_deliveries()
+            events = outbox.list_for_run(record.run_id)
+            self.assertEqual(events[0]["delivery_state"], "dead")
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(events[0]["attempt_count"], 5)
+            err = events[0]["last_error"] or ""
+            self.assertEqual(err, "pushover_rejected")
+            self.assertNotIn(_TEST_TOKEN, err)
+            self.assertNotIn(_TEST_USER, err)
+            self.assertNotIn("application token", err)
+            self.assertNotIn("token", err.lower())
+            dump = json.dumps(events)
+            self.assertNotIn(_TEST_TOKEN, dump)
+            self.assertNotIn(_TEST_USER, dump)
+        finally:
+            outbox.close()
+
+    def test_status_one_only_success_shapes(self) -> None:
+        """Only JSON integer status 1 counts as success; other shapes fail closed."""
+        self.assertTrue(
+            is_pushover_success_response(
+                httpx.Response(200, json={"status": 1, "request": "x"})
+            )
+        )
+        non_success_bodies = [
+            {"status": True},
+            {"status": "1"},
+            {},  # missing status
+            {"status": [1]},
+            {"status": 1.0},
+            {"status": 0},
+            {"status": 2},
+        ]
+        for body in non_success_bodies:
+            with self.subTest(body=body):
+                response = httpx.Response(200, json=body)
+                self.assertFalse(is_pushover_success_response(response))
+
+        malformed = httpx.Response(200, content=b"not-json")
+        self.assertFalse(is_pushover_success_response(malformed))
+        empty = httpx.Response(200, content=b"")
+        self.assertFalse(is_pushover_success_response(empty))
+        listed = httpx.Response(200, json=[1])
+        self.assertFalse(is_pushover_success_response(listed))
+
+        # Clear integer rejection on 2xx → permanent.
+        rejected = httpx.Response(200, json={"status": 0, "errors": ["no"]})
+        code, retryable = classify_pushover_response(rejected)
+        self.assertFalse(retryable)
+        self.assertTrue(code.startswith("pushover_rejected"))
+
+        # Ambiguous 2xx bodies → retryable, never delivered.
+        for response in (malformed, empty, listed, httpx.Response(200, json={})):
+            with self.subTest(kind=response.content[:20]):
+                code, retryable = classify_pushover_response(response)
+                self.assertTrue(retryable)
+                self.assertEqual(code, "pushover_malformed_response")
+                self.assertFalse(is_pushover_success_response(response))
+
     def test_timeout_and_5xx_retry(self) -> None:
         calls = {"n": 0}
 
@@ -383,8 +512,19 @@ class TestPushoverDelivery(unittest.TestCase):
 
         response = httpx.Response(200, json={"status": 0})
         self.assertFalse(is_pushover_success_response(response))
+        code, retryable = classify_pushover_response(response)
+        self.assertFalse(retryable)
+        self.assertEqual(code, "pushover_rejected")
         response = httpx.Response(200, json={"status": 1})
         self.assertTrue(is_pushover_success_response(response))
+        code, retryable = classify_pushover_response(
+            httpx.Response(400, json={"status": 0})
+        )
+        self.assertFalse(retryable)
+        code, retryable = classify_pushover_response(httpx.Response(429))
+        self.assertTrue(retryable)
+        code, retryable = classify_pushover_response(httpx.Response(503))
+        self.assertTrue(retryable)
 
     def test_redaction_of_credentials(self) -> None:
         self.assertEqual(

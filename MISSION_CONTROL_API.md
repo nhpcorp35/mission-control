@@ -882,7 +882,13 @@ only to the fixed official host `api.pushover.net` over HTTPS.
 
 Webhook HMAC header `X-Mission-Control-Signature` uses `t=<unix>,v1=<hex>` over
 `{timestamp}.{body}` (HMAC-SHA256). Retries use exponential backoff; exhausted
-attempts become `dead` without changing mission status. Inspect with
+attempts become `dead` without changing mission status. Pushover delivery
+succeeds only on HTTP 2xx with JSON integer `status: 1`. Valid JSON with any
+other integer `status` (including HTTP 200 + `status: 0`) is permanent
+`dead` with a redacted `pushover_rejected` error. Malformed/empty/non-JSON
+2xx bodies retry then `dead` (never `delivered`). Transport errors, timeouts,
+429, and 5xx retry; ordinary non-retryable 4xx are permanent. Optional device
+and sound env values reject ASCII control characters. Inspect with
 `GET /runs/{run_id}/notifications`, MCP `list_run_notifications`, or Unified
 `mission.list_notifications`. Rotate secrets by updating receivers first, then
 Mission Control; disable by clearing URL/secret and/or Pushover credentials.
