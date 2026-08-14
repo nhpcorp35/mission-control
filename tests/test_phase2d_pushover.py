@@ -1071,20 +1071,26 @@ class TestPushoverAlertTuning(unittest.TestCase):
         outbox = self._outbox(handler)
         try:
             record = _record(self.registry)
+            self.registry.update_status(record.run_id, RunStatus.RUNNING)
+            record = self.registry.get_run(record.run_id)
+            assert record is not None
             with patch(
                 "mission_control.notifications.validate_webhook_url",
                 return_value=PUSHOVER_API_URL,
             ):
+                # Deliver exceptional alerts while the run is still active.
                 outbox.enqueue_for_record(
                     record,
                     event_kind=NotificationEventKind.STALE,
                     dedupe_key="stale:seq",
                 )
+                outbox.process_due_deliveries(limit=16)
                 outbox.enqueue_for_record(
                     record,
                     event_kind=NotificationEventKind.RECOVERY,
-                    dedupe_key="recovery:seq",
+                    dedupe_key="recovery:stale:seq-episode",
                 )
+                outbox.process_due_deliveries(limit=16)
                 self.registry.update_status(record.run_id, RunStatus.COMPLETED)
                 record = self.registry.get_run(record.run_id)
                 assert record is not None
