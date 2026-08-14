@@ -47,6 +47,11 @@ from mission_control.notifications import (
     load_notification_config,
 )
 from mission_control.run_result import StructuredRunResult
+from mission_control.workflow_reconciler import WorkflowReconciler
+from mission_control.workflow_registry import (
+    WorkflowRegistry,
+    is_workflow_orchestration_enabled,
+)
 from mission_control.workspace import execute_registered_run
 from mission_control.command_runner import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -77,6 +82,13 @@ run_queue = RunQueue()
 # Phase 2C durable notifications share the run registry SQLite database.
 notification_outbox = run_registry._get_notification_outbox()
 notification_delivery_worker = NotificationDeliveryWorker(notification_outbox)
+# Workflow orchestration (slice 3): shared DB; worker starts only when enabled.
+workflow_registry = WorkflowRegistry()
+workflow_reconciler = WorkflowReconciler(
+    workflow_registry=workflow_registry,
+    run_registry=run_registry,
+    run_queue=run_queue,
+)
 
 # Bounds for POST /runs/{run_id}/wait (and the MCP wait_for_run tool).
 WAIT_MIN_TIMEOUT_SECONDS = 0.1
@@ -243,9 +255,19 @@ async def lifespan(_: FastAPI):
         logger.info(
             "Phase 2C notifications: disabled (opt-in; no webhook configured)"
         )
+    # Workflow reconciler: off by default; start only when flag is explicit.
+    if is_workflow_orchestration_enabled():
+        workflow_reconciler.start()
+        logger.info("Workflow reconciler: started (feature flag enabled)")
+    else:
+        logger.info(
+            "Workflow reconciler: disabled "
+            "(MISSION_CONTROL_WORKFLOW_ORCHESTRATION off)"
+        )
     try:
         yield
     finally:
+        workflow_reconciler.stop()
         notification_delivery_worker.stop()
 
 

@@ -174,10 +174,27 @@ def _budget_ceiling_reason(
     return None
 
 
+def _strip_followup_context_trailer(mission_yaml: str) -> str:
+    """Return YAML authority text with opaque follow-up trailer removed.
+
+    The trailer is not YAML and must not participate in ``yaml.safe_load``;
+    ``create_run`` still receives the exact stored ``mission_yaml``.
+    """
+    begin_marker = "<<<MC_FOLLOWUP_CONTEXT_V1>>>"
+    text = mission_yaml or ""
+    begin = text.find(begin_marker)
+    if begin == -1:
+        return text
+    return text[:begin].rstrip() + "\n"
+
+
 def _parse_exact_mission(mission_yaml: str) -> dict[str, Any] | None:
     """Parse stored YAML into a mission mapping without regenerating text."""
+    # Opaque follow-up trailers are appended after the template; strip them
+    # for structure parse only. Exact stored text is still used for create.
+    parse_text = _strip_followup_context_trailer(mission_yaml)
     try:
-        data = yaml.safe_load(mission_yaml)
+        data = yaml.safe_load(parse_text)
     except yaml.YAMLError:
         return None
     if not isinstance(data, dict):

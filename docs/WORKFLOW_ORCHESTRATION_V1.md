@@ -2,24 +2,25 @@
 
 Durable, bounded server-side workflow orchestration for Mission Control.
 **Disabled by default.** Do not enable in production until follow-up missions
-wire API/MCP, the background reconciler, and notification suppression.
+wire API/MCP and notification suppression.
 
-## Objective (this mission slice)
+## Objective
 
-Ship the durable model + deterministic state machine so Mission Control—not a
-ChatGPT turn—can own implementation → substantive review → targeted fix →
-re-review progression. This revision hardens security and atomicity from
-review `8a575671-6b80-4280-88da-193bf1386a47`.
+Ship the durable model + deterministic state machine + lifespan reconciler so
+Mission Control—not a ChatGPT turn—can own implementation → substantive
+review → targeted fix → re-review progression.
 
-| Delivered here | Deferred (follow-up missions) |
+| Delivered | Deferred (follow-up missions) |
 | --- | --- |
-| SQLite workflow / step / audit tables (schema v2) | HTTP submit/status/history/cancel API |
+| SQLite workflow / step / audit / dispatch tables (schema **v3**) | HTTP submit/status/history/cancel API |
 | CAS via exact `cursor.rowcount` + idempotent claims | MCP tools |
-| Spoof-resistant verdict envelope + opaque follow-up context | Lifespan reconciler worker hook |
-| Transactional policy gates at every child-launch claim | Outbox/Pushover child-alert suppression wiring |
-| Claim / materialization states + mark-then-launch recovery | Lifespan reconciler / production enablement |
-| `RunRegistry.create_run(run_id=…)` reserved-ID contract | HTTP/MCP, notifications, production enablement |
-| Crash-safe claim→create materializer + enqueue-once | Auto-merge / Railway deploy primitives |
+| Spoof-resistant verdict envelope + opaque follow-up context | Outbox/Pushover child-alert suppression wiring |
+| Transactional policy gates at every child-launch claim | Production enablement |
+| Claim / materialization states + mark-then-launch recovery | Auto-merge / Railway deploy primitives |
+| `RunRegistry.create_run(run_id=…)` reserved-ID contract | — |
+| Crash-safe claim→create materializer + enqueue-once | — |
+| Durable dispatch intents + execution-observed ack | — |
+| **Lifespan-managed background reconciler** (flag off by default) | — |
 | Budget ceilings with documented inclusive semantics | — |
 | Feature flag (off by default) | — |
 
@@ -27,28 +28,37 @@ review `8a575671-6b80-4280-88da-193bf1386a47`.
 
 | Path | Role |
 | --- | --- |
-| `mission_control/workflow_registry.py` | Durable registry, schema v2, CAS, claim + mark dual-CAS |
+| `mission_control/workflow_registry.py` | Durable registry, schema v3, CAS, claim + mark dual-CAS, dispatch intents |
 | `mission_control/workflow_orchestrator.py` | Verdict envelope, context builder, gates, state machine |
-| `mission_control/workflow_materializer.py` | Crash-safe claim→`RunRegistry` materialize + enqueue-once |
+| `mission_control/workflow_materializer.py` | Crash-safe claim→`RunRegistry` materialize + enqueue-once; strips opaque follow-up trailer for YAML structure parse only (exact stored text still used for `create_run`) |
+| `mission_control/workflow_reconciler.py` | Lifespan background reconciler (bounded ticks) |
 | `mission_control/run_registry.py` | Reserved-ID `create_run(run_id=…)` materialization contract |
+| `app/api.py` | Lifespan start/stop when feature flag is enabled |
 | `tests/test_workflow_orchestration_v1.py` | Exploit, concurrency, budget, migration tests |
 | `tests/test_workflow_materialization.py` | Materialize crash / concurrency / policy tests |
+| `tests/test_workflow_reconciler.py` | Reconciler progression / recovery / fairness tests |
 | `tests/test_run_registry.py` | Reserved-ID create / conflict / concurrency tests |
 | `docs/WORKFLOW_ORCHESTRATION_V1.md` | This document |
 
-## Feature flag
+## Feature flag and reconciler config
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MISSION_CONTROL_WORKFLOW_ORCHESTRATION` | unset/false | Master enable (must stay off in prod) |
-| `MISSION_CONTROL_WORKFLOW_RECONCILE_INTERVAL_SECONDS` | `5` | Future worker poll interval |
+| `MISSION_CONTROL_WORKFLOW_RECONCILE_INTERVAL_SECONDS` | `5` | Worker poll interval (floor **0.5s**) |
+| `MISSION_CONTROL_WORKFLOW_RECONCILE_BATCH_SIZE` | `16` | Max workflows processed per tick (1–64) |
+| `MISSION_CONTROL_WORKFLOW_RECONCILE_MAX_TICK_SECONDS` | `2` | Per-tick wall-clock budget |
 | `MISSION_CONTROL_DB_PATH` | `./data/mission-control.db` | Shared SQLite path with run registry |
 
 ## Schema
 
-**Current schema version: `2`.** Stored in `workflow_schema_meta`. Opening a DB
+**Current schema version: `3`.** Stored in `workflow_schema_meta`. Opening a DB
 with a newer unsupported version **fails closed**
 (`WorkflowSchemaUnsupportedError`). Migrations are additive only.
+
+- **v1 → v2:** `materialization_state` + `UNIQUE(child_run_id)` on steps
+- **v2 → v3:** `workflow_dispatch_intents` (unique per `child_run_id`) for
+  durable RunQueue handoff / lease / ack / poison
 
 ### `workflows`
 
@@ -90,6 +100,78 @@ with a newer unsupported version **fails closed**
 Append-only audit: `from_state`, `to_state`, `reason`, `detail_json`
 (includes `policy_audit` on launches), `version_after`, optional `step_id` /
 `child_run_id`, `created_at`.
+
+### `workflow_dispatch_intents` (v3)
+
+| Column | Notes |
+| --- | --- |
+| `child_run_id` | PK; one intent per reserved child |
+| `workflow_id` / `step_id` | Lineage |
+| `state` | `pending` \| `leased` \| `acked` \| `poisoned` |
+| `attempt_count` / `lease_owner` / `lease_expires_at` | Multi-replica lease |
+| `next_attempt_at` / `last_error` | Backoff (secret-safe reason only) |
+| timestamps | `created_at` / `updated_at` / `acked_at` |
+
+## Lifespan reconciler
+
+`WorkflowReconciler` follows the notification delivery worker pattern:
+start on API lifespan when the feature flag is **explicitly** enabled; on
+shutdown set the stop latch and **await** the thread.
+
+When the flag is off, `start()` returns `False` and creates **no** thread /
+activity. Lifespan still calls `stop()` (no-op) so shutdown stays symmetric.
+
+### Tick contract (bounded)
+
+Each tick, independently of HTTP/MCP/`mission.status` reads:
+
+1. **Discover** eligible non-terminal workflows (fair rotated order).
+2. **Observe** child `RunRegistry` statuses and apply orchestrator decisions
+   (mark terminal steps, claim next children, enforce ceilings / blockers).
+3. **Materialize** claimed/unmaterialized steps via `materialize_claimed_child`.
+4. **Redrive** pending / expired-lease durable dispatch intents.
+5. **Finalize** intents once `RunRegistry` observes `running` or terminal
+   (`completed` / `failed` / `timed_out`).
+
+Run terminal-state writes alone must make the next tick advance the workflow.
+No status-API or user polling is required.
+
+### Correctness vs process-local
+
+| Boundary | Role |
+| --- | --- |
+| SQLite CAS (`version`, claim idempotency, mark dual-CAS) | Correctness |
+| Dispatch intent leases (`BEGIN IMMEDIATE`) | Correctness across replicas |
+| Process-local fairness cursor / poison skip / tick lock | Work reduction only |
+
+Two reconcilers (two DB connections) must not launch duplicate child runs or
+execute a child twice — uniqueness + leases prevent that.
+
+### Bounds and isolation
+
+- Interval default **5s**, floor **0.5s**; sleep uses Event wait (no busy poll).
+- Batch size + per-tick time budget bound work.
+- Fair round-robin ordering so one workflow cannot starve others.
+- Per-workflow exceptions are isolated; after repeated failures the worker
+  skips that id briefly (poison isolation) without blocking the tick.
+- Infrastructure errors (SQLite/OS) apply jittered exponential backoff.
+- Logs are structured and secret-safe: never mission YAML, raw findings, or
+  credentials. Lightweight counters live on `WorkflowReconciler.counters`.
+
+### Startup / crash recovery
+
+The same tick recovers:
+
+| Residual state | Recovery |
+| --- | --- |
+| Claimed / unmaterialized step | `materialize_claimed_child` |
+| Materialized queued child + pending intent | `redrive_materialized_dispatch` |
+| Expired dispatch lease | Listed as redrivable → reclaim + redrive |
+| Terminal child not yet reconciled | `ChildRunView` from `RunRegistry` → orchestrator |
+| Partial transition (mark without follow-up claim) | Orchestrator follow-up recovery |
+
+Ceilings (child / fix / wall-clock / credit) and repeated blocker fingerprints
+stop workflows deterministically via existing orchestrator gates.
 
 ## Hardened verdict contract
 
@@ -174,6 +256,11 @@ completed step.
 | any non-terminal | scope/repo/branch/permission escalation | `blocked` | Default deny (transactional) |
 | terminal actionable | alert latch | `notification_emitted=1` | Once |
 
+Child terminal observation uses authoritative `RunStatus` values
+`completed` / `failed` / `timed_out` (no separate cancelled run status).
+Orchestrator still accepts a `cancelled` child view for fail-closed mapping
+when projected externally.
+
 ## Budget semantics (inclusive)
 
 | Ceiling | Deny / exhaust when |
@@ -210,7 +297,7 @@ persisted on the transition / `last_decision_json`.
    unique `child_run_id` and `UNIQUE(idempotency_key)`.
 4. Restart / concurrent claim with the same key returns the same
    `child_run_id` (`already_claimed=true`) — no duplicate step.
-5. **Materialize** via `materialize_claimed_child` (below). Uses exact stored
+5. **Materialize** via `materialize_claimed_child`. Uses exact stored
    step YAML + reserved `child_run_id` + canonical `retried_from` ownership.
    Marks the step materialized only after `created` or
    `recovered_idempotently`, with CAS on both workflow version **and**
@@ -254,10 +341,9 @@ the process while a queued registry row must remain redriveable.
 | Expired dispatch lease | Reclaim + redrive (leases must not strand queued work) |
 
 Concurrent materializers / redrivers across two DB connections yield one
-registry row and at most one process-local enqueue per live queue. Durable
-redrive of post-enqueue process-death gaps is available via
-`redrive_materialized_dispatch` / `list_redrivable_dispatch_intents`; the
-lifespan reconciler worker hook remains a follow-up.
+registry row and at most one process-local enqueue per live queue. The
+lifespan reconciler redrives pending intents after process death via the
+same primitives.
 
 ## Reserved RunRegistry IDs
 
@@ -287,8 +373,6 @@ Rules:
 - Idempotent recover compares immutable mission identity / launch metadata only.
 - Lifecycle logs must not include raw mission YAML or secrets.
 - Feature flag `MISSION_CONTROL_WORKFLOW_ORCHESTRATION` remains off by default.
-  The materializer refuses when the flag is disabled; this slice does **not**
-  wire the lifespan reconciler or HTTP/MCP surfaces.
 
 ## Notifications (design; wiring deferred)
 
@@ -303,69 +387,52 @@ Rules:
 python -m unittest tests.test_run_registry -v
 python -m unittest tests.test_workflow_orchestration_v1 -v
 python -m unittest tests.test_workflow_materialization -v
-python -m unittest discover -s tests -v
+python -m unittest tests.test_workflow_reconciler -v
 ```
 
-Covered:
+Covered (reconciler slice):
 
-- Spoof-resistant verdicts (safe + malicious, fences, blockquotes, examples)
-- YAML authority injection + secrets in all context fields
-- Unused-helper / transactional gate enforcement on claim
-- Concurrent same-connection and multi-connection CAS
-- Crash after claim before materialize; crash after mark before launch
-- Crash-safe materialize: created, idempotent recover, mismatch poison,
-  missing parent, final policy denial, concurrent materializers, injected
-  crashes before/after create and before/after mark persistence
-- Execution-observed dispatch ack: enqueue-then-process-death before running,
-  restart with queued row + empty queue, same-process queued duplicate
-  suppress without attempt inflation, worker/terminal-before-bookkeeping,
-  lease expiry reclaim, concurrent redrivers
-- Duplicate `child_run_id` uniqueness; schema upgrade + newer-version reject
-- All budget boundaries (child, estimated credit, actual credit, wall-clock,
-  fix-cycle) with off-by-one checks
-- Canonical fingerprint ordering/whitespace
-- Feature remains disabled by default; materialize no-ops when off
+- Implementation terminal → later tick creates/queues review (no status API)
+- Review terminal → fix/re-review or needs_approval / stop
+- Startup recovery for claim/materialize/dispatch/terminal residuals
+- Two concurrent reconcilers do not duplicate child creation/execution
+- Feature-off: no thread; enable starts; shutdown cancels/awaits
+- Interval floor, batch/time bounds, fairness, poison isolation, infra backoff
+- Child terminals via actual `RunStatus` (`completed`/`failed`/`timed_out`)
+- Ceilings / repeated blocker / approval boundary
+- Existing materializer, registry, queue, workflow, execution-lifecycle suites
 
 ## Residual risks
 
-1. Materializer inserts reserved children into `runs`, enqueues process-locally,
-   and keeps dispatch intents redrivable until `RunRegistry` observes
-   `running`/terminal — but the lifespan reconciler worker is not wired yet,
-   so automatic background redrive of pending intents after hard process death
-   waits for the reconciler follow-up (primitive
-   `redrive_materialized_dispatch` / `list_redrivable_dispatch_intents` exists).
-2. Notification suppression is decided in-process; outbox/Pushover not hooked.
-3. No HTTP/MCP surface yet — operators cannot submit via API.
-4. Auto-merge/deploy explicitly deferred; policy bits are recorded only.
-5. Credit metering still uses a conservative unit counter; actual usage is
+1. Notification suppression is decided in-process; outbox/Pushover not hooked.
+2. No HTTP/MCP surface yet — operators cannot submit via API.
+3. Auto-merge/deploy explicitly deferred; policy bits are recorded only.
+4. Credit metering still uses a conservative unit counter; actual usage is
    optional until provider metering lands.
-6. Feature flag must remain off until worker + API missions land.
-7. Corrective git commit/push is owned by Mission Control platform
+5. Feature flag must remain off until API + notification missions land.
+6. Corrective git commit/push is owned by Mission Control platform
    persistence (agents must not commit/push in this mission).
 
 ## Rollout plan
 
-1. **Merge this slice** (flag off) — hardened schema + library + materializer.
-2. **Mission B — lifespan reconciler:** worker hook behind the flag, structured
-   metrics logs, pending-intent redrive after process death.
-3. **Mission C — API + MCP:** submit/status/history/cancel + connector tools.
-4. **Mission D — notifications:** suppress workflow-managed child terminals;
+1. **Merged:** schema + orchestrator + materializer + reconciler (flag off).
+2. **Mission C — API + MCP:** submit/status/history/cancel + connector tools.
+3. **Mission D — notifications:** suppress workflow-managed child terminals;
    one actionable workflow alert.
-5. **Mission E — staging enable:** flag on in non-prod; soak; then prod.
+4. **Mission E — staging enable:** flag on in non-prod; soak; then prod.
 
 ## Split recommendation (remaining work)
 
 Per split-run policy (≤4 files / one objective), do **not** expand this
 mission further. Recommended follow-ups:
 
-1. Lifespan reconciler hook + pending-intent redrive loop
-2. FastAPI + MCP submit/status/history/cancel
-3. Notification outbox suppression + workflow alert enqueue
-4. Staging enablement + operator runbook
+1. FastAPI + MCP submit/status/history/cancel
+2. Notification outbox suppression + workflow alert enqueue
+3. Staging enablement + operator runbook
 
 ## Platform commit SHA
 
-Base review commit: `af08a3da3f1b06835625c9d4f6ba6f17bc3db09f`.
+Base review commit: `91dca4c0cb0fc7d9279c3b83132250b7b1531862`.
 
 Corrective commit SHA: owned by Mission Control platform persistence after
 this workspace is collected (this mission must not commit or push).
