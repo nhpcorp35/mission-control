@@ -599,6 +599,8 @@ only and are **not** durable proof.
 
 Configure clone URLs via `MISSION_CONTROL_REPOSITORY_URL_MAP` (JSON) or `MISSION_CONTROL_LEGAL_AI_REPOSITORY_URL`. Mounted artifact/data roots via `MISSION_CONTROL_MOUNTED_PATHS` (colon-separated absolute paths).
 
+Isolated `POST /runs` workspaces clone `repository.base_branch` with a depth-1 single-branch clone by default for network/`file://` remotes, verify `HEAD` against the requested remote tip, and fall back to a full single-branch clone when the shallow path cannot safely satisfy semantics. Path-style local remotes keep the native full single-branch clone (Git ignores `--depth` on path clones). Set `MISSION_CONTROL_WORKSPACE_CLONE_DEPTH=0` or `full` to force the legacy full-clone path (for example when comparing preparation cost).
+
 ### MCP tools
 
 The Mission Control MCP connector exposes exactly these run-operation tools:

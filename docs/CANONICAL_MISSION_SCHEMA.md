@@ -446,8 +446,18 @@ For **`POST /runs`** (async execute):
    explicit `owner/repo` → `https://github.com/owner/repo.git`, else legacy
    `MISSION_CONTROL_REPOSITORY_URL`). Clone that remote at
    `repository.base_branch` into a temporary directory
-   (`mission-control-run-*`). Fail closed before execution when clone fails or
-   workspace origin does not match the selected repository.
+   (`mission-control-run-*`). Prefer a depth-1 `--single-branch` clone of the
+   requested branch for network/`file://` remotes; path-style local remotes
+   keep the native full single-branch clone (Git ignores `--depth` on path
+   clones, and forcing `file://` is typically slower locally). When shallow
+   clone cannot safely satisfy ref semantics, fall back to the legacy full
+   single-branch clone. Resolve the remote branch tip (`git ls-remote`) when
+   possible and verify workspace `HEAD` matches that tip before agent
+   execution — never continue on a mismatched or stale commit. Set
+   `MISSION_CONTROL_WORKSPACE_CLONE_DEPTH=0` or `full` to force the full
+   clone path. Fail closed before execution when the ref is missing, clone
+   fails, HEAD verification fails after fallback, or workspace origin does not
+   match the selected repository.
 2. Rewrite `repository.path` for that run to the temp checkout (`.` → repo
    root; relative subdirectories must resolve inside the checkout). Absolute
    submit-time validation paths bind the agent to checkout root.

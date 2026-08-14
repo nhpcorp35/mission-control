@@ -77,6 +77,13 @@ _REFS_HEADS_PREFIX = "refs/heads/"
 # Post-push tip must equal local HEAD before pushed=true.
 POST_PUSH_RECONCILIATION_FAILURE_STAGE = "post_push_reconciliation"
 
+# Optional workspace clone depth. Default ``1`` (shallow). Set to ``0`` or
+# ``full`` to force the legacy full-history clone path (also used as fallback).
+WORKSPACE_CLONE_DEPTH_ENV = "MISSION_CONTROL_WORKSPACE_CLONE_DEPTH"
+DEFAULT_WORKSPACE_CLONE_DEPTH = 1
+CLONE_STRATEGY_SHALLOW = "shallow"
+CLONE_STRATEGY_FULL = "full"
+
 # Optional JSON object mapping repository.name → clone URL.
 REPOSITORY_URL_MAP_ENV = "MISSION_CONTROL_REPOSITORY_URL_MAP"
 # Optional override when repository.name selects Mission Control itself.
@@ -152,6 +159,8 @@ class WorkspacePrepResult:
     error: str | None = None
     # Local/remote tip SHA captured after clone, before agent execution.
     baseline_sha: str | None = None
+    # ``shallow`` or ``full`` when preparation cloned a workspace; else None.
+    clone_strategy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -824,8 +833,170 @@ def resolve_mission_clone_url(mission: dict) -> tuple[str | None, str | None]:
     return repository_url, None
 
 
+def resolve_workspace_clone_depth() -> int | None:
+    """Return clone ``--depth`` when shallow prep is enabled, else ``None``.
+
+    Default is depth ``1``. Operators force the legacy full clone with
+    ``MISSION_CONTROL_WORKSPACE_CLONE_DEPTH=0`` or ``full``. Invalid values
+    fall back to the safe default depth rather than disabling verification.
+    """
+    raw = os.environ.get(WORKSPACE_CLONE_DEPTH_ENV, "").strip()
+    if not raw:
+        return DEFAULT_WORKSPACE_CLONE_DEPTH
+    folded = raw.casefold()
+    if folded in {"0", "full", "false", "no", "off"}:
+        return None
+    try:
+        depth = int(raw)
+    except ValueError:
+        return DEFAULT_WORKSPACE_CLONE_DEPTH
+    if depth <= 0:
+        return None
+    return depth
+
+
+def _ls_remote_branch_sha(
+    repository_url: str,
+    base_branch: str,
+    *,
+    env: dict[str, str] | None,
+) -> tuple[str | None, str | None, bool]:
+    """Return ``(sha, error, ref_missing)`` for ``base_branch`` on the remote.
+
+    Prefers ``refs/heads/<base_branch>`` and accepts ``refs/tags/<base_branch>``
+    (``git clone --branch`` can check out tags). ``ref_missing`` is True only
+    when ``ls-remote`` succeeded and neither tip was present. Soft
+    transport/auth failures return ``ref_missing=False`` so callers can still
+    attempt clone + post-clone verification.
+    """
+    head_ref = f"refs/heads/{base_branch}"
+    tag_ref = f"refs/tags/{base_branch}"
+    result = _run_git(
+        ["ls-remote", repository_url, head_ref, tag_ref],
+        env=env,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        if not message:
+            message = f"git ls-remote failed with code {result.returncode}"
+        return None, _redact_secret_text(message), False
+
+    head_sha: str | None = None
+    tag_sha: str | None = None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        sha, ref = parts[0].strip(), parts[1].strip()
+        if not sha:
+            continue
+        if ref == head_ref:
+            head_sha = sha
+        elif ref == tag_ref:
+            tag_sha = sha
+        elif ref == f"{tag_ref}^{{}}":
+            # Prefer the peeled commit object for annotated tags.
+            tag_sha = sha
+    if head_sha:
+        return head_sha, None, False
+    if tag_sha:
+        return tag_sha, None, False
+    return (
+        None,
+        f"Remote ref {head_ref!r} (or tag) not found at {repository_url}",
+        True,
+    )
+
+
+def _is_filesystem_path_clone_url(repository_url: str) -> bool:
+    """Return whether ``repository_url`` is a path-style local clone source.
+
+    Path-style local clones already use Git's local hardlink/copy optimizations
+    and ignore ``--depth``. Rewriting them to ``file://`` enables shallow
+    history but disables those optimizations and is usually slower on local
+    disks, so the optimized path skips shallow for plain filesystem paths.
+    Explicit ``file://`` URLs still use the shallow protocol clone.
+    """
+    raw = (repository_url or "").strip()
+    if not raw:
+        return False
+    if raw.startswith(("file://", "http://", "https://", "git://", "ssh://")):
+        return False
+    if raw.startswith("git@"):
+        return False
+    # scp-like host:path (not an absolute/relative filesystem path).
+    if ":" in raw and not raw.startswith(("/", ".", "~")):
+        return False
+    return True
+
+
+def _clone_at_base_branch(
+    *,
+    repository_url: str,
+    workspace_path: str,
+    base_branch: str,
+    env: dict[str, str] | None,
+    depth: int | None,
+) -> subprocess.CompletedProcess[str]:
+    """Clone ``base_branch`` only; optional ``depth`` enables shallow history."""
+    args = [
+        "clone",
+        "--branch",
+        str(base_branch),
+        "--single-branch",
+    ]
+    if depth is not None:
+        args.extend(["--depth", str(depth)])
+    args.extend([repository_url, workspace_path])
+    return _run_git(args, env=env)
+
+
+def _verify_workspace_head_matches_ref(
+    workspace_path: str,
+    *,
+    base_branch: str,
+    expected_sha: str | None,
+) -> tuple[str | None, str | None]:
+    """Return ``(head_sha, error)`` after confirming HEAD matches the tip.
+
+    Prefers an independently resolved ``expected_sha`` (from ``ls-remote``).
+    When that tip is unavailable, falls back to ``origin/<base_branch>`` from
+    the clone so we still refuse a detached/wrong checkout before execution.
+    """
+    head_sha, head_error = _read_commit_sha(workspace_path, "HEAD")
+    if head_error is not None or not head_sha:
+        return None, head_error or "failed to read workspace HEAD"
+
+    tip_sha = expected_sha
+    if not tip_sha:
+        tip_sha, tip_error = _read_commit_sha(
+            workspace_path,
+            f"origin/{base_branch}",
+        )
+        if tip_error is not None or not tip_sha:
+            return None, tip_error or (
+                f"failed to resolve origin/{base_branch} for HEAD verification"
+            )
+
+    if head_sha != tip_sha:
+        return None, (
+            "Workspace HEAD does not match requested remote ref "
+            f"{base_branch!r}: head={head_sha} expected={tip_sha}"
+        )
+    return head_sha, None
+
+
 def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
-    """Clone the mission's target repository into a temporary workspace."""
+    """Clone the mission's target repository into a temporary workspace.
+
+    Prefers a depth-1 single-branch clone of ``repository.base_branch`` for
+    network and ``file://`` remotes when safe. Path-style local remotes keep
+    Git's native full single-branch clone (``--depth`` is ignored on path
+    clones). Falls back deterministically to the legacy full single-branch
+    clone when shallow clone fails or HEAD verification cannot be satisfied.
+    Workspace HEAD is verified against the requested remote branch tip before
+    the result is returned for agent execution.
+    """
     repository = mission["repository"]
     base_branch = repository["base_branch"]
     repo_name = _repository_name(mission) or "<unknown>"
@@ -841,60 +1012,105 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
             ),
         )
 
-    workspace_path = tempfile.mkdtemp(prefix="mission-control-run-")
-
     # Prefer GitHub HTTPS auth when available so private allowed repositories
     # can clone; missing token is fine for local/file remotes in tests.
     clone_env, _auth_error = _github_push_environment()
-    clone = _run_git(
-        [
-            "clone",
-            "--branch",
-            str(base_branch),
-            "--single-branch",
-            repository_url,
-            workspace_path,
-        ],
+
+    expected_sha, ref_error, ref_missing = _ls_remote_branch_sha(
+        repository_url,
+        str(base_branch),
         env=clone_env,
     )
-    if clone.returncode != 0:
-        _safe_cleanup(workspace_path)
-        message = clone.stderr.strip() or clone.stdout.strip()
-        if not message:
-            message = f"git clone failed with code {clone.returncode}"
+    if ref_missing:
         return WorkspacePrepResult(
             ok=False,
             error=(
                 f"Failed to clone repository.name={repo_name!r} "
-                f"at ref {base_branch!r} from {repository_url}: {message}"
+                f"at ref {base_branch!r} from {repository_url}: "
+                f"{ref_error or 'remote ref not found'}"
             ),
         )
 
-    # Canonicalize so agent --workspace / cwd and persistence git -C agree
-    # even when /tmp (or the mkdtemp path) involves symlinks.
-    real_workspace = os.path.realpath(workspace_path)
-    mismatch = verify_workspace_origin_matches_mission(mission, real_workspace)
-    if mismatch is not None:
-        _safe_cleanup(real_workspace)
-        return WorkspacePrepResult(ok=False, error=mismatch)
+    shallow_depth = resolve_workspace_clone_depth()
+    strategies: list[tuple[str, int | None]]
+    if shallow_depth is not None and not _is_filesystem_path_clone_url(
+        repository_url
+    ):
+        strategies = [
+            (CLONE_STRATEGY_SHALLOW, shallow_depth),
+            (CLONE_STRATEGY_FULL, None),
+        ]
+    else:
+        # Path-style local remotes: native full single-branch clone (depth is
+        # ignored by Git and file:// shallow is typically slower locally).
+        strategies = [(CLONE_STRATEGY_FULL, None)]
 
-    push_deny_error = disable_agent_git_push(real_workspace)
-    if push_deny_error is not None:
-        _safe_cleanup(real_workspace)
-        return WorkspacePrepResult(ok=False, error=push_deny_error)
+    last_error: str | None = None
+    for strategy, depth in strategies:
+        workspace_path = tempfile.mkdtemp(prefix="mission-control-run-")
+        clone = _clone_at_base_branch(
+            repository_url=repository_url,
+            workspace_path=workspace_path,
+            base_branch=str(base_branch),
+            env=clone_env,
+            depth=depth,
+        )
+        if clone.returncode != 0:
+            _safe_cleanup(workspace_path)
+            message = clone.stderr.strip() or clone.stdout.strip()
+            if not message:
+                message = f"git clone failed with code {clone.returncode}"
+            last_error = (
+                f"Failed to clone repository.name={repo_name!r} "
+                f"at ref {base_branch!r} from {repository_url}: {message}"
+            )
+            continue
 
-    baseline_sha, baseline_error = _read_commit_sha(real_workspace, "HEAD")
-    if baseline_error is not None or not baseline_sha:
-        _safe_cleanup(real_workspace)
+        # Canonicalize so agent --workspace / cwd and persistence git -C agree
+        # even when /tmp (or the mkdtemp path) involves symlinks.
+        real_workspace = os.path.realpath(workspace_path)
+        mismatch = verify_workspace_origin_matches_mission(mission, real_workspace)
+        if mismatch is not None:
+            _safe_cleanup(real_workspace)
+            last_error = mismatch
+            if strategy == CLONE_STRATEGY_SHALLOW:
+                continue
+            return WorkspacePrepResult(ok=False, error=mismatch)
+
+        push_deny_error = disable_agent_git_push(real_workspace)
+        if push_deny_error is not None:
+            _safe_cleanup(real_workspace)
+            last_error = push_deny_error
+            if strategy == CLONE_STRATEGY_SHALLOW:
+                continue
+            return WorkspacePrepResult(ok=False, error=push_deny_error)
+
+        head_sha, head_error = _verify_workspace_head_matches_ref(
+            real_workspace,
+            base_branch=str(base_branch),
+            expected_sha=expected_sha,
+        )
+        if head_error is not None or not head_sha:
+            _safe_cleanup(real_workspace)
+            last_error = head_error or "failed to verify workspace HEAD against ref"
+            if strategy == CLONE_STRATEGY_SHALLOW:
+                continue
+            return WorkspacePrepResult(ok=False, error=last_error)
+
         return WorkspacePrepResult(
-            ok=False,
-            error=baseline_error or "failed to capture baseline commit SHA",
+            ok=True,
+            workspace_path=real_workspace,
+            baseline_sha=head_sha,
+            clone_strategy=strategy,
         )
 
     return WorkspacePrepResult(
-        ok=True,
-        workspace_path=real_workspace,
-        baseline_sha=baseline_sha,
+        ok=False,
+        error=last_error
+        or (
+            f"Failed to clone repository.name={repo_name!r} "
+            f"at ref {base_branch!r} from {repository_url}"
+        ),
     )
 
 
