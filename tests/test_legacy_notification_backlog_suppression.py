@@ -24,7 +24,7 @@ from mission_control.notifications import (
     NotificationOutbox,
     _format_dt,
 )
-from mission_control.run_registry import RunRegistry
+from mission_control.run_registry import RunRegistry, RunStatus
 
 TEST_API_KEY = "mc_test_authentication_key"
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
@@ -484,6 +484,11 @@ class TestStartupOrderingBeforeWorker(unittest.TestCase):
         assert before is not None
         after = _format_dt(_CUTOFF + timedelta(minutes=2))
         assert after is not None
+        # Fresh post-cutoff stale must belong to an active run so delivery-time
+        # fail-closed (missing run row) does not skip it; legacy cutoff alone
+        # is what this test isolates.
+        fresh_run = self.registry.create_run()
+        self.registry.update_status(fresh_run.run_id, RunStatus.RUNNING)
         _insert_row(
             self.outbox,
             event_id="legacy-stale",
@@ -495,7 +500,7 @@ class TestStartupOrderingBeforeWorker(unittest.TestCase):
         _insert_row(
             self.outbox,
             event_id="fresh-stale",
-            run_id="run-fresh",
+            run_id=fresh_run.run_id,
             event_kind=NotificationEventKind.STALE.value,
             delivery_state=DeliveryState.PENDING.value,
             created_at=after,
