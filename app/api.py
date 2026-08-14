@@ -231,6 +231,9 @@ async def lifespan(_: FastAPI):
             "Marked %s interrupted run(s) failed on startup",
             recovered,
         )
+    # Suppress pre-deploy stale/recovery backlog before the worker can drain.
+    # Failure rolls back and aborts startup so legacy rows are not delivered.
+    notification_outbox.suppress_legacy_predeploy_backlog()
     # Phase 2C: background delivery drains due/retry work off request paths.
     notification_delivery_worker.start()
     _kick_notification_delivery()

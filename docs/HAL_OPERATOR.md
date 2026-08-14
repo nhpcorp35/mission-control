@@ -209,6 +209,29 @@ API, MCP, Unified, or database inspection payloads.
   control characters are rejected (option omitted; sound falls back to
   default `pushover`) rather than forwarded.
 
+### Legacy pre-deploy backlog suppression (2026-08-14 hotfix)
+
+After the 2026-08-14 container redeploy, the durable SQLite outbox could still
+hold undelivered `stale` / `recovery` rows from runs created before the new
+process. Railway production DB access is read-only, so cleanup runs once in
+API lifespan **before** `NotificationDeliveryWorker` starts.
+
+| Field | Rule |
+| --- | --- |
+| Table | `notification_outbox` only |
+| `event_kind` | `stale` or `recovery` only (never `terminal` / `phase_change`) |
+| `created_at` | strictly before cutoff `2026-08-14T16:38:00+00:00` (canonical `_format_dt` / UTC ISO form; lexicographic `<` on that format) |
+| `delivery_state` | `pending` or `in_flight` only |
+| Mutation | `delivery_state=skipped`, `last_error=legacy_predeploy_backlog_suppressed`, clear `claim_owner` / `claim_expires_at`, refresh `updated_at` |
+| Preserved | `event_id`, `run_id`, `payload_json`, `attempt_count`, `next_attempt_at`, `created_at`, `delivered_at` |
+
+**Idempotency:** a second startup updates zero rows (already-`skipped` rows no
+longer match). Logs report only the aggregate affected count — never payloads,
+secrets, run IDs, or notification bodies. Transaction failure rolls back and
+aborts startup so the worker cannot drain the targeted backlog. Newer rows
+(at/after cutoff) keep normal stale/recovery/terminal pairing, Pushover,
+webhook, retry, security, and redaction behavior.
+
 ### Inspection workflow (redacted)
 
 - REST: `GET /runs/{run_id}/notifications?limit=N` (auth required; `limit`

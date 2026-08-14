@@ -110,6 +110,12 @@ PUSHOVER_DEVICE_MAX_CHARS = 64
 PUSHOVER_SOUND_MAX_CHARS = 32
 # Terminal outbox reason when Pushover skips routine phase_change (not dead).
 PUSHOVER_PHASE_CHANGE_SUPPRESSED = "pushover_phase_change_suppressed"
+# One-time hotfix: suppress stale/recovery rows enqueued before the 2026-08-14
+# redeploy so the delivery worker does not replay the pre-container backlog.
+LEGACY_PREDEPLOY_BACKLOG_CUTOFF_UTC = datetime(
+    2026, 8, 14, 16, 38, 0, tzinfo=timezone.utc
+)
+LEGACY_PREDEPLOY_BACKLOG_SUPPRESSED = "legacy_predeploy_backlog_suppressed"
 
 # Active delivery backend when notifications are opted in.
 BACKEND_NONE = "none"
@@ -1951,6 +1957,63 @@ class NotificationOutbox:
                 (DeliveryState.PENDING.value, DeliveryState.IN_FLIGHT.value),
             ).fetchone()
             return int(row["count"])
+
+    def suppress_legacy_predeploy_backlog(self) -> int:
+        """Idempotently skip pre-deploy stale/recovery outbox backlog.
+
+        Runs in one ``BEGIN IMMEDIATE`` transaction. Only
+        ``notification_outbox`` rows with ``event_kind`` in
+        ``('stale', 'recovery')``, ``created_at`` strictly before the
+        canonical cutoff, and ``delivery_state`` in
+        ``('pending', 'in_flight')`` are updated to ``skipped`` with
+        ``last_error=legacy_predeploy_backlog_suppressed``. Claims are
+        cleared; audit fields (``event_id``, ``run_id``, ``payload_json``,
+        ``attempt_count``, ``next_attempt_at``, ``created_at``,
+        ``delivered_at``) are preserved. Terminal/phase_change rows and
+        already-terminal delivery states are never touched. On failure the
+        transaction is rolled back and the error propagates so callers must
+        not start the delivery worker.
+        """
+        cutoff_s = _format_dt(LEGACY_PREDEPLOY_BACKLOG_CUTOFF_UTC)
+        assert cutoff_s is not None
+        now_s = _format_dt(_utc_now())
+        assert now_s is not None
+        with self._lock:
+            try:
+                self._begin_immediate_unlocked()
+                cursor = self._conn.execute(
+                    f"""
+                    UPDATE {_OUTBOX_TABLE}
+                    SET delivery_state = ?,
+                        last_error = ?,
+                        claim_owner = NULL,
+                        claim_expires_at = NULL,
+                        updated_at = ?
+                    WHERE event_kind IN (?, ?)
+                      AND created_at < ?
+                      AND delivery_state IN (?, ?)
+                    """,
+                    (
+                        DeliveryState.SKIPPED.value,
+                        LEGACY_PREDEPLOY_BACKLOG_SUPPRESSED,
+                        now_s,
+                        NotificationEventKind.STALE.value,
+                        NotificationEventKind.RECOVERY.value,
+                        cutoff_s,
+                        DeliveryState.PENDING.value,
+                        DeliveryState.IN_FLIGHT.value,
+                    ),
+                )
+                affected = int(cursor.rowcount or 0)
+                self._conn.commit()
+            except Exception:
+                self._rollback_unlocked()
+                raise
+        logger.info(
+            "legacy predeploy notification backlog suppressed count=%s",
+            affected,
+        )
+        return affected
 
     def reclaim_stale_claims(
         self,
