@@ -451,13 +451,21 @@ For **`POST /runs`** (async execute):
    keep the native full single-branch clone (Git ignores `--depth` on path
    clones, and forcing `file://` is typically slower locally). When shallow
    clone cannot safely satisfy ref semantics, fall back to the legacy full
-   single-branch clone. Resolve the remote branch tip (`git ls-remote`) when
-   possible and verify workspace `HEAD` matches that tip before agent
-   execution — never continue on a mismatched or stale commit. Set
+   single-branch clone. Resolve the remote tip with an exact `git ls-remote`
+   of `refs/heads/<base_branch>`, `refs/tags/<base_branch>`, and the peeled
+   `refs/tags/<base_branch>^{}` when possible so annotated tags map to the
+   commit `git clone --branch` checks out (never the tag-object SHA);
+   branches take precedence over same-named tags. Verify workspace `HEAD`
+   matches that resolved commit before agent execution — never continue on a
+   mismatched, unpeeled, or stale commit. Set
    `MISSION_CONTROL_WORKSPACE_CLONE_DEPTH=0` or `full` to force the full
    clone path. Fail closed before execution when the ref is missing, clone
    fails, HEAD verification fails after fallback, or workspace origin does not
-   match the selected repository.
+   match the selected repository. Operator-facing preparation/clone/ref errors
+   must redact credentials (URL userinfo, token query parameters,
+   bearer/authorization material) before run error fields, logs, API/MCP
+   responses, or SQLite persistence; Git subprocess argv must not include
+   credential-bearing userinfo.
 2. Rewrite `repository.path` for that run to the temp checkout (`.` → repo
    root; relative subdirectories must resolve inside the checkout). Absolute
    submit-time validation paths bind the agent to checkout root.

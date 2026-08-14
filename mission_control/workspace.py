@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from mission_control.executor import execute_cursor_agent
 from mission_control.run_registry import (
@@ -83,6 +84,31 @@ WORKSPACE_CLONE_DEPTH_ENV = "MISSION_CONTROL_WORKSPACE_CLONE_DEPTH"
 DEFAULT_WORKSPACE_CLONE_DEPTH = 1
 CLONE_STRATEGY_SHALLOW = "shallow"
 CLONE_STRATEGY_FULL = "full"
+
+# Operator-facing Git/clone error redaction (keep aligned with platform secret
+# scrubbing: never echo userinfo, token query params, or bearer material).
+_URL_USERINFO_RE = re.compile(r"(https?://)([^/@\s]+)@", re.IGNORECASE)
+_URL_SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:access[_-]?token|api[_-]?key|auth(?:orization)?|password|"
+    r"secret|token)=)([^&\s#]+)"
+)
+_BASIC_AUTH_HEADER_RE = re.compile(
+    r"(?i)(authorization:\s*basic\s+)([A-Za-z0-9+/=]+)"
+)
+_X_ACCESS_TOKEN_RE = re.compile(r"(?i)(x-access-token:)(\S+)")
+_SECRET_QUERY_PARAM_NAMES = frozenset(
+    {
+        "access_token",
+        "access-token",
+        "api_key",
+        "api-key",
+        "auth",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+    }
+)
 
 # Optional JSON object mapping repository.name → clone URL.
 REPOSITORY_URL_MAP_ENV = "MISSION_CONTROL_REPOSITORY_URL_MAP"
@@ -855,6 +881,129 @@ def resolve_workspace_clone_depth() -> int | None:
     return depth
 
 
+def _redact_secret_text(message: str) -> str:
+    """Remove credentials and secret-like values from operator-facing messages.
+
+    Applied to every workspace-preparation / clone / ref error before it enters
+    run error fields, logs, API/MCP responses, or SQLite-backed state.
+    """
+    if not message:
+        return message
+    redacted = message
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        redacted = redacted.replace(token, "***")
+    redacted = _URL_USERINFO_RE.sub(r"\1***@", redacted)
+    redacted = _URL_SECRET_QUERY_RE.sub(r"\1***", redacted)
+    # Bearer must run before generic Authorization= so "Authorization: Bearer
+    # <token>" does not treat the word Bearer as the secret value.
+    redacted = re.sub(
+        r"(?i)(Authorization:\s*Bearer\s+)\S+",
+        r"\1***",
+        redacted,
+    )
+    redacted = re.sub(r"(?i)(\bBearer\s+)\S+", r"\1***", redacted)
+    redacted = re.sub(
+        r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)(?!Bearer\b)([^\s\"']+)",
+        r"\1***",
+        redacted,
+    )
+    redacted = _BASIC_AUTH_HEADER_RE.sub(r"\1***", redacted)
+    redacted = _X_ACCESS_TOKEN_RE.sub(r"\1***", redacted)
+    return redacted
+
+
+def _workspace_prep_failure(message: str) -> WorkspacePrepResult:
+    """Build a failed prep result with credentials scrubbed from ``error``."""
+    return WorkspacePrepResult(ok=False, error=_redact_secret_text(message))
+
+
+def _argv_safe_repository_url(
+    repository_url: str,
+) -> tuple[str, str | None]:
+    """Return ``(argv_safe_url, basic_userinfo)`` for Git subprocess argv.
+
+    Strips HTTPS userinfo and secret-bearing query parameters so credentials
+    never appear in subprocess argv. When userinfo was present, returns the
+    decoded ``user:password`` (or ``user``) for injection via http extraheader.
+    """
+    raw = (repository_url or "").strip()
+    if not raw:
+        return raw, None
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return raw, None
+    if parts.scheme not in {"http", "https"}:
+        return raw, None
+
+    userinfo: str | None = None
+    if parts.username is not None:
+        user = parts.username
+        password = parts.password
+        if password is not None:
+            userinfo = f"{user}:{password}"
+        else:
+            userinfo = user
+
+    hostname = parts.hostname or ""
+    if parts.port:
+        netloc = f"{hostname}:{parts.port}"
+    else:
+        netloc = hostname
+
+    query_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.casefold() not in _SECRET_QUERY_PARAM_NAMES
+    ]
+    safe_query = urlencode(query_pairs)
+    safe_url = urlunsplit(
+        (parts.scheme, netloc, parts.path, safe_query, parts.fragment)
+    )
+    return safe_url, userinfo
+
+
+def _git_env_with_url_userinfo(
+    env: dict[str, str] | None,
+    *,
+    safe_url: str,
+    userinfo: str | None,
+) -> dict[str, str] | None:
+    """Inject stripped URL userinfo as ``http.<origin>/.extraheader`` auth."""
+    if not userinfo:
+        return env
+    try:
+        parts = urlsplit(safe_url)
+    except ValueError:
+        return env
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return env
+    origin = f"{parts.scheme}://{parts.netloc}"
+    credentials = base64.b64encode(userinfo.encode("utf-8")).decode("ascii")
+    out = dict(env) if env is not None else os.environ.copy()
+    try:
+        count = int(out.get("GIT_CONFIG_COUNT") or "0")
+    except ValueError:
+        count = 0
+    out[f"GIT_CONFIG_KEY_{count}"] = f"http.{origin}/.extraheader"
+    out[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {credentials}"
+    out["GIT_CONFIG_COUNT"] = str(count + 1)
+    out["GIT_TERMINAL_PROMPT"] = "0"
+    return out
+
+
+def _prepare_git_url_and_env(
+    repository_url: str,
+    env: dict[str, str] | None,
+) -> tuple[str, dict[str, str] | None]:
+    """Return argv-safe clone URL plus env with any stripped userinfo restored."""
+    safe_url, userinfo = _argv_safe_repository_url(repository_url)
+    return safe_url, _git_env_with_url_userinfo(
+        env, safe_url=safe_url, userinfo=userinfo
+    )
+
+
 def _ls_remote_branch_sha(
     repository_url: str,
     base_branch: str,
@@ -863,17 +1012,23 @@ def _ls_remote_branch_sha(
 ) -> tuple[str | None, str | None, bool]:
     """Return ``(sha, error, ref_missing)`` for ``base_branch`` on the remote.
 
-    Prefers ``refs/heads/<base_branch>`` and accepts ``refs/tags/<base_branch>``
-    (``git clone --branch`` can check out tags). ``ref_missing`` is True only
-    when ``ls-remote`` succeeded and neither tip was present. Soft
-    transport/auth failures return ``ref_missing=False`` so callers can still
-    attempt clone + post-clone verification.
+    Prefers ``refs/heads/<base_branch>`` over tags (``git clone --branch``
+    precedence). For tags, queries both ``refs/tags/<name>`` and the peeled
+    ``refs/tags/<name>^{}`` so annotated tags resolve to the commit that
+    ``git clone --branch`` checks out — never the tag-object SHA.
+    Lightweight tags (no peel line) resolve to the tag SHA itself.
+
+    ``ref_missing`` is True only when ``ls-remote`` succeeded and neither tip
+    was present. Soft transport/auth failures return ``ref_missing=False`` so
+    callers can still attempt clone + post-clone verification.
     """
     head_ref = f"refs/heads/{base_branch}"
     tag_ref = f"refs/tags/{base_branch}"
+    peeled_tag_ref = f"{tag_ref}^{{}}"
+    safe_url, git_env = _prepare_git_url_and_env(repository_url, env)
     result = _run_git(
-        ["ls-remote", repository_url, head_ref, tag_ref],
-        env=env,
+        ["ls-remote", safe_url, head_ref, tag_ref, peeled_tag_ref],
+        env=git_env,
     )
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
@@ -883,6 +1038,7 @@ def _ls_remote_branch_sha(
 
     head_sha: str | None = None
     tag_sha: str | None = None
+    peeled_sha: str | None = None
     for line in result.stdout.splitlines():
         parts = line.split()
         if len(parts) < 2:
@@ -894,16 +1050,24 @@ def _ls_remote_branch_sha(
             head_sha = sha
         elif ref == tag_ref:
             tag_sha = sha
-        elif ref == f"{tag_ref}^{{}}":
-            # Prefer the peeled commit object for annotated tags.
-            tag_sha = sha
+        elif ref == peeled_tag_ref:
+            peeled_sha = sha
+
     if head_sha:
         return head_sha, None, False
+    if peeled_sha:
+        # Annotated tag: clone --branch checks out the peeled commit.
+        return peeled_sha, None, False
     if tag_sha:
+        # Lightweight tag (no peel advertised) — SHA is already a commit.
+        # Annotated tags that omit the peel line are fail-closed later: using the
+        # tag-object SHA as expected makes HEAD verification reject the checkout.
         return tag_sha, None, False
     return (
         None,
-        f"Remote ref {head_ref!r} (or tag) not found at {repository_url}",
+        _redact_secret_text(
+            f"Remote ref {head_ref!r} (or tag) not found at {repository_url}"
+        ),
         True,
     )
 
@@ -939,6 +1103,7 @@ def _clone_at_base_branch(
     depth: int | None,
 ) -> subprocess.CompletedProcess[str]:
     """Clone ``base_branch`` only; optional ``depth`` enables shallow history."""
+    safe_url, git_env = _prepare_git_url_and_env(repository_url, env)
     args = [
         "clone",
         "--branch",
@@ -947,8 +1112,8 @@ def _clone_at_base_branch(
     ]
     if depth is not None:
         args.extend(["--depth", str(depth)])
-    args.extend([repository_url, workspace_path])
-    return _run_git(args, env=env)
+    args.extend([safe_url, workspace_path])
+    return _run_git(args, env=git_env)
 
 
 def _verify_workspace_head_matches_ref(
@@ -1003,13 +1168,12 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
     repository_url, url_error = resolve_mission_clone_url(mission)
 
     if url_error is not None or not repository_url:
-        return WorkspacePrepResult(
-            ok=False,
-            error=url_error
+        return _workspace_prep_failure(
+            url_error
             or (
                 "MISSION_CONTROL_REPOSITORY_URL is not configured. "
                 "Set it to the Git clone URL for the repository."
-            ),
+            )
         )
 
     # Prefer GitHub HTTPS auth when available so private allowed repositories
@@ -1022,13 +1186,10 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
         env=clone_env,
     )
     if ref_missing:
-        return WorkspacePrepResult(
-            ok=False,
-            error=(
-                f"Failed to clone repository.name={repo_name!r} "
-                f"at ref {base_branch!r} from {repository_url}: "
-                f"{ref_error or 'remote ref not found'}"
-            ),
+        return _workspace_prep_failure(
+            f"Failed to clone repository.name={repo_name!r} "
+            f"at ref {base_branch!r} from {repository_url}: "
+            f"{ref_error or 'remote ref not found'}"
         )
 
     shallow_depth = resolve_workspace_clone_depth()
@@ -1060,7 +1221,7 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
             message = clone.stderr.strip() or clone.stdout.strip()
             if not message:
                 message = f"git clone failed with code {clone.returncode}"
-            last_error = (
+            last_error = _redact_secret_text(
                 f"Failed to clone repository.name={repo_name!r} "
                 f"at ref {base_branch!r} from {repository_url}: {message}"
             )
@@ -1072,18 +1233,18 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
         mismatch = verify_workspace_origin_matches_mission(mission, real_workspace)
         if mismatch is not None:
             _safe_cleanup(real_workspace)
-            last_error = mismatch
+            last_error = _redact_secret_text(mismatch)
             if strategy == CLONE_STRATEGY_SHALLOW:
                 continue
-            return WorkspacePrepResult(ok=False, error=mismatch)
+            return _workspace_prep_failure(mismatch)
 
         push_deny_error = disable_agent_git_push(real_workspace)
         if push_deny_error is not None:
             _safe_cleanup(real_workspace)
-            last_error = push_deny_error
+            last_error = _redact_secret_text(push_deny_error)
             if strategy == CLONE_STRATEGY_SHALLOW:
                 continue
-            return WorkspacePrepResult(ok=False, error=push_deny_error)
+            return _workspace_prep_failure(push_deny_error)
 
         head_sha, head_error = _verify_workspace_head_matches_ref(
             real_workspace,
@@ -1092,10 +1253,12 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
         )
         if head_error is not None or not head_sha:
             _safe_cleanup(real_workspace)
-            last_error = head_error or "failed to verify workspace HEAD against ref"
+            last_error = _redact_secret_text(
+                head_error or "failed to verify workspace HEAD against ref"
+            )
             if strategy == CLONE_STRATEGY_SHALLOW:
                 continue
-            return WorkspacePrepResult(ok=False, error=last_error)
+            return _workspace_prep_failure(last_error)
 
         return WorkspacePrepResult(
             ok=True,
@@ -1104,13 +1267,12 @@ def prepare_isolated_workspace(mission: dict) -> WorkspacePrepResult:
             clone_strategy=strategy,
         )
 
-    return WorkspacePrepResult(
-        ok=False,
-        error=last_error
+    return _workspace_prep_failure(
+        last_error
         or (
             f"Failed to clone repository.name={repo_name!r} "
             f"at ref {base_branch!r} from {repository_url}"
-        ),
+        )
     )
 
 
@@ -1126,33 +1288,32 @@ def prepare_ephemeral_checkout(
     platform push when ``GITHUB_TOKEN`` is configured.
     """
     if not isinstance(repository_url, str) or not repository_url.strip():
-        return WorkspacePrepResult(
-            ok=False,
-            error="repository_url is required for ephemeral checkout",
+        return _workspace_prep_failure(
+            "repository_url is required for ephemeral checkout"
         )
     if not isinstance(ref, str) or not ref.strip():
-        return WorkspacePrepResult(
-            ok=False,
-            error="ref is required for ephemeral checkout",
-        )
+        return _workspace_prep_failure("ref is required for ephemeral checkout")
 
     workspace_path = tempfile.mkdtemp(prefix="mission-control-cmd-")
     clone_env, _auth_error = _github_push_environment()
     # Missing GITHUB_TOKEN is fine for local/file remotes used in tests.
+    safe_url, git_env = _prepare_git_url_and_env(
+        repository_url.strip(), clone_env
+    )
     clone = _run_git(
         [
             "clone",
-            repository_url.strip(),
+            safe_url,
             workspace_path,
         ],
-        env=clone_env,
+        env=git_env,
     )
     if clone.returncode != 0:
         _safe_cleanup(workspace_path)
         message = clone.stderr.strip() or clone.stdout.strip()
         if not message:
             message = f"git clone failed with code {clone.returncode}"
-        return WorkspacePrepResult(ok=False, error=message)
+        return _workspace_prep_failure(message)
 
     checkout = _run_git(
         [
@@ -1162,36 +1323,20 @@ def prepare_ephemeral_checkout(
             "--detach",
             ref.strip(),
         ],
-        env=clone_env,
+        env=git_env,
     )
     if checkout.returncode != 0:
         _safe_cleanup(workspace_path)
         message = checkout.stderr.strip() or checkout.stdout.strip()
         if not message:
             message = f"git checkout failed with code {checkout.returncode}"
-        return WorkspacePrepResult(ok=False, error=message)
+        return _workspace_prep_failure(message)
 
     return WorkspacePrepResult(ok=True, workspace_path=workspace_path)
 
 
 def _git_status_porcelain(workspace_path: str) -> subprocess.CompletedProcess[str]:
     return _run_git(["-C", workspace_path, "status", "--porcelain"])
-
-
-def _redact_secret_text(message: str) -> str:
-    """Remove known secret values from operator-facing Git messages."""
-    redacted = message
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    if token:
-        redacted = redacted.replace(token, "***")
-    # HTTPS basic-auth credentials embedded in URLs.
-    redacted = re.sub(
-        r"(https?://)([^/@\s]+)@",
-        r"\1***@",
-        redacted,
-        flags=re.IGNORECASE,
-    )
-    return redacted
 
 
 def _read_commit_sha(

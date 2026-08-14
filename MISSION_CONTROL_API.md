@@ -601,6 +601,8 @@ Configure clone URLs via `MISSION_CONTROL_REPOSITORY_URL_MAP` (JSON) or `MISSION
 
 Isolated `POST /runs` workspaces clone `repository.base_branch` with a depth-1 single-branch clone by default for network/`file://` remotes, verify `HEAD` against the requested remote tip, and fall back to a full single-branch clone when the shallow path cannot safely satisfy semantics. Path-style local remotes keep the native full single-branch clone (Git ignores `--depth` on path clones). Set `MISSION_CONTROL_WORKSPACE_CLONE_DEPTH=0` or `full` to force the legacy full-clone path (for example when comparing preparation cost).
 
+`repository.base_branch` may name a branch or tag. Remote tip resolution queries `refs/heads/<name>`, `refs/tags/<name>`, and the peeled `refs/tags/<name>^{}` so annotated tags resolve to the commit `git clone --branch` checks out (never the tag-object SHA). Branches win over same-named tags. Lightweight tags resolve to their commit SHA. Workspace preparation / clone / ref errors redact URL userinfo, token query parameters, and bearer/authorization material before they enter run error fields, logs, API/MCP responses, or SQLite state; credential-bearing userinfo is stripped from Git subprocess argv.
+
 ### MCP tools
 
 The Mission Control MCP connector exposes exactly these run-operation tools:
