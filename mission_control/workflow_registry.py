@@ -16,7 +16,7 @@ Schema is versioned. Unsupported newer schema versions fail closed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
 import logging
@@ -35,10 +35,17 @@ _SQLITE_BUSY_TIMEOUT_MS = 5000
 _WORKFLOWS_TABLE = "workflows"
 _WORKFLOW_STEPS_TABLE = "workflow_steps"
 _WORKFLOW_TRANSITIONS_TABLE = "workflow_transitions"
+_WORKFLOW_DISPATCH_INTENTS_TABLE = "workflow_dispatch_intents"
 _SCHEMA_META_TABLE = "workflow_schema_meta"
 
 # Monotonic schema version for additive migrations.
-WORKFLOW_SCHEMA_VERSION = 2
+WORKFLOW_SCHEMA_VERSION = 3
+
+# Durable RunQueue handoff / redrive (SQLite is the correctness boundary).
+DISPATCH_LEASE_SECONDS = 30.0
+DISPATCH_MAX_ATTEMPTS = 5
+DISPATCH_BACKOFF_BASE_SECONDS = 0.5
+DISPATCH_BACKOFF_MAX_SECONDS = 60.0
 
 # Environment flag — disabled by default (production must not enable yet).
 WORKFLOW_ORCHESTRATION_ENV = "MISSION_CONTROL_WORKFLOW_ORCHESTRATION"
@@ -119,6 +126,15 @@ class StepMaterializationState(str, Enum):
     MATERIALIZED = "materialized"
 
 
+class DispatchIntentState(str, Enum):
+    """Durable RunQueue handoff intent for materialized children."""
+
+    PENDING = "pending"
+    LEASED = "leased"
+    ACKED = "acked"
+    POISONED = "poisoned"
+
+
 class TransitionReason(str, Enum):
     """Machine-readable reasons recorded on audit transitions."""
 
@@ -134,6 +150,7 @@ class TransitionReason(str, Enum):
     INTERVENTION = "intervention"
     ERROR = "error"
     SCHEMA_MIGRATE = "schema_migrate"
+    DISPATCH = "dispatch"
 
 
 def is_terminal_workflow_state(state: WorkflowState | str) -> bool:
@@ -445,6 +462,34 @@ class LaunchClaimResult:
     policy_audit: dict[str, Any] | None = None
 
 
+@dataclass
+class DispatchIntentRecord:
+    """Durable enqueue/redrive intent keyed by ``child_run_id``."""
+
+    child_run_id: str
+    workflow_id: str
+    step_id: str
+    state: DispatchIntentState
+    attempt_count: int
+    created_at: datetime
+    updated_at: datetime
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    next_attempt_at: datetime | None = None
+    last_error: str | None = None
+    acked_at: datetime | None = None
+
+
+@dataclass
+class DispatchClaimResult:
+    """Outcome of claiming a dispatch intent lease."""
+
+    ok: bool
+    intent: DispatchIntentRecord | None
+    error: str | None = None
+    poisoned: bool = False
+
+
 def make_idempotency_key(
     workflow_id: str,
     step_type: StepType | str,
@@ -622,6 +667,10 @@ class WorkflowRegistry:
                     self._migrate_to_v2_unlocked()
                     self._write_schema_version_unlocked(2)
                     current = 2
+                if current < 3:
+                    self._migrate_to_v3_unlocked()
+                    self._write_schema_version_unlocked(3)
+                    current = 3
                 if current != WORKFLOW_SCHEMA_VERSION:
                     self._conn.rollback()
                     raise WorkflowSchemaUnsupportedError(
@@ -686,6 +735,57 @@ class WorkflowRegistry:
             SET materialization_state = 'claimed'
             WHERE materialization_state IS NULL OR materialization_state = ''
             """
+        )
+
+    def _migrate_to_v3_unlocked(self) -> None:
+        """Additive v3: durable unique dispatch intents per child_run_id."""
+        self._conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_WORKFLOW_DISPATCH_INTENTS_TABLE} (
+                child_run_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                next_attempt_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                acked_at TEXT
+            )
+            """
+        )
+        self._conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_workflow_dispatch_intents_state
+            ON {_WORKFLOW_DISPATCH_INTENTS_TABLE}(state, next_attempt_at)
+            """
+        )
+        self._conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_workflow_dispatch_intents_workflow
+            ON {_WORKFLOW_DISPATCH_INTENTS_TABLE}(workflow_id)
+            """
+        )
+
+    def _row_to_dispatch_intent(
+        self, row: sqlite3.Row
+    ) -> DispatchIntentRecord:
+        return DispatchIntentRecord(
+            child_run_id=row["child_run_id"],
+            workflow_id=row["workflow_id"],
+            step_id=row["step_id"],
+            state=DispatchIntentState(row["state"]),
+            attempt_count=int(row["attempt_count"] or 0),
+            lease_owner=row["lease_owner"],
+            lease_expires_at=_parse_dt(row["lease_expires_at"]),
+            next_attempt_at=_parse_dt(row["next_attempt_at"]),
+            last_error=row["last_error"],
+            created_at=_parse_dt(row["created_at"]) or _utc_now(),
+            updated_at=_parse_dt(row["updated_at"]) or _utc_now(),
+            acked_at=_parse_dt(row["acked_at"]),
         )
 
     def _row_to_workflow(self, row: sqlite3.Row) -> WorkflowRecord:
@@ -1513,10 +1613,19 @@ class WorkflowRegistry:
                             StepMaterializationState.MATERIALIZED.value
                         ),
                         "child_status": child_status,
+                        "dispatch_intent": DispatchIntentState.PENDING.value,
                     },
                     version_after=new_version,
                     step_id=step_id,
                     child_run_id=step.child_run_id,
+                )
+                # MATERIALIZED must imply a recoverable dispatch intent exists.
+                assert step.child_run_id is not None
+                self._insert_pending_dispatch_intent_unlocked(
+                    child_run_id=step.child_run_id,
+                    workflow_id=workflow_id,
+                    step_id=step_id,
+                    now=now,
                 )
                 self._conn.commit()
                 updated = self._fetch_workflow_unlocked(workflow_id)
@@ -1535,6 +1644,398 @@ class WorkflowRegistry:
                 self._conn.rollback()
                 raise
 
+    def _insert_pending_dispatch_intent_unlocked(
+        self,
+        *,
+        child_run_id: str,
+        workflow_id: str,
+        step_id: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Insert pending dispatch intent; ignore if already present."""
+        clock = now or _utc_now()
+        now_s = _format_dt(clock)
+        self._conn.execute(
+            f"""
+            INSERT OR IGNORE INTO {_WORKFLOW_DISPATCH_INTENTS_TABLE} (
+                child_run_id, workflow_id, step_id, state, attempt_count,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                child_run_id,
+                workflow_id,
+                step_id,
+                DispatchIntentState.PENDING.value,
+                now_s,
+                now_s,
+            ),
+        )
+
+    def _fetch_dispatch_intent_unlocked(
+        self, child_run_id: str
+    ) -> DispatchIntentRecord | None:
+        row = self._conn.execute(
+            f"""
+            SELECT * FROM {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+            WHERE child_run_id = ?
+            """,
+            (child_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_dispatch_intent(row)
+
+    def get_dispatch_intent(
+        self, child_run_id: str
+    ) -> DispatchIntentRecord | None:
+        """Return the durable dispatch intent for ``child_run_id``, if any."""
+        with self._lock:
+            return self._fetch_dispatch_intent_unlocked(child_run_id)
+
+    def ensure_dispatch_intent(
+        self,
+        *,
+        child_run_id: str,
+        workflow_id: str,
+        step_id: str,
+    ) -> DispatchIntentRecord:
+        """Ensure a unique intent row exists for a materialized child.
+
+        Creates a pending intent when missing (lazy heal for pre-v3 rows).
+        Existing terminal/acked/poisoned/leased rows are left unchanged.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._insert_pending_dispatch_intent_unlocked(
+                    child_run_id=child_run_id,
+                    workflow_id=workflow_id,
+                    step_id=step_id,
+                )
+                self._conn.commit()
+                intent = self._fetch_dispatch_intent_unlocked(child_run_id)
+                assert intent is not None
+                return intent
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def claim_dispatch_intent(
+        self,
+        *,
+        child_run_id: str,
+        owner: str,
+        lease_seconds: float = DISPATCH_LEASE_SECONDS,
+        max_attempts: int = DISPATCH_MAX_ATTEMPTS,
+        now: datetime | None = None,
+    ) -> DispatchClaimResult:
+        """Claim a lease on a pending / expired dispatch intent.
+
+        SQLite CAS is the correctness boundary across concurrent dispatchers
+        and process restarts. Active non-expired leases are not stolen.
+        """
+        clock = now or _utc_now()
+        now_s = _format_dt(clock)
+        assert now_s is not None
+        expires = clock + timedelta(seconds=max(0.01, float(lease_seconds)))
+        expires_s = _format_dt(expires)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                intent = self._fetch_dispatch_intent_unlocked(child_run_id)
+                if intent is None:
+                    self._conn.rollback()
+                    return DispatchClaimResult(
+                        ok=False, intent=None, error="intent_not_found"
+                    )
+                if intent.state is DispatchIntentState.ACKED:
+                    self._conn.rollback()
+                    return DispatchClaimResult(
+                        ok=False, intent=intent, error="already_acked"
+                    )
+                if intent.state is DispatchIntentState.POISONED:
+                    self._conn.rollback()
+                    return DispatchClaimResult(
+                        ok=False,
+                        intent=intent,
+                        error="poisoned",
+                        poisoned=True,
+                    )
+                lease_active = (
+                    intent.state is DispatchIntentState.LEASED
+                    and intent.lease_expires_at is not None
+                    and intent.lease_expires_at > clock
+                    and intent.lease_owner
+                    and intent.lease_owner != owner
+                )
+                if lease_active:
+                    self._conn.rollback()
+                    return DispatchClaimResult(
+                        ok=False, intent=intent, error="lease_held"
+                    )
+                if (
+                    intent.next_attempt_at is not None
+                    and intent.next_attempt_at > clock
+                    and intent.state is DispatchIntentState.PENDING
+                ):
+                    self._conn.rollback()
+                    return DispatchClaimResult(
+                        ok=False, intent=intent, error="backoff"
+                    )
+
+                next_attempt = intent.attempt_count + 1
+                if next_attempt > max_attempts:
+                    self._conn.execute(
+                        f"""
+                        UPDATE {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+                        SET state = ?,
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE child_run_id = ?
+                        """,
+                        (
+                            DispatchIntentState.POISONED.value,
+                            "dispatch_attempt_ceiling",
+                            now_s,
+                            child_run_id,
+                        ),
+                    )
+                    self._conn.commit()
+                    poisoned = self._fetch_dispatch_intent_unlocked(child_run_id)
+                    return DispatchClaimResult(
+                        ok=False,
+                        intent=poisoned,
+                        error="dispatch_attempt_ceiling",
+                        poisoned=True,
+                    )
+
+                cur = self._conn.execute(
+                    f"""
+                    UPDATE {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+                    SET state = ?,
+                        attempt_count = ?,
+                        lease_owner = ?,
+                        lease_expires_at = ?,
+                        next_attempt_at = NULL,
+                        updated_at = ?
+                    WHERE child_run_id = ?
+                      AND state IN (?, ?)
+                      AND (
+                        lease_owner IS NULL
+                        OR lease_owner = ?
+                        OR lease_expires_at IS NULL
+                        OR lease_expires_at <= ?
+                      )
+                    """,
+                    (
+                        DispatchIntentState.LEASED.value,
+                        next_attempt,
+                        owner,
+                        expires_s,
+                        now_s,
+                        child_run_id,
+                        DispatchIntentState.PENDING.value,
+                        DispatchIntentState.LEASED.value,
+                        owner,
+                        now_s,
+                    ),
+                )
+                if int(cur.rowcount or 0) < 1:
+                    self._conn.rollback()
+                    latest = self._fetch_dispatch_intent_unlocked(child_run_id)
+                    return DispatchClaimResult(
+                        ok=False,
+                        intent=latest,
+                        error="claim_conflict",
+                    )
+                self._conn.commit()
+                claimed = self._fetch_dispatch_intent_unlocked(child_run_id)
+                return DispatchClaimResult(ok=True, intent=claimed)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def ack_dispatch_intent(
+        self,
+        *,
+        child_run_id: str,
+        owner: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Acknowledge durable handoff after enqueue (or suppress-as-done)."""
+        clock = now or _utc_now()
+        now_s = _format_dt(clock)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    f"""
+                    UPDATE {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+                    SET state = ?,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        acked_at = ?,
+                        updated_at = ?,
+                        last_error = NULL
+                    WHERE child_run_id = ?
+                      AND state = ?
+                      AND lease_owner = ?
+                    """,
+                    (
+                        DispatchIntentState.ACKED.value,
+                        now_s,
+                        now_s,
+                        child_run_id,
+                        DispatchIntentState.LEASED.value,
+                        owner,
+                    ),
+                )
+                if int(cur.rowcount or 0) < 1:
+                    # Idempotent: already acked counts as success.
+                    intent = self._fetch_dispatch_intent_unlocked(child_run_id)
+                    self._conn.rollback()
+                    return bool(
+                        intent is not None
+                        and intent.state is DispatchIntentState.ACKED
+                    )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def fail_dispatch_intent(
+        self,
+        *,
+        child_run_id: str,
+        owner: str,
+        error: str,
+        max_attempts: int = DISPATCH_MAX_ATTEMPTS,
+        backoff_base_seconds: float = DISPATCH_BACKOFF_BASE_SECONDS,
+        backoff_max_seconds: float = DISPATCH_BACKOFF_MAX_SECONDS,
+        now: datetime | None = None,
+    ) -> DispatchIntentRecord | None:
+        """Release a lease for retry with bounded backoff, or poison.
+
+        Enqueue exceptions leave retryable durable intent. After the attempt
+        ceiling the intent is poisoned (fail closed).
+        """
+        clock = now or _utc_now()
+        now_s = _format_dt(clock)
+        assert now_s is not None
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                intent = self._fetch_dispatch_intent_unlocked(child_run_id)
+                if intent is None:
+                    self._conn.rollback()
+                    return None
+                if intent.state is DispatchIntentState.ACKED:
+                    self._conn.rollback()
+                    return intent
+                if (
+                    intent.state is DispatchIntentState.LEASED
+                    and intent.lease_owner
+                    and intent.lease_owner != owner
+                    and intent.lease_expires_at is not None
+                    and intent.lease_expires_at > clock
+                ):
+                    self._conn.rollback()
+                    return intent
+
+                if intent.attempt_count >= max_attempts:
+                    self._conn.execute(
+                        f"""
+                        UPDATE {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+                        SET state = ?,
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE child_run_id = ?
+                        """,
+                        (
+                            DispatchIntentState.POISONED.value,
+                            error or "dispatch_attempt_ceiling",
+                            now_s,
+                            child_run_id,
+                        ),
+                    )
+                else:
+                    delay = min(
+                        float(backoff_max_seconds),
+                        float(backoff_base_seconds)
+                        * (2 ** max(0, intent.attempt_count - 1)),
+                    )
+                    next_at = clock + timedelta(seconds=delay)
+                    self._conn.execute(
+                        f"""
+                        UPDATE {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+                        SET state = ?,
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            next_attempt_at = ?,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE child_run_id = ?
+                        """,
+                        (
+                            DispatchIntentState.PENDING.value,
+                            _format_dt(next_at),
+                            error,
+                            now_s,
+                            child_run_id,
+                        ),
+                    )
+                self._conn.commit()
+                return self._fetch_dispatch_intent_unlocked(child_run_id)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def list_redrivable_dispatch_intents(
+        self,
+        *,
+        limit: int = 32,
+        now: datetime | None = None,
+    ) -> list[DispatchIntentRecord]:
+        """Return pending / expired-lease intents due for reconciler redrive.
+
+        Exposed for the lifespan reconciler follow-up; this slice does not
+        start a continuous worker.
+        """
+        clock = now or _utc_now()
+        now_s = _format_dt(clock)
+        assert now_s is not None
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM {_WORKFLOW_DISPATCH_INTENTS_TABLE}
+                WHERE (
+                    state = ?
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ) OR (
+                    state = ?
+                    AND (
+                        lease_expires_at IS NULL
+                        OR lease_expires_at <= ?
+                    )
+                )
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (
+                    DispatchIntentState.PENDING.value,
+                    now_s,
+                    DispatchIntentState.LEASED.value,
+                    now_s,
+                    max(1, int(limit)),
+                ),
+            ).fetchall()
+            return [self._row_to_dispatch_intent(row) for row in rows]
 
     def apply_cas_transition(
         self,
