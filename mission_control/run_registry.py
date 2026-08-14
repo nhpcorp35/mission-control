@@ -233,11 +233,13 @@ class ReservedRunOutcome(str, Enum):
 # Stable conflict classes for fail-closed reserved-id materialization.
 CONFLICT_INVALID_RUN_ID = "invalid_run_id"
 CONFLICT_NONCANONICAL_RUN_ID = "noncanonical_run_id"
+CONFLICT_MISSING_BINDING_IDENTITY = "missing_binding_identity"
 CONFLICT_MISSION_YAML_MISMATCH = "mission_yaml_mismatch"
 CONFLICT_PERMISSIONS_MISMATCH = "permissions_mismatch"
 CONFLICT_EXECUTION_MISMATCH = "execution_mismatch"
 CONFLICT_REPOSITORY_MISMATCH = "repository_mismatch"
 CONFLICT_OWNERSHIP_MISMATCH = "ownership_mismatch"
+CONFLICT_OWNERSHIP_ALIAS_CONFLICT = "ownership_alias_conflict"
 CONFLICT_EXISTING_RUN_COLLISION = "existing_run_collision"
 
 
@@ -274,6 +276,72 @@ def require_canonical_run_uuid(run_id: str) -> str:
     return canonical
 
 
+def _is_blank(value: str | None) -> bool:
+    """True when ``value`` is missing or whitespace-only."""
+    return value is None or str(value).strip() == ""
+
+
+def normalize_ownership_id(value: str | None) -> str | None:
+    """Strip ownership ids; blank / whitespace-only becomes ``None``."""
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    return stripped if stripped else None
+
+
+def normalize_optional_mission_yaml(value: str | None) -> str | None:
+    """Preserve exact YAML text; blank / whitespace-only becomes ``None``."""
+    if value is None:
+        return None
+    if str(value).strip() == "":
+        return None
+    return value
+
+
+def binding_identity_complete(
+    mission_yaml: str | None,
+    retried_from: str | None,
+) -> bool:
+    """True when both immutable binding fields are nonblank."""
+    return not _is_blank(mission_yaml) and not _is_blank(retried_from)
+
+
+def resolve_run_registry_ownership(
+    *,
+    retried_from: str | None = None,
+    parent_run_id: str | None = None,
+) -> str | None:
+    """Resolve canonical RunRegistry ownership (``retried_from``).
+
+    Workflow materialization may speak ``parent_run_id``; RunRegistry stores
+    ``retried_from``. This is the single alias-translation point: identical
+    nonblank values collapse, blanks normalize to ``None``, and conflicting
+    aliases fail closed.
+    """
+    ownership = normalize_ownership_id(retried_from)
+    parent = normalize_ownership_id(parent_run_id)
+    if ownership is not None and parent is not None and ownership != parent:
+        raise ValueError(CONFLICT_OWNERSHIP_ALIAS_CONFLICT)
+    return ownership if ownership is not None else parent
+
+
+def require_reserved_binding_identity(
+    mission_yaml: str | None,
+    retried_from: str | None,
+) -> tuple[str, str]:
+    """Require nonblank mission YAML + ownership for reserved creates.
+
+    Returns ``(mission_yaml, normalized_retried_from)``. Raises ``ValueError``
+    with ``missing_binding_identity`` when either field is omitted, empty, or
+    whitespace-only.
+    """
+    yaml_text = normalize_optional_mission_yaml(mission_yaml)
+    ownership = normalize_ownership_id(retried_from)
+    if yaml_text is None or ownership is None:
+        raise ValueError(CONFLICT_MISSING_BINDING_IDENTITY)
+    return yaml_text, ownership
+
+
 def _mission_mapping(mission_yaml: str | None) -> dict[str, Any]:
     """Best-effort parse of mission YAML for conflict classification only."""
     if mission_yaml is None or str(mission_yaml).strip() == "":
@@ -300,10 +368,21 @@ def reserved_run_identity_matches(
     mission_yaml: str | None,
     retried_from: str | None,
 ) -> bool:
-    """True when immutable mission identity + launch metadata match exactly."""
+    """True when immutable mission identity + launch metadata match exactly.
+
+    Incomplete / blank bindings never match — legacy unowned rows cannot be
+    claimed via idempotent recovery.
+    """
+    if not binding_identity_complete(mission_yaml, retried_from):
+        return False
+    if not binding_identity_complete(
+        existing.mission_yaml, existing.retried_from
+    ):
+        return False
     return (
         existing.mission_yaml == mission_yaml
-        and existing.retried_from == retried_from
+        and normalize_ownership_id(existing.retried_from)
+        == normalize_ownership_id(retried_from)
     )
 
 
@@ -325,14 +404,19 @@ def classify_reserved_run_conflict(
     ):
         raise ValueError("identity matches; not a conflict")
 
-    existing_blank = existing.mission_yaml is None or str(
-        existing.mission_yaml
-    ).strip() == ""
-    expected_present = mission_yaml is not None and str(mission_yaml).strip() != ""
-    if existing_blank and expected_present:
+    existing_incomplete = not binding_identity_complete(
+        existing.mission_yaml, existing.retried_from
+    )
+    expected_complete = binding_identity_complete(mission_yaml, retried_from)
+    if existing_incomplete and expected_complete:
+        return CONFLICT_EXISTING_RUN_COLLISION
+    if existing_incomplete or not expected_complete:
+        # Blank / legacy / omitted identity must never be claimed.
         return CONFLICT_EXISTING_RUN_COLLISION
 
-    if existing.retried_from != retried_from:
+    if normalize_ownership_id(existing.retried_from) != normalize_ownership_id(
+        retried_from
+    ):
         return CONFLICT_OWNERSHIP_MISMATCH
 
     expected = _mission_mapping(mission_yaml)
@@ -804,8 +888,6 @@ class RunRegistry:
                 return_code = excluded.return_code,
                 commit_sha = excluded.commit_sha,
                 result_json = excluded.result_json,
-                mission_yaml = excluded.mission_yaml,
-                retried_from = excluded.retried_from,
                 phase = excluded.phase,
                 phase_started_at = excluded.phase_started_at,
                 heartbeat_at = excluded.heartbeat_at,
@@ -973,10 +1055,32 @@ class RunRegistry:
                 conflict_class=conflict_class,
             )
 
+        try:
+            bound_yaml, bound_ownership = require_reserved_binding_identity(
+                mission_yaml, retried_from
+            )
+        except ValueError as exc:
+            conflict_class = str(exc) or CONFLICT_MISSING_BINDING_IDENTITY
+            logger.info(
+                (
+                    "lifecycle run_id=%s event=reserved_run_conflict "
+                    "conflict_class=%s api_pid=%s registry_id=%s"
+                ),
+                canonical_id,
+                conflict_class,
+                os.getpid(),
+                id(self),
+            )
+            return ReservedRunCreateResult(
+                outcome=ReservedRunOutcome.CONFLICT,
+                record=None,
+                conflict_class=conflict_class,
+            )
+
         record = self._new_queued_record(
             run_id=canonical_id,
-            mission_yaml=mission_yaml,
-            retried_from=retried_from,
+            mission_yaml=bound_yaml,
+            retried_from=bound_ownership,
         )
         with self._lock:
             inserted = self._insert_new_run_unlocked(record)
@@ -1012,8 +1116,8 @@ class RunRegistry:
 
         if reserved_run_identity_matches(
             existing,
-            mission_yaml=mission_yaml,
-            retried_from=retried_from,
+            mission_yaml=bound_yaml,
+            retried_from=bound_ownership,
         ):
             logger.info(
                 (
@@ -1032,8 +1136,8 @@ class RunRegistry:
 
         conflict_class = classify_reserved_run_conflict(
             existing,
-            mission_yaml=mission_yaml,
-            retried_from=retried_from,
+            mission_yaml=bound_yaml,
+            retried_from=bound_ownership,
         )
         logger.info(
             (
@@ -1061,12 +1165,14 @@ class RunRegistry:
         """Create a new run in ``queued`` status.
 
         When ``run_id`` is omitted, allocates a fresh UUID4 and returns a
-        :class:`RunRecord` (existing callers unchanged).
+        :class:`RunRecord` (existing callers unchanged). Blank mission /
+        ownership strings normalize to ``None``.
 
         When ``run_id`` is supplied, materializes that caller-reserved
         canonical UUID and returns a :class:`ReservedRunCreateResult`
         discriminating ``created``, ``recovered_idempotently``, or
-        ``conflict``. Existing rows are never overwritten or recycled.
+        ``conflict``. Reserved creates require nonblank ``mission_yaml`` and
+        ``retried_from``; existing rows are never overwritten or recycled.
         """
         if run_id is not None:
             return self._create_reserved_run(
@@ -1077,8 +1183,8 @@ class RunRegistry:
 
         record = self._new_queued_record(
             run_id=str(uuid.uuid4()),
-            mission_yaml=mission_yaml,
-            retried_from=retried_from,
+            mission_yaml=normalize_optional_mission_yaml(mission_yaml),
+            retried_from=normalize_ownership_id(retried_from),
         )
         with self._lock:
             self._persist_record(record)

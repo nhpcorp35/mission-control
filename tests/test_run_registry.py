@@ -12,6 +12,7 @@ from mission_control.run_registry import (
     CONFLICT_EXECUTION_MISMATCH,
     CONFLICT_EXISTING_RUN_COLLISION,
     CONFLICT_INVALID_RUN_ID,
+    CONFLICT_MISSING_BINDING_IDENTITY,
     CONFLICT_MISSION_YAML_MISMATCH,
     CONFLICT_NONCANONICAL_RUN_ID,
     CONFLICT_OWNERSHIP_MISMATCH,
@@ -319,6 +320,89 @@ class TestReservedRunIds(SqliteRegistryTestCase):
         fetched = self.registry.get_run(reserved)
         assert fetched is not None
         self.assertEqual(fetched.mission_yaml, yaml_text)
+
+    def test_blank_legacy_row_omitted_identity_cannot_recover(self) -> None:
+        legacy = self.registry.create_run()
+        conflict = self.registry.create_run(run_id=legacy.run_id)
+
+        self.assertEqual(conflict.outcome, ReservedRunOutcome.CONFLICT)
+        self.assertEqual(
+            conflict.conflict_class, CONFLICT_MISSING_BINDING_IDENTITY
+        )
+        self.assertIsNone(conflict.record)
+        fetched = self.registry.get_run(legacy.run_id)
+        assert fetched is not None
+        self.assertIsNone(fetched.mission_yaml)
+        self.assertIsNone(fetched.retried_from)
+        self.assertEqual(self.registry.count_runs(), 1)
+
+    def test_reserved_missing_or_blank_identity_rejected_without_insert(
+        self,
+    ) -> None:
+        reserved = str(uuid.uuid4())
+        yaml_text = _mission_yaml()
+        cases = [
+            {"mission_yaml": None, "retried_from": "owner"},
+            {"mission_yaml": "", "retried_from": "owner"},
+            {"mission_yaml": "   \n", "retried_from": "owner"},
+            {"mission_yaml": yaml_text, "retried_from": None},
+            {"mission_yaml": yaml_text, "retried_from": ""},
+            {"mission_yaml": yaml_text, "retried_from": "  \t"},
+            {},
+        ]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                result = self.registry.create_run(run_id=reserved, **kwargs)
+                self.assertEqual(result.outcome, ReservedRunOutcome.CONFLICT)
+                self.assertEqual(
+                    result.conflict_class, CONFLICT_MISSING_BINDING_IDENTITY
+                )
+                self.assertIsNone(result.record)
+                self.assertEqual(self.registry.count_runs(), 0)
+                self.assertIsNone(self.registry.get_run(reserved))
+
+    def test_valid_binding_creates_and_recovers(self) -> None:
+        reserved = str(uuid.uuid4())
+        yaml_text = _mission_yaml()
+        first = self.registry.create_run(
+            run_id=reserved,
+            mission_yaml=yaml_text,
+            retried_from="owner-1",
+        )
+        self.assertEqual(first.outcome, ReservedRunOutcome.CREATED)
+        assert first.record is not None
+        self.assertEqual(first.record.retried_from, "owner-1")
+
+        second = self.registry.create_run(
+            run_id=reserved,
+            mission_yaml=yaml_text,
+            retried_from="owner-1",
+        )
+        self.assertEqual(
+            second.outcome, ReservedRunOutcome.RECOVERED_IDEMPOTENTLY
+        )
+        assert second.record is not None
+        self.assertEqual(second.record.run_id, reserved)
+        self.assertEqual(second.record.retried_from, "owner-1")
+        self.assertEqual(self.registry.count_runs(), 1)
+
+    def test_status_persist_does_not_mutate_immutable_identity(self) -> None:
+        reserved = str(uuid.uuid4())
+        yaml_text = _mission_yaml()
+        created = self.registry.create_run(
+            run_id=reserved,
+            mission_yaml=yaml_text,
+            retried_from="immutable-owner",
+        )
+        assert created.record is not None
+        updated = self.registry.update_status(reserved, RunStatus.RUNNING)
+        assert updated is not None
+        self.assertEqual(updated.mission_yaml, yaml_text)
+        self.assertEqual(updated.retried_from, "immutable-owner")
+        fetched = self.registry.get_run(reserved)
+        assert fetched is not None
+        self.assertEqual(fetched.mission_yaml, yaml_text)
+        self.assertEqual(fetched.retried_from, "immutable-owner")
 
 
 class TestRetrieveAndUnknown(SqliteRegistryTestCase):

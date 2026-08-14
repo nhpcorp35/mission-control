@@ -174,19 +174,32 @@ def reserved_child_run_materialization_spec(
     child_run_id: str,
     mission_yaml: str,
     parent_run_id: str | None = None,
+    retried_from: str | None = None,
 ) -> dict[str, Any]:
     """Describe reserved-id materialization for future RunRegistry wiring.
 
-    Does **not** call ``RunRegistry.create_run``. Callers / a later mission
-    should pass ``run_id=child_run_id`` once that API exists.
+    Does **not** call ``RunRegistry.create_run``. Ownership uses the
+    RunRegistry-canonical ``retried_from`` field. Workflow callers may pass
+    ``parent_run_id``; alias translation lives in
+    :func:`mission_control.run_registry.resolve_run_registry_ownership`.
+    Conflicting ``parent_run_id`` / ``retried_from`` values fail closed.
     """
+    from mission_control.run_registry import resolve_run_registry_ownership
+
+    ownership = resolve_run_registry_ownership(
+        parent_run_id=parent_run_id,
+        retried_from=retried_from,
+    )
     return {
         "contract_version": RESERVED_CHILD_RUN_ID_CONTRACT_VERSION,
         "run_id": child_run_id,
         "mission_yaml": mission_yaml,
-        "parent_run_id": parent_run_id,
+        "retried_from": ownership,
         "status": "queued",
-        "note": "future_RunRegistry.create_run(run_id=...)",
+        "note": (
+            "RunRegistry.create_run(run_id=..., mission_yaml=..., "
+            "retried_from=...)"
+        ),
     }
 
 

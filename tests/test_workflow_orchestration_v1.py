@@ -1125,16 +1125,117 @@ class SchemaMigrationTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+
+class ReservedRunMaterializationContractTests(unittest.TestCase):
     def test_reserved_run_contract(self) -> None:
         spec = reserved_child_run_materialization_spec(
             child_run_id="abc",
             mission_yaml="mission: x\n",
+            parent_run_id="parent-run",
         )
         self.assertEqual(
             spec["contract_version"], RESERVED_CHILD_RUN_ID_CONTRACT_VERSION
         )
         self.assertEqual(spec["run_id"], "abc")
+        self.assertEqual(spec["retried_from"], "parent-run")
+        self.assertNotIn("parent_run_id", spec)
         self.assertIn("create_run", spec["note"])
+        self.assertIn("retried_from", spec["note"])
+
+    def test_materialization_ownership_maps_to_run_registry(self) -> None:
+        from mission_control.run_registry import (
+            CONFLICT_OWNERSHIP_ALIAS_CONFLICT,
+            ReservedRunOutcome,
+            RunRegistry,
+        )
+
+        child_run_id = "11111111-1111-4111-8111-111111111111"
+        mission_yaml = (
+            "version: '1.0'\n"
+            "mission_id: wf-ownership\n"
+            "title: Ownership map\n"
+            "repository:\n"
+            "  name: demo-repo\n"
+            "  path: .\n"
+            "  base_branch: main\n"
+            "execution:\n"
+            "  agent: cursor\n"
+            "  mode: execute\n"
+            "permissions:\n"
+            "  read: true\n"
+            "  create_files: false\n"
+            "  modify_files: false\n"
+            "  delete_files: false\n"
+            "  run_commands: false\n"
+            "  stage_changes: false\n"
+            "  commit: false\n"
+            "  push: false\n"
+            "instructions: |\n  map ownership\n"
+            "deliverables: []\n"
+            "approval:\n"
+            "  execute_without_approval: true\n"
+            "  commit_requires_approval: true\n"
+            "  push_requires_approval: true\n"
+        )
+        owner = "22222222-2222-4222-8222-222222222222"
+        spec = reserved_child_run_materialization_spec(
+            child_run_id=child_run_id,
+            mission_yaml=mission_yaml,
+            parent_run_id=owner,
+        )
+        self.assertEqual(spec["retried_from"], owner)
+
+        identical = reserved_child_run_materialization_spec(
+            child_run_id=child_run_id,
+            mission_yaml=mission_yaml,
+            parent_run_id=owner,
+            retried_from=owner,
+        )
+        self.assertEqual(identical["retried_from"], owner)
+
+        with self.assertRaises(ValueError) as raised:
+            reserved_child_run_materialization_spec(
+                child_run_id=child_run_id,
+                mission_yaml=mission_yaml,
+                parent_run_id="owner-a",
+                retried_from="owner-b",
+            )
+        self.assertEqual(
+            str(raised.exception), CONFLICT_OWNERSHIP_ALIAS_CONFLICT
+        )
+
+        path = None
+        registry = None
+        try:
+            fd, path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            registry = RunRegistry(path)
+            first = registry.create_run(
+                run_id=spec["run_id"],
+                mission_yaml=spec["mission_yaml"],
+                retried_from=spec["retried_from"],
+            )
+            self.assertEqual(first.outcome, ReservedRunOutcome.CREATED)
+            retry_spec = reserved_child_run_materialization_spec(
+                child_run_id=child_run_id,
+                mission_yaml=mission_yaml,
+                parent_run_id=owner,
+            )
+            recovered = registry.create_run(
+                run_id=retry_spec["run_id"],
+                mission_yaml=retry_spec["mission_yaml"],
+                retried_from=retry_spec["retried_from"],
+            )
+            self.assertEqual(
+                recovered.outcome, ReservedRunOutcome.RECOVERED_IDEMPOTENTLY
+            )
+            assert recovered.record is not None
+            self.assertEqual(recovered.record.retried_from, owner)
+        finally:
+            if registry is not None:
+                registry.close()
+            if path is not None:
+                os.unlink(path)
 
 
 class NotificationDecisionTests(WorkflowRegistryTestCase):
