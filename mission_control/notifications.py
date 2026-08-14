@@ -3,6 +3,11 @@
 Opt-in generic HMAC webhook and native Pushover delivery for phase_change,
 stale, recovery, and terminal events only (never heartbeats). Failures never
 mutate mission status. Network delivery stays off request/wait/status paths.
+
+Pushover phone alerts are tuned for one audible notification per normal
+mission: routine ``phase_change`` events remain durable for inspection but are
+intentionally skipped for the native Pushover backend (webhook delivery of
+``phase_change`` is unchanged). Stale and recovery alerts still deliver.
 """
 
 from __future__ import annotations
@@ -81,12 +86,16 @@ PUSHOVER_API_HOST = "api.pushover.net"
 PUSHOVER_MESSAGES_PATH = "/1/messages.json"
 PUSHOVER_API_URL = f"https://{PUSHOVER_API_HOST}{PUSHOVER_MESSAGES_PATH}"
 DEFAULT_PUSHOVER_PRIORITY = 0
+# Official Pushover default sound name (explicit in Messages API form).
+DEFAULT_PUSHOVER_SOUND = "pushover"
 # Emergency priority (2) requires retry/expire and is rejected for safety.
 ALLOWED_PUSHOVER_PRIORITIES = frozenset({-2, -1, 0, 1})
 PUSHOVER_TITLE_MAX_CHARS = 100
 PUSHOVER_MESSAGE_MAX_CHARS = 400
 PUSHOVER_DEVICE_MAX_CHARS = 64
 PUSHOVER_SOUND_MAX_CHARS = 32
+# Terminal outbox reason when Pushover skips routine phase_change (not dead).
+PUSHOVER_PHASE_CHANGE_SUPPRESSED = "pushover_phase_change_suppressed"
 
 # Active delivery backend when notifications are opted in.
 BACKEND_NONE = "none"
@@ -157,9 +166,21 @@ class DeliveryState(str, Enum):
     IN_FLIGHT = "in_flight"
     DELIVERED = "delivered"
     DEAD = "dead"
+    # Terminal non-failure: intentionally not delivered (e.g. Pushover filter).
+    SKIPPED = "skipped"
 
 
 EMITTED_EVENT_KINDS = frozenset(kind.value for kind in NotificationEventKind)
+
+# Native Pushover phone alerts: terminal + exceptional stale/recovery only.
+# Routine phase_change stays durable but is not POSTed to Pushover.
+PUSHOVER_DELIVERABLE_EVENT_KINDS = frozenset(
+    {
+        NotificationEventKind.STALE.value,
+        NotificationEventKind.RECOVERY.value,
+        NotificationEventKind.TERMINAL.value,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -323,6 +344,33 @@ def sanitize_pushover_device_or_sound(
     if _has_ascii_control_chars(text):
         return None
     return text[:max_chars]
+
+
+def resolve_pushover_sound(sound: str | None) -> str:
+    """Return the Messages API sound name (default official ``pushover``).
+
+    Explicit ``MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND`` overrides win
+    when they pass validation; otherwise the standard sound is used. OS Focus
+    / silent modes on the device can still suppress audible playback.
+    """
+    safe = sanitize_pushover_device_or_sound(
+        sound, max_chars=PUSHOVER_SOUND_MAX_CHARS
+    )
+    return safe or DEFAULT_PUSHOVER_SOUND
+
+
+def should_deliver_pushover_event(event_kind: str | NotificationEventKind) -> bool:
+    """True when the native Pushover backend should HTTP-deliver ``event_kind``.
+
+    Routine ``phase_change`` events are durable for inspection but intentionally
+    skipped for phone alerts so a normal mission yields one terminal alert.
+    """
+    kind = (
+        event_kind.value
+        if isinstance(event_kind, NotificationEventKind)
+        else str(event_kind)
+    )
+    return kind in PUSHOVER_DELIVERABLE_EVENT_KINDS
 
 
 def parse_pushover_priority(raw: str | None) -> int:
@@ -697,12 +745,8 @@ def build_pushover_form(
         )
         if safe_device:
             form["device"] = safe_device
-    if sound:
-        safe_sound = sanitize_pushover_device_or_sound(
-            sound, max_chars=PUSHOVER_SOUND_MAX_CHARS
-        )
-        if safe_sound:
-            form["sound"] = safe_sound
+    # Always send an explicit sound; default is the official "pushover" name.
+    form["sound"] = resolve_pushover_sound(sound)
     return form
 
 
@@ -1601,6 +1645,23 @@ class NotificationOutbox:
             clear_error=True,
         )
 
+    def _mark_skipped(
+        self,
+        event_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Terminal non-failure: intentionally not delivered (no retries)."""
+        safe_reason = (
+            redact_notification_error(reason) or PUSHOVER_PHASE_CHANGE_SUPPRESSED
+        )
+        self._clear_claim_fields(
+            event_id,
+            delivery_state=DeliveryState.SKIPPED.value,
+            next_attempt_at=None,
+            last_error=safe_reason,
+        )
+
     def _mark_retry_or_dead(
         self,
         event_id: str,
@@ -1767,12 +1828,29 @@ class NotificationOutbox:
         assert credentials is not None
         user_key, app_token = credentials
 
+        event_kind = str(row["event_kind"] or "")
+        if not should_deliver_pushover_event(event_kind):
+            # Keep the durable outbox row; do not HTTP, dead, or retry.
+            self._mark_skipped(
+                row["event_id"],
+                reason=PUSHOVER_PHASE_CHANGE_SUPPRESSED,
+            )
+            logger.info(
+                "notification skipped backend=pushover event_id=%s "
+                "run_id=%s event_kind=%s reason=%s",
+                row["event_id"],
+                row["run_id"],
+                event_kind,
+                PUSHOVER_PHASE_CHANGE_SUPPRESSED,
+            )
+            return
+
         attempt_count = int(row["attempt_count"]) + 1
         try:
             payload = sanitize_notification_payload(
                 json.loads(row["payload_json"])
             )
-            title = format_pushover_title(str(row["event_kind"]))
+            title = format_pushover_title(event_kind)
             message = format_pushover_message(payload)
             form = build_pushover_form(
                 user_key=user_key,

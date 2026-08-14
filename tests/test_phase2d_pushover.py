@@ -19,10 +19,12 @@ from mission_control.notifications import (
     BACKEND_NONE,
     BACKEND_PUSHOVER,
     BACKEND_WEBHOOK,
+    DEFAULT_PUSHOVER_SOUND,
     PUSHOVER_API_URL,
     PUSHOVER_APP_TOKEN_ENV,
     PUSHOVER_DEVICE_ENV,
     PUSHOVER_MESSAGE_MAX_CHARS,
+    PUSHOVER_PHASE_CHANGE_SUPPRESSED,
     PUSHOVER_PRIORITY_ENV,
     PUSHOVER_SOUND_ENV,
     PUSHOVER_TITLE_MAX_CHARS,
@@ -46,9 +48,12 @@ from mission_control.notifications import (
     parse_pushover_priority,
     redact_notification_error,
     resolve_delivery_backend,
+    resolve_pushover_sound,
     sanitize_pushover_device_or_sound,
+    should_deliver_pushover_event,
 )
 from mission_control.run_registry import (
+    RunPhase,
     RunRegistry,
     RunStatus,
 )
@@ -327,6 +332,7 @@ class TestPushoverDelivery(unittest.TestCase):
             self.assertIn("title=", body)
             self.assertIn("Mission", body)
             self.assertIn("terminal", body)
+            self.assertIn(f"sound={DEFAULT_PUSHOVER_SOUND}", body)
             self.assertNotIn(_TEST_USER, json.dumps(events))
             self.assertNotIn(_TEST_TOKEN, json.dumps(events))
         finally:
@@ -699,8 +705,8 @@ class TestPushoverDelivery(unittest.TestCase):
             ):
                 outbox.enqueue_for_record(
                     record,
-                    event_kind=NotificationEventKind.PHASE_CHANGE,
-                    dedupe_key="phase:1",
+                    event_kind=NotificationEventKind.TERMINAL,
+                    dedupe_key="terminal:retry",
                 )
                 outbox.process_due_deliveries()
                 with outbox._lock:
@@ -717,6 +723,7 @@ class TestPushoverDelivery(unittest.TestCase):
                 outbox.process_due_deliveries()
             events = outbox.list_for_run(record.run_id)
             self.assertEqual(events[0]["delivery_state"], "delivered")
+            self.assertEqual(events[0]["event_kind"], "terminal")
             self.assertEqual(calls["n"], 3)
         finally:
             outbox.close()
@@ -844,6 +851,443 @@ class TestPushoverDelivery(unittest.TestCase):
             self.assertEqual(row["delivery_state"], DeliveryState.PENDING.value)
         finally:
             outbox2.close()
+
+
+class TestPushoverAlertTuning(unittest.TestCase):
+    """One phone alert per normal mission; phase_change suppressed on Pushover."""
+
+    def setUp(self) -> None:
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        self.registry = RunRegistry(self._db_path)
+
+    def tearDown(self) -> None:
+        self.registry.close()
+        os.unlink(self._db_path)
+
+    def _outbox(self, handler, **cfg_kwargs) -> NotificationOutbox:
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport, follow_redirects=False)
+        return NotificationOutbox(
+            self._db_path,
+            config=_pushover_config(**cfg_kwargs),
+            http_client=client,
+        )
+
+    def _drain_with_url_patch(self, outbox: NotificationOutbox) -> None:
+        with patch(
+            "mission_control.notifications.validate_webhook_url",
+            return_value=PUSHOVER_API_URL,
+        ):
+            outbox.process_due_deliveries()
+
+    def test_should_deliver_pushover_policy(self) -> None:
+        self.assertTrue(should_deliver_pushover_event("terminal"))
+        self.assertTrue(should_deliver_pushover_event("stale"))
+        self.assertTrue(should_deliver_pushover_event("recovery"))
+        self.assertFalse(should_deliver_pushover_event("phase_change"))
+        self.assertFalse(
+            should_deliver_pushover_event(NotificationEventKind.PHASE_CHANGE)
+        )
+        self.assertEqual(resolve_pushover_sound(None), DEFAULT_PUSHOVER_SOUND)
+        self.assertEqual(resolve_pushover_sound("pushover"), "pushover")
+        self.assertEqual(resolve_pushover_sound("cosmic"), "cosmic")
+        self.assertEqual(resolve_pushover_sound("bad\nsound"), DEFAULT_PUSHOVER_SOUND)
+        form = build_pushover_form(
+            user_key=_TEST_USER,
+            app_token=_TEST_TOKEN,
+            title="t",
+            message="m",
+            priority=0,
+            sound=None,
+        )
+        self.assertEqual(form["sound"], DEFAULT_PUSHOVER_SOUND)
+
+    def test_default_sound_pushover_and_safe_override(self) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.content.decode("utf-8"))
+            return httpx.Response(200, json={"status": 1})
+
+        outbox = self._outbox(handler)
+        try:
+            record = _record(self.registry)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.TERMINAL,
+                    dedupe_key="terminal:default-sound",
+                )
+                outbox.process_due_deliveries()
+            self.assertEqual(len(seen), 1)
+            self.assertIn(f"sound={DEFAULT_PUSHOVER_SOUND}", seen[0])
+        finally:
+            outbox.close()
+
+        seen.clear()
+        outbox2 = self._outbox(handler, sound="cosmic")
+        try:
+            record = _record(self.registry)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                outbox2.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.TERMINAL,
+                    dedupe_key="terminal:override-sound",
+                )
+                outbox2.process_due_deliveries()
+            self.assertEqual(len(seen), 1)
+            self.assertIn("sound=cosmic", seen[0])
+            self.assertNotIn(f"sound={DEFAULT_PUSHOVER_SOUND}", seen[0])
+        finally:
+            outbox2.close()
+
+        cfg = load_notification_config(
+            environ={
+                PUSHOVER_USER_KEY_ENV: _TEST_USER,
+                PUSHOVER_APP_TOKEN_ENV: _TEST_TOKEN,
+                PUSHOVER_SOUND_ENV: "magic",
+            }
+        )
+        self.assertEqual(cfg.pushover_sound, "magic")
+        self.assertEqual(resolve_pushover_sound(cfg.pushover_sound), "magic")
+
+    def test_terminal_completed_failed_cancelled_one_request_each(self) -> None:
+        cases = (
+            ("completed", RunStatus.COMPLETED),
+            ("failed", RunStatus.FAILED),
+            ("cancelled", None),
+        )
+        for label, status in cases:
+            with self.subTest(status=label):
+                calls = {"n": 0}
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    calls["n"] += 1
+                    return httpx.Response(200, json={"status": 1})
+
+                outbox = self._outbox(handler)
+                try:
+                    record = _record(self.registry)
+                    with patch(
+                        "mission_control.notifications.validate_webhook_url",
+                        return_value=PUSHOVER_API_URL,
+                    ):
+                        if status is not None:
+                            # Registry durable enqueue + our Pushover worker.
+                            self.registry.update_status(record.run_id, status)
+                        else:
+                            outbox.enqueue(
+                                run_id=record.run_id,
+                                event_kind=NotificationEventKind.TERMINAL,
+                                dedupe_key="terminal:cancelled",
+                                payload={
+                                    "run_id": record.run_id,
+                                    "event_kind": "terminal",
+                                    "status": "cancelled",
+                                    "phase": "failed",
+                                },
+                            )
+                        outbox.process_due_deliveries(limit=32)
+                        outbox.process_due_deliveries(limit=32)
+                    self.assertEqual(calls["n"], 1, label)
+                    events = outbox.list_for_run(record.run_id)
+                    terminal = [
+                        e for e in events if e["event_kind"] == "terminal"
+                    ]
+                    self.assertEqual(len(terminal), 1)
+                    self.assertEqual(terminal[0]["delivery_state"], "delivered")
+                    for event in events:
+                        if event["event_kind"] == "phase_change":
+                            self.assertEqual(event["delivery_state"], "skipped")
+                finally:
+                    outbox.close()
+
+    def test_routine_phase_changes_produce_zero_pushover_requests(self) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(200, json={"status": 1})
+
+        phases = (
+            RunPhase.QUEUED,
+            RunPhase.WORKSPACE_PREPARATION,  # preparing
+            RunPhase.AGENT_EXECUTION,
+            RunPhase.PERSISTENCE,
+        )
+        outbox = self._outbox(handler)
+        try:
+            record = _record(self.registry)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                for phase in phases:
+                    self.registry.set_phase(record.run_id, phase)
+                    record = self.registry.get_run(record.run_id)
+                    assert record is not None
+                    # Force a distinct previous phase so enqueue always fires.
+                    outbox.maybe_enqueue_phase_change(
+                        record, previous_phase="__force__"
+                    )
+                outbox.process_due_deliveries(limit=32)
+                outbox.process_due_deliveries(limit=32)
+            self.assertEqual(calls["n"], 0)
+            events = outbox.list_for_run(record.run_id)
+            phase_events = [
+                e for e in events if e["event_kind"] == "phase_change"
+            ]
+            self.assertEqual(len(phase_events), len(phases))
+            for event in phase_events:
+                self.assertEqual(event["delivery_state"], "skipped")
+                self.assertEqual(
+                    event["last_error"], PUSHOVER_PHASE_CHANGE_SUPPRESSED
+                )
+                self.assertNotEqual(event["delivery_state"], "dead")
+                self.assertIsNone(event.get("delivered_at"))
+            dump = json.dumps(events)
+            self.assertNotIn(_TEST_USER, dump)
+            self.assertNotIn(_TEST_TOKEN, dump)
+            self.assertNotIn(PUSHOVER_USER_KEY_ENV, dump)
+            self.assertNotIn(PUSHOVER_APP_TOKEN_ENV, dump)
+        finally:
+            outbox.close()
+
+    def test_stale_recovery_terminal_three_logical_deliveries(self) -> None:
+        kinds_seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            # event_kind is not in form; count requests only.
+            kinds_seen.append("http")
+            return httpx.Response(200, json={"status": 1})
+
+        outbox = self._outbox(handler)
+        try:
+            record = _record(self.registry)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.STALE,
+                    dedupe_key="stale:seq",
+                )
+                outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.RECOVERY,
+                    dedupe_key="recovery:seq",
+                )
+                self.registry.update_status(record.run_id, RunStatus.COMPLETED)
+                record = self.registry.get_run(record.run_id)
+                assert record is not None
+                outbox.maybe_enqueue_terminal(record)
+                outbox.process_due_deliveries(limit=16)
+            self.assertEqual(len(kinds_seen), 3)
+            events = outbox.list_for_run(record.run_id)
+            by_kind = {e["event_kind"]: e for e in events}
+            self.assertEqual(by_kind["stale"]["delivery_state"], "delivered")
+            self.assertEqual(by_kind["recovery"]["delivery_state"], "delivered")
+            self.assertEqual(by_kind["terminal"]["delivery_state"], "delivered")
+        finally:
+            outbox.close()
+
+    def test_restart_drain_no_suppressed_retry_or_terminal_duplicate(
+        self,
+    ) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(200, json={"status": 1})
+
+        outbox = self._outbox(handler)
+        try:
+            record = _record(self.registry)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                phase = outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.PHASE_CHANGE,
+                    dedupe_key="phase:restart",
+                )
+                first = outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.TERMINAL,
+                    dedupe_key="terminal:restart-idem",
+                )
+                self.assertTrue(phase.created)
+                self.assertTrue(first.created)
+                outbox.process_due_deliveries()
+                self.assertEqual(calls["n"], 1)
+                # Simulate worker restart / repeated drains.
+                with outbox._lock:
+                    outbox._conn.execute(
+                        "UPDATE notification_outbox SET next_attempt_at = NULL"
+                    )
+                    outbox._conn.commit()
+                outbox.process_due_deliveries()
+                outbox.reclaim_stale_claims()
+                outbox.process_due_deliveries()
+                # Idempotent re-enqueue must not create a second terminal row.
+                second = outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.TERMINAL,
+                    dedupe_key="terminal:restart-idem",
+                )
+                self.assertFalse(second.created)
+                self.assertEqual(second.skipped_reason, "duplicate")
+                outbox.process_due_deliveries()
+            self.assertEqual(calls["n"], 1)
+            events = outbox.list_for_run(record.run_id)
+            phase_events = [
+                e for e in events if e["event_kind"] == "phase_change"
+            ]
+            terminal = [e for e in events if e["event_kind"] == "terminal"]
+            self.assertEqual(len(phase_events), 1)
+            self.assertEqual(phase_events[0]["delivery_state"], "skipped")
+            self.assertEqual(
+                phase_events[0]["last_error"], PUSHOVER_PHASE_CHANGE_SUPPRESSED
+            )
+            self.assertEqual(len(terminal), 1)
+            self.assertEqual(terminal[0]["delivery_state"], "delivered")
+        finally:
+            outbox.close()
+
+        # Fresh outbox handle (restart) must not re-deliver skipped/delivered.
+        outbox2 = self._outbox(handler)
+        try:
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                outbox2.reclaim_stale_claims()
+                outbox2.process_due_deliveries()
+            self.assertEqual(calls["n"], 1)
+        finally:
+            outbox2.close()
+
+    def test_webhook_phase_change_delivery_unchanged(self) -> None:
+        seen_kinds: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_kinds.append(request.headers.get("X-Mission-Control-Event-Kind", ""))
+            return httpx.Response(200, json={"ok": True})
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport, follow_redirects=False)
+        outbox = NotificationOutbox(
+            self._db_path,
+            config=_pushover_config(
+                user_key=None,
+                app_token=None,
+                webhook_url=_PUBLIC_WEBHOOK,
+                webhook_secret="webhook-secret-value",
+            ),
+            http_client=client,
+        )
+        try:
+            record = _record(self.registry)
+            self.registry.set_phase(record.run_id, RunPhase.AGENT_EXECUTION)
+            record = self.registry.get_run(record.run_id)
+            assert record is not None
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=_PUBLIC_WEBHOOK,
+            ):
+                outbox.maybe_enqueue_phase_change(
+                    record, previous_phase="queued"
+                )
+                outbox.process_due_deliveries()
+            self.assertEqual(seen_kinds, ["phase_change"])
+            events = outbox.list_for_run(record.run_id)
+            self.assertEqual(events[0]["delivery_state"], "delivered")
+            self.assertEqual(events[0]["event_kind"], "phase_change")
+        finally:
+            outbox.close()
+
+    def test_webhook_wins_dual_backend_unchanged(self) -> None:
+        seen_hosts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_hosts.append(request.url.host or "")
+            return httpx.Response(200, json={"status": 1, "ok": True})
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport, follow_redirects=False)
+        outbox = NotificationOutbox(
+            self._db_path,
+            config=_pushover_config(
+                webhook_url=_PUBLIC_WEBHOOK,
+                webhook_secret="webhook-secret-value",
+            ),
+            http_client=client,
+        )
+        try:
+            record = _record(self.registry)
+            self.registry.set_phase(record.run_id, RunPhase.PERSISTENCE)
+            record = self.registry.get_run(record.run_id)
+            assert record is not None
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=_PUBLIC_WEBHOOK,
+            ):
+                outbox.maybe_enqueue_phase_change(
+                    record, previous_phase="agent_execution"
+                )
+                outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.TERMINAL,
+                    dedupe_key="terminal:dual-wins",
+                )
+                outbox.process_due_deliveries(limit=16)
+            self.assertEqual(seen_hosts, ["example.com", "example.com"])
+            self.assertNotIn("api.pushover.net", seen_hosts)
+            events = outbox.list_for_run(record.run_id)
+            for event in events:
+                self.assertEqual(event["delivery_state"], "delivered")
+                self.assertNotEqual(event["delivery_state"], "skipped")
+        finally:
+            outbox.close()
+
+    def test_inspection_identifies_suppressed_without_secret_leak(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": 1})
+
+        outbox = self._outbox(handler)
+        try:
+            record = _record(self.registry)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                outbox.enqueue_for_record(
+                    record,
+                    event_kind=NotificationEventKind.PHASE_CHANGE,
+                    dedupe_key="phase:inspect",
+                )
+                outbox.process_due_deliveries()
+            event = outbox.get_event(outbox.list_for_run(record.run_id)[0]["event_id"])
+            assert event is not None
+            self.assertEqual(event["delivery_state"], DeliveryState.SKIPPED.value)
+            self.assertEqual(event["last_error"], PUSHOVER_PHASE_CHANGE_SUPPRESSED)
+            self.assertIn("suppressed", (event["last_error"] or "").lower())
+            blob = json.dumps(event)
+            self.assertNotIn(_TEST_USER, blob)
+            self.assertNotIn(_TEST_TOKEN, blob)
+            self.assertNotIn(PUSHOVER_USER_KEY_ENV, blob)
+            self.assertNotIn(PUSHOVER_APP_TOKEN_ENV, blob)
+        finally:
+            outbox.close()
 
 
 class TestPushoverNonBlockingApi(unittest.TestCase):

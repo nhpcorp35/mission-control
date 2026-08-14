@@ -410,7 +410,11 @@ Requires authentication.
 Bounded, redacted Phase 2C/2D durable notification inspection for a run
 (`phase_change`, `stale`, `recovery`, `terminal`). Opt-in delivery (HMAC
 webhook and/or native Pushover) is independent: inspection works even when
-delivery backends are disabled.
+delivery backends are disabled. All eligible kinds remain in the durable
+outbox. For the native Pushover backend only, routine `phase_change` events
+are intentionally not POSTed (terminal `delivery_state=skipped` with
+`last_error=pushover_phase_change_suppressed`) so a normal mission yields one
+phone alert at `terminal`; webhook delivery of `phase_change` is unchanged.
 
 | Query | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -867,7 +871,7 @@ Set `MISSION_CONTROL_API_KEY` and `CURSOR_API_KEY` in the Railway service **Vari
 | `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_APP_TOKEN` | for Pushover delivery | Pushover application API token. Placeholder: `YOUR_PUSHOVER_APP_TOKEN`. |
 | `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_DEVICE` | no | Optional device name filter. |
 | `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_PRIORITY` | no | `-2`..`1` (default `0`). Emergency `2` is rejected. |
-| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` | no | Optional Pushover sound name. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` | no | Optional Pushover sound override. Default (unset) is the official sound `pushover`. Phone OS Focus/silent settings can still suppress audible playback. |
 | `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable; delivery still needs a fully configured backend. |
 | `MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS` | no | Per-attempt timeout (default `5`). |
 | `MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS` | no | Attempts before `dead` (default `8`). |
@@ -879,6 +883,17 @@ Delivery enables when **either** webhook (URL+secret) **or** Pushover
 (user key+app token) is fully configured. If **both** are configured, the
 HMAC webhook backend is used exclusively (no duplicate alerts). Pushover posts
 only to the fixed official host `api.pushover.net` over HTTPS.
+
+**Pushover alert tuning:** a normal mission with no stale interval produces
+exactly one Pushover HTTP request — the `terminal` alert (`completed`,
+`failed`, or `cancelled`). Durable outbox rows still record `phase_change`,
+`stale`, `recovery`, and `terminal`. For Pushover only, routine
+`phase_change` is not delivered: inspection shows `delivery_state=skipped`
+and `last_error=pushover_phase_change_suppressed` (not `dead`, not retried).
+Exceptional `stale` / `recovery` still alert, then the eventual terminal
+alert. Generic webhook backends continue to deliver `phase_change` under the
+existing policy. Messages API requests always set an explicit sound (default
+`pushover` unless `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` overrides).
 
 Webhook HMAC header `X-Mission-Control-Signature` uses `t=<unix>,v1=<hex>` over
 `{timestamp}.{body}` (HMAC-SHA256). Retries use exponential backoff; exhausted
@@ -895,7 +910,8 @@ characters. Inspect with `GET /runs/{run_id}/notifications`, MCP
 `list_run_notifications`, or Unified `mission.list_notifications`. Rotate
 secrets by updating receivers first, then Mission Control; disable by clearing
 URL/secret and/or Pushover credentials. See `docs/HAL_OPERATOR.md` for
-Pushover Railway setup, rotation, test procedure, and privacy notes.
+Pushover Railway setup, one-alert behavior, rotation, test procedure, and
+privacy notes.
 
 ### Build and start commands
 

@@ -98,13 +98,25 @@ ambiguity requires user input.
 ## Phase 2C/2D durable notifications (opt-in webhooks + Pushover)
 
 Opt-in delivery for `phase_change`, `stale`, `recovery`, and `terminal`
-events only (never heartbeats). Delivery failures never mutate mission/run
+events only (never heartbeats). All four kinds are always written to the
+durable outbox for inspection. Delivery failures never mutate mission/run
 status. With no backend fully configured, notifications stay disabled (safe
 default). Supported backends:
 
-1. **HMAC webhook** — generic HTTPS receiver (`WEBHOOK_URL` + `WEBHOOK_SECRET`)
+1. **HMAC webhook** — generic HTTPS receiver (`WEBHOOK_URL` + `WEBHOOK_SECRET`).
+   Delivers `phase_change`, `stale`, `recovery`, and `terminal` under the
+   existing policy.
 2. **Native Pushover** — official `https://api.pushover.net/1/messages.json`
-   (`PUSHOVER_USER_KEY` + `PUSHOVER_APP_TOKEN`)
+   (`PUSHOVER_USER_KEY` + `PUSHOVER_APP_TOKEN`). **Phone alerts are tuned for
+   one audible notification per normal mission:** only `terminal`
+   (`completed` / `failed` / `cancelled`), `stale`, and `recovery` are POSTed
+   to Pushover. Routine `phase_change` rows remain durable but are marked
+   terminal `delivery_state=skipped` with
+   `last_error=pushover_phase_change_suppressed` (not `dead` / not failed) so
+   the worker does not retry them. A normal successful mission with no stale
+   interval therefore yields exactly one Pushover request (terminal
+   completed). Stale then recovery may add their alerts plus the eventual
+   terminal alert.
 
 **Dual-backend policy:** when both backends are fully configured, Mission
 Control delivers via the **webhook only** (no duplicate user alerts). To use
@@ -120,7 +132,7 @@ Pushover exclusively, leave webhook URL/secret unset.
 | `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_APP_TOKEN` | for Pushover delivery | Application API token from a Pushover application. Placeholder: `YOUR_PUSHOVER_APP_TOKEN`. |
 | `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_DEVICE` | no | Optional device name filter. |
 | `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_PRIORITY` | no | `-2`..`1` (default `0`). Emergency priority `2` is rejected. |
-| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` | no | Optional Pushover sound name. |
+| `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` | no | Optional Pushover sound name override. Default (when unset) is the official sound `pushover`. OS Focus / silent / Do Not Disturb settings on the phone can still suppress audible playback even when the API sound is set. |
 | `MISSION_CONTROL_NOTIFICATIONS_ENABLED` | no | Soft enable flag; delivery still requires a fully configured backend. |
 | `MISSION_CONTROL_NOTIFICATIONS_TIMEOUT_SECONDS` | no | Per-attempt HTTP timeout (default 5s). |
 | `MISSION_CONTROL_NOTIFICATIONS_MAX_ATTEMPTS` | no | Attempts before `dead` (default 8). |
@@ -137,13 +149,19 @@ Pushover exclusively, leave webhook URL/secret unset.
 3. In the Railway service **Variables** tab, set:
    - `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_USER_KEY=YOUR_PUSHOVER_USER_KEY`
    - `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_APP_TOKEN=YOUR_PUSHOVER_APP_TOKEN`
-   - Optional: `…_DEVICE`, `…_PRIORITY` (`0` or `1`), `…_SOUND`
+   - Optional: `…_DEVICE`, `…_PRIORITY` (`0` or `1`), `…_SOUND` (override;
+     default API sound is `pushover`)
 4. Redeploy / restart so the worker picks up env. Leave webhook URL/secret
    unset unless you intentionally want webhook delivery (webhook wins if both
    are set).
-5. **Test:** enqueue a terminal/stale event (complete or stale a run) and confirm
-   a Pushover notification arrives. Inspect
-   `GET /runs/{run_id}/notifications` for `delivery_state=delivered`.
+5. **Test:** complete a normal mission and confirm **exactly one** Pushover
+   notification (terminal). Inspect
+   `GET /runs/{run_id}/notifications`: terminal
+   `delivery_state=delivered`; any `phase_change` rows show
+   `delivery_state=skipped` with `last_error=pushover_phase_change_suppressed`.
+   Optionally stale a run to confirm stale/recovery alerts are exceptional
+   extras. Note: phone Focus/silent modes can mute sound even when delivery
+   succeeds.
 6. **Rotate:** create a new app token (or regenerate), update Railway variables,
    restart, then revoke the old token in Pushover.
 7. **Disable:** clear user key and/or app token (or set
@@ -180,8 +198,11 @@ API, MCP, Unified, or database inspection payloads.
 - Malformed / empty / non-JSON HTTP 2xx bodies (acceptance uncertain) are
   **retryable** up to max attempts, then `dead`. They are never marked
   `delivered`.
+- Pushover-filtered `phase_change` events use terminal `skipped` (reason
+  `pushover_phase_change_suppressed`), never `dead` or retryable `pending`.
 - Optional `PUSHOVER_DEVICE` / `PUSHOVER_SOUND` values that contain ASCII
-  control characters are rejected (option omitted) rather than forwarded.
+  control characters are rejected (option omitted; sound falls back to
+  default `pushover`) rather than forwarded.
 
 ### Inspection workflow (redacted)
 
@@ -192,7 +213,9 @@ API, MCP, Unified, or database inspection payloads.
 - Responses include only allowlisted fields (`event_id`, `event_kind`,
   `delivery_state`, redacted `last_error`, etc.). Never webhook URL/secret,
   Pushover user key/app token, claim owner, raw request headers/body, mission
-  YAML, or raw stdout/stderr.
+  YAML, or raw stdout/stderr. `delivery_state` may be `pending`, `in_flight`,
+  `delivered`, `dead`, or `skipped` (intentionally suppressed for the active
+  backend).
 - Backend health helper `notification_backend_health()` reports
   `active_backend`, booleans for webhook/pushover configured, and option
   flags — never whether secret values match.
