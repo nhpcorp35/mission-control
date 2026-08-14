@@ -271,7 +271,7 @@ class TestWaitForRunClient(unittest.IsolatedAsyncioTestCase):
                 }
             ],
             "cursor": cursor,
-            "stale_threshold_seconds": 30.0,
+            "stale_threshold_seconds": 90.0,
         }
         return payload
 
@@ -570,7 +570,7 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
             "stale_heartbeat": False,
             "monitoring_history": [],
             "cursor": "cursor-1",
-            "stale_threshold_seconds": 30.0,
+            "stale_threshold_seconds": 90.0,
         }
         with patch.object(
             mcp_server.client,

@@ -97,7 +97,7 @@ def _kick_notification_delivery() -> None:
 
 
 def _observe_notifications(record: RunRecord) -> None:
-    """Enqueue stale (if applicable) without synchronous webhook HTTP."""
+    """Enqueue stale/paired-recovery from heartbeat observation (no sync HTTP)."""
     try:
         notification_outbox.maybe_enqueue_stale(record)
         _kick_notification_delivery()

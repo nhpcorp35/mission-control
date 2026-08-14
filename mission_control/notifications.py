@@ -8,6 +8,12 @@ Pushover phone alerts are tuned for one audible notification per normal
 mission: routine ``phase_change`` events remain durable for inspection but are
 intentionally skipped for the native Pushover backend (webhook delivery of
 ``phase_change`` is unchanged). Stale and recovery alerts still deliver.
+
+Heartbeat stale/recovery pairing is restart-safe: once a stale event is
+durably enqueued, SQLite records an open stale episode so the first later
+healthy observation enqueues exactly one paired recovery (independent of
+in-memory wait cursors). Terminalization while still stale closes the
+episode without a false recovery.
 """
 
 from __future__ import annotations
@@ -48,6 +54,10 @@ from mission_control.run_registry import (
 logger = logging.getLogger(__name__)
 
 _OUTBOX_TABLE = "notification_outbox"
+_STALE_EPISODE_TABLE = "notification_stale_episodes"
+_STALE_EPISODE_OPEN = "open"
+_STALE_EPISODE_RECOVERED = "recovered"
+_STALE_EPISODE_CLOSED_TERMINAL = "closed_terminal"
 _SQLITE_BUSY_TIMEOUT_MS = 5000
 
 # Delivery bounds (operator-overridable via env).
@@ -1200,6 +1210,26 @@ class NotificationOutbox:
                 ON {_OUTBOX_TABLE} (delivery_state, claim_expires_at)
                 """
             )
+            self._conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_STALE_EPISODE_TABLE} (
+                    run_id TEXT PRIMARY KEY,
+                    episode_id TEXT NOT NULL,
+                    stale_dedupe_key TEXT NOT NULL,
+                    stale_event_id TEXT,
+                    stale_heartbeat_at TEXT,
+                    state TEXT NOT NULL,
+                    opened_at TEXT NOT NULL,
+                    resolved_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_notification_stale_episodes_state
+                ON {_STALE_EPISODE_TABLE} (state, run_id)
+                """
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -1360,7 +1390,11 @@ class NotificationOutbox:
         )
 
     def maybe_enqueue_terminal(self, record: RunRecord) -> EnqueueResult:
-        """Emit terminal once per terminal status snapshot."""
+        """Emit terminal once per terminal status snapshot.
+
+        Closes any open stale episode without emitting recovery so a run that
+        becomes terminal while still stale cannot produce a false recovery.
+        """
         if not is_terminal_status(record.status):
             return EnqueueResult(
                 created=False,
@@ -1374,6 +1408,12 @@ class NotificationOutbox:
         )
         completed = _format_dt(record.completed_at) or _format_dt(_utc_now())
         dedupe = f"terminal:{status_value}:{completed}"
+        with self._lock:
+            self._resolve_open_stale_episode_unlocked(
+                record.run_id,
+                state=_STALE_EPISODE_CLOSED_TERMINAL,
+                resolved_at=record.completed_at or _utc_now(),
+            )
         return self.enqueue_for_record(
             record,
             event_kind=NotificationEventKind.TERMINAL,
@@ -1401,27 +1441,318 @@ class NotificationOutbox:
         now: datetime | None = None,
         stale_threshold_seconds: float = HEARTBEAT_STALE_THRESHOLD_SECONDS,
     ) -> EnqueueResult:
-        """Emit stale at most once per stale heartbeat observation window."""
+        """Observe heartbeat health and pair stale/recovery notifications.
+
+        Production wait/status/notification paths call this on each observation.
+        When health is ``stale``, enqueues at most one stale event per heartbeat
+        observation window and durably opens a stale episode. When health is
+        later ``healthy``, enqueues exactly one paired recovery for that
+        episode (restart-safe; independent of in-memory monitoring cursors).
+        Terminal observations close an open episode without recovery.
+        """
+        clock = now or _utc_now()
         health = classify_heartbeat_health(
             record,
-            now=now,
+            now=clock,
             stale_threshold_seconds=stale_threshold_seconds,
         )
-        if health is not HeartbeatHealth.STALE:
+        if health is HeartbeatHealth.STALE:
+            return self._enqueue_stale_and_open_episode(
+                record, now=clock
+            )
+        if health is HeartbeatHealth.HEALTHY:
+            return self._enqueue_paired_recovery_if_open(
+                record, now=clock
+            )
+        if health is HeartbeatHealth.TERMINAL:
+            with self._lock:
+                self._resolve_open_stale_episode_unlocked(
+                    record.run_id,
+                    state=_STALE_EPISODE_CLOSED_TERMINAL,
+                    resolved_at=clock,
+                )
             return EnqueueResult(
                 created=False,
                 event_id=None,
-                skipped_reason="not_stale",
+                skipped_reason="terminal",
             )
+        return EnqueueResult(
+            created=False,
+            event_id=None,
+            skipped_reason="not_stale",
+        )
+
+    def _get_open_stale_episode_unlocked(
+        self, run_id: str
+    ) -> sqlite3.Row | None:
+        return self._conn.execute(
+            f"""
+            SELECT * FROM {_STALE_EPISODE_TABLE}
+            WHERE run_id = ? AND state = ?
+            """,
+            (str(run_id), _STALE_EPISODE_OPEN),
+        ).fetchone()
+
+    def _open_stale_episode_unlocked(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        stale_dedupe_key: str,
+        stale_event_id: str | None,
+        stale_heartbeat_at: str | None,
+        opened_at: datetime,
+        commit: bool = True,
+    ) -> None:
+        existing = self._conn.execute(
+            f"SELECT * FROM {_STALE_EPISODE_TABLE} WHERE run_id = ?",
+            (str(run_id),),
+        ).fetchone()
+        if existing is not None:
+            if existing["state"] == _STALE_EPISODE_OPEN:
+                return
+            if existing["stale_dedupe_key"] == stale_dedupe_key:
+                # Same stale window already resolved; do not reopen.
+                return
+        opened_s = _format_dt(opened_at)
+        assert opened_s is not None
+        self._conn.execute(
+            f"""
+            INSERT INTO {_STALE_EPISODE_TABLE} (
+                run_id,
+                episode_id,
+                stale_dedupe_key,
+                stale_event_id,
+                stale_heartbeat_at,
+                state,
+                opened_at,
+                resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(run_id) DO UPDATE SET
+                episode_id = excluded.episode_id,
+                stale_dedupe_key = excluded.stale_dedupe_key,
+                stale_event_id = excluded.stale_event_id,
+                stale_heartbeat_at = excluded.stale_heartbeat_at,
+                state = excluded.state,
+                opened_at = excluded.opened_at,
+                resolved_at = NULL
+            """,
+            (
+                str(run_id)[:64],
+                episode_id,
+                stale_dedupe_key[:128],
+                stale_event_id,
+                stale_heartbeat_at,
+                _STALE_EPISODE_OPEN,
+                opened_s,
+            ),
+        )
+        if commit:
+            self._conn.commit()
+
+    def _resolve_open_stale_episode_unlocked(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        resolved_at: datetime,
+        episode_id: str | None = None,
+        commit: bool = True,
+    ) -> bool:
+        resolved_s = _format_dt(resolved_at)
+        assert resolved_s is not None
+        if episode_id is None:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE {_STALE_EPISODE_TABLE}
+                SET state = ?, resolved_at = ?
+                WHERE run_id = ? AND state = ?
+                """,
+                (
+                    state,
+                    resolved_s,
+                    str(run_id),
+                    _STALE_EPISODE_OPEN,
+                ),
+            )
+        else:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE {_STALE_EPISODE_TABLE}
+                SET state = ?, resolved_at = ?
+                WHERE run_id = ? AND episode_id = ? AND state = ?
+                """,
+                (
+                    state,
+                    resolved_s,
+                    str(run_id),
+                    episode_id,
+                    _STALE_EPISODE_OPEN,
+                ),
+            )
+        if commit:
+            self._conn.commit()
+        return int(cursor.rowcount or 0) > 0
+
+    def _enqueue_stale_and_open_episode(
+        self,
+        record: RunRecord,
+        *,
+        now: datetime,
+    ) -> EnqueueResult:
+        """Durably enqueue stale and open the pairing episode in one commit."""
         hb = _format_dt(record.heartbeat_at) or "absent"
         dedupe = f"stale:{hb}"
-        return self.enqueue_for_record(
-            record,
-            event_kind=NotificationEventKind.STALE,
-            dedupe_key=dedupe,
-            occurred_at=now,
-            heartbeat_health=HeartbeatHealth.STALE.value,
+        kind = NotificationEventKind.STALE.value
+        run_id = str(record.run_id)[:64]
+        with self._lock:
+            existing = self._conn.execute(
+                f"""
+                SELECT event_id FROM {_OUTBOX_TABLE}
+                WHERE run_id = ? AND event_kind = ? AND dedupe_key = ?
+                """,
+                (run_id, kind, dedupe[:128]),
+            ).fetchone()
+            if existing is not None:
+                event_id = str(existing["event_id"])
+                self._open_stale_episode_unlocked(
+                    run_id=run_id,
+                    episode_id=str(uuid.uuid4()),
+                    stale_dedupe_key=dedupe,
+                    stale_event_id=event_id,
+                    stale_heartbeat_at=hb if hb != "absent" else None,
+                    opened_at=now,
+                    commit=True,
+                )
+                return EnqueueResult(
+                    created=False,
+                    event_id=event_id,
+                    skipped_reason="duplicate",
+                )
+
+            event_id = str(uuid.uuid4())
+            episode_id = str(uuid.uuid4())
+            payload = build_event_payload(
+                record,
+                event_kind=NotificationEventKind.STALE,
+                dedupe_key=dedupe,
+                occurred_at=now,
+                heartbeat_health=HeartbeatHealth.STALE.value,
+            )
+            now_s = _format_dt(now)
+            assert now_s is not None
+            try:
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {_OUTBOX_TABLE} (
+                        event_id,
+                        run_id,
+                        event_kind,
+                        dedupe_key,
+                        payload_json,
+                        delivery_state,
+                        attempt_count,
+                        next_attempt_at,
+                        last_error,
+                        delivered_at,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        run_id,
+                        kind,
+                        dedupe[:128],
+                        json.dumps(
+                            payload, separators=(",", ":"), sort_keys=True
+                        ),
+                        DeliveryState.PENDING.value,
+                        now_s,
+                        now_s,
+                        now_s,
+                    ),
+                )
+                self._open_stale_episode_unlocked(
+                    run_id=run_id,
+                    episode_id=episode_id,
+                    stale_dedupe_key=dedupe,
+                    stale_event_id=event_id,
+                    stale_heartbeat_at=hb if hb != "absent" else None,
+                    opened_at=now,
+                    commit=False,
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                row = self._conn.execute(
+                    f"""
+                    SELECT event_id FROM {_OUTBOX_TABLE}
+                    WHERE run_id = ? AND event_kind = ? AND dedupe_key = ?
+                    """,
+                    (run_id, kind, dedupe[:128]),
+                ).fetchone()
+                event_id = str(row["event_id"]) if row else None
+                if event_id is not None:
+                    self._open_stale_episode_unlocked(
+                        run_id=run_id,
+                        episode_id=str(uuid.uuid4()),
+                        stale_dedupe_key=dedupe,
+                        stale_event_id=event_id,
+                        stale_heartbeat_at=hb if hb != "absent" else None,
+                        opened_at=now,
+                        commit=True,
+                    )
+                return EnqueueResult(
+                    created=False,
+                    event_id=event_id,
+                    skipped_reason="duplicate",
+                )
+
+        logger.info(
+            "notification enqueued run_id=%s event_kind=%s event_id=%s",
+            run_id,
+            kind,
+            event_id,
         )
+        wake_notification_delivery()
+        return EnqueueResult(created=True, event_id=event_id)
+
+    def _enqueue_paired_recovery_if_open(
+        self,
+        record: RunRecord,
+        *,
+        now: datetime,
+    ) -> EnqueueResult:
+        """Enqueue one recovery for an open stale episode (idempotent)."""
+        with self._lock:
+            episode = self._get_open_stale_episode_unlocked(record.run_id)
+            if episode is None:
+                return EnqueueResult(
+                    created=False,
+                    event_id=None,
+                    skipped_reason="no_open_stale_episode",
+                )
+            episode_id = str(episode["episode_id"])
+            dedupe = f"recovery:stale:{episode_id}"
+            result = self.enqueue_for_record(
+                record,
+                event_kind=NotificationEventKind.RECOVERY,
+                dedupe_key=dedupe,
+                occurred_at=now,
+                heartbeat_health=HeartbeatHealth.HEALTHY.value,
+            )
+            if result.created or result.skipped_reason == "duplicate":
+                self._resolve_open_stale_episode_unlocked(
+                    record.run_id,
+                    state=_STALE_EPISODE_RECOVERED,
+                    resolved_at=now,
+                    episode_id=episode_id,
+                )
+            return result
 
     def list_for_run(
         self,

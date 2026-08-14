@@ -116,7 +116,12 @@ default). Supported backends:
    the worker does not retry them. A normal successful mission with no stale
    interval therefore yields exactly one Pushover request (terminal
    completed). Stale then recovery may add their alerts plus the eventual
-   terminal alert.
+   terminal alert (exactly three Pushover deliveries when a stale episode
+   recovers before completion). Default stale threshold is **90 seconds**
+   (eighteen heartbeat intervals); operators may pass an explicit override.
+   Paired recovery is restart-safe via durable SQLite stale-episode state and
+   does not depend on in-memory wait cursors. Terminal-while-stale closes the
+   episode without a false recovery.
 
 **Dual-backend policy:** when both backends are fully configured, Mission
 Control delivers via the **webhook only** (no duplicate user alerts). To use

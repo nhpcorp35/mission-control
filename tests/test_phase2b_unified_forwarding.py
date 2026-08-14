@@ -85,7 +85,7 @@ def _wait_expired_payload(*, cursor: str = "cursor-out") -> dict[str, Any]:
             }
         ],
         "cursor": cursor,
-        "stale_threshold_seconds": 30.0,
+            "stale_threshold_seconds": 90.0,
     }
 
 

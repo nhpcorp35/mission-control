@@ -496,7 +496,7 @@ Includes the same fields as `GET /runs/{run_id}`, plus:
 | `timeout_seconds` | number | Effective wait budget used for this call |
 | `heartbeat_health` | string | `healthy`, `stale`, `absent`, `not_applicable`, or `terminal` |
 | `stale_heartbeat` | boolean | `true` when `heartbeat_health` is `stale` (reported only; does not cancel or mutate the run) |
-| `stale_threshold_seconds` | number | Documented stale threshold (`30`, six times the 5s heartbeat cadence) |
+| `stale_threshold_seconds` | number | Documented stale threshold (`90`, eighteen times the 5s heartbeat cadence). Callers may pass an explicit override to observe helpers; the wait response field reports the server default. |
 | `monitoring_history` | array | Bounded (max 32) deduplicated phase/progress/health events; excludes prompts, commands, secrets, stdout, and stderr |
 | `cursor` | string | Opaque resumable cursor encoding the current bounded history |
 
@@ -505,7 +505,9 @@ Includes the same fields as `GET /runs/{run_id}`, plus:
 | Already terminal / becomes terminal during wait | `true` | `false` | No (wait only observes) |
 | Wait budget exhausted while non-terminal | `false` | `true` | No (latest status + `cursor` / `run_id` returned; resume with the same `run_id`) |
 
-**Heartbeat health.** While a run is `queued`, health is `not_applicable` (agent heartbeat cadence is not active). Active non-terminal runs with a recent `heartbeat_at` are `healthy`; when `heartbeat_at` is older than `stale_threshold_seconds` the wait reports `stale` / `stale_heartbeat: true` without cancelling. Missing `heartbeat_at` on an active run is `absent`. Terminal statuses classify as `terminal`.
+**Heartbeat health.** While a run is `queued`, health is `not_applicable` (agent heartbeat cadence is not active). Active non-terminal runs with a recent `heartbeat_at` are `healthy`; when `heartbeat_at` is older than `stale_threshold_seconds` (default **90s**) the wait reports `stale` / `stale_heartbeat: true` without cancelling. Missing `heartbeat_at` on an active run is `absent`. Terminal statuses classify as `terminal`.
+
+**Stale / recovery pairing.** When wait/status/notification observation durably enqueues a `stale` event, Mission Control persists an open stale episode in SQLite. The first later healthy heartbeat observation durably enqueues exactly one paired `recovery` for that episode. Pairing does not depend on an in-memory monitoring cursor: process restart, multiple waiters, repeated stale checks, and delivery-worker restart must not lose or duplicate recovery. A run that becomes terminal while still stale closes the episode **without** a recovery event, then emits the usual single `terminal` event.
 
 **Monitoring history.** Events are appended only on meaningful `status` / `phase` / sanitized `progress` / `heartbeat_health` changes (repeated heartbeat refreshes alone do not duplicate events). Progress is platform-authored and redacted via the same sanitizer as live status.
 
@@ -891,7 +893,9 @@ exactly one Pushover HTTP request — the `terminal` alert (`completed`,
 `phase_change` is not delivered: inspection shows `delivery_state=skipped`
 and `last_error=pushover_phase_change_suppressed` (not `dead`, not retried).
 Exceptional `stale` / `recovery` still alert, then the eventual terminal
-alert. Generic webhook backends continue to deliver `phase_change` under the
+alert. Paired recovery after a stale episode is restart-safe (SQLite episode
+state) and does not require the waiter to preserve an in-memory cursor.
+Generic webhook backends continue to deliver `phase_change` under the
 existing policy. Messages API requests always set an explicit sound (default
 `pushover` unless `MISSION_CONTROL_NOTIFICATIONS_PUSHOVER_SOUND` overrides).
 

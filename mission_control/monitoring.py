@@ -27,8 +27,10 @@ from mission_control.run_registry import (
 DEFAULT_MONITOR_POLL_INTERVAL_SECONDS = 25.0
 
 # Stale threshold must be safely larger than the live heartbeat cadence (5s).
-# Six intervals gives headroom for scheduling jitter without false positives.
-HEARTBEAT_STALE_THRESHOLD_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 6.0  # 30s
+# Eighteen intervals (90s) reduces false stale alerts under scheduling jitter
+# while remaining well below typical operator wait budgets. Operators may pass
+# an explicit stale_threshold_seconds override on observe/enqueue helpers.
+HEARTBEAT_STALE_THRESHOLD_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 18.0  # 90s
 
 # Bound monitoring payload size (events are already redacted/sanitized).
 MONITORING_HISTORY_MAX_EVENTS = 32

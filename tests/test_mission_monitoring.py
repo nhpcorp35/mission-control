@@ -58,7 +58,7 @@ class TestMonitoringHelpers(unittest.TestCase):
         self.assertEqual(DEFAULT_MONITOR_POLL_INTERVAL_SECONDS, 25.0)
         self.assertEqual(WAIT_DEFAULT_POLL_INTERVAL_SECONDS, 25.0)
         self.assertGreater(HEARTBEAT_STALE_THRESHOLD_SECONDS, 5.0)
-        self.assertEqual(HEARTBEAT_STALE_THRESHOLD_SECONDS, 30.0)
+        self.assertEqual(HEARTBEAT_STALE_THRESHOLD_SECONDS, 90.0)
 
     def test_terminal_includes_cancelled(self) -> None:
         for status in (

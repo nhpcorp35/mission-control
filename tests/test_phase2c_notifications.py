@@ -207,11 +207,15 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
         self.registry.close()
         os.unlink(self._db_path)
 
-    def test_stale_and_terminal_and_recovery(self) -> None:
+    def _running_with_stale_heartbeat(
+        self, *, age_seconds: float = 120.0, require_default_stale: bool = True
+    ):
+        from mission_control.monitoring import HEARTBEAT_STALE_THRESHOLD_SECONDS
+
         record = self.registry.create_run()
         self.registry.update_status(record.run_id, RunStatus.RUNNING)
         self.registry.set_phase(record.run_id, RunPhase.AGENT_EXECUTION)
-        stale_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+        stale_at = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
         with self.registry._lock:
             self.registry._conn.execute(
                 "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
@@ -220,20 +224,28 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
             self.registry._conn.commit()
         live = self.registry.get_run(record.run_id)
         assert live is not None
+        if require_default_stale:
+            self.assertGreater(age_seconds, HEARTBEAT_STALE_THRESHOLD_SECONDS)
+        return live
+
+    def test_stale_and_terminal_and_recovery(self) -> None:
+        live = self._running_with_stale_heartbeat()
         first = self.outbox.maybe_enqueue_stale(live)
         second = self.outbox.maybe_enqueue_stale(live)
         self.assertTrue(first.created)
         self.assertFalse(second.created)
 
-        self.registry.update_status(record.run_id, RunStatus.COMPLETED)
+        self.registry.update_status(live.run_id, RunStatus.COMPLETED)
         kinds = {
-            e["event_kind"] for e in self.outbox.list_for_run(record.run_id)
+            e["event_kind"] for e in self.outbox.list_for_run(live.run_id)
         }
         self.assertIn("stale", kinds)
         self.assertIn("terminal", kinds)
         self.assertIn("phase_change", kinds)
+        # Terminal-while-stale must not invent a paired recovery.
+        self.assertNotIn("recovery", kinds)
 
-        # Recovery path on a fresh interrupted run.
+        # Interrupted-run startup recovery path (distinct from heartbeat pair).
         interrupted = self.registry.create_run()
         self.registry.update_status(interrupted.run_id, RunStatus.RUNNING)
         recovered = self.registry.recover_interrupted_runs()
@@ -247,6 +259,287 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
         final = self.registry.get_run(interrupted.run_id)
         assert final is not None
         self.assertEqual(final.status, RunStatus.FAILED)
+
+    def test_production_stale_healthy_recovery_terminal_sequence(self) -> None:
+        """Exact production call sequence: observe stale → healthy → terminal."""
+        live = self._running_with_stale_heartbeat()
+        stale = self.outbox.maybe_enqueue_stale(live)
+        self.assertTrue(stale.created)
+
+        self.registry.touch_heartbeat(live.run_id)
+        healthy = self.registry.get_run(live.run_id)
+        assert healthy is not None
+        recovery = self.outbox.maybe_enqueue_stale(healthy)
+        self.assertTrue(recovery.created)
+        again = self.outbox.maybe_enqueue_stale(healthy)
+        self.assertFalse(again.created)
+        self.assertEqual(again.skipped_reason, "no_open_stale_episode")
+
+        self.registry.update_status(live.run_id, RunStatus.COMPLETED)
+        events = self.outbox.list_for_run(live.run_id)
+        kinds = [e["event_kind"] for e in events]
+        self.assertEqual(kinds.count("stale"), 1)
+        self.assertEqual(kinds.count("recovery"), 1)
+        self.assertEqual(kinds.count("terminal"), 1)
+        paired = [k for k in kinds if k in {"stale", "recovery", "terminal"}]
+        self.assertEqual(paired, ["stale", "recovery", "terminal"])
+
+    def test_restart_between_stale_and_recovery(self) -> None:
+        live = self._running_with_stale_heartbeat()
+        self.assertTrue(self.outbox.maybe_enqueue_stale(live).created)
+        self.outbox.close()
+
+        restarted = NotificationOutbox(
+            self._db_path, config=_config(enabled=False)
+        )
+        try:
+            self.registry.touch_heartbeat(live.run_id)
+            healthy = self.registry.get_run(live.run_id)
+            assert healthy is not None
+            recovery = restarted.maybe_enqueue_stale(healthy)
+            self.assertTrue(recovery.created)
+            events = restarted.list_for_run(live.run_id)
+            kinds = [e["event_kind"] for e in events]
+            self.assertEqual(kinds.count("stale"), 1)
+            self.assertEqual(kinds.count("recovery"), 1)
+        finally:
+            restarted.close()
+
+    def test_concurrent_waiters_single_recovery(self) -> None:
+        live = self._running_with_stale_heartbeat()
+        self.assertTrue(self.outbox.maybe_enqueue_stale(live).created)
+        self.registry.touch_heartbeat(live.run_id)
+        healthy = self.registry.get_run(live.run_id)
+        assert healthy is not None
+
+        results: list = []
+        errors: list[BaseException] = []
+
+        def _observe() -> None:
+            try:
+                results.append(self.outbox.maybe_enqueue_stale(healthy))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_observe) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        created = [r for r in results if r.created]
+        self.assertEqual(len(created), 1)
+        events = self.outbox.list_for_run(live.run_id)
+        self.assertEqual(
+            sum(1 for e in events if e["event_kind"] == "recovery"), 1
+        )
+
+    def test_repeated_stale_checks_single_stale_event(self) -> None:
+        live = self._running_with_stale_heartbeat()
+        outcomes = [self.outbox.maybe_enqueue_stale(live) for _ in range(5)]
+        self.assertTrue(outcomes[0].created)
+        self.assertTrue(all(not o.created for o in outcomes[1:]))
+        events = self.outbox.list_for_run(live.run_id)
+        self.assertEqual(
+            sum(1 for e in events if e["event_kind"] == "stale"), 1
+        )
+
+    def test_terminal_while_stale_no_false_recovery(self) -> None:
+        live = self._running_with_stale_heartbeat()
+        self.assertTrue(self.outbox.maybe_enqueue_stale(live).created)
+        self.registry.update_status(live.run_id, RunStatus.FAILED)
+        terminal = self.registry.get_run(live.run_id)
+        assert terminal is not None
+        # Observation after terminal must not emit recovery.
+        observed = self.outbox.maybe_enqueue_stale(terminal)
+        self.assertFalse(observed.created)
+        kinds = {
+            e["event_kind"] for e in self.outbox.list_for_run(live.run_id)
+        }
+        self.assertIn("stale", kinds)
+        self.assertIn("terminal", kinds)
+        self.assertNotIn("recovery", kinds)
+
+    def test_default_threshold_90_and_explicit_override(self) -> None:
+        from mission_control.monitoring import HEARTBEAT_STALE_THRESHOLD_SECONDS
+
+        self.assertEqual(HEARTBEAT_STALE_THRESHOLD_SECONDS, 90.0)
+        # 60s old: healthy under default 90s (no stale, no open episode).
+        live = self._running_with_stale_heartbeat(
+            age_seconds=60.0, require_default_stale=False
+        )
+        skipped = self.outbox.maybe_enqueue_stale(live)
+        self.assertFalse(skipped.created)
+        self.assertEqual(skipped.skipped_reason, "no_open_stale_episode")
+        # Explicit operator override still respected.
+        forced = self.outbox.maybe_enqueue_stale(
+            live, stale_threshold_seconds=30.0
+        )
+        self.assertTrue(forced.created)
+
+    def test_schema_migration_adds_stale_episode_table(self) -> None:
+        """Existing production DBs gain the episode table without failure."""
+        legacy_fd, legacy_path = tempfile.mkstemp(suffix=".db")
+        os.close(legacy_fd)
+        try:
+            conn = __import__("sqlite3").connect(legacy_path)
+            conn.execute(
+                """
+                CREATE TABLE notification_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    event_kind TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    last_error TEXT,
+                    delivered_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (run_id, event_kind, dedupe_key)
+                )
+                """
+            )
+            conn.commit()
+            conn.close()
+            outbox = NotificationOutbox(
+                legacy_path, config=_config(enabled=False)
+            )
+            try:
+                rows = outbox._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name = ?",
+                    ("notification_stale_episodes",),
+                ).fetchall()
+                self.assertEqual(len(rows), 1)
+            finally:
+                outbox.close()
+        finally:
+            os.unlink(legacy_path)
+
+
+class TestStaleRecoveryPushoverCounts(unittest.TestCase):
+    """Pushover: stale+recovery+terminal == 3; normal mission == 1."""
+
+    def setUp(self) -> None:
+        self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._db_fd)
+        self.registry = RunRegistry(self._db_path)
+
+    def tearDown(self) -> None:
+        self.registry.close()
+        os.unlink(self._db_path)
+
+    def test_pushover_stale_recovery_terminal_exactly_three(self) -> None:
+        from mission_control.notifications import (
+            PUSHOVER_API_URL,
+            PUSHOVER_APP_TOKEN_ENV,
+            PUSHOVER_USER_KEY_ENV,
+            load_notification_config,
+        )
+
+        posts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"status": 1})
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport, follow_redirects=False)
+        environ = {
+            PUSHOVER_USER_KEY_ENV: "pushover-user-key-fixture-aaaa",
+            PUSHOVER_APP_TOKEN_ENV: "pushover-app-token-fixture-bbbb",
+        }
+        cfg = load_notification_config(environ=environ)
+        outbox = NotificationOutbox(
+            self._db_path, config=cfg, http_client=client
+        )
+        try:
+            record = self.registry.create_run()
+            self.registry.update_status(record.run_id, RunStatus.RUNNING)
+            self.registry.set_phase(record.run_id, RunPhase.AGENT_EXECUTION)
+            stale_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+            with self.registry._lock:
+                self.registry._conn.execute(
+                    "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
+                    (stale_at.isoformat(), record.run_id),
+                )
+                self.registry._conn.commit()
+            live = self.registry.get_run(record.run_id)
+            assert live is not None
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                self.assertTrue(outbox.maybe_enqueue_stale(live).created)
+                self.registry.touch_heartbeat(record.run_id)
+                healthy = self.registry.get_run(record.run_id)
+                assert healthy is not None
+                self.assertTrue(outbox.maybe_enqueue_stale(healthy).created)
+                self.registry.update_status(record.run_id, RunStatus.COMPLETED)
+                outbox.process_due_deliveries(limit=32)
+            self.assertEqual(len(posts), 3)
+            kinds = [
+                e["event_kind"]
+                for e in outbox.list_for_run(record.run_id)
+                if e["event_kind"] in {"stale", "recovery", "terminal"}
+            ]
+            self.assertEqual(sorted(kinds), ["recovery", "stale", "terminal"])
+            for event in outbox.list_for_run(record.run_id):
+                if event["event_kind"] in {"stale", "recovery", "terminal"}:
+                    self.assertEqual(event["delivery_state"], "delivered")
+                if event["event_kind"] == "phase_change":
+                    self.assertEqual(event["delivery_state"], "skipped")
+        finally:
+            outbox.close()
+            client.close()
+
+    def test_pushover_normal_mission_exactly_one_terminal(self) -> None:
+        from mission_control.notifications import (
+            PUSHOVER_API_URL,
+            PUSHOVER_APP_TOKEN_ENV,
+            PUSHOVER_USER_KEY_ENV,
+            load_notification_config,
+        )
+
+        posts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append("http")
+            return httpx.Response(200, json={"status": 1})
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport, follow_redirects=False)
+        environ = {
+            PUSHOVER_USER_KEY_ENV: "pushover-user-key-fixture-aaaa",
+            PUSHOVER_APP_TOKEN_ENV: "pushover-app-token-fixture-bbbb",
+        }
+        cfg = load_notification_config(environ=environ)
+        outbox = NotificationOutbox(
+            self._db_path, config=cfg, http_client=client
+        )
+        try:
+            record = self.registry.create_run()
+            self.registry.update_status(record.run_id, RunStatus.RUNNING)
+            self.registry.set_phase(record.run_id, RunPhase.AGENT_EXECUTION)
+            self.registry.update_status(record.run_id, RunStatus.COMPLETED)
+            with patch(
+                "mission_control.notifications.validate_webhook_url",
+                return_value=PUSHOVER_API_URL,
+            ):
+                outbox.process_due_deliveries(limit=32)
+            self.assertEqual(len(posts), 1)
+            events = outbox.list_for_run(record.run_id)
+            terminals = [e for e in events if e["event_kind"] == "terminal"]
+            self.assertEqual(len(terminals), 1)
+            self.assertEqual(terminals[0]["delivery_state"], "delivered")
+            for event in events:
+                if event["event_kind"] == "phase_change":
+                    self.assertEqual(event["delivery_state"], "skipped")
+        finally:
+            outbox.close()
+            client.close()
 
 
 class TestDeliveryRetriesAndHmac(unittest.TestCase):
