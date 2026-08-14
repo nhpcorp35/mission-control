@@ -445,11 +445,11 @@ class TestPushoverDelivery(unittest.TestCase):
         listed = httpx.Response(200, json=[1])
         self.assertFalse(is_pushover_success_response(listed))
 
-        # Clear integer rejection on 2xx → permanent.
+        # Clear integer rejection on 2xx → permanent; never echo provider text.
         rejected = httpx.Response(200, json={"status": 0, "errors": ["no"]})
         code, retryable = classify_pushover_response(rejected)
         self.assertFalse(retryable)
-        self.assertTrue(code.startswith("pushover_rejected"))
+        self.assertEqual(code, "pushover_rejected")
 
         # Ambiguous 2xx bodies → retryable, never delivered.
         for response in (malformed, empty, listed, httpx.Response(200, json={})):
@@ -458,6 +458,226 @@ class TestPushoverDelivery(unittest.TestCase):
                 self.assertTrue(retryable)
                 self.assertEqual(code, "pushover_malformed_response")
                 self.assertFalse(is_pushover_success_response(response))
+
+    def test_adversarial_provider_error_echo_never_leaks(self) -> None:
+        """Provider errors[] / fields must never echo opaque credentials."""
+        from urllib.parse import quote
+
+        from mcp_connector.client import project_notification_inspection
+
+        opaque_user = "uK9mX2pL7qR4vN8wY3zA1bC5dE6fG0hJ"
+        opaque_token = "aT8nY3qM6sP1wK5xZ2cB9dF4eH7gJ0iL"
+        user_enc = quote(opaque_user, safe="")
+        token_enc = quote(opaque_token, safe="")
+        form_user = quote(f"user={opaque_user}", safe="")
+        form_token = quote(f"token={opaque_token}", safe="")
+        allowlisted = frozenset(
+            {
+                "pushover_rejected",
+                "pushover_malformed_response",
+                "pushover_invalid_credentials_or_request",
+                "pushover_rate_limited",
+                "delivery_error",
+                "invalid_pushover_config",
+                "delivery_failed",
+            }
+        )
+        leak_needles = (
+            opaque_user,
+            opaque_token,
+            f"user={opaque_user}",
+            f"token={opaque_token}",
+            f"User={opaque_user}",
+            f"TOKEN={opaque_token}",
+            user_enc,
+            token_enc,
+            form_user,
+            form_token,
+            f'{{"user":"{opaque_user}"}}',
+            f'{{"token":"{opaque_token}"}}',
+        )
+        adversarial_errors = [
+            opaque_user,
+            opaque_token,
+            f"{opaque_user} {opaque_token}",
+            f"user={opaque_user}",
+            f"token={opaque_token}",
+            f"user={opaque_user} token={opaque_token}",
+            f"User={opaque_user} TOKEN={opaque_token}",
+            f"rejected for {opaque_user} / {opaque_token}",
+            f"attacker prefix user={opaque_user} mid token={opaque_token} suffix",
+            user_enc,
+            token_enc,
+            form_user,
+            form_token,
+            f"user%3D{user_enc}&token%3D{token_enc}",
+            json.dumps({"user": opaque_user, "token": opaque_token}),
+            f'{{"user":"{opaque_user}","token":"{opaque_token}"}}',
+            f"UsEr KeY {opaque_user} ApP ToKeN {opaque_token}",
+        ]
+
+        def _assert_no_leak(blob: str, *, context: str) -> None:
+            lowered = blob.lower()
+            for needle in leak_needles:
+                self.assertNotIn(
+                    needle,
+                    blob,
+                    msg=f"credential echo in {context}: {needle!r}",
+                )
+                self.assertNotIn(
+                    needle.lower(),
+                    lowered,
+                    msg=f"credential echo (casefold) in {context}: {needle!r}",
+                )
+
+        def _assert_allowlisted_error(err: str | None) -> None:
+            self.assertIsNotNone(err)
+            assert err is not None
+            self.assertIn(err, allowlisted)
+            self.assertFalse(err.startswith("pushover_rejected:"))
+            _assert_no_leak(err, context="last_error")
+
+        for idx, err_text in enumerate(adversarial_errors):
+            with self.subTest(error=err_text[:48]):
+                calls = {"n": 0}
+
+                def handler(
+                    request: httpx.Request,
+                    *,
+                    _err: str = err_text,
+                ) -> httpx.Response:
+                    calls["n"] += 1
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": 0,
+                            "request": f"req-{opaque_user}-{opaque_token}",
+                            "errors": [_err],
+                            "user": opaque_user,
+                            "token": opaque_token,
+                            "User": opaque_user,
+                            "TOKEN": opaque_token,
+                        },
+                    )
+
+                outbox = self._outbox(
+                    handler,
+                    max_attempts=5,
+                    user_key=opaque_user,
+                    app_token=opaque_token,
+                )
+                try:
+                    record = _record(self.registry)
+                    with patch(
+                        "mission_control.notifications.validate_webhook_url",
+                        return_value=PUSHOVER_API_URL,
+                    ):
+                        with self.assertLogs(
+                            "mission_control.notifications",
+                            level="WARNING",
+                        ) as captured:
+                            outbox.enqueue_for_record(
+                                record,
+                                event_kind=NotificationEventKind.TERMINAL,
+                                dedupe_key=f"terminal:echo:{idx}",
+                            )
+                            outbox.process_due_deliveries()
+
+                    self.assertEqual(calls["n"], 1)
+                    events = outbox.list_for_run(record.run_id)
+                    self.assertEqual(events[0]["delivery_state"], "dead")
+                    _assert_allowlisted_error(events[0]["last_error"])
+                    self.assertEqual(events[0]["last_error"], "pushover_rejected")
+
+                    # Raw SQLite last_error + payload must stay credential-free.
+                    with outbox._lock:
+                        row = outbox._conn.execute(
+                            "SELECT last_error, payload_json FROM "
+                            "notification_outbox WHERE run_id = ?",
+                            (record.run_id,),
+                        ).fetchone()
+                    self.assertIsNotNone(row)
+                    assert row is not None
+                    _assert_allowlisted_error(row["last_error"])
+                    payload = json.loads(row["payload_json"])
+                    payload_blob = json.dumps(payload)
+                    _assert_no_leak(payload_blob, context="stored payload")
+                    for key in ("user", "token", "user_key", "app_token", "secret"):
+                        self.assertNotIn(key, payload)
+
+                    log_blob = "\n".join(
+                        f"{r.getMessage()} {r.exc_text or ''}"
+                        for r in captured.records
+                    )
+                    _assert_no_leak(log_blob, context="logger output")
+                    self.assertIn("pushover_rejected", log_blob)
+
+                    # REST inspection projection.
+                    api_registry = self.registry
+                    prev_reg = api_module.run_registry
+                    prev_out = api_module.notification_outbox
+                    api_module.run_registry = api_registry
+                    api_module.notification_outbox = outbox
+                    try:
+                        client = TestClient(app)
+                        resp = client.get(
+                            f"/runs/{record.run_id}/notifications",
+                            headers=AUTH_HEADERS,
+                        )
+                    finally:
+                        api_module.run_registry = prev_reg
+                        api_module.notification_outbox = prev_out
+                    self.assertEqual(resp.status_code, 200)
+                    rest_body = resp.json()
+                    rest_blob = json.dumps(rest_body)
+                    _assert_no_leak(rest_blob, context="REST notifications")
+                    self.assertEqual(
+                        rest_body["events"][0]["last_error"],
+                        "pushover_rejected",
+                    )
+
+                    # MCP / Unified projection surface.
+                    projected = project_notification_inspection(
+                        rest_body, limit=8
+                    )
+                    proj_blob = json.dumps(projected)
+                    _assert_no_leak(proj_blob, context="MCP/Unified projection")
+                    self.assertEqual(
+                        projected["events"][0]["last_error"],
+                        "pushover_rejected",
+                    )
+
+                    # Classifier direct path.
+                    code, retryable = classify_pushover_response(
+                        httpx.Response(
+                            200,
+                            json={
+                                "status": 0,
+                                "errors": [err_text],
+                                "user": opaque_user,
+                                "token": opaque_token,
+                            },
+                        )
+                    )
+                    self.assertFalse(retryable)
+                    self.assertEqual(code, "pushover_rejected")
+                    _assert_no_leak(code, context="classifier code")
+                    _assert_no_leak(repr(code), context="classifier repr")
+                finally:
+                    outbox.close()
+
+        # String-shaped errors[] also discarded.
+        code, retryable = classify_pushover_response(
+            httpx.Response(
+                200,
+                json={
+                    "status": 0,
+                    "errors": f"user={opaque_user} token={opaque_token}",
+                },
+            )
+        )
+        self.assertFalse(retryable)
+        self.assertEqual(code, "pushover_rejected")
 
     def test_timeout_and_5xx_retry(self) -> None:
         calls = {"n": 0}

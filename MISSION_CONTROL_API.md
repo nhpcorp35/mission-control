@@ -885,15 +885,17 @@ Webhook HMAC header `X-Mission-Control-Signature` uses `t=<unix>,v1=<hex>` over
 attempts become `dead` without changing mission status. Pushover delivery
 succeeds only on HTTP 2xx with JSON integer `status: 1`. Valid JSON with any
 other integer `status` (including HTTP 200 + `status: 0`) is permanent
-`dead` with a redacted `pushover_rejected` error. Malformed/empty/non-JSON
-2xx bodies retry then `dead` (never `delivered`). Transport errors, timeouts,
-429, and 5xx retry; ordinary non-retryable 4xx are permanent. Optional device
-and sound env values reject ASCII control characters. Inspect with
-`GET /runs/{run_id}/notifications`, MCP `list_run_notifications`, or Unified
-`mission.list_notifications`. Rotate secrets by updating receivers first, then
-Mission Control; disable by clearing URL/secret and/or Pushover credentials.
-See `docs/HAL_OPERATOR.md` for Pushover Railway setup, rotation, test
-procedure, and privacy notes.
+`dead` with stable `last_error` `pushover_rejected`. Provider error bodies are
+discarded entirely (not redacted or echoed): `errors[]`, `request`, token/user
+fields, and response snippets never reach SQLite, logs, REST, MCP, or Unified.
+Malformed/empty/non-JSON 2xx bodies retry then `dead` (never `delivered`).
+Transport errors, timeouts, 429, and 5xx retry; ordinary non-retryable 4xx are
+permanent. Optional device and sound env values reject ASCII control
+characters. Inspect with `GET /runs/{run_id}/notifications`, MCP
+`list_run_notifications`, or Unified `mission.list_notifications`. Rotate
+secrets by updating receivers first, then Mission Control; disable by clearing
+URL/secret and/or Pushover credentials. See `docs/HAL_OPERATOR.md` for
+Pushover Railway setup, rotation, test procedure, and privacy notes.
 
 ### Build and start commands
 

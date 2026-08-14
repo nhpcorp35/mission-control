@@ -171,9 +171,10 @@ API, MCP, Unified, or database inspection payloads.
 - Any syntactically valid Pushover JSON object whose integer `status` is not
   `1` (including HTTP 2xx with `status: 0`) is a **permanent** delivery
   failure: the outbox row goes `dead` immediately and is not retried.
-  Normalized `last_error` is `pushover_rejected` (provider error text that
-  mentions tokens/keys is redacted; response credential echoes are never
-  stored).
+  Normalized `last_error` is always the stable code `pushover_rejected`.
+  Provider error bodies (`errors[]`, `request`, token/user fields, and any
+  other response snippets) are discarded entirely — not redacted or echoed —
+  so credential echoes cannot reach SQLite, logs, REST, MCP, or Unified.
 - Ordinary non-retryable 4xx (for example 400/401/403) remain permanent;
   transport exceptions, timeouts, HTTP 429, and HTTP 5xx remain retryable.
 - Malformed / empty / non-JSON HTTP 2xx bodies (acceptance uncertain) are

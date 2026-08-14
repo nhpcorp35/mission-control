@@ -747,16 +747,15 @@ def classify_pushover_http_failure(status_code: int) -> tuple[str, bool]:
     return f"pushover_http_{status_code}", True
 
 
-def _normalize_pushover_rejection_error(body: Mapping[str, Any]) -> str:
-    """Stable permanent-failure code; never echo provider credential fields."""
-    errors = body.get("errors")
-    hint: str | None = None
-    if isinstance(errors, list) and errors:
-        hint = redact_notification_error(str(errors[0]))
-    elif isinstance(errors, str) and errors.strip():
-        hint = redact_notification_error(errors)
-    if hint and hint != "[redacted]":
-        return f"pushover_rejected:{hint}"
+def _normalize_pushover_rejection_error(
+    _body: Mapping[str, Any] | None = None,
+) -> str:
+    """Stable permanent-failure code; provider response bodies are discarded.
+
+    Never append ``errors[]``, ``request``, token/user fields, or any other
+    provider-supplied text — redaction is insufficient when the provider echoes
+    opaque credential values without sensitive keywords.
+    """
     return "pushover_rejected"
 
 
@@ -766,6 +765,8 @@ def classify_pushover_response(response: httpx.Response) -> tuple[str, bool]:
     Policy:
     - Syntactically valid JSON object whose ``status`` is an integer other than
       ``1`` (including ``0``) is a **permanent** rejection, even on HTTP 2xx.
+      ``last_error`` is always the stable code ``pushover_rejected`` (provider
+      error bodies are discarded, not redacted or echoed).
     - Ordinary non-retryable 4xx stay permanent; 429 and 5xx stay retryable.
     - Malformed / non-JSON / empty / non-object 2xx bodies, or 2xx bodies whose
       ``status`` is missing or not an integer, are **retryable** (then ``dead``
