@@ -694,10 +694,12 @@ class TestStaleRecoveryPushoverCounts(unittest.TestCase):
                 return_value=PUSHOVER_API_URL,
             ):
                 self.assertTrue(outbox.maybe_enqueue_stale(live).created)
+                outbox.process_due_deliveries(limit=32)
                 self.registry.touch_heartbeat(record.run_id)
                 healthy = self.registry.get_run(record.run_id)
                 assert healthy is not None
                 self.assertTrue(outbox.maybe_enqueue_stale(healthy).created)
+                outbox.process_due_deliveries(limit=32)
                 self.registry.update_status(record.run_id, RunStatus.COMPLETED)
                 outbox.process_due_deliveries(limit=32)
             self.assertEqual(len(posts), 3)

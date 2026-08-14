@@ -17,6 +17,13 @@ outbox insert run in one ``BEGIN IMMEDIATE`` transaction with a conditional
 UPDATE (CAS) so terminal-versus-healthy races across connections admit
 exactly one winner. Terminalization while still stale closes the episode
 without a false recovery.
+
+Once a run is terminal, pending or in-flight heartbeat ``stale`` /
+paired ``recovery`` (dedupe ``recovery:stale:*``) rows are auditably
+skipped rather than delivered. Delivery finalization uses a compare-and-set
+guard so a run that becomes terminal mid-flight cannot mark those rows
+delivered. Interrupted-run startup ``recovery`` rows and ``terminal`` /
+``phase_change`` events are preserved.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ from mission_control.monitoring import (
     validate_stale_threshold_seconds,
 )
 from mission_control.run_registry import (
+    TERMINAL_STATUSES,
     RunPhase,
     RunRecord,
     RunStatus,
@@ -116,6 +124,11 @@ LEGACY_PREDEPLOY_BACKLOG_CUTOFF_UTC = datetime(
     2026, 8, 14, 16, 38, 0, tzinfo=timezone.utc
 )
 LEGACY_PREDEPLOY_BACKLOG_SUPPRESSED = "legacy_predeploy_backlog_suppressed"
+# Generic rule: heartbeat stale / paired recovery must not page after the run
+# is already terminal (auditable skipped; history retained).
+STALE_RECOVERY_TERMINAL_RUN_SUPPRESSED = "stale_recovery_terminal_run_suppressed"
+# Paired heartbeat recovery dedupe prefix (not interrupted-run startup recovery).
+_HEARTBEAT_RECOVERY_DEDUPE_PREFIX = "recovery:stale:"
 
 # Active delivery backend when notifications are opted in.
 BACKEND_NONE = "none"
@@ -201,6 +214,23 @@ PUSHOVER_DELIVERABLE_EVENT_KINDS = frozenset(
         NotificationEventKind.TERMINAL.value,
     }
 )
+
+
+def is_heartbeat_stale_or_paired_recovery(
+    event_kind: str | NotificationEventKind,
+    dedupe_key: str | None = None,
+) -> bool:
+    """True for heartbeat stale or paired recovery (not startup recovery)."""
+    kind = (
+        event_kind.value
+        if isinstance(event_kind, NotificationEventKind)
+        else str(event_kind)
+    )
+    if kind == NotificationEventKind.STALE.value:
+        return True
+    if kind != NotificationEventKind.RECOVERY.value:
+        return False
+    return str(dedupe_key or "").startswith(_HEARTBEAT_RECOVERY_DEDUPE_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -1439,6 +1469,10 @@ class NotificationOutbox:
                 record.run_id,
                 resolved_at=record.completed_at or _utc_now(),
             )
+            # Drop obsolete heartbeat stale/recovery before they can page.
+            self._suppress_stale_recovery_for_terminal_run_unlocked(
+                str(record.run_id)
+            )
         return self.enqueue_for_record(
             record,
             event_kind=NotificationEventKind.TERMINAL,
@@ -2015,6 +2049,175 @@ class NotificationOutbox:
         )
         return affected
 
+    def _runs_table_exists_unlocked(self) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 AS ok FROM sqlite_master
+            WHERE type = 'table' AND name = 'runs'
+            """
+        ).fetchone()
+        return row is not None
+
+    def _read_run_status_unlocked(self, run_id: str) -> str | None:
+        if not self._runs_table_exists_unlocked():
+            return None
+        row = self._conn.execute(
+            "SELECT status FROM runs WHERE run_id = ?",
+            (str(run_id)[:64],),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["status"])
+
+    def _suppress_stale_recovery_sql_params(
+        self, *, now_s: str, run_id: str | None = None
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build UPDATE ... WHERE for heartbeat stale/recovery on terminal runs."""
+        terminal_list = sorted(TERMINAL_STATUSES)
+        placeholders = ", ".join("?" for _ in terminal_list)
+        sets_and_kinds = f"""
+            UPDATE {_OUTBOX_TABLE}
+            SET delivery_state = ?,
+                last_error = ?,
+                claim_owner = NULL,
+                claim_expires_at = NULL,
+                updated_at = ?
+            WHERE delivery_state IN (?, ?)
+              AND (
+                event_kind = ?
+                OR (
+                  event_kind = ?
+                  AND dedupe_key LIKE ?
+                )
+              )
+              AND EXISTS (
+                SELECT 1 FROM runs r
+                WHERE r.run_id = {_OUTBOX_TABLE}.run_id
+                  AND r.status IN ({placeholders})
+              )
+        """
+        params: list[Any] = [
+            DeliveryState.SKIPPED.value,
+            STALE_RECOVERY_TERMINAL_RUN_SUPPRESSED,
+            now_s,
+            DeliveryState.PENDING.value,
+            DeliveryState.IN_FLIGHT.value,
+            NotificationEventKind.STALE.value,
+            NotificationEventKind.RECOVERY.value,
+            f"{_HEARTBEAT_RECOVERY_DEDUPE_PREFIX}%",
+            *terminal_list,
+        ]
+        if run_id is not None:
+            sets_and_kinds += f" AND {_OUTBOX_TABLE}.run_id = ?"
+            params.append(str(run_id)[:64])
+        return sets_and_kinds, tuple(params)
+
+    def _suppress_stale_recovery_for_terminal_run_unlocked(
+        self, run_id: str
+    ) -> int:
+        """Suppress pending/in-flight heartbeat stale/recovery for one run.
+
+        Caller holds ``self._lock``. Uses ``BEGIN IMMEDIATE``. No-op when the
+        ``runs`` table is absent or the run is not terminal. Does not delete
+        rows; marks them ``skipped`` with an auditable reason.
+        """
+        if not self._runs_table_exists_unlocked():
+            return 0
+        status = self._read_run_status_unlocked(run_id)
+        if status is None or not is_terminal_status(status):
+            return 0
+        now_s = _format_dt(_utc_now())
+        assert now_s is not None
+        sql, params = self._suppress_stale_recovery_sql_params(
+            now_s=now_s, run_id=run_id
+        )
+        try:
+            self._begin_immediate_unlocked()
+            cursor = self._conn.execute(sql, params)
+            affected = int(cursor.rowcount or 0)
+            self._conn.commit()
+        except Exception:
+            self._rollback_unlocked()
+            raise
+        if affected:
+            logger.info(
+                "stale/recovery suppressed for terminal run count=%s",
+                affected,
+            )
+        return affected
+
+    def suppress_stale_recovery_for_terminal_run(self, run_id: str) -> int:
+        """Idempotently skip heartbeat stale/recovery once ``run_id`` is terminal.
+
+        Only ``stale`` and paired heartbeat ``recovery`` (dedupe prefix
+        ``recovery:stale:``) rows in ``pending`` / ``in_flight`` are updated to
+        ``skipped`` with ``last_error=stale_recovery_terminal_run_suppressed``.
+        Interrupted-run startup recovery, ``terminal``, ``phase_change``, and
+        already-terminal delivery states are never touched. History is retained.
+        """
+        with self._lock:
+            return self._suppress_stale_recovery_for_terminal_run_unlocked(
+                run_id
+            )
+
+    def _try_suppress_claimed_stale_recovery_if_terminal(
+        self, row: sqlite3.Row
+    ) -> bool:
+        """Delivery-time guard: skip claimed heartbeat stale/recovery if terminal.
+
+        Returns True when the row was transitioned to ``skipped`` (caller must
+        not HTTP-deliver). Uses ``BEGIN IMMEDIATE`` and CAS on
+        ``delivery_state='in_flight'``.
+        """
+        if not is_heartbeat_stale_or_paired_recovery(
+            row["event_kind"], row["dedupe_key"]
+        ):
+            return False
+        now_s = _format_dt(_utc_now())
+        assert now_s is not None
+        with self._lock:
+            try:
+                self._begin_immediate_unlocked()
+                status = self._read_run_status_unlocked(row["run_id"])
+                if status is None or not is_terminal_status(status):
+                    self._conn.commit()
+                    return False
+                cursor = self._conn.execute(
+                    f"""
+                    UPDATE {_OUTBOX_TABLE}
+                    SET delivery_state = ?,
+                        last_error = ?,
+                        claim_owner = NULL,
+                        claim_expires_at = NULL,
+                        next_attempt_at = NULL,
+                        updated_at = ?
+                    WHERE event_id = ?
+                      AND delivery_state = ?
+                    """,
+                    (
+                        DeliveryState.SKIPPED.value,
+                        STALE_RECOVERY_TERMINAL_RUN_SUPPRESSED,
+                        now_s,
+                        row["event_id"],
+                        DeliveryState.IN_FLIGHT.value,
+                    ),
+                )
+                suppressed = int(cursor.rowcount or 0) > 0
+                self._conn.commit()
+            except Exception:
+                self._rollback_unlocked()
+                raise
+        if suppressed:
+            logger.info(
+                "notification skipped event_id=%s run_id=%s event_kind=%s "
+                "reason=%s",
+                row["event_id"],
+                row["run_id"],
+                row["event_kind"],
+                STALE_RECOVERY_TERMINAL_RUN_SUPPRESSED,
+            )
+        return suppressed
+
     def reclaim_stale_claims(
         self,
         *,
@@ -2151,7 +2354,8 @@ class NotificationOutbox:
         last_error: str | None = None,
         delivered_at: str | None = None,
         clear_error: bool = False,
-    ) -> None:
+        only_if_in_flight: bool = False,
+    ) -> bool:
         now_s = _format_dt(_utc_now())
         with self._lock:
             sets = [
@@ -2178,22 +2382,54 @@ class NotificationOutbox:
                 sets.append("delivered_at = ?")
                 params.append(delivered_at)
             params.append(event_id)
-            self._conn.execute(
-                f"UPDATE {_OUTBOX_TABLE} SET {', '.join(sets)} WHERE event_id = ?",
+            where = "event_id = ?"
+            if only_if_in_flight:
+                where += " AND delivery_state = ?"
+                params.append(DeliveryState.IN_FLIGHT.value)
+            cursor = self._conn.execute(
+                f"UPDATE {_OUTBOX_TABLE} SET {', '.join(sets)} WHERE {where}",
                 tuple(params),
             )
             self._conn.commit()
+            return int(cursor.rowcount or 0) > 0
 
-    def _mark_delivered(self, event_id: str) -> None:
+    def _mark_delivered(self, event_id: str) -> bool:
+        """CAS ``in_flight`` → ``delivered``. Returns False if claim was lost."""
         now_s = _format_dt(_utc_now())
         assert now_s is not None
-        self._clear_claim_fields(
+        return self._clear_claim_fields(
             event_id,
             delivery_state=DeliveryState.DELIVERED.value,
             next_attempt_at=None,
             delivered_at=now_s,
             clear_error=True,
+            only_if_in_flight=True,
         )
+
+    def _finalize_successful_delivery(self, row: sqlite3.Row) -> str:
+        """CAS deliver, or suppress if run became terminal mid-flight.
+
+        Heartbeat stale/paired recovery rows re-check run status under
+        ``BEGIN IMMEDIATE`` so a concurrent terminal transition wins the CAS
+        and the row is auditably skipped instead of delivered.
+
+        Returns ``delivered``, ``skipped``, or ``cas_missed``.
+        """
+        if is_heartbeat_stale_or_paired_recovery(
+            row["event_kind"], row["dedupe_key"]
+        ):
+            if self._try_suppress_claimed_stale_recovery_if_terminal(row):
+                return "skipped"
+        if self._mark_delivered(row["event_id"]):
+            return "delivered"
+        logger.info(
+            "notification deliver CAS missed event_id=%s run_id=%s "
+            "event_kind=%s (already terminalized or reclaimed)",
+            row["event_id"],
+            row["run_id"],
+            row["event_kind"],
+        )
+        return "cas_missed"
 
     def _mark_skipped(
         self,
@@ -2245,10 +2481,16 @@ class NotificationOutbox:
             attempt_count=attempt_count,
             next_attempt_at=next_at,
             last_error=safe_error,
+            only_if_in_flight=True,
         )
 
     def _deliver_one(self, row: sqlite3.Row, config: NotificationConfig) -> None:
         """Attempt one backend delivery. Never mutates mission/run status."""
+        # Race-safe: skip obsolete heartbeat stale/recovery once run is terminal
+        # (even when delivery backends are opt-in disabled).
+        if self._try_suppress_claimed_stale_recovery_if_terminal(row):
+            return
+
         backend = resolve_delivery_backend(config)
         if backend == BACKEND_NONE:
             # Opt-in off: leave pending so inspection still works; do not HTTP.
@@ -2256,6 +2498,7 @@ class NotificationOutbox:
                 row["event_id"],
                 delivery_state=DeliveryState.PENDING.value,
                 next_attempt_at=_format_dt(_utc_now()),
+                only_if_in_flight=True,
             )
             return
 
@@ -2317,15 +2560,16 @@ class NotificationOutbox:
                 )
 
             if 200 <= response.status_code < 300:
-                self._mark_delivered(row["event_id"])
-                logger.info(
-                    "notification delivered backend=webhook event_id=%s "
-                    "run_id=%s event_kind=%s status_code=%s",
-                    row["event_id"],
-                    row["run_id"],
-                    row["event_kind"],
-                    response.status_code,
-                )
+                outcome = self._finalize_successful_delivery(row)
+                if outcome == "delivered":
+                    logger.info(
+                        "notification delivered backend=webhook event_id=%s "
+                        "run_id=%s event_kind=%s status_code=%s",
+                        row["event_id"],
+                        row["run_id"],
+                        row["event_kind"],
+                        response.status_code,
+                    )
                 return
 
             error = f"http_status_{response.status_code}"
@@ -2431,15 +2675,16 @@ class NotificationOutbox:
                 )
 
             if is_pushover_success_response(response):
-                self._mark_delivered(row["event_id"])
-                logger.info(
-                    "notification delivered backend=pushover event_id=%s "
-                    "run_id=%s event_kind=%s status_code=%s",
-                    row["event_id"],
-                    row["run_id"],
-                    row["event_kind"],
-                    response.status_code,
-                )
+                outcome = self._finalize_successful_delivery(row)
+                if outcome == "delivered":
+                    logger.info(
+                        "notification delivered backend=pushover event_id=%s "
+                        "run_id=%s event_kind=%s status_code=%s",
+                        row["event_id"],
+                        row["run_id"],
+                        row["event_kind"],
+                        response.status_code,
+                    )
                 return
 
             error, retryable = classify_pushover_response(response)
