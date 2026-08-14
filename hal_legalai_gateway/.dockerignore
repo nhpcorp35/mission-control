@@ -1,0 +1,22 @@
+# Build context is this package directory. Keep non-runtime / local noise out.
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+.env
+.env.*
+*.pem
+*.key
+secrets
+secrets.*
+tests
+test_*.py
+*_test.py
+.DS_Store
+*.local
+.coverage
+htmlcov
