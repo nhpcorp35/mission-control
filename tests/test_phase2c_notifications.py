@@ -377,6 +377,227 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
         )
         self.assertTrue(forced.created)
 
+    def test_invalid_stale_threshold_fails_closed_no_queue_mutation(self) -> None:
+        from mission_control.monitoring import validate_stale_threshold_seconds
+
+        live = self._running_with_stale_heartbeat(
+            age_seconds=60.0, require_default_stale=False
+        )
+        before = self.outbox.list_for_run(live.run_id)
+        for bad in (0.0, -1.0, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(threshold=bad):
+                with self.assertRaises(ValueError):
+                    validate_stale_threshold_seconds(bad)
+                result = self.outbox.maybe_enqueue_stale(
+                    live, stale_threshold_seconds=bad
+                )
+                self.assertFalse(result.created)
+                self.assertEqual(
+                    result.skipped_reason, "invalid_stale_threshold"
+                )
+        after = self.outbox.list_for_run(live.run_id)
+        self.assertEqual(after, before)
+
+    def test_cross_connection_terminal_wins_no_false_recovery(self) -> None:
+        """Separate outbox connections: terminal CAS beats healthy recovery."""
+        live = self._running_with_stale_heartbeat()
+        self.assertTrue(self.outbox.maybe_enqueue_stale(live).created)
+
+        healthy_box = NotificationOutbox(
+            self._db_path, config=_config(enabled=False)
+        )
+        terminal_box = NotificationOutbox(
+            self._db_path, config=_config(enabled=False)
+        )
+        try:
+            self.registry.touch_heartbeat(live.run_id)
+            healthy = self.registry.get_run(live.run_id)
+            assert healthy is not None
+            self.registry.update_status(live.run_id, RunStatus.FAILED)
+            terminal = self.registry.get_run(live.run_id)
+            assert terminal is not None
+
+            barrier = threading.Barrier(2)
+            outcomes: dict[str, object] = {}
+            errors: list[BaseException] = []
+
+            def _healthy() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    outcomes["healthy"] = healthy_box.maybe_enqueue_stale(
+                        healthy
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            def _terminal() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    outcomes["terminal"] = terminal_box.maybe_enqueue_stale(
+                        terminal
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=_healthy),
+                threading.Thread(target=_terminal),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertEqual(errors, [])
+
+            events = self.outbox.list_for_run(live.run_id)
+            kinds = [e["event_kind"] for e in events]
+            recovery_count = kinds.count("recovery")
+            episode = self.outbox._conn.execute(
+                "SELECT state FROM notification_stale_episodes WHERE run_id = ?",
+                (live.run_id,),
+            ).fetchone()
+            assert episode is not None
+            state = str(episode["state"])
+            if state == "closed_terminal":
+                self.assertEqual(recovery_count, 0)
+                self.assertFalse(
+                    getattr(outcomes["healthy"], "created", True)
+                )
+            else:
+                self.assertEqual(state, "recovered")
+                self.assertEqual(recovery_count, 1)
+                self.assertTrue(getattr(outcomes["healthy"], "created", False))
+            # Never both terminal-closed and a recovery row.
+            self.assertFalse(
+                state == "closed_terminal" and recovery_count > 0
+            )
+        finally:
+            healthy_box.close()
+            terminal_box.close()
+
+    def test_cross_connection_terminal_healthy_stress_no_false_pairing(
+        self,
+    ) -> None:
+        """Adversarial multi-connection terminal×healthy races stay exclusive."""
+        iterations = 40
+        false_pairings = 0
+        duplicate_recoveries = 0
+        for i in range(iterations):
+            live = self._running_with_stale_heartbeat()
+            self.assertTrue(self.outbox.maybe_enqueue_stale(live).created)
+            self.registry.touch_heartbeat(live.run_id)
+            healthy = self.registry.get_run(live.run_id)
+            assert healthy is not None
+            self.registry.update_status(live.run_id, RunStatus.COMPLETED)
+            terminal = self.registry.get_run(live.run_id)
+            assert terminal is not None
+
+            boxes = [
+                NotificationOutbox(
+                    self._db_path, config=_config(enabled=False)
+                )
+                for _ in range(4)
+            ]
+            barrier = threading.Barrier(4)
+            errors: list[BaseException] = []
+
+            def _race(box: NotificationOutbox, record, label: str) -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    if label == "healthy":
+                        box.maybe_enqueue_stale(record)
+                    else:
+                        box.maybe_enqueue_terminal(record)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(
+                    target=_race, args=(boxes[0], healthy, "healthy")
+                ),
+                threading.Thread(
+                    target=_race, args=(boxes[1], healthy, "healthy")
+                ),
+                threading.Thread(
+                    target=_race, args=(boxes[2], terminal, "terminal")
+                ),
+                threading.Thread(
+                    target=_race, args=(boxes[3], terminal, "terminal")
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertEqual(errors, [])
+
+            events = self.outbox.list_for_run(live.run_id)
+            kinds = [e["event_kind"] for e in events]
+            recovery_count = kinds.count("recovery")
+            if recovery_count > 1:
+                duplicate_recoveries += 1
+            episode = self.outbox._conn.execute(
+                "SELECT state FROM notification_stale_episodes WHERE run_id = ?",
+                (live.run_id,),
+            ).fetchone()
+            assert episode is not None
+            state = str(episode["state"])
+            if state == "closed_terminal" and recovery_count > 0:
+                false_pairings += 1
+            elif state == "recovered":
+                self.assertEqual(recovery_count, 1)
+            else:
+                self.assertEqual(state, "closed_terminal")
+                self.assertEqual(recovery_count, 0)
+            for box in boxes:
+                box.close()
+
+        self.assertEqual(false_pairings, 0)
+        self.assertEqual(duplicate_recoveries, 0)
+
+    def test_cross_connection_repeated_healthy_single_recovery(self) -> None:
+        live = self._running_with_stale_heartbeat()
+        self.assertTrue(self.outbox.maybe_enqueue_stale(live).created)
+        self.registry.touch_heartbeat(live.run_id)
+        healthy = self.registry.get_run(live.run_id)
+        assert healthy is not None
+
+        boxes = [
+            NotificationOutbox(self._db_path, config=_config(enabled=False))
+            for _ in range(6)
+        ]
+        barrier = threading.Barrier(6)
+        created = 0
+        lock = threading.Lock()
+        errors: list[BaseException] = []
+
+        def _observe(box: NotificationOutbox) -> None:
+            nonlocal created
+            try:
+                barrier.wait(timeout=5)
+                result = box.maybe_enqueue_stale(healthy)
+                if result.created:
+                    with lock:
+                        created += 1
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_observe, args=(box,)) for box in boxes
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(created, 1)
+        events = self.outbox.list_for_run(live.run_id)
+        self.assertEqual(
+            sum(1 for e in events if e["event_kind"] == "recovery"), 1
+        )
+        for box in boxes:
+            box.close()
+
     def test_schema_migration_adds_stale_episode_table(self) -> None:
         """Existing production DBs gain the episode table without failure."""
         legacy_fd, legacy_path = tempfile.mkstemp(suffix=".db")

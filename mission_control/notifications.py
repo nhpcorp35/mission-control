@@ -12,8 +12,11 @@ intentionally skipped for the native Pushover backend (webhook delivery of
 Heartbeat stale/recovery pairing is restart-safe: once a stale event is
 durably enqueued, SQLite records an open stale episode so the first later
 healthy observation enqueues exactly one paired recovery (independent of
-in-memory wait cursors). Terminalization while still stale closes the
-episode without a false recovery.
+in-memory wait cursors). Open-episode transitions and the corresponding
+outbox insert run in one ``BEGIN IMMEDIATE`` transaction with a conditional
+UPDATE (CAS) so terminal-versus-healthy races across connections admit
+exactly one winner. Terminalization while still stale closes the episode
+without a false recovery.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ from mission_control.monitoring import (
     HEARTBEAT_STALE_THRESHOLD_SECONDS,
     HeartbeatHealth,
     classify_heartbeat_health,
+    validate_stale_threshold_seconds,
 )
 from mission_control.run_registry import (
     RunPhase,
@@ -1236,6 +1240,19 @@ class NotificationOutbox:
         with self._lock:
             self._conn.close()
 
+    def _begin_immediate_unlocked(self) -> None:
+        """Take a reserved write lock (cross-connection / cross-process)."""
+        # End any implicit transaction so BEGIN IMMEDIATE can acquire the
+        # reserved lock against other NotificationOutbox connections.
+        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+
+    def _rollback_unlocked(self) -> None:
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:
+            pass
+
     def enqueue(
         self,
         *,
@@ -1394,6 +1411,9 @@ class NotificationOutbox:
 
         Closes any open stale episode without emitting recovery so a run that
         becomes terminal while still stale cannot produce a false recovery.
+        Episode close uses a SQLite ``BEGIN IMMEDIATE`` CAS so a concurrent
+        healthy observation on another connection cannot insert recovery after
+        ``closed_terminal``.
         """
         if not is_terminal_status(record.status):
             return EnqueueResult(
@@ -1409,9 +1429,8 @@ class NotificationOutbox:
         completed = _format_dt(record.completed_at) or _format_dt(_utc_now())
         dedupe = f"terminal:{status_value}:{completed}"
         with self._lock:
-            self._resolve_open_stale_episode_unlocked(
+            self._close_open_stale_episode_terminal_unlocked(
                 record.run_id,
-                state=_STALE_EPISODE_CLOSED_TERMINAL,
                 resolved_at=record.completed_at or _utc_now(),
             )
         return self.enqueue_for_record(
@@ -1443,18 +1462,31 @@ class NotificationOutbox:
     ) -> EnqueueResult:
         """Observe heartbeat health and pair stale/recovery notifications.
 
-        Production wait/status/notification paths call this on each observation.
-        When health is ``stale``, enqueues at most one stale event per heartbeat
-        observation window and durably opens a stale episode. When health is
-        later ``healthy``, enqueues exactly one paired recovery for that
-        episode (restart-safe; independent of in-memory monitoring cursors).
-        Terminal observations close an open episode without recovery.
+        Production wait and notification-inspection paths call this on each
+        observation (not bare ``GET /runs/{run_id}`` status). When health is
+        ``stale``, enqueues at most one stale event per heartbeat observation
+        window and durably opens a stale episode. When health is later
+        ``healthy``, enqueues exactly one paired recovery for that episode
+        (restart-safe; independent of in-memory monitoring cursors). Terminal
+        observations close an open episode without recovery. Open-episode
+        transitions and paired outbox inserts share one ``BEGIN IMMEDIATE``
+        transaction with conditional UPDATE/CAS.
         """
+        try:
+            threshold = validate_stale_threshold_seconds(
+                stale_threshold_seconds
+            )
+        except ValueError:
+            return EnqueueResult(
+                created=False,
+                event_id=None,
+                skipped_reason="invalid_stale_threshold",
+            )
         clock = now or _utc_now()
         health = classify_heartbeat_health(
             record,
             now=clock,
-            stale_threshold_seconds=stale_threshold_seconds,
+            stale_threshold_seconds=threshold,
         )
         if health is HeartbeatHealth.STALE:
             return self._enqueue_stale_and_open_episode(
@@ -1466,9 +1498,8 @@ class NotificationOutbox:
             )
         if health is HeartbeatHealth.TERMINAL:
             with self._lock:
-                self._resolve_open_stale_episode_unlocked(
+                self._close_open_stale_episode_terminal_unlocked(
                     record.run_id,
-                    state=_STALE_EPISODE_CLOSED_TERMINAL,
                     resolved_at=clock,
                 )
             return EnqueueResult(
@@ -1492,6 +1523,27 @@ class NotificationOutbox:
             """,
             (str(run_id), _STALE_EPISODE_OPEN),
         ).fetchone()
+
+    def _close_open_stale_episode_terminal_unlocked(
+        self,
+        run_id: str,
+        *,
+        resolved_at: datetime,
+    ) -> bool:
+        """CAS open → closed_terminal under BEGIN IMMEDIATE (no recovery)."""
+        try:
+            self._begin_immediate_unlocked()
+            won = self._resolve_open_stale_episode_unlocked(
+                run_id,
+                state=_STALE_EPISODE_CLOSED_TERMINAL,
+                resolved_at=resolved_at,
+                commit=False,
+            )
+            self._conn.commit()
+            return won
+        except sqlite3.Error:
+            self._rollback_unlocked()
+            raise
 
     def _open_stale_episode_unlocked(
         self,
@@ -1594,6 +1646,53 @@ class NotificationOutbox:
             self._conn.commit()
         return int(cursor.rowcount or 0) > 0
 
+    def _insert_outbox_row_unlocked(
+        self,
+        *,
+        event_id: str,
+        run_id: str,
+        event_kind: str,
+        dedupe_key: str,
+        payload: Mapping[str, Any],
+        now_s: str,
+    ) -> None:
+        """Insert one outbox row; caller owns the surrounding transaction."""
+        clean = sanitize_notification_payload(payload)
+        clean["run_id"] = str(run_id)[:64]
+        clean["event_kind"] = event_kind
+        clean["dedupe_key"] = str(dedupe_key)[:128]
+        if "occurred_at" not in clean or not clean["occurred_at"]:
+            clean["occurred_at"] = now_s
+        self._conn.execute(
+            f"""
+            INSERT INTO {_OUTBOX_TABLE} (
+                event_id,
+                run_id,
+                event_kind,
+                dedupe_key,
+                payload_json,
+                delivery_state,
+                attempt_count,
+                next_attempt_at,
+                last_error,
+                delivered_at,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+            """,
+            (
+                event_id,
+                str(run_id)[:64],
+                event_kind,
+                str(dedupe_key)[:128],
+                json.dumps(clean, separators=(",", ":"), sort_keys=True),
+                DeliveryState.PENDING.value,
+                now_s,
+                now_s,
+                now_s,
+            ),
+        )
+
     def _enqueue_stale_and_open_episode(
         self,
         record: RunRecord,
@@ -1606,72 +1705,51 @@ class NotificationOutbox:
         kind = NotificationEventKind.STALE.value
         run_id = str(record.run_id)[:64]
         with self._lock:
-            existing = self._conn.execute(
-                f"""
-                SELECT event_id FROM {_OUTBOX_TABLE}
-                WHERE run_id = ? AND event_kind = ? AND dedupe_key = ?
-                """,
-                (run_id, kind, dedupe[:128]),
-            ).fetchone()
-            if existing is not None:
-                event_id = str(existing["event_id"])
-                self._open_stale_episode_unlocked(
-                    run_id=run_id,
-                    episode_id=str(uuid.uuid4()),
-                    stale_dedupe_key=dedupe,
-                    stale_event_id=event_id,
-                    stale_heartbeat_at=hb if hb != "absent" else None,
-                    opened_at=now,
-                    commit=True,
-                )
-                return EnqueueResult(
-                    created=False,
-                    event_id=event_id,
-                    skipped_reason="duplicate",
-                )
-
-            event_id = str(uuid.uuid4())
-            episode_id = str(uuid.uuid4())
-            payload = build_event_payload(
-                record,
-                event_kind=NotificationEventKind.STALE,
-                dedupe_key=dedupe,
-                occurred_at=now,
-                heartbeat_health=HeartbeatHealth.STALE.value,
-            )
-            now_s = _format_dt(now)
-            assert now_s is not None
             try:
-                self._conn.execute(
+                self._begin_immediate_unlocked()
+                existing = self._conn.execute(
                     f"""
-                    INSERT INTO {_OUTBOX_TABLE} (
-                        event_id,
-                        run_id,
-                        event_kind,
-                        dedupe_key,
-                        payload_json,
-                        delivery_state,
-                        attempt_count,
-                        next_attempt_at,
-                        last_error,
-                        delivered_at,
-                        created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+                    SELECT event_id FROM {_OUTBOX_TABLE}
+                    WHERE run_id = ? AND event_kind = ? AND dedupe_key = ?
                     """,
-                    (
-                        event_id,
-                        run_id,
-                        kind,
-                        dedupe[:128],
-                        json.dumps(
-                            payload, separators=(",", ":"), sort_keys=True
-                        ),
-                        DeliveryState.PENDING.value,
-                        now_s,
-                        now_s,
-                        now_s,
-                    ),
+                    (run_id, kind, dedupe[:128]),
+                ).fetchone()
+                if existing is not None:
+                    event_id = str(existing["event_id"])
+                    self._open_stale_episode_unlocked(
+                        run_id=run_id,
+                        episode_id=str(uuid.uuid4()),
+                        stale_dedupe_key=dedupe,
+                        stale_event_id=event_id,
+                        stale_heartbeat_at=hb if hb != "absent" else None,
+                        opened_at=now,
+                        commit=False,
+                    )
+                    self._conn.commit()
+                    return EnqueueResult(
+                        created=False,
+                        event_id=event_id,
+                        skipped_reason="duplicate",
+                    )
+
+                event_id = str(uuid.uuid4())
+                episode_id = str(uuid.uuid4())
+                payload = build_event_payload(
+                    record,
+                    event_kind=NotificationEventKind.STALE,
+                    dedupe_key=dedupe,
+                    occurred_at=now,
+                    heartbeat_health=HeartbeatHealth.STALE.value,
+                )
+                now_s = _format_dt(now)
+                assert now_s is not None
+                self._insert_outbox_row_unlocked(
+                    event_id=event_id,
+                    run_id=run_id,
+                    event_kind=kind,
+                    dedupe_key=dedupe,
+                    payload=payload,
+                    now_s=now_s,
                 )
                 self._open_stale_episode_unlocked(
                     run_id=run_id,
@@ -1684,10 +1762,7 @@ class NotificationOutbox:
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError:
-                try:
-                    self._conn.rollback()
-                except sqlite3.Error:
-                    pass
+                self._rollback_unlocked()
                 row = self._conn.execute(
                     f"""
                     SELECT event_id FROM {_OUTBOX_TABLE}
@@ -1697,20 +1772,29 @@ class NotificationOutbox:
                 ).fetchone()
                 event_id = str(row["event_id"]) if row else None
                 if event_id is not None:
-                    self._open_stale_episode_unlocked(
-                        run_id=run_id,
-                        episode_id=str(uuid.uuid4()),
-                        stale_dedupe_key=dedupe,
-                        stale_event_id=event_id,
-                        stale_heartbeat_at=hb if hb != "absent" else None,
-                        opened_at=now,
-                        commit=True,
-                    )
+                    try:
+                        self._begin_immediate_unlocked()
+                        self._open_stale_episode_unlocked(
+                            run_id=run_id,
+                            episode_id=str(uuid.uuid4()),
+                            stale_dedupe_key=dedupe,
+                            stale_event_id=event_id,
+                            stale_heartbeat_at=hb if hb != "absent" else None,
+                            opened_at=now,
+                            commit=False,
+                        )
+                        self._conn.commit()
+                    except sqlite3.Error:
+                        self._rollback_unlocked()
+                        raise
                 return EnqueueResult(
                     created=False,
                     event_id=event_id,
                     skipped_reason="duplicate",
                 )
+            except sqlite3.Error:
+                self._rollback_unlocked()
+                raise
 
         logger.info(
             "notification enqueued run_id=%s event_kind=%s event_id=%s",
@@ -1727,32 +1811,104 @@ class NotificationOutbox:
         *,
         now: datetime,
     ) -> EnqueueResult:
-        """Enqueue one recovery for an open stale episode (idempotent)."""
+        """Enqueue one recovery for an open stale episode (idempotent).
+
+        CAS ``open`` → ``recovered`` and insert the paired recovery row in the
+        same ``BEGIN IMMEDIATE`` transaction so a concurrent terminal close on
+        another connection cannot observe recovery after ``closed_terminal``.
+        """
+        run_id = str(record.run_id)[:64]
+        kind = NotificationEventKind.RECOVERY.value
         with self._lock:
-            episode = self._get_open_stale_episode_unlocked(record.run_id)
-            if episode is None:
-                return EnqueueResult(
-                    created=False,
-                    event_id=None,
-                    skipped_reason="no_open_stale_episode",
-                )
-            episode_id = str(episode["episode_id"])
-            dedupe = f"recovery:stale:{episode_id}"
-            result = self.enqueue_for_record(
-                record,
-                event_kind=NotificationEventKind.RECOVERY,
-                dedupe_key=dedupe,
-                occurred_at=now,
-                heartbeat_health=HeartbeatHealth.HEALTHY.value,
-            )
-            if result.created or result.skipped_reason == "duplicate":
-                self._resolve_open_stale_episode_unlocked(
-                    record.run_id,
+            try:
+                self._begin_immediate_unlocked()
+                episode = self._get_open_stale_episode_unlocked(run_id)
+                if episode is None:
+                    self._conn.commit()
+                    return EnqueueResult(
+                        created=False,
+                        event_id=None,
+                        skipped_reason="no_open_stale_episode",
+                    )
+                episode_id = str(episode["episode_id"])
+                dedupe = f"recovery:stale:{episode_id}"
+                existing = self._conn.execute(
+                    f"""
+                    SELECT event_id FROM {_OUTBOX_TABLE}
+                    WHERE run_id = ? AND event_kind = ? AND dedupe_key = ?
+                    """,
+                    (run_id, kind, dedupe[:128]),
+                ).fetchone()
+                won = self._resolve_open_stale_episode_unlocked(
+                    run_id,
                     state=_STALE_EPISODE_RECOVERED,
                     resolved_at=now,
                     episode_id=episode_id,
+                    commit=False,
                 )
-            return result
+                if not won:
+                    self._conn.commit()
+                    return EnqueueResult(
+                        created=False,
+                        event_id=None,
+                        skipped_reason="no_open_stale_episode",
+                    )
+                if existing is not None:
+                    self._conn.commit()
+                    return EnqueueResult(
+                        created=False,
+                        event_id=str(existing["event_id"]),
+                        skipped_reason="duplicate",
+                    )
+                event_id = str(uuid.uuid4())
+                payload = build_event_payload(
+                    record,
+                    event_kind=NotificationEventKind.RECOVERY,
+                    dedupe_key=dedupe,
+                    occurred_at=now,
+                    heartbeat_health=HeartbeatHealth.HEALTHY.value,
+                )
+                now_s = _format_dt(now)
+                assert now_s is not None
+                self._insert_outbox_row_unlocked(
+                    event_id=event_id,
+                    run_id=run_id,
+                    event_kind=kind,
+                    dedupe_key=dedupe,
+                    payload=payload,
+                    now_s=now_s,
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                self._rollback_unlocked()
+                row = self._conn.execute(
+                    f"""
+                    SELECT event_id FROM {_OUTBOX_TABLE}
+                    WHERE run_id = ? AND event_kind = ? AND dedupe_key = ?
+                    """,
+                    (
+                        run_id,
+                        kind,
+                        f"recovery:stale:{episode_id}"[:128],
+                    ),
+                ).fetchone()
+                return EnqueueResult(
+                    created=False,
+                    event_id=str(row["event_id"]) if row else None,
+                    skipped_reason="duplicate",
+                )
+            except sqlite3.Error:
+                self._rollback_unlocked()
+                raise
+
+        logger.info(
+            "notification enqueued run_id=%s event_kind=%s event_id=%s",
+            run_id,
+            kind,
+            event_id,
+        )
+        wake_notification_delivery()
+        return EnqueueResult(created=True, event_id=event_id)
 
     def list_for_run(
         self,

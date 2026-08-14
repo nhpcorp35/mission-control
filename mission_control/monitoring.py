@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
@@ -31,6 +32,25 @@ DEFAULT_MONITOR_POLL_INTERVAL_SECONDS = 25.0
 # while remaining well below typical operator wait budgets. Operators may pass
 # an explicit stale_threshold_seconds override on observe/enqueue helpers.
 HEARTBEAT_STALE_THRESHOLD_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 18.0  # 90s
+
+
+def validate_stale_threshold_seconds(value: float) -> float:
+    """Return ``value`` when it is finite and strictly positive.
+
+    Invalid overrides must fail closed before any outbox/queue mutation.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "stale_threshold_seconds must be a finite number > 0"
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0.0:
+        raise ValueError(
+            "stale_threshold_seconds must be finite and strictly positive"
+        )
+    return seconds
+
 
 # Bound monitoring payload size (events are already redacted/sanitized).
 MONITORING_HISTORY_MAX_EVENTS = 32
@@ -126,6 +146,7 @@ def classify_heartbeat_health(
     ``stale`` means ``heartbeat_at`` is older than the documented threshold.
     Terminal statuses always classify as ``terminal``.
     """
+    threshold = validate_stale_threshold_seconds(stale_threshold_seconds)
     if isinstance(record, Mapping):
         status = record.get("status")
         phase = record.get("phase")
@@ -158,7 +179,7 @@ def classify_heartbeat_health(
         return HeartbeatHealth.ABSENT
 
     age = (clock - _as_utc(hb)).total_seconds()
-    if age > stale_threshold_seconds:
+    if age > threshold:
         return HeartbeatHealth.STALE
     return HeartbeatHealth.HEALTHY
 
