@@ -1370,31 +1370,171 @@ class WorkflowRegistry:
     ) -> CasResult:
         """Mark a claimed step as materialized into the run registry.
 
-        Prepares compatibility with ``RunRegistry.create_run(run_id=...)``
-        without implementing that wiring here.
+        Compare-and-swap on both workflow ``version`` and step
+        ``materialization_state='claimed'`` so concurrent materializers
+        cannot double-bind the same logical child. Already-materialized
+        steps return ``ok=False`` / ``error='already_materialized'``
+        without bumping the workflow version.
         """
         status = (
             StepStatus.RUNNING
             if child_status == "running"
             else StepStatus.QUEUED
         )
-        return self.apply_cas_transition(
-            workflow_id=workflow_id,
-            expected_version=expected_version,
-            to_state=WorkflowState.RUNNING,
-            reason=TransitionReason.CHILD_BOUND,
-            detail={
-                "materialization_state": (
-                    StepMaterializationState.MATERIALIZED.value
-                ),
-                "child_status": child_status,
-            },
-            step_id=step_id,
-            step_updates={
-                "status": status,
-                "materialization_state": StepMaterializationState.MATERIALIZED,
-            },
-        )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                workflow = self._fetch_workflow_unlocked(workflow_id)
+                if workflow is None:
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False, workflow=None, error="workflow_not_found"
+                    )
+                if workflow.version != expected_version:
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False,
+                        workflow=workflow,
+                        conflict=True,
+                        error="version_conflict",
+                    )
+                if is_terminal_workflow_state(workflow.state):
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False,
+                        workflow=workflow,
+                        error="workflow_terminal",
+                    )
+
+                step = self._fetch_step_unlocked(step_id)
+                if step is None or step.workflow_id != workflow_id:
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False,
+                        workflow=workflow,
+                        error="step_not_found",
+                    )
+                if (
+                    step.materialization_state
+                    is StepMaterializationState.MATERIALIZED
+                ):
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False,
+                        workflow=workflow,
+                        error="already_materialized",
+                    )
+                if (
+                    step.materialization_state
+                    is not StepMaterializationState.CLAIMED
+                    or step.status is not StepStatus.CLAIMED
+                ):
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False,
+                        workflow=workflow,
+                        error="not_claimed",
+                    )
+
+                now = _utc_now()
+                new_version = workflow.version + 1
+                cur = self._conn.execute(
+                    f"""
+                    UPDATE {_WORKFLOW_STEPS_TABLE}
+                    SET status = ?,
+                        materialization_state = ?,
+                        updated_at = ?
+                    WHERE step_id = ?
+                      AND materialization_state = ?
+                      AND status = ?
+                    """,
+                    (
+                        status.value,
+                        StepMaterializationState.MATERIALIZED.value,
+                        _format_dt(now),
+                        step_id,
+                        StepMaterializationState.CLAIMED.value,
+                        StepStatus.CLAIMED.value,
+                    ),
+                )
+                if int(cur.rowcount or 0) < 1:
+                    self._conn.rollback()
+                    latest = self._fetch_workflow_unlocked(workflow_id)
+                    return CasResult(
+                        ok=False,
+                        workflow=latest,
+                        conflict=True,
+                        error="already_materialized",
+                    )
+
+                wcur = self._conn.execute(
+                    f"""
+                    UPDATE {_WORKFLOWS_TABLE}
+                    SET state = ?,
+                        version = ?,
+                        updated_at = ?,
+                        last_decision_json = ?
+                    WHERE workflow_id = ? AND version = ?
+                    """,
+                    (
+                        WorkflowState.RUNNING.value,
+                        new_version,
+                        _format_dt(now),
+                        _dumps(
+                            {
+                                "action": "child_bound",
+                                "materialization_state": (
+                                    StepMaterializationState.MATERIALIZED.value
+                                ),
+                                "child_status": child_status,
+                            }
+                        ),
+                        workflow_id,
+                        expected_version,
+                    ),
+                )
+                if int(wcur.rowcount or 0) < 1:
+                    self._conn.rollback()
+                    latest = self._fetch_workflow_unlocked(workflow_id)
+                    return CasResult(
+                        ok=False,
+                        workflow=latest,
+                        conflict=True,
+                        error="version_conflict",
+                    )
+
+                self._append_transition_unlocked(
+                    workflow_id=workflow_id,
+                    from_state=workflow.state.value,
+                    to_state=WorkflowState.RUNNING.value,
+                    reason=TransitionReason.CHILD_BOUND.value,
+                    detail={
+                        "materialization_state": (
+                            StepMaterializationState.MATERIALIZED.value
+                        ),
+                        "child_status": child_status,
+                    },
+                    version_after=new_version,
+                    step_id=step_id,
+                    child_run_id=step.child_run_id,
+                )
+                self._conn.commit()
+                updated = self._fetch_workflow_unlocked(workflow_id)
+                logger.info(
+                    (
+                        "workflow event=child_bound workflow_id=%s "
+                        "step_id=%s child_run_id=%s version=%s"
+                    ),
+                    workflow_id,
+                    step_id,
+                    step.child_run_id,
+                    new_version,
+                )
+                return CasResult(ok=True, workflow=updated)
+            except Exception:
+                self._conn.rollback()
+                raise
+
 
     def apply_cas_transition(
         self,

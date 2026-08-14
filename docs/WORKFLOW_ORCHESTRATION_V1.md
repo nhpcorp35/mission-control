@@ -17,19 +17,22 @@ review `8a575671-6b80-4280-88da-193bf1386a47`.
 | CAS via exact `cursor.rowcount` + idempotent claims | MCP tools |
 | Spoof-resistant verdict envelope + opaque follow-up context | Lifespan reconciler worker hook |
 | Transactional policy gates at every child-launch claim | Outbox/Pushover child-alert suppression wiring |
-| Claim / materialization states + mark-then-launch recovery | Orchestrator materialize + lifespan reconciler |
+| Claim / materialization states + mark-then-launch recovery | Lifespan reconciler / production enablement |
 | `RunRegistry.create_run(run_id=…)` reserved-ID contract | HTTP/MCP, notifications, production enablement |
-| Budget ceilings with documented inclusive semantics | Auto-merge / Railway deploy primitives |
+| Crash-safe claim→create materializer + enqueue-once | Auto-merge / Railway deploy primitives |
+| Budget ceilings with documented inclusive semantics | — |
 | Feature flag (off by default) | — |
 
 ## Files
 
 | Path | Role |
 | --- | --- |
-| `mission_control/workflow_registry.py` | Durable registry, schema v2 migrations, CAS, audit |
+| `mission_control/workflow_registry.py` | Durable registry, schema v2, CAS, claim + mark dual-CAS |
 | `mission_control/workflow_orchestrator.py` | Verdict envelope, context builder, gates, state machine |
+| `mission_control/workflow_materializer.py` | Crash-safe claim→`RunRegistry` materialize + enqueue-once |
 | `mission_control/run_registry.py` | Reserved-ID `create_run(run_id=…)` materialization contract |
 | `tests/test_workflow_orchestration_v1.py` | Exploit, concurrency, budget, migration tests |
+| `tests/test_workflow_materialization.py` | Materialize crash / concurrency / policy tests |
 | `tests/test_run_registry.py` | Reserved-ID create / conflict / concurrency tests |
 | `docs/WORKFLOW_ORCHESTRATION_V1.md` | This document |
 
@@ -207,9 +210,40 @@ persisted on the transition / `last_decision_json`.
    unique `child_run_id` and `UNIQUE(idempotency_key)`.
 4. Restart / concurrent claim with the same key returns the same
    `child_run_id` (`already_claimed=true`) — no duplicate step.
-5. **Materialize** via `RunRegistry.create_run(run_id=…)` (reserved-ID
-   contract below). Call `mark_step_materialized` after a successful
-   `created` or `recovered_idempotently` outcome.
+5. **Materialize** via `materialize_claimed_child` (below). Uses exact stored
+   step YAML + reserved `child_run_id` + canonical `retried_from` ownership.
+   Marks the step materialized only after `created` or
+   `recovered_idempotently`, with CAS on both workflow version **and**
+   `materialization_state='claimed'`. Enqueues **once** when this attempt
+   wins the mark. Feature flag must be on for the call; default remains off.
+
+## Claim-to-create crash contract
+
+Deterministic protocol (SQLite PK + CAS are the correctness boundary; do not
+rely on process-local locks):
+
+```text
+CLAIMED + exact mission_yaml + parent binding
+  → final policy / ceiling / authority gates
+  → RunRegistry.create_run(run_id=child_run_id, mission_yaml=exact,
+                           retried_from=ownership)
+  → mark_step_materialized (CAS)
+  → RunQueue.enqueue exactly once (mark winner only)
+```
+
+| Window | Retry behavior |
+| --- | --- |
+| Before create | Fresh `create_run` |
+| After create, before mark | `recovered_idempotently` → mark → enqueue |
+| After mark, before enqueue | `already_materialized`; **no** second enqueue |
+| Existing matching run | Idempotent recover |
+| Existing mismatch | Poison / fail closed (`conflict_class`, no secrets) |
+| Missing parent binding | Reject **before** create |
+| Final policy denial | Block workflow; no registry row |
+
+Concurrent materializers across two DB connections yield one registry row and
+at most one enqueue. Lifespan reconciler re-drive of the post-mark enqueue gap
+is deferred.
 
 ## Reserved RunRegistry IDs
 
@@ -238,8 +272,9 @@ Rules:
 - Inserts use `BEGIN IMMEDIATE` + primary-key create-once across connections.
 - Idempotent recover compares immutable mission identity / launch metadata only.
 - Lifecycle logs must not include raw mission YAML or secrets.
-- Feature flag `MISSION_CONTROL_WORKFLOW_ORCHESTRATION` remains off; this slice
-  does not wire the orchestrator materializer.
+- Feature flag `MISSION_CONTROL_WORKFLOW_ORCHESTRATION` remains off by default.
+  The materializer refuses when the flag is disabled; this slice does **not**
+  wire the lifespan reconciler or HTTP/MCP surfaces.
 
 ## Notifications (design; wiring deferred)
 
@@ -253,6 +288,7 @@ Rules:
 ```bash
 python -m unittest tests.test_run_registry -v
 python -m unittest tests.test_workflow_orchestration_v1 -v
+python -m unittest tests.test_workflow_materialization -v
 python -m unittest discover -s tests -v
 ```
 
@@ -263,18 +299,20 @@ Covered:
 - Unused-helper / transactional gate enforcement on claim
 - Concurrent same-connection and multi-connection CAS
 - Crash after claim before materialize; crash after mark before launch
+- Crash-safe materialize: created, idempotent recover, mismatch poison,
+  missing parent, final policy denial, concurrent materializers, injected
+  crashes before/after create and before/after mark persistence
 - Duplicate `child_run_id` uniqueness; schema upgrade + newer-version reject
 - All budget boundaries (child, estimated credit, actual credit, wall-clock,
   fix-cycle) with off-by-one checks
 - Canonical fingerprint ordering/whitespace
-- Feature remains disabled by default
+- Feature remains disabled by default; materialize no-ops when off
 
 ## Residual risks
 
-1. Child runs are **reserved** and can be inserted into `runs` via
-   `create_run(run_id=…)`, but the orchestrator materializer / reconciler
-   worker is not wired yet — without that follow-up, workflows still wait at
-   `awaiting_child_materialize`.
+1. Materializer can insert reserved children into `runs` and enqueue once, but
+   the lifespan reconciler is not wired — post-mark enqueue gaps after hard
+   process death wait for the reconciler follow-up.
 2. Notification suppression is decided in-process; outbox/Pushover not hooked.
 3. No HTTP/MCP surface yet — operators cannot submit via API.
 4. Auto-merge/deploy explicitly deferred; policy bits are recorded only.
@@ -286,10 +324,9 @@ Covered:
 
 ## Rollout plan
 
-1. **Merge this slice** (flag off) — hardened schema + library only.
-2. **Mission B — materialize + worker:** orchestrator calls
-   `create_run(run_id=…)`, lifespan reconciler behind the flag, structured
-   metrics logs.
+1. **Merge this slice** (flag off) — hardened schema + library + materializer.
+2. **Mission B — lifespan reconciler:** worker hook behind the flag, structured
+   metrics logs, post-mark enqueue re-drive.
 3. **Mission C — API + MCP:** submit/status/history/cancel + connector tools.
 4. **Mission D — notifications:** suppress workflow-managed child terminals;
    one actionable workflow alert.
@@ -300,8 +337,7 @@ Covered:
 Per split-run policy (≤4 files / one objective), do **not** expand this
 mission further. Recommended follow-ups:
 
-1. Orchestrator materialize + lifespan reconciler hook (registry reserved-id
-   create is available)
+1. Lifespan reconciler hook + post-mark enqueue re-drive
 2. FastAPI + MCP submit/status/history/cancel
 3. Notification outbox suppression + workflow alert enqueue
 4. Staging enablement + operator runbook
