@@ -17,6 +17,8 @@ from mission_control.validator import validate_mission_for_execute
 from mission_control.workspace import (
     DEFAULT_LEGAL_AI_CLONE_URL,
     DEFAULT_MISSION_CONTROL_CLONE_URL,
+    CLONE_STRATEGY_FULL,
+    CLONE_STRATEGY_SHALLOW,
     LEGAL_AI_REPOSITORY_URL_ENV,
     NESTED_WORKSPACE_CONTAMINATION_PREFIX,
     PLATFORM_MAIN_WRITE_ACK_REQUIRED,
@@ -27,8 +29,12 @@ from mission_control.workspace import (
     REPOSITORY_ORIGIN_MISMATCH_PREFIX,
     REPOSITORY_URL_MAP_ENV,
     SELF_REPOSITORY_URL_ENV,
+    WORKSPACE_CLONE_DEPTH_ENV,
     PersistenceResult,
     WorkspacePrepResult,
+    _argv_safe_repository_url,
+    _ls_remote_branch_sha,
+    _redact_secret_text,
     build_persistence_evidence,
     cleanup_workspace,
     collect_deliverable_evidence,
@@ -43,6 +49,7 @@ from mission_control.workspace import (
     nested_workspace_contamination_error,
     normalize_remote_url_identity,
     persist_workspace_changes,
+    prepare_ephemeral_checkout,
     prepare_isolated_workspace,
     require_persistence_push_target,
     require_platform_push_approval,
@@ -50,6 +57,7 @@ from mission_control.workspace import (
     resolve_mission_clone_url,
     resolve_persistence_target_branch,
     resolve_safe_workspace_deliverable,
+    resolve_workspace_clone_depth,
     verify_declared_file_deliverables,
     verify_workspace_origin_matches_mission,
 )
@@ -132,9 +140,91 @@ class GitRepoFixture:
         self._previous_repo_url = os.environ.get("MISSION_CONTROL_REPOSITORY_URL")
         self._previous_git_name = os.environ.get("MISSION_CONTROL_GIT_NAME")
         self._previous_git_email = os.environ.get("MISSION_CONTROL_GIT_EMAIL")
+        self._previous_clone_depth = os.environ.get(WORKSPACE_CLONE_DEPTH_ENV)
         os.environ["MISSION_CONTROL_REPOSITORY_URL"] = str(self.bare_remote)
         os.environ["MISSION_CONTROL_GIT_NAME"] = "Test User"
         os.environ["MISSION_CONTROL_GIT_EMAIL"] = "test@example.com"
+
+    def add_branch(self, branch: str, *, content: str = "branch\n") -> str:
+        """Create and push ``branch`` from the current source tip; return tip SHA."""
+        _run_git(["-C", str(self.source_repo), "checkout", "-B", branch])
+        (self.source_repo / f"{branch.replace('/', '_')}.txt").write_text(
+            content,
+            encoding="utf-8",
+        )
+        _run_git(["-C", str(self.source_repo), "add", "-A"])
+        _run_git(
+            ["-C", str(self.source_repo), "commit", "-m", f"add {branch}"]
+        )
+        _run_git(
+            [
+                "-C",
+                str(self.source_repo),
+                "push",
+                "-u",
+                "origin",
+                f"refs/heads/{branch}:refs/heads/{branch}",
+            ]
+        )
+        tip = _run_git(
+            ["-C", str(self.source_repo), "rev-parse", "HEAD"]
+        ).stdout.strip()
+        _run_git(
+            ["-C", str(self.source_repo), "checkout", self.base_branch]
+        )
+        return tip
+
+    def add_tag(
+        self,
+        tag: str,
+        *,
+        annotated: bool = False,
+        message: str = "tag",
+        content: str | None = None,
+    ) -> tuple[str, str]:
+        """Create and push ``tag``; return ``(commit_sha, tag_sha)``.
+
+        For lightweight tags both SHAs are equal. For annotated tags
+        ``tag_sha`` is the tag object and ``commit_sha`` is the peeled commit.
+        """
+        if content is not None:
+            marker = self.source_repo / f"{tag.replace('/', '_')}.txt"
+            marker.write_text(content, encoding="utf-8")
+            _run_git(["-C", str(self.source_repo), "add", "-A"])
+            _run_git(
+                ["-C", str(self.source_repo), "commit", "-m", f"tag base {tag}"]
+            )
+            _run_git(
+                [
+                    "-C",
+                    str(self.source_repo),
+                    "push",
+                    "origin",
+                    self.base_branch,
+                ]
+            )
+        if annotated:
+            _run_git(
+                [
+                    "-C",
+                    str(self.source_repo),
+                    "tag",
+                    "-a",
+                    tag,
+                    "-m",
+                    message,
+                ]
+            )
+        else:
+            _run_git(["-C", str(self.source_repo), "tag", tag])
+        _run_git(["-C", str(self.source_repo), "push", "origin", tag])
+        commit_sha = _run_git(
+            ["-C", str(self.source_repo), "rev-parse", f"{tag}^{{}}"]
+        ).stdout.strip()
+        tag_sha = _run_git(
+            ["-C", str(self.source_repo), "rev-parse", tag]
+        ).stdout.strip()
+        return commit_sha, tag_sha
 
     def mission(
         self,
@@ -146,13 +236,15 @@ class GitRepoFixture:
         target_branch: str | None = None,
         permissions_push: bool = False,
         include_default_push_target: bool = True,
+        base_branch: str | None = None,
     ) -> dict:
+        resolved_base = self.base_branch if base_branch is None else base_branch
         mission = {
             "mission_id": "2026-07-19-workspace",
             "repository": {
                 "name": "test-repo",
                 "path": str(self.source_repo),
-                "base_branch": self.base_branch,
+                "base_branch": resolved_base,
             },
             "permissions": {
                 "push": permissions_push,
@@ -162,7 +254,7 @@ class GitRepoFixture:
             persistence: dict[str, str] = {"mode": persistence_mode}
             if persistence_mode == "push" and include_default_push_target:
                 persistence["target_branch"] = (
-                    self.base_branch if target_branch is None else target_branch
+                    resolved_base if target_branch is None else target_branch
                 )
             elif target_branch is not None:
                 persistence["target_branch"] = target_branch
@@ -189,7 +281,7 @@ class GitRepoFixture:
             # Fixture base_branch is main; approved push tests need the
             # distinct main-write acknowledgement unless a test overrides it.
             resolved_target = (
-                self.base_branch if target_branch is None else target_branch
+                resolved_base if target_branch is None else target_branch
             )
             if is_protected_default_branch(resolved_target):
                 approval["platform_main_write_acknowledged"] = True
@@ -212,6 +304,11 @@ class GitRepoFixture:
             os.environ.pop("MISSION_CONTROL_GIT_EMAIL", None)
         else:
             os.environ["MISSION_CONTROL_GIT_EMAIL"] = self._previous_git_email
+
+        if self._previous_clone_depth is None:
+            os.environ.pop(WORKSPACE_CLONE_DEPTH_ENV, None)
+        else:
+            os.environ[WORKSPACE_CLONE_DEPTH_ENV] = self._previous_clone_depth
 
         self.temp.cleanup()
 
@@ -271,6 +368,675 @@ class TestWorkspacePreparation(unittest.TestCase):
             "mission_control_repository_url",
             (prep.error or "").lower(),
         )
+
+
+class TestShallowWorkspaceClone(unittest.TestCase):
+    """Phase-3 shallow clone + HEAD verification + full-clone fallback."""
+
+    def setUp(self) -> None:
+        self.fixture = GitRepoFixture()
+        # Path-style local clones skip shallow (Git ignores --depth and native
+        # local clones are faster). Use file:// so depth-1 is actually applied.
+        self._path_url = os.environ["MISSION_CONTROL_REPOSITORY_URL"]
+        self._file_url = Path(self.fixture.bare_remote).resolve().as_uri()
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._file_url
+
+    def tearDown(self) -> None:
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._path_url
+        self.fixture.cleanup()
+
+    def test_path_local_clone_skips_shallow(self) -> None:
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._path_url
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_FULL)
+            is_shallow = _run_git(
+                [
+                    "-C",
+                    prep.workspace_path,
+                    "rev-parse",
+                    "--is-shallow-repository",
+                ]
+            ).stdout.strip()
+            self.assertEqual(is_shallow, "false")
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_shallow_clone_main_matches_remote_tip(self) -> None:
+        remote_tip = _run_git(
+            [
+                "-C",
+                str(self.fixture.bare_remote),
+                "rev-parse",
+                self.fixture.base_branch,
+            ]
+        ).stdout.strip()
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_SHALLOW)
+            self.assertEqual(prep.baseline_sha, remote_tip)
+            head = _run_git(
+                ["-C", prep.workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            self.assertEqual(head, remote_tip)
+            is_shallow = _run_git(
+                [
+                    "-C",
+                    prep.workspace_path,
+                    "rev-parse",
+                    "--is-shallow-repository",
+                ]
+            ).stdout.strip()
+            self.assertEqual(is_shallow, "true")
+            # Origin identity matches the path-form remote.
+            self.assertEqual(
+                normalize_remote_url_identity(
+                    get_origin_url(prep.workspace_path) or ""
+                ),
+                normalize_remote_url_identity(self._path_url),
+            )
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_shallow_clone_non_main_base_branch(self) -> None:
+        tip = self.fixture.add_branch("release/phase3", content="non-main\n")
+        prep = prepare_isolated_workspace(
+            self.fixture.mission(base_branch="release/phase3")
+        )
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_SHALLOW)
+            self.assertEqual(prep.baseline_sha, tip)
+            branch = _run_git(
+                ["-C", prep.workspace_path, "rev-parse", "--abbrev-ref", "HEAD"]
+            ).stdout.strip()
+            self.assertEqual(branch, "release/phase3")
+            marker = Path(prep.workspace_path) / "release_phase3.txt"
+            self.assertTrue(marker.is_file())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "non-main\n")
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_missing_base_branch_fails_without_workspace(self) -> None:
+        prep = prepare_isolated_workspace(
+            self.fixture.mission(base_branch="does-not-exist")
+        )
+        self.assertFalse(prep.ok)
+        self.assertIn("does-not-exist", prep.error or "")
+        self.assertIsNone(prep.workspace_path)
+
+    def test_force_full_clone_via_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {WORKSPACE_CLONE_DEPTH_ENV: "full"},
+            clear=False,
+        ):
+            self.assertIsNone(resolve_workspace_clone_depth())
+            prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_FULL)
+            is_shallow = _run_git(
+                [
+                    "-C",
+                    prep.workspace_path,
+                    "rev-parse",
+                    "--is-shallow-repository",
+                ]
+            ).stdout.strip()
+            self.assertEqual(is_shallow, "false")
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_shallow_failure_falls_back_to_full_clone(self) -> None:
+        real_clone = prepare_isolated_workspace.__globals__["_clone_at_base_branch"]
+        calls: list[int | None] = []
+
+        def _flaky_clone(*, depth: int | None, **kwargs):
+            calls.append(depth)
+            if depth is not None:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=1,
+                    stdout="",
+                    stderr="shallow clone unsupported",
+                )
+            return real_clone(depth=depth, **kwargs)
+
+        with patch(
+            "mission_control.workspace._clone_at_base_branch",
+            side_effect=_flaky_clone,
+        ):
+            prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(calls, [1, None])
+            self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_FULL)
+            remote_tip = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(prep.baseline_sha, remote_tip)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_head_mismatch_after_shallow_triggers_full_fallback(self) -> None:
+        real_verify = prepare_isolated_workspace.__globals__[
+            "_verify_workspace_head_matches_ref"
+        ]
+        calls = {"n": 0}
+
+        def _verify_once(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None, "Workspace HEAD does not match requested remote ref"
+            return real_verify(*args, **kwargs)
+
+        with patch(
+            "mission_control.workspace._verify_workspace_head_matches_ref",
+            side_effect=_verify_once,
+        ):
+            prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_FULL)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_target_branch_persistence_from_shallow_workspace(self) -> None:
+        target = "mission/phase3-persist"
+        _run_git(
+            [
+                "-C",
+                str(self.fixture.source_repo),
+                "push",
+                "origin",
+                f"{self.fixture.base_branch}:{target}",
+            ]
+        )
+        prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_SHALLOW)
+        try:
+            (Path(prep.workspace_path) / "phase3.txt").write_text(
+                "persist\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "mission_control.workspace._github_push_environment",
+                return_value=(os.environ.copy(), None),
+            ):
+                result = persist_workspace_changes(
+                    "run-shallow-persist",
+                    self.fixture.mission(
+                        persistence_mode="push",
+                        platform_push_approved=True,
+                        platform_main_write_acknowledged=False,
+                        target_branch=target,
+                    ),
+                    prep.workspace_path,
+                    baseline_sha=prep.baseline_sha,
+                )
+            self.assertTrue(result.ok, result.error)
+            self.assertTrue(result.pushed)
+            self.assertEqual(result.target_branch, target)
+            remote_tip = _run_git(
+                ["-C", str(self.fixture.bare_remote), "rev-parse", target]
+            ).stdout.strip()
+            self.assertEqual(remote_tip, result.commit_sha)
+            main_tip = _run_git(
+                [
+                    "-C",
+                    str(self.fixture.bare_remote),
+                    "rev-parse",
+                    self.fixture.base_branch,
+                ]
+            ).stdout.strip()
+            self.assertEqual(main_tip, prep.baseline_sha)
+            self.assertNotEqual(main_tip, result.commit_sha)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+
+class TestTagRefResolution(unittest.TestCase):
+    """Annotated/lightweight tags, collisions, peel gaps, and movement."""
+
+    def setUp(self) -> None:
+        self.fixture = GitRepoFixture()
+        self._path_url = os.environ["MISSION_CONTROL_REPOSITORY_URL"]
+        self._file_url = Path(self.fixture.bare_remote).resolve().as_uri()
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._file_url
+
+    def tearDown(self) -> None:
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._path_url
+        self.fixture.cleanup()
+
+    def test_annotated_tag_resolves_to_peeled_commit(self) -> None:
+        commit_sha, tag_sha = self.fixture.add_tag(
+            "v-annot",
+            annotated=True,
+            message="annotated release",
+            content="annot\n",
+        )
+        self.assertNotEqual(commit_sha, tag_sha)
+        resolved, err, missing = _ls_remote_branch_sha(
+            self._file_url, "v-annot", env=None
+        )
+        self.assertIsNone(err)
+        self.assertFalse(missing)
+        self.assertEqual(resolved, commit_sha)
+        self.assertNotEqual(resolved, tag_sha)
+
+        prep = prepare_isolated_workspace(
+            self.fixture.mission(base_branch="v-annot")
+        )
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(prep.baseline_sha, commit_sha)
+            head = _run_git(
+                ["-C", prep.workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            self.assertEqual(head, commit_sha)
+            self.assertNotEqual(head, tag_sha)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_lightweight_tag_resolves_to_commit(self) -> None:
+        commit_sha, tag_sha = self.fixture.add_tag(
+            "v-lite",
+            annotated=False,
+            content="lite\n",
+        )
+        self.assertEqual(commit_sha, tag_sha)
+        resolved, err, missing = _ls_remote_branch_sha(
+            self._file_url, "v-lite", env=None
+        )
+        self.assertIsNone(err)
+        self.assertFalse(missing)
+        self.assertEqual(resolved, commit_sha)
+
+        prep = prepare_isolated_workspace(
+            self.fixture.mission(base_branch="v-lite")
+        )
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(prep.baseline_sha, commit_sha)
+            head = _run_git(
+                ["-C", prep.workspace_path, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            self.assertEqual(head, commit_sha)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_branch_wins_over_same_named_tag(self) -> None:
+        tag_commit, _tag_sha = self.fixture.add_tag(
+            "release",
+            annotated=True,
+            message="tag side",
+            content="from-tag\n",
+        )
+        branch_tip = self.fixture.add_branch(
+            "release", content="from-branch\n"
+        )
+        self.assertNotEqual(tag_commit, branch_tip)
+        resolved, err, missing = _ls_remote_branch_sha(
+            self._file_url, "release", env=None
+        )
+        self.assertIsNone(err)
+        self.assertFalse(missing)
+        self.assertEqual(resolved, branch_tip)
+
+        prep = prepare_isolated_workspace(
+            self.fixture.mission(base_branch="release")
+        )
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(prep.baseline_sha, branch_tip)
+            marker = Path(prep.workspace_path) / "release.txt"
+            self.assertEqual(marker.read_text(encoding="utf-8"), "from-branch\n")
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+    def test_annotated_tag_missing_peel_advertisement_fails_closed(self) -> None:
+        commit_sha, tag_sha = self.fixture.add_tag(
+            "v-nopeel",
+            annotated=True,
+            message="no peel",
+            content="nopeel\n",
+        )
+        self.assertNotEqual(commit_sha, tag_sha)
+        real_run_git = prepare_isolated_workspace.__globals__["_run_git"]
+
+        def _ls_remote_without_peel(args, **kwargs):
+            if args and args[0] == "ls-remote":
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=f"{tag_sha}\trefs/tags/v-nopeel\n",
+                    stderr="",
+                )
+            return real_run_git(args, **kwargs)
+
+        with patch(
+            "mission_control.workspace._run_git",
+            side_effect=_ls_remote_without_peel,
+        ):
+            prep = prepare_isolated_workspace(
+                self.fixture.mission(base_branch="v-nopeel")
+            )
+        self.assertFalse(prep.ok)
+        self.assertIsNone(prep.workspace_path)
+        self.assertIn("does not match", (prep.error or "").lower())
+
+    def test_remote_movement_between_ls_remote_and_clone_fails(self) -> None:
+        stale = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        with patch(
+            "mission_control.workspace._ls_remote_branch_sha",
+            return_value=(stale, None, False),
+        ):
+            prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertFalse(prep.ok)
+        self.assertIsNone(prep.workspace_path)
+        error = (prep.error or "").lower()
+        self.assertTrue(
+            "does not match" in error or "failed to clone" in error,
+            prep.error,
+        )
+
+    def test_annotated_tag_shallow_failure_falls_back_to_full(self) -> None:
+        commit_sha, tag_sha = self.fixture.add_tag(
+            "v-fallback",
+            annotated=True,
+            message="fallback",
+            content="fallback\n",
+        )
+        self.assertNotEqual(commit_sha, tag_sha)
+        real_clone = prepare_isolated_workspace.__globals__["_clone_at_base_branch"]
+        calls: list[int | None] = []
+
+        def _flaky_clone(*, depth: int | None, **kwargs):
+            calls.append(depth)
+            if depth is not None:
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=1,
+                    stdout="",
+                    stderr="shallow clone unsupported for tag",
+                )
+            return real_clone(depth=depth, **kwargs)
+
+        with patch(
+            "mission_control.workspace._clone_at_base_branch",
+            side_effect=_flaky_clone,
+        ):
+            prep = prepare_isolated_workspace(
+                self.fixture.mission(base_branch="v-fallback")
+            )
+        self.assertTrue(prep.ok, prep.error)
+        assert prep.workspace_path is not None
+        try:
+            self.assertEqual(calls, [1, None])
+            self.assertEqual(prep.clone_strategy, CLONE_STRATEGY_FULL)
+            self.assertEqual(prep.baseline_sha, commit_sha)
+        finally:
+            cleanup_workspace(prep.workspace_path)
+
+
+class TestCloneErrorRedaction(unittest.TestCase):
+    """Credential-safe workspace preparation / clone / ref errors."""
+
+    def setUp(self) -> None:
+        self.fixture = GitRepoFixture()
+        self._path_url = os.environ["MISSION_CONTROL_REPOSITORY_URL"]
+        self._file_url = Path(self.fixture.bare_remote).resolve().as_uri()
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._file_url
+
+    def tearDown(self) -> None:
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = self._path_url
+        self.fixture.cleanup()
+
+    def test_redact_https_userinfo_and_encoded_credentials(self) -> None:
+        raw = (
+            "clone failed for "
+            "https://user:s3cret-pass@github.com/org/repo.git "
+            "and https://user%3Aname:%70%61%73%73@example.com/r.git"
+        )
+        redacted = _redact_secret_text(raw)
+        self.assertNotIn("s3cret-pass", redacted)
+        self.assertNotIn("%70%61%73%73", redacted)
+        self.assertNotIn("user%3Aname", redacted)
+        self.assertIn("https://***@", redacted)
+        self.assertIn("github.com/org/repo.git", redacted)
+
+    def test_redact_token_query_and_bearer_stderr(self) -> None:
+        raw = (
+            "fatal: unable to access "
+            "'https://github.com/org/repo.git?access_token=ghs_LEAK1234567890abcd"
+            "&token=abc123': "
+            "Authorization: Bearer ghs_LEAK1234567890abcd "
+            "authorization=ghs_LEAK1234567890abcd"
+        )
+        redacted = _redact_secret_text(raw)
+        self.assertNotIn("ghs_LEAK1234567890abcd", redacted)
+        self.assertNotIn("token=abc123", redacted)
+        self.assertIn("access_token=***", redacted)
+        self.assertIn("Bearer ***", redacted)
+
+    def test_redact_basic_authorization_credential(self) -> None:
+        """Basic must redact the credential, not only the scheme word."""
+        sentinel = "dXNlcjpTRU5USU5FTF9CQVNJQ19TRUNSRVQ="
+        cases = (
+            f"Authorization: Basic {sentinel}",
+            f"AUTHORIZATION: BASIC {sentinel}",
+            f"authorization = Basic  {sentinel}",
+            f"authorization:basic {sentinel}",
+            f'Authorization: "Basic {sentinel}"',
+            f"Authorization: Basic {sentinel}.",
+            f"Authorization: Basic {sentinel})",
+            f"Authorization:\nBasic\t{sentinel}",
+            f"Authorization: Basic {sentinel} and Authorization: Basic {sentinel}",
+            f"Authorization: Basic !!not-base64!!{sentinel}",
+            "Authorization: Basic",
+            "Authorization: Basic ",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                redacted = _redact_secret_text(raw)
+                self.assertNotIn(sentinel, redacted)
+                self.assertNotIn("SENTINEL_BASIC_SECRET", redacted)
+                if sentinel in raw or "!!not-base64!!" in raw:
+                    self.assertRegex(redacted, r"(?i)basic\s+\*\*\*")
+                    self.assertNotRegex(
+                        redacted,
+                        r"(?i)Authorization:\s*\*\*\*\s+\S+",
+                    )
+
+    def test_argv_safe_url_strips_userinfo_and_secret_query(self) -> None:
+        safe, userinfo = _argv_safe_repository_url(
+            "https://x-access-token:ghs_SECRET@github.com/org/repo.git"
+            "?token=leak&path=src"
+        )
+        self.assertEqual(userinfo, "x-access-token:ghs_SECRET")
+        self.assertNotIn("ghs_SECRET", safe)
+        self.assertNotIn("token=leak", safe)
+        self.assertIn("github.com/org/repo.git", safe)
+        self.assertIn("path=src", safe)
+
+    def test_clone_failure_redacts_credential_url_and_stderr(self) -> None:
+        secret_url = (
+            "https://user:passw0rd_LEAK@github.com/org/private.git?token=leak_token"
+        )
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = secret_url
+        captured_argv: list[list[str]] = []
+
+        def _fake_run_git(args, **kwargs):
+            captured_argv.append(list(args))
+            if args and args[0] == "ls-remote":
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=(
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t"
+                        "refs/heads/main\n"
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=1,
+                stdout="",
+                stderr=(
+                    f"fatal: could not read Username for '{secret_url}': "
+                    "Authorization: Bearer ghs_NESTED_SECRET "
+                    "Authorization: Basic dXNlcjpORVNURURfQkFTSUNfU0VDUkVU "
+                    "x-access-token:ghs_NESTED_SECRET"
+                ),
+            )
+
+        with patch(
+            "mission_control.workspace._run_git",
+            side_effect=_fake_run_git,
+        ):
+            prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertFalse(prep.ok)
+        error = prep.error or ""
+        self.assertNotIn("passw0rd_LEAK", error)
+        self.assertNotIn("leak_token", error)
+        self.assertNotIn("ghs_NESTED_SECRET", error)
+        self.assertNotIn("NESTED_BASIC_SECRET", error)
+        self.assertNotIn("dXNlcjpORVNURURfQkFTSUNfU0VDUkVU", error)
+        self.assertIn("https://***@", error)
+        self.assertIn("Basic ***", error)
+        for args in captured_argv:
+            joined = " ".join(args)
+            self.assertNotIn("passw0rd_LEAK", joined)
+            self.assertNotIn("leak_token", joined)
+
+    def test_ls_remote_failure_redacts_secrets(self) -> None:
+        secret_url = "https://bot:tok_VALUE@github.com/org/repo.git"
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = secret_url
+
+        def _fake_run_git(args, **kwargs):
+            if args and args[0] == "ls-remote":
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=128,
+                    stdout="",
+                    stderr=(
+                        f"fatal: Authentication failed for '{secret_url}' "
+                        "Bearer tok_VALUE"
+                    ),
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="unexpected"
+            )
+
+        with patch(
+            "mission_control.workspace._run_git",
+            side_effect=_fake_run_git,
+        ):
+            # Soft ls-remote failure still attempts clone; force clone fail too.
+            prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertFalse(prep.ok)
+        error = prep.error or ""
+        self.assertNotIn("tok_VALUE", error)
+        self.assertNotIn("bot:tok_VALUE", error)
+
+    def test_fallback_failure_redacts_nested_exception_text(self) -> None:
+        secret = "super_secret_clone_token_xyz"
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = (
+            f"https://user:{secret}@example.com/r.git"
+        )
+
+        def _always_fail(*, depth: int | None = None, **kwargs):
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr=(
+                    f"CalledProcessError: clone failed nested "
+                    f"https://user:{secret}@example.com/r.git "
+                    f"Authorization: Bearer {secret}"
+                ),
+            )
+
+        with patch(
+            "mission_control.workspace._ls_remote_branch_sha",
+            return_value=(
+                "cccccccccccccccccccccccccccccccccccccccc",
+                None,
+                False,
+            ),
+        ), patch(
+            "mission_control.workspace._clone_at_base_branch",
+            side_effect=_always_fail,
+        ):
+            prep = prepare_isolated_workspace(self.fixture.mission())
+        self.assertFalse(prep.ok)
+        error = prep.error or ""
+        self.assertNotIn(secret, error)
+        self.assertIn("https://***@", error)
+
+    def test_ephemeral_checkout_errors_are_redacted(self) -> None:
+        secret_url = "https://user:ephem_SECRET@github.com/org/repo.git"
+        with patch(
+            "mission_control.workspace._run_git",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr=f"fatal: '{secret_url}' Bearer ephem_SECRET",
+            ),
+        ):
+            prep = prepare_ephemeral_checkout(
+                repository_url=secret_url, ref="main"
+            )
+        self.assertFalse(prep.ok)
+        error = prep.error or ""
+        self.assertNotIn("ephem_SECRET", error)
+        self.assertNotIn("user:ephem_SECRET", error)
+
+    def test_missing_ref_error_redacts_credential_url(self) -> None:
+        secret_url = (
+            "https://user:missing_ref_SECRET@github.com/org/repo.git"
+            "?access_token=missing_ref_SECRET"
+        )
+        os.environ["MISSION_CONTROL_REPOSITORY_URL"] = secret_url
+        with patch(
+            "mission_control.workspace._ls_remote_branch_sha",
+            return_value=(
+                None,
+                _redact_secret_text(
+                    f"Remote ref 'refs/heads/missing' (or tag) not found at "
+                    f"{secret_url}"
+                ),
+                True,
+            ),
+        ):
+            prep = prepare_isolated_workspace(
+                self.fixture.mission(base_branch="missing")
+            )
+        self.assertFalse(prep.ok)
+        error = prep.error or ""
+        self.assertNotIn("missing_ref_SECRET", error)
+        self.assertIn("missing", error)
 
 
 class TestWorkspacePersistence(unittest.TestCase):
@@ -1082,7 +1848,7 @@ class TestExecuteRegisteredRun(unittest.TestCase):
 
         prep = prepare_isolated_workspace(self.fixture.mission())
         self.assertFalse(prep.ok)
-        mock_safe_cleanup.assert_called_once()
+        self.assertGreaterEqual(mock_safe_cleanup.call_count, 1)
 
     @patch("mission_control.workspace.cleanup_workspace")
     @patch("mission_control.workspace.persist_workspace_changes")
