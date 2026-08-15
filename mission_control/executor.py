@@ -9,13 +9,57 @@ import subprocess
 from app.cursor_cli import cursor_cli_env, find_cursor_agent_binary
 
 CURSOR_AGENT = "cursor-agent"
-EXECUTION_TIMEOUT_SECONDS = 600
+CURSOR_EXECUTION_TIMEOUT_ENV = "CURSOR_EXECUTION_TIMEOUT_SECONDS"
+DEFAULT_EXECUTION_TIMEOUT_SECONDS = 600
+# Conservative ceiling: 1 hour. A higher operator value would pin a run worker.
+MAX_EXECUTION_TIMEOUT_SECONDS = 3600
+MIN_EXECUTION_TIMEOUT_SECONDS = 1
+# Compatibility alias for the default hard timeout (runtime uses the resolver).
+EXECUTION_TIMEOUT_SECONDS = DEFAULT_EXECUTION_TIMEOUT_SECONDS
 # After killing a timed-out agent, wait at most this long for pipes to close.
 # Unbounded communicate() can hang forever when grandchildren keep stdio open.
 CLEANUP_TIMEOUT_SECONDS = 10
 _MAX_ERROR_LOG_CHARS = 500
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_execution_timeout_seconds() -> int:
+    """Return the Cursor-agent hard timeout in seconds.
+
+    Reads ``CURSOR_EXECUTION_TIMEOUT_SECONDS``. Absent or blank values use
+    ``DEFAULT_EXECUTION_TIMEOUT_SECONDS`` (600). Invalid, non-positive, or
+    values above ``MAX_EXECUTION_TIMEOUT_SECONDS`` (3600) fall back to 600.
+    """
+    raw = os.environ.get(CURSOR_EXECUTION_TIMEOUT_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_EXECUTION_TIMEOUT_SECONDS
+    try:
+        value = int(str(raw).strip(), 10)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r; falling back to %s seconds",
+            CURSOR_EXECUTION_TIMEOUT_ENV,
+            raw,
+            DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_EXECUTION_TIMEOUT_SECONDS
+    if (
+        value < MIN_EXECUTION_TIMEOUT_SECONDS
+        or value > MAX_EXECUTION_TIMEOUT_SECONDS
+    ):
+        logger.warning(
+            (
+                "%s=%s is outside [%s, %s]; falling back to %s seconds"
+            ),
+            CURSOR_EXECUTION_TIMEOUT_ENV,
+            value,
+            MIN_EXECUTION_TIMEOUT_SECONDS,
+            MAX_EXECUTION_TIMEOUT_SECONDS,
+            DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_EXECUTION_TIMEOUT_SECONDS
+    return value
 
 
 def _bound_error_text(text: str | None) -> str:
@@ -130,7 +174,7 @@ DOCUMENTATION_REQUIRED_INSTRUCTIONS = (
     "Treat documentation review as part of completion.",
 )
 
-# Soft budget before the hard EXECUTION_TIMEOUT_SECONDS ceiling.
+# Soft budget before the hard execution-timeout ceiling.
 SPLIT_RUN_SOFT_TIMEOUT_SECONDS = 360
 
 RECOMMENDED_SPLIT_PHASES = (
@@ -140,19 +184,26 @@ RECOMMENDED_SPLIT_PHASES = (
     "deployment/verification",
 )
 
-SPLIT_RUN_POLICY_INSTRUCTIONS = (
-    "Pursue exactly one objective per mission.",
-    "Target four files or fewer.",
-    "Separate implementation, broad testing, documentation, and "
-    "deployment/verification into distinct missions.",
-    "Never blindly retry a timed-out mission; split remaining work into "
-    "smaller follow-up missions instead.",
-    (
-        f"At {SPLIT_RUN_SOFT_TIMEOUT_SECONDS // 60} minutes of agent work, "
-        "treat remaining broad scope as oversized: stop expanding scope and "
-        "return a structured split recommendation before the "
-        f"{EXECUTION_TIMEOUT_SECONDS}-second hard timeout when possible."
-    ),
+
+def _split_run_policy_instructions(timeout_seconds: int) -> tuple[str, ...]:
+    return (
+        "Pursue exactly one objective per mission.",
+        "Target four files or fewer.",
+        "Separate implementation, broad testing, documentation, and "
+        "deployment/verification into distinct missions.",
+        "Never blindly retry a timed-out mission; split remaining work into "
+        "smaller follow-up missions instead.",
+        (
+            f"At {SPLIT_RUN_SOFT_TIMEOUT_SECONDS // 60} minutes of agent work, "
+            "treat remaining broad scope as oversized: stop expanding scope and "
+            "return a structured split recommendation before the "
+            f"{timeout_seconds}-second hard timeout when possible."
+        ),
+    )
+
+
+SPLIT_RUN_POLICY_INSTRUCTIONS = _split_run_policy_instructions(
+    DEFAULT_EXECUTION_TIMEOUT_SECONDS,
 )
 
 # Injected into every agent prompt. Coding agents may edit/test the workspace;
@@ -232,12 +283,19 @@ def _workspace_binding_constraints(mission: dict) -> tuple[str, ...]:
 def build_cursor_instruction(
     mission: dict,
     constraints: tuple[str, ...] = READ_ONLY_CONSTRAINTS,
+    *,
+    execution_timeout_seconds: int | None = None,
 ) -> str:
     from mission_control.validator import resolve_documentation_mode
 
     title = mission.get("title", "")
     instructions = mission.get("instructions", "")
     deliverables = mission.get("deliverables", [])
+    timeout_seconds = (
+        execution_timeout_seconds
+        if execution_timeout_seconds is not None
+        else resolve_execution_timeout_seconds()
+    )
 
     lines = [
         f"Mission: {title}",
@@ -259,7 +317,9 @@ def build_cursor_instruction(
             "Split-run scope policy:",
         ]
     )
-    lines.extend(f"- {item}" for item in SPLIT_RUN_POLICY_INSTRUCTIONS)
+    lines.extend(
+        f"- {item}" for item in _split_run_policy_instructions(timeout_seconds)
+    )
 
     if resolve_documentation_mode(mission) == "required":
         lines.extend(
@@ -332,9 +392,11 @@ def _run_cursor_agent(
     repository = mission["repository"]
     workspace = repository["path"]
 
+    timeout_seconds = resolve_execution_timeout_seconds()
     instruction = build_cursor_instruction(
         mission,
         constraints=constraints,
+        execution_timeout_seconds=timeout_seconds,
     )
 
     mission_id = mission.get("mission_id", "unknown")
@@ -466,11 +528,11 @@ def _run_cursor_agent(
         run_label,
         os.getpid(),
         child_pid,
-        EXECUTION_TIMEOUT_SECONDS,
+        timeout_seconds,
     )
 
     try:
-        stdout, stderr = proc.communicate(timeout=EXECUTION_TIMEOUT_SECONDS)
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as timed_out:
         _terminate_process_tree(proc)
         try:
@@ -501,12 +563,12 @@ def _run_cursor_agent(
             os.getpid(),
             child_pid,
             mission_id,
-            EXECUTION_TIMEOUT_SECONDS,
+            timeout_seconds,
         )
         logger.error(
             "Cursor mission timed out: mission_id=%s timeout_seconds=%s",
             mission_id,
-            EXECUTION_TIMEOUT_SECONDS,
+            timeout_seconds,
         )
 
         return ExecutionResult(
@@ -515,7 +577,7 @@ def _run_cursor_agent(
             stderr=stderr or "",
             error=(
                 "cursor-agent timed out after "
-                f"{EXECUTION_TIMEOUT_SECONDS} seconds"
+                f"{timeout_seconds} seconds"
             ),
             command=command_evidence,
             timeout_split_guidance=build_timeout_split_guidance(
