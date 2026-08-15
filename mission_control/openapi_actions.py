@@ -66,6 +66,16 @@ _ACTIONS_OPERATION_DESCRIPTIONS: dict[str, str] = {
         "allowed_env_names. Persistence is always none. Sensitive argv "
         "values are redacted."
     ),
+    "submit_workflow": (
+        "Submit bounded workflow YAML (implementation+review, optional "
+        "fix/re_review). Feature-gated; bearer auth required. Replays with "
+        "Idempotency-Key. Poll GET /workflows/{workflow_id} for status."
+    ),
+    "get_workflow": (
+        "Return sanitized durable workflow status and child-run summaries. "
+        "Never includes secrets or child mission YAML. Feature-gated; "
+        "bearer auth required. 403 while orchestration is disabled."
+    ),
 }
 
 
