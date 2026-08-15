@@ -16,11 +16,32 @@ from mission_control.run_registry import (
     EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS,
     EXECUTION_LEASE_GRACE_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS,
+    INTERRUPTED_RUN_ERROR,
+    LEGACY_INTERRUPT_REFUSED_ERROR,
+    OBSERVED_FALSE_INTERRUPT_SECONDS,
     OWNER_LOST_RUN_ERROR,
     STARTUP_RECOVERY_LEASE_NAME,
+    STARTUP_RECOVERY_POLICY_VERSION,
+    RunPhase,
     RunRegistry,
     RunStatus,
+    _BUILD_FINGERPRINT_LEN,
+    _LEGACY_INTERRUPT_INSERT_TRIGGER,
+    _LEGACY_INTERRUPT_UPDATE_TRIGGER,
+    _PYTHON_STRIP_WHITESPACE_CODEPOINTS,
+    _SQL_STRIP_CHARS,
+    _sql_trim_chars_expr,
+    bound_terminal_provenance,
+    build_terminal_provenance,
+    deployed_build_marker,
+    is_legacy_interrupt_error,
+    refuse_legacy_interrupt_error,
+    sanitize_build_fingerprint,
+    sanitize_progress,
+    startup_recovery_module_identity,
+    startup_recovery_policy_diagnostics,
 )
+from tests.registry_test_utils import SqliteRegistryTestCase
 
 _LEASE_TABLE = "startup_recovery_leases"
 _RUNS_TABLE = "runs"
@@ -798,6 +819,742 @@ class TestLeaseRecoveryCasAndClockHardening(unittest.TestCase):
             self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
         finally:
             verify.close()
+
+
+class TestFalseInterruptProvenanceGuards(SqliteRegistryTestCase):
+    """Post-hotfix secondary-writer guards and 30s timeline regression."""
+
+    def test_observed_30s_timeline_cannot_reach_legacy_interrupt_error(
+        self,
+    ) -> None:
+        """Reproduce run 019bf53f…: created→failed in 30s must not legacy-fail.
+
+        A running run whose lease is only OBSERVED_FALSE_INTERRUPT_SECONDS old
+        (30s) is still within the 90s grace window. Recovery must leave it
+        running, and no path may attribute INTERRUPTED_RUN_ERROR.
+        """
+        self.assertLess(
+            OBSERVED_FALSE_INTERRUPT_SECONDS,
+            EXECUTION_LEASE_GRACE_SECONDS,
+        )
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        owner = self.registry.get_run(running.run_id)
+        assert owner is not None
+        self.registry.close()
+
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=OBSERVED_FALSE_INTERRUPT_SECONDS,
+        )
+
+        successor = RunRegistry(self._db_path)
+        try:
+            recovered = successor.recover_interrupted_runs()
+            self.assertEqual(recovered, 0)
+            record = successor.get_run(running.run_id)
+            assert record is not None
+            self.assertEqual(record.status, RunStatus.RUNNING)
+            self.assertIsNone(record.error)
+            self.assertNotEqual(record.error, INTERRUPTED_RUN_ERROR)
+            self.assertEqual(record.execution_owner, owner.execution_owner)
+        finally:
+            successor.close()
+
+    def test_store_result_refuses_legacy_interrupt_error(self) -> None:
+        record = self.registry.create_run()
+        self.registry.update_status(record.run_id, RunStatus.RUNNING)
+        updated = self.registry.store_result(
+            record.run_id,
+            error=INTERRUPTED_RUN_ERROR,
+        )
+        assert updated is not None
+        self.assertEqual(updated.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+        self.assertNotEqual(updated.error, INTERRUPTED_RUN_ERROR)
+        fetched = self.registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+
+    def test_owner_lost_terminalize_attaches_provenance(self) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        before = self.registry.get_run(running.run_id)
+        assert before is not None
+        prior_owner = before.execution_owner
+        self.registry.close()
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=EXECUTION_LEASE_GRACE_SECONDS + 5,
+        )
+
+        railway_sha = "a1b2c3d4e5f6789012345678abcdef0123456789"
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_GIT_COMMIT_SHA": railway_sha},
+            clear=False,
+        ):
+            successor = RunRegistry(self._db_path)
+            try:
+                self.assertEqual(successor.recover_interrupted_runs(), 1)
+                record = successor.get_run(running.run_id)
+                assert record is not None
+                self.assertEqual(record.status, RunStatus.FAILED)
+                self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
+                self.assertNotEqual(record.error, INTERRUPTED_RUN_ERROR)
+                self.assertEqual(record.phase, RunPhase.FAILED)
+                assert record.progress is not None
+                provenance = record.progress.get("provenance")
+                assert isinstance(provenance, dict)
+                self.assertEqual(
+                    provenance.get("event"), "terminalize_owner_lost"
+                )
+                self.assertEqual(
+                    provenance.get("source"),
+                    "startup_recovery.owner_lease_cas",
+                )
+                self.assertEqual(
+                    provenance.get("execution_owner"), prior_owner or "none"
+                )
+                self.assertEqual(
+                    provenance.get("policy_version"),
+                    STARTUP_RECOVERY_POLICY_VERSION,
+                )
+                self.assertEqual(
+                    provenance.get("build_marker"),
+                    railway_sha[:_BUILD_FINGERPRINT_LEN],
+                )
+                self.assertTrue(provenance.get("process_instance_id"))
+                # Public step/detail remain compatible.
+                self.assertEqual(
+                    record.progress.get("step"), RunPhase.FAILED.value
+                )
+            finally:
+                successor.close()
+
+    def test_refuse_helper_and_policy_diagnostics(self) -> None:
+        self.assertEqual(
+            refuse_legacy_interrupt_error(INTERRUPTED_RUN_ERROR),
+            LEGACY_INTERRUPT_REFUSED_ERROR,
+        )
+        self.assertEqual(
+            refuse_legacy_interrupt_error(
+                f"  {INTERRUPTED_RUN_ERROR.upper()}  "
+            ),
+            LEGACY_INTERRUPT_REFUSED_ERROR,
+        )
+        self.assertTrue(
+            is_legacy_interrupt_error(f"\t{INTERRUPTED_RUN_ERROR} \n")
+        )
+        self.assertEqual(refuse_legacy_interrupt_error("other"), "other")
+        self.assertIsNone(refuse_legacy_interrupt_error(None))
+        diag = startup_recovery_policy_diagnostics()
+        self.assertEqual(
+            diag["policy_version"], STARTUP_RECOVERY_POLICY_VERSION
+        )
+        self.assertEqual(
+            diag["module_path"], startup_recovery_module_identity()
+        )
+        self.assertEqual(diag["module_path"], "mission_control.run_registry")
+        self.assertNotIn(os.sep, str(diag["module_path"]))
+        self.assertEqual(diag["grace_seconds"], EXECUTION_LEASE_GRACE_SECONDS)
+        self.assertTrue(diag["legacy_interrupt_quarantined"])
+        self.assertEqual(diag["owner_lost_error"], OWNER_LOST_RUN_ERROR)
+        self.assertNotEqual(OWNER_LOST_RUN_ERROR, INTERRUPTED_RUN_ERROR)
+
+    def test_legacy_interrupt_constant_not_written_by_registry_source(
+        self,
+    ) -> None:
+        """Quarantine: production writers must not assign INTERRUPTED_RUN_ERROR."""
+        import mission_control.run_registry as rr_mod
+        import pathlib
+
+        source = pathlib.Path(rr_mod.__file__).read_text(encoding="utf-8")
+        # Allow the constant definition and explicit comparisons / quarantine docs.
+        write_patterns = (
+            "error = INTERRUPTED_RUN_ERROR",
+            "error=INTERRUPTED_RUN_ERROR",
+            "error= INTERRUPTED_RUN_ERROR",
+            ",\n                        INTERRUPTED_RUN_ERROR,",
+            ", INTERRUPTED_RUN_ERROR,",
+        )
+        for pattern in write_patterns:
+            self.assertNotIn(pattern, source)
+
+    def test_concurrent_recovery_never_writes_legacy_interrupt(
+        self,
+    ) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        self.registry.close()
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=EXECUTION_LEASE_GRACE_SECONDS + 5,
+        )
+
+        ctx = multiprocessing.get_context("spawn")
+        result_queue: multiprocessing.Queue = ctx.Queue()
+        start = ctx.Event()
+        ready_events = [ctx.Event() for _ in range(4)]
+        workers = [
+            ctx.Process(
+                target=_recover_worker,
+                args=(self._db_path, ready, start, result_queue),
+            )
+            for ready in ready_events
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            for ready in ready_events:
+                self.assertTrue(ready.wait(timeout=10))
+            start.set()
+            results = [result_queue.get(timeout=30) for _ in workers]
+        finally:
+            for worker in workers:
+                worker.join(timeout=30)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+
+        self.assertTrue(all(item[0] == "ok" for item in results), results)
+        verify = RunRegistry(self._db_path)
+        try:
+            record = verify.get_run(running.run_id)
+            assert record is not None
+            self.assertEqual(record.status, RunStatus.FAILED)
+            self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
+            self.assertNotEqual(record.error, INTERRUPTED_RUN_ERROR)
+        finally:
+            verify.close()
+
+
+class TestLegacyInterruptSqliteBoundary(SqliteRegistryTestCase):
+    """Adversarial guards: DB trigger, variants, build fingerprint, no path leak."""
+
+    _RAILWAY_SHA = "deadbeefcafebabe0123456789abcdef01234567"
+
+    def _trigger_names(self) -> set[str]:
+        conn = sqlite3.connect(self._db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            ).fetchall()
+            return {row[0] for row in rows}
+        finally:
+            conn.close()
+
+    def test_direct_sqlite_update_blocked_atomically(self) -> None:
+        record = self.registry.create_run()
+        self.registry.update_status(record.run_id, RunStatus.RUNNING)
+        before = self.registry.get_run(record.run_id)
+        assert before is not None
+        self.assertEqual(before.status, RunStatus.RUNNING)
+        self.assertIsNone(before.error)
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"""
+                    UPDATE {_RUNS_TABLE}
+                    SET error = ?, status = ?, phase = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        INTERRUPTED_RUN_ERROR,
+                        RunStatus.FAILED.value,
+                        RunPhase.FAILED.value,
+                        record.run_id,
+                    ),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+        finally:
+            conn.close()
+
+        after = self.registry.get_run(record.run_id)
+        assert after is not None
+        self.assertEqual(after.status, RunStatus.RUNNING)
+        self.assertEqual(after.phase, before.phase)
+        self.assertIsNone(after.error)
+        self.assertNotEqual(after.error, INTERRUPTED_RUN_ERROR)
+
+    def test_direct_sqlite_insert_blocked(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"""
+                    INSERT INTO {_RUNS_TABLE} (
+                        run_id, status, created_at, error, phase
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "adversarial-insert-legacy",
+                        RunStatus.FAILED.value,
+                        now,
+                        INTERRUPTED_RUN_ERROR,
+                        RunPhase.FAILED.value,
+                    ),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+            found = conn.execute(
+                f"SELECT 1 FROM {_RUNS_TABLE} WHERE run_id = ?",
+                ("adversarial-insert-legacy",),
+            ).fetchone()
+            self.assertIsNone(found)
+        finally:
+            conn.close()
+
+    def test_sql_strip_chars_generated_from_canonical_python_whitespace(
+        self,
+    ) -> None:
+        """SQLite trim set must be derived from one Python strip() list."""
+        expected = tuple(i for i in range(0x110000) if chr(i).isspace())
+        self.assertEqual(_PYTHON_STRIP_WHITESPACE_CODEPOINTS, expected)
+        self.assertEqual(
+            _SQL_STRIP_CHARS,
+            _sql_trim_chars_expr(_PYTHON_STRIP_WHITESPACE_CODEPOINTS),
+        )
+        # Named families required by the quarantine contract.
+        named = {
+            0x0009,
+            0x000A,
+            0x000B,
+            0x000C,
+            0x000D,
+            0x0020,
+            0x00A0,  # NBSP
+            0x2000,
+            0x2001,
+            0x2002,
+            0x2003,  # EN/EM SPACE family
+            0x2004,
+            0x2005,
+            0x2006,
+            0x2007,  # FIGURE SPACE
+            0x2008,
+            0x2009,
+            0x200A,
+            0x2028,  # LINE SEPARATOR
+            0x2029,  # PARAGRAPH SEPARATOR
+            0x202F,  # NARROW NO-BREAK SPACE
+            0x205F,
+            0x3000,  # IDEOGRAPHIC SPACE
+        }
+        self.assertTrue(named.issubset(_PYTHON_STRIP_WHITESPACE_CODEPOINTS))
+        # BOM is not Python strip whitespace — must not enter SQLite trim set.
+        self.assertNotIn(0xFEFF, _PYTHON_STRIP_WHITESPACE_CODEPOINTS)
+
+    def _assert_app_and_sql_reject_legacy(self, variant: str) -> None:
+        self.assertTrue(is_legacy_interrupt_error(variant))
+        self.assertEqual(
+            refuse_legacy_interrupt_error(variant),
+            LEGACY_INTERRUPT_REFUSED_ERROR,
+        )
+        run = self.registry.create_run()
+        self.registry.update_status(run.run_id, RunStatus.RUNNING)
+        refused = self.registry.store_result(run.run_id, error=variant)
+        assert refused is not None
+        self.assertEqual(refused.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"UPDATE {_RUNS_TABLE} SET error = ? WHERE run_id = ?",
+                    (variant, run.run_id),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+        finally:
+            conn.close()
+        fetched = self.registry.get_run(run.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+        self.assertEqual(fetched.status, RunStatus.RUNNING)
+
+    def _assert_app_and_sql_allow_non_legacy(self, variant: str) -> None:
+        self.assertFalse(is_legacy_interrupt_error(variant))
+        self.assertEqual(refuse_legacy_interrupt_error(variant), variant)
+        run = self.registry.create_run()
+        self.registry.update_status(run.run_id, RunStatus.RUNNING)
+        stored = self.registry.store_result(run.run_id, error=variant)
+        assert stored is not None
+        self.assertEqual(stored.error, variant)
+
+        other = self.registry.create_run()
+        self.registry.update_status(other.run_id, RunStatus.RUNNING)
+        before = self.registry.get_run(other.run_id)
+        assert before is not None
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                f"UPDATE {_RUNS_TABLE} SET error = ? WHERE run_id = ?",
+                (variant, other.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        fetched = self.registry.get_run(other.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.error, variant)
+        self.assertEqual(fetched.status, before.status)
+
+    def test_canonical_unicode_whitespace_parity_app_and_sql(self) -> None:
+        """Each Python strip() whitespace padding is refused by app and SQL."""
+        for cp in _PYTHON_STRIP_WHITESPACE_CODEPOINTS:
+            ch = chr(cp)
+            variant = f"{ch}{INTERRUPTED_RUN_ERROR}{ch}"
+            with self.subTest(codepoint=f"U+{cp:04X}", variant=variant):
+                self.assertEqual(variant.strip(), INTERRUPTED_RUN_ERROR)
+                self._assert_app_and_sql_reject_legacy(variant)
+
+    def test_whitespace_case_variants_blocked_app_and_sql(self) -> None:
+        variants = (
+            INTERRUPTED_RUN_ERROR,
+            f"  {INTERRUPTED_RUN_ERROR}  ",
+            INTERRUPTED_RUN_ERROR.upper(),
+            INTERRUPTED_RUN_ERROR.swapcase(),
+            f"\n{INTERRUPTED_RUN_ERROR}\t",
+            f"\u00a0{INTERRUPTED_RUN_ERROR.upper()}\u3000",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self._assert_app_and_sql_reject_legacy(variant)
+
+    def test_non_whitespace_lookalikes_not_treated_as_legacy(self) -> None:
+        """Zero-width / BOM lookalikes stay outside strip() on both layers."""
+        lookalikes = (
+            "\u200b",  # ZERO WIDTH SPACE
+            "\u200c",  # ZERO WIDTH NON-JOINER
+            "\u200d",  # ZERO WIDTH JOINER
+            "\u2060",  # WORD JOINER
+            "\ufeff",  # BOM / ZWNBSP (not Python strip whitespace)
+        )
+        for ch in lookalikes:
+            variant = f"{ch}{INTERRUPTED_RUN_ERROR}"
+            with self.subTest(codepoint=f"U+{ord(ch):04X}"):
+                self.assertNotEqual(variant.strip(), INTERRUPTED_RUN_ERROR)
+                self._assert_app_and_sql_allow_non_legacy(variant)
+
+    def test_direct_sqlite_replace_and_upsert_blocked(self) -> None:
+        """REPLACE/UPSERT writers must hit the same legacy-error guards."""
+        now = datetime.now(timezone.utc).isoformat()
+        padded = f"\u00a0{INTERRUPTED_RUN_ERROR}\u3000"
+        self.assertTrue(is_legacy_interrupt_error(padded))
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"""
+                    REPLACE INTO {_RUNS_TABLE} (
+                        run_id, status, created_at, error, phase
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "adversarial-replace-legacy",
+                        RunStatus.FAILED.value,
+                        now,
+                        padded,
+                        RunPhase.FAILED.value,
+                    ),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+
+            seed = self.registry.create_run()
+            self.registry.update_status(seed.run_id, RunStatus.RUNNING)
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"""
+                    INSERT INTO {_RUNS_TABLE} (
+                        run_id, status, created_at, error, phase
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        error = excluded.error,
+                        status = excluded.status,
+                        phase = excluded.phase
+                    """,
+                    (
+                        seed.run_id,
+                        RunStatus.FAILED.value,
+                        now,
+                        padded,
+                        RunPhase.FAILED.value,
+                    ),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+        finally:
+            conn.close()
+
+        self.assertIsNone(self.registry.get_run("adversarial-replace-legacy"))
+        after = self.registry.get_run(seed.run_id)
+        assert after is not None
+        self.assertEqual(after.status, RunStatus.RUNNING)
+        self.assertIsNone(after.error)
+
+    def test_historical_legacy_error_remains_readable(self) -> None:
+        historical_id = "historical-legacy-interrupt"
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS {_LEGACY_INTERRUPT_INSERT_TRIGGER}"
+            )
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS {_LEGACY_INTERRUPT_UPDATE_TRIGGER}"
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                f"""
+                INSERT INTO {_RUNS_TABLE} (
+                    run_id, status, created_at, completed_at, error, phase
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    historical_id,
+                    RunStatus.FAILED.value,
+                    now,
+                    now,
+                    INTERRUPTED_RUN_ERROR,
+                    RunPhase.FAILED.value,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Re-open installs triggers again; historical row stays readable.
+        self.registry.close()
+        registry = RunRegistry(self._db_path)
+        try:
+            row = registry.get_run(historical_id)
+            assert row is not None
+            self.assertEqual(row.error, INTERRUPTED_RUN_ERROR)
+            self.assertEqual(row.status, RunStatus.FAILED)
+            # Unrelated repair on historical row must still succeed.
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute(
+                    f"""
+                    UPDATE {_RUNS_TABLE}
+                    SET stderr = 'operator note'
+                    WHERE run_id = ?
+                    """,
+                    (historical_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            repaired = registry.get_run(historical_id)
+            assert repaired is not None
+            self.assertEqual(repaired.error, INTERRUPTED_RUN_ERROR)
+            self.assertEqual(repaired.stderr, "operator note")
+        finally:
+            registry.close()
+            self.registry = RunRegistry(self._db_path)
+
+    def test_trigger_install_idempotent_across_reopen(self) -> None:
+        first = self._trigger_names()
+        self.assertIn(_LEGACY_INTERRUPT_INSERT_TRIGGER, first)
+        self.assertIn(_LEGACY_INTERRUPT_UPDATE_TRIGGER, first)
+        self.registry.close()
+        again = RunRegistry(self._db_path)
+        try:
+            second = self._trigger_names()
+            self.assertEqual(
+                first & {
+                    _LEGACY_INTERRUPT_INSERT_TRIGGER,
+                    _LEGACY_INTERRUPT_UPDATE_TRIGGER,
+                },
+                second & {
+                    _LEGACY_INTERRUPT_INSERT_TRIGGER,
+                    _LEGACY_INTERRUPT_UPDATE_TRIGGER,
+                },
+            )
+            # Third ensure_schema path (new connection) still rejects.
+            conn = sqlite3.connect(self._db_path)
+            try:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(
+                        f"""
+                        INSERT INTO {_RUNS_TABLE} (
+                            run_id, status, created_at, error
+                        ) VALUES ('idempotent-legacy', 'failed', ?, ?)
+                        """,
+                        (
+                            datetime.now(timezone.utc).isoformat(),
+                            INTERRUPTED_RUN_ERROR,
+                        ),
+                    )
+                conn.rollback()
+            finally:
+                conn.close()
+        finally:
+            again.close()
+            self.registry = RunRegistry(self._db_path)
+
+    def test_concurrent_stale_and_new_connections_reject(self) -> None:
+        record = self.registry.create_run()
+        self.registry.update_status(record.run_id, RunStatus.RUNNING)
+        # Stale-shaped peer: connection opened without going through RunRegistry.
+        stale = sqlite3.connect(self._db_path)
+        fresh = sqlite3.connect(self._db_path)
+        try:
+            for conn in (stale, fresh):
+                with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                    conn.execute(
+                        f"""
+                        UPDATE {_RUNS_TABLE}
+                        SET error = ?, status = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            INTERRUPTED_RUN_ERROR,
+                            RunStatus.FAILED.value,
+                            record.run_id,
+                        ),
+                    )
+                self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+                conn.rollback()
+        finally:
+            stale.close()
+            fresh.close()
+        fetched = self.registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.status, RunStatus.RUNNING)
+        self.assertIsNone(fetched.error)
+
+    def test_legitimate_terminal_errors_still_writable(self) -> None:
+        allowed = (
+            OWNER_LOST_RUN_ERROR,
+            LEGACY_INTERRUPT_REFUSED_ERROR,
+            "Worker boom",
+            "mission timed out after 120s",
+            "operator repair: reset attribution",
+        )
+        for message in allowed:
+            with self.subTest(message=message):
+                run = self.registry.create_run()
+                self.registry.update_status(run.run_id, RunStatus.RUNNING)
+                updated = self.registry.store_result(run.run_id, error=message)
+                assert updated is not None
+                self.assertEqual(updated.error, message)
+                failed = self.registry.update_status(
+                    run.run_id, RunStatus.FAILED
+                )
+                assert failed is not None
+                self.assertEqual(failed.status, RunStatus.FAILED)
+                self.assertEqual(failed.error, message)
+
+    def test_railway_sha_fingerprint_and_malicious_marker_rejection(
+        self,
+    ) -> None:
+        self.assertEqual(
+            sanitize_build_fingerprint(self._RAILWAY_SHA),
+            self._RAILWAY_SHA[:_BUILD_FINGERPRINT_LEN],
+        )
+        self.assertEqual(
+            sanitize_build_fingerprint("abc1234"),
+            "abc1234",
+        )
+        malicious = (
+            "not-a-git-sha",
+            "abc123deadbeef",  # 14 hex: neither full nor short fallback
+            "g" * 40,  # non-hex
+            "supersecret_token_abcdefghijklmnopqrstuv",
+            "A" * 64,
+        )
+        for value in malicious:
+            with self.subTest(value=value):
+                self.assertIsNone(sanitize_build_fingerprint(value))
+
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_GIT_COMMIT_SHA": self._RAILWAY_SHA},
+            clear=False,
+        ):
+            self.assertEqual(
+                deployed_build_marker(),
+                self._RAILWAY_SHA[:_BUILD_FINGERPRINT_LEN],
+            )
+            prov = build_terminal_provenance(
+                event="terminalize_owner_lost",
+                source="startup_recovery.owner_lease_cas",
+                execution_owner="owner-1",
+            )
+            self.assertEqual(
+                prov.get("build_marker"),
+                self._RAILWAY_SHA[:_BUILD_FINGERPRINT_LEN],
+            )
+
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_GIT_COMMIT_SHA": "password=hunter2_abcdefghijklmnopqrstuvwxyz"},
+            clear=False,
+        ):
+            self.assertIsNone(deployed_build_marker())
+            diag = startup_recovery_policy_diagnostics()
+            self.assertEqual(diag["build_marker"], "unknown")
+
+        cleaned = bound_terminal_provenance(
+            {
+                "event": "terminalize_owner_lost",
+                "source": "x",
+                "build_marker": "password=hunter2_abcdefghijklmnopqrstuvwxyz",
+                "policy_version": STARTUP_RECOVERY_POLICY_VERSION,
+            }
+        )
+        assert cleaned is not None
+        self.assertNotIn("build_marker", cleaned)
+        self.assertNotIn("password", str(cleaned))
+
+    def test_public_api_progress_strips_provenance(self) -> None:
+        from app.api import _run_status_response
+
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        self.registry.close()
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=EXECUTION_LEASE_GRACE_SECONDS + 5,
+        )
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_GIT_COMMIT_SHA": self._RAILWAY_SHA},
+            clear=False,
+        ):
+            successor = RunRegistry(self._db_path)
+            try:
+                self.assertEqual(successor.recover_interrupted_runs(), 1)
+                record = successor.get_run(running.run_id)
+                assert record is not None
+                assert record.progress is not None
+                self.assertIn("provenance", record.progress)
+                public = _run_status_response(record).model_dump()
+                self.assertEqual(
+                    set(public["progress"].keys()), {"step", "detail"}
+                )
+                blob = str(public)
+                self.assertNotIn("provenance", blob)
+                self.assertNotIn("build_marker", blob)
+                self.assertNotIn("process_instance_id", blob)
+                self.assertNotIn(self._RAILWAY_SHA, blob)
+                # sanitize_progress also drops provenance for monitoring surfaces.
+                cleaned = sanitize_progress(record.progress)
+                assert cleaned is not None
+                self.assertNotIn("provenance", cleaned)
+            finally:
+                successor.close()
+                self.registry = RunRegistry(self._db_path)
 
 
 class TestStartupRequeueApiHelpers(unittest.TestCase):

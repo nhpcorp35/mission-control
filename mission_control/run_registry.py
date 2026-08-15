@@ -23,10 +23,19 @@ from mission_control.run_result import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "./data/mission-control.db"
-# Legacy message retained for API/compat imports. Startup recovery no longer
-# attributes owner-loss failures to a service restart.
+# Quarantined legacy attribution. Must never be written to runs.error.
+# Retained only so detectors/tests can identify stale binaries or forks.
 INTERRUPTED_RUN_ERROR = "Run interrupted by service restart."
 OWNER_LOST_RUN_ERROR = "Run execution owner lost; lease expired."
+# Distinct refusal string when a writer attempts the quarantined legacy error.
+LEGACY_INTERRUPT_REFUSED_ERROR = (
+    "Platform refused legacy service-restart interruption attribution."
+)
+
+# Bumped when owner-loss terminalization / provenance guards change.
+# Logged at API startup so deployed-image vs source mismatches are visible.
+STARTUP_RECOVERY_POLICY_VERSION = "owner-lost-lease-v2"
+_PROCESS_INSTANCE_ID = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
 
 _RUNS_TABLE = "runs"
 _STARTUP_RECOVERY_LEASE_TABLE = "startup_recovery_leases"
@@ -46,15 +55,64 @@ EXECUTION_LEASE_GRACE_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 18.0  # 90s
 # far-future values cannot pin dead work indefinitely, while small skew cannot
 # false-terminalize a healthy owner.
 EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS = 30.0
+# Observed post-hotfix false-interrupt window (run 019bf53f…); must remain
+# strictly less than EXECUTION_LEASE_GRACE_SECONDS.
+OBSERVED_FALSE_INTERRUPT_SECONDS = 30.0
 
 # Bounded platform-authored progress (never raw model output / secrets).
 _PROGRESS_ALLOWED_KEYS = frozenset({"step", "detail"})
+_PROGRESS_PROVENANCE_KEY = "provenance"
 _PROGRESS_STEP_MAX_LEN = 64
 _PROGRESS_DETAIL_MAX_LEN = 160
+_PROVENANCE_VALUE_MAX_LEN = 96
+_PROVENANCE_ALLOWED_KEYS = frozenset(
+    {
+        "event",
+        "source",
+        "execution_owner",
+        "process_instance_id",
+        "build_marker",
+        "policy_version",
+    }
+)
 _SECRETISH_RE = re.compile(
     r"(?i)\b(token|secret|password|api[_-]?key|authorization|bearer)\b|"
     r"\b[A-Za-z0-9_-]{24,}\b"
 )
+# Durable build provenance: full git SHA or documented short (7–12) hex only.
+_COMMIT_SHA_FULL_RE = re.compile(r"^[0-9a-f]{40}$")
+_COMMIT_SHA_SHORT_RE = re.compile(r"^[0-9a-f]{7,12}$")
+_BUILD_FINGERPRINT_LEN = 12
+_BUILD_MARKER_UNKNOWN = "unknown"
+_BUILD_MARKER_ENV_KEYS = (
+    "RAILWAY_GIT_COMMIT_SHA",
+    "RAILWAY_GIT_COMMIT",
+    "GIT_COMMIT_SHA",
+    "MISSION_CONTROL_BUILD_SHA",
+)
+# Shared SQLite invariant: refuse quarantined legacy interrupt attribution.
+_LEGACY_INTERRUPT_INSERT_TRIGGER = "runs_block_legacy_interrupt_insert"
+_LEGACY_INTERRUPT_UPDATE_TRIGGER = "runs_block_legacy_interrupt_update"
+_LEGACY_INTERRUPT_SQL_CANON = INTERRUPTED_RUN_ERROR.replace("'", "''")
+
+
+def _python_strip_whitespace_codepoints() -> tuple[int, ...]:
+    """Code points removed by ``str.strip()`` (Unicode whitespace / isspace).
+
+    BOM (U+FEFF) and zero-width lookalikes are intentionally excluded: Python
+    ``str.strip()`` does not treat them as whitespace, so SQLite must not either.
+    """
+    return tuple(i for i in range(0x110000) if chr(i).isspace())
+
+
+def _sql_trim_chars_expr(codepoints: tuple[int, ...]) -> str:
+    """Deterministic SQLite ``trim`` second-arg expression from code points."""
+    return "char(" + ", ".join(str(cp) for cp in codepoints) + ")"
+
+
+# Single canonical list: application strip() and SQLite triggers share policy.
+_PYTHON_STRIP_WHITESPACE_CODEPOINTS = _python_strip_whitespace_codepoints()
+_SQL_STRIP_CHARS = _sql_trim_chars_expr(_PYTHON_STRIP_WHITESPACE_CODEPOINTS)
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -151,8 +209,136 @@ def platform_progress(*, step: str, detail: str) -> dict[str, str]:
     }
 
 
+def sanitize_build_fingerprint(value: object | None) -> str | None:
+    """Accept only validated git SHA material; return a bounded non-secret fingerprint.
+
+    Full 40-hex SHAs are shortened to the first 12 hex characters. The documented
+    short fallback accepts 7–12 hex characters as-is. Arbitrary / high-entropy
+    values are rejected so they never persist as build markers.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if _COMMIT_SHA_FULL_RE.fullmatch(text):
+        return text[:_BUILD_FINGERPRINT_LEN]
+    if _COMMIT_SHA_SHORT_RE.fullmatch(text):
+        return text
+    return None
+
+
+def deployed_build_marker() -> str | None:
+    """Return a validated deploy fingerprint when the host provides a real git SHA."""
+    for key in _BUILD_MARKER_ENV_KEYS:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        fingerprint = sanitize_build_fingerprint(raw)
+        if fingerprint is not None:
+            return fingerprint
+    return None
+
+
+def bound_terminal_provenance(
+    value: object | None,
+) -> dict[str, str] | None:
+    """Allowlist and bound platform terminal-mutation provenance."""
+    if not isinstance(value, dict):
+        return None
+    cleaned: dict[str, str] = {}
+    for key in _PROVENANCE_ALLOWED_KEYS:
+        raw = value.get(key)
+        if raw is None:
+            continue
+        if key == "build_marker":
+            text = str(raw).strip()
+            if text == _BUILD_MARKER_UNKNOWN:
+                cleaned[key] = _BUILD_MARKER_UNKNOWN
+                continue
+            fingerprint = sanitize_build_fingerprint(text)
+            if fingerprint is not None:
+                cleaned[key] = fingerprint
+            # Invalid / high-entropy markers are dropped (not secret-redacted).
+            continue
+        text = _bound_text(_redact_progress_text(str(raw)), _PROVENANCE_VALUE_MAX_LEN)
+        if text:
+            cleaned[key] = text
+    return cleaned or None
+
+
+def build_terminal_provenance(
+    *,
+    event: str,
+    source: str,
+    execution_owner: str | None,
+) -> dict[str, str]:
+    """Bounded non-secret provenance for platform-authored terminal mutations."""
+    marker = deployed_build_marker() or _BUILD_MARKER_UNKNOWN
+    owner = execution_owner or "none"
+    return bound_terminal_provenance(
+        {
+            "event": event,
+            "source": source,
+            "execution_owner": owner,
+            "process_instance_id": _PROCESS_INSTANCE_ID,
+            "build_marker": marker,
+            "policy_version": STARTUP_RECOVERY_POLICY_VERSION,
+        }
+    ) or {}
+
+
+def is_legacy_interrupt_error(error: str | None) -> bool:
+    """True when ``error`` is the quarantined restart string (strip/casefold)."""
+    if error is None:
+        return False
+    return error.strip().casefold() == INTERRUPTED_RUN_ERROR.strip().casefold()
+
+
+def refuse_legacy_interrupt_error(error: str | None) -> str | None:
+    """Block quarantined service-restart attribution on any error write path."""
+    if error is None:
+        return None
+    if is_legacy_interrupt_error(error):
+        logger.error(
+            (
+                "rejected_legacy_interrupt_error policy_version=%s "
+                "process_instance_id=%s build_marker=%s"
+            ),
+            STARTUP_RECOVERY_POLICY_VERSION,
+            _PROCESS_INSTANCE_ID,
+            deployed_build_marker() or _BUILD_MARKER_UNKNOWN,
+        )
+        return LEGACY_INTERRUPT_REFUSED_ERROR
+    return error
+
+
+def startup_recovery_module_identity() -> str:
+    """Package/module identity for diagnostics (never an absolute host path)."""
+    stem = Path(__file__).stem
+    if __package__:
+        return f"{__package__}.{stem}"
+    return stem
+
+
+def startup_recovery_policy_diagnostics() -> dict[str, object]:
+    """Runtime identity for loaded recovery policy (startup assertion / logs)."""
+    return {
+        "policy_version": STARTUP_RECOVERY_POLICY_VERSION,
+        "module_path": startup_recovery_module_identity(),
+        "grace_seconds": EXECUTION_LEASE_GRACE_SECONDS,
+        "observed_false_interrupt_seconds": OBSERVED_FALSE_INTERRUPT_SECONDS,
+        "legacy_interrupt_quarantined": True,
+        "owner_lost_error": OWNER_LOST_RUN_ERROR,
+        "process_instance_id": _PROCESS_INSTANCE_ID,
+        "build_marker": deployed_build_marker() or _BUILD_MARKER_UNKNOWN,
+    }
+
+
 def sanitize_progress(value: object | None) -> dict[str, str] | None:
-    """Normalize stored/API progress; drop unknown keys and bound values."""
+    """Normalize stored/API progress; drop unknown keys and bound values.
+
+    Provenance is stripped here so public/monitoring surfaces stay step/detail
+    only. Durable provenance is restored by ``deserialize_progress``.
+    """
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -166,21 +352,33 @@ def sanitize_progress(value: object | None) -> dict[str, str] | None:
     return platform_progress(step=step, detail=detail)
 
 
-def serialize_progress(value: dict[str, str] | None) -> str | None:
+def serialize_progress(value: dict | None) -> str | None:
     cleaned = sanitize_progress(value)
     if cleaned is None:
         return None
-    return json.dumps(cleaned, separators=(",", ":"), sort_keys=True)
+    payload: dict[str, object] = dict(cleaned)
+    if isinstance(value, dict):
+        provenance = bound_terminal_provenance(value.get(_PROGRESS_PROVENANCE_KEY))
+        if provenance is not None:
+            payload[_PROGRESS_PROVENANCE_KEY] = provenance
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
-def deserialize_progress(raw: str | None) -> dict[str, str] | None:
+def deserialize_progress(raw: str | None) -> dict | None:
     if raw is None or raw == "":
         return None
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
-    return sanitize_progress(parsed)
+    cleaned = sanitize_progress(parsed)
+    if cleaned is None:
+        return None
+    if isinstance(parsed, dict):
+        provenance = bound_terminal_provenance(parsed.get(_PROGRESS_PROVENANCE_KEY))
+        if provenance is not None:
+            return {**cleaned, _PROGRESS_PROVENANCE_KEY: provenance}
+    return cleaned
 
 
 def phase_for_status(status: RunStatus) -> RunPhase:
@@ -224,7 +422,7 @@ class RunRecord:
     phase: RunPhase = RunPhase.QUEUED
     phase_started_at: datetime | None = None
     heartbeat_at: datetime | None = None
-    progress: dict[str, str] | None = None
+    progress: dict | None = None
     execution_owner: str | None = None
 
     @property
@@ -463,7 +661,60 @@ class RunRegistry:
                 self._conn.execute(
                     f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN execution_owner TEXT"
                 )
+            self._install_legacy_interrupt_guards_unlocked()
             self._conn.commit()
+
+    def _install_legacy_interrupt_guards_unlocked(self) -> None:
+        """Idempotent SQLite triggers blocking legacy interrupt error writes.
+
+        DROP+CREATE is safe across replicas/startup and refreshes the body when
+        the refusal message or strip charset changes. Normalization uses the
+        shared ``_SQL_STRIP_CHARS`` expression (Python ``str.strip()`` whitespace)
+        plus ``lower()`` so direct SQL matches ``strip().casefold()`` for the
+        ASCII quarantined string. Historical rows that already store the
+        quarantined string remain readable; only NEW writes of that string
+        (INSERT or error-changing UPDATE) are aborted atomically.
+        """
+        refused = LEGACY_INTERRUPT_REFUSED_ERROR.replace("'", "''")
+        canon = _LEGACY_INTERRUPT_SQL_CANON
+        strip_chars = _SQL_STRIP_CHARS
+        self._conn.execute(
+            f"DROP TRIGGER IF EXISTS {_LEGACY_INTERRUPT_INSERT_TRIGGER}"
+        )
+        self._conn.execute(
+            f"DROP TRIGGER IF EXISTS {_LEGACY_INTERRUPT_UPDATE_TRIGGER}"
+        )
+        self._conn.execute(
+            f"""
+            CREATE TRIGGER {_LEGACY_INTERRUPT_INSERT_TRIGGER}
+            BEFORE INSERT ON {_RUNS_TABLE}
+            WHEN NEW.error IS NOT NULL
+             AND lower(trim(NEW.error, {strip_chars}))
+                 = lower(trim('{canon}', {strip_chars}))
+            BEGIN
+              SELECT RAISE(ABORT, '{refused}');
+            END
+            """
+        )
+        # Fire only when error is newly set/changed to the quarantined string so
+        # historical rows can still be updated for unrelated columns/repairs.
+        self._conn.execute(
+            f"""
+            CREATE TRIGGER {_LEGACY_INTERRUPT_UPDATE_TRIGGER}
+            BEFORE UPDATE OF error ON {_RUNS_TABLE}
+            WHEN NEW.error IS NOT NULL
+             AND lower(trim(NEW.error, {strip_chars}))
+                 = lower(trim('{canon}', {strip_chars}))
+             AND (
+                  OLD.error IS NULL
+                  OR lower(trim(OLD.error, {strip_chars}))
+                     != lower(trim(NEW.error, {strip_chars}))
+             )
+            BEGIN
+              SELECT RAISE(ABORT, '{refused}');
+            END
+            """
+        )
 
     def _execution_lease_age_seconds(
         self,
@@ -605,6 +856,114 @@ class RunRegistry:
                 exc,
             )
 
+    def _terminalize_owner_lost_cas_unlocked(
+        self,
+        *,
+        run_id: str,
+        execution_owner: str | None,
+        raw_heartbeat: object | None,
+        raw_started: object | None,
+        started_at: datetime | None,
+        now: datetime,
+        age: float | None,
+        lease_clock_malformed: bool,
+    ) -> bool:
+        """CAS-terminalize one running run as owner-lost with provenance.
+
+        The only registry path allowed to fail active work for lease/owner
+        loss. Never writes ``INTERRUPTED_RUN_ERROR``. Returns True when the
+        CAS update claimed the row.
+        """
+        elapsed_seconds = None
+        if started_at is not None:
+            elapsed_seconds = (now - started_at).total_seconds()
+
+        provenance = build_terminal_provenance(
+            event="terminalize_owner_lost",
+            source="startup_recovery.owner_lease_cas",
+            execution_owner=execution_owner,
+        )
+        progress_payload: dict = platform_progress(
+            step=RunPhase.FAILED.value,
+            detail="Execution owner lost; lease expired",
+        )
+        progress_payload[_PROGRESS_PROVENANCE_KEY] = provenance
+        progress = serialize_progress(progress_payload)
+
+        # Hard invariant: owner-loss never uses the quarantined legacy string.
+        if OWNER_LOST_RUN_ERROR == INTERRUPTED_RUN_ERROR:
+            raise RuntimeError(
+                "OWNER_LOST_RUN_ERROR must not equal quarantined "
+                "INTERRUPTED_RUN_ERROR"
+            )
+
+        # CAS on exact observed lease clocks: if the owner refreshes
+        # heartbeat (or repairs clocks) after this read, rowcount=0.
+        cursor = self._conn.execute(
+            f"""
+            UPDATE {_RUNS_TABLE}
+            SET status = ?,
+                completed_at = ?,
+                elapsed_seconds = ?,
+                error = ?,
+                phase = ?,
+                phase_started_at = ?,
+                heartbeat_at = ?,
+                progress_json = ?,
+                execution_owner = NULL
+            WHERE run_id = ?
+              AND status = ?
+              AND heartbeat_at IS ?
+              AND started_at IS ?
+            """,
+            (
+                RunStatus.FAILED.value,
+                _format_dt(now),
+                elapsed_seconds,
+                OWNER_LOST_RUN_ERROR,
+                RunPhase.FAILED.value,
+                _format_dt(now),
+                _format_dt(now),
+                progress,
+                run_id,
+                RunStatus.RUNNING.value,
+                raw_heartbeat,
+                raw_started,
+            ),
+        )
+        if cursor.rowcount != 1:
+            logger.info(
+                (
+                    "startup_recovery decision=skip_race run_id=%s "
+                    "execution_owner=%s policy_version=%s"
+                ),
+                run_id,
+                execution_owner,
+                STARTUP_RECOVERY_POLICY_VERSION,
+            )
+            return False
+
+        logger.info(
+            (
+                "startup_recovery decision=terminalize_owner_lost "
+                "run_id=%s status=%s execution_owner=%s "
+                "lease_age_seconds=%s grace_seconds=%s "
+                "lease_clock_malformed=%s policy_version=%s "
+                "process_instance_id=%s build_marker=%s source=%s"
+            ),
+            run_id,
+            RunStatus.RUNNING.value,
+            execution_owner,
+            None if age is None else round(age, 3),
+            EXECUTION_LEASE_GRACE_SECONDS,
+            lease_clock_malformed,
+            STARTUP_RECOVERY_POLICY_VERSION,
+            provenance.get("process_instance_id"),
+            provenance.get("build_marker"),
+            provenance.get("source"),
+        )
+        return True
+
     def _recover_interrupted_runs_unlocked(self) -> tuple[int, list[str]]:
         """Terminalize dead running owners only. Caller holds ``self._lock``.
 
@@ -712,77 +1071,18 @@ class RunRegistry:
                     )
                     continue
 
-                started_at = record.started_at
-                elapsed_seconds = None
-                if started_at is not None:
-                    elapsed_seconds = (now - started_at).total_seconds()
-
-                progress = serialize_progress(
-                    platform_progress(
-                        step=RunPhase.FAILED.value,
-                        detail="Execution owner lost; lease expired",
-                    )
-                )
-                # CAS on exact observed lease clocks: if the owner refreshes
-                # heartbeat (or repairs clocks) after this read, rowcount=0.
-                cursor = self._conn.execute(
-                    f"""
-                    UPDATE {_RUNS_TABLE}
-                    SET status = ?,
-                        completed_at = ?,
-                        elapsed_seconds = ?,
-                        error = ?,
-                        phase = ?,
-                        phase_started_at = ?,
-                        heartbeat_at = ?,
-                        progress_json = ?,
-                        execution_owner = NULL
-                    WHERE run_id = ?
-                      AND status = ?
-                      AND heartbeat_at IS ?
-                      AND started_at IS ?
-                    """,
-                    (
-                        RunStatus.FAILED.value,
-                        _format_dt(now),
-                        elapsed_seconds,
-                        OWNER_LOST_RUN_ERROR,
-                        RunPhase.FAILED.value,
-                        _format_dt(now),
-                        _format_dt(now),
-                        progress,
-                        record.run_id,
-                        RunStatus.RUNNING.value,
-                        raw_heartbeat,
-                        raw_started,
-                    ),
-                )
-                if cursor.rowcount != 1:
-                    logger.info(
-                        (
-                            "startup_recovery decision=skip_race run_id=%s "
-                            "status=%s execution_owner=%s"
-                        ),
-                        record.run_id,
-                        record.status.value,
-                        record.execution_owner,
-                    )
+                if not self._terminalize_owner_lost_cas_unlocked(
+                    run_id=record.run_id,
+                    execution_owner=record.execution_owner,
+                    raw_heartbeat=raw_heartbeat,
+                    raw_started=raw_started,
+                    started_at=record.started_at,
+                    now=now,
+                    age=age,
+                    lease_clock_malformed=lease_clock_malformed,
+                ):
                     continue
 
-                logger.info(
-                    (
-                        "startup_recovery decision=terminalize_owner_lost "
-                        "run_id=%s status=%s execution_owner=%s "
-                        "lease_age_seconds=%s grace_seconds=%s "
-                        "lease_clock_malformed=%s"
-                    ),
-                    record.run_id,
-                    record.status.value,
-                    record.execution_owner,
-                    None if age is None else round(age, 3),
-                    EXECUTION_LEASE_GRACE_SECONDS,
-                    lease_clock_malformed,
-                )
                 recovered += 1
                 recovered_ids.append(record.run_id)
             except Exception as exc:
@@ -1281,7 +1581,7 @@ class RunRegistry:
         run_id: str,
         phase: RunPhase,
         *,
-        progress: dict[str, str] | None = None,
+        progress: dict | None = None,
     ) -> RunRecord | None:
         """Advance the authoritative platform phase for a non-terminal run.
 
@@ -1372,7 +1672,7 @@ class RunRegistry:
             record = _row_to_record(row)
             record.stdout = stdout
             record.stderr = stderr
-            record.error = error
+            record.error = refuse_legacy_interrupt_error(error)
             record.return_code = return_code
             if commit_sha is not None:
                 record.commit_sha = commit_sha
