@@ -675,6 +675,11 @@ class LifecycleTests(unittest.TestCase):
                     return_value=0,
                 ),
                 patch.object(
+                    api_module,
+                    "_requeue_persisted_queued_runs",
+                    return_value=0,
+                ),
+                patch.object(
                     api_module.notification_outbox,
                     "suppress_legacy_predeploy_backlog",
                 ),

@@ -71,6 +71,7 @@ class TestRetryRunApi(unittest.TestCase):
     def setUp(self) -> None:
         self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(self._db_fd)
+        self._previous_registry = api_module.run_registry
         api_module.run_registry = RunRegistry(self._db_path)
         from mission_control.run_queue import RunQueue
 
@@ -87,8 +88,13 @@ class TestRetryRunApi(unittest.TestCase):
         self.addCleanup(self._disable_push_patcher.stop)
 
     def tearDown(self) -> None:
-        api_module.run_registry.close()
-        os.unlink(self._db_path)
+        try:
+            test_registry = api_module.run_registry
+            if test_registry is not self._previous_registry:
+                test_registry.close()
+        finally:
+            api_module.run_registry = self._previous_registry
+            os.unlink(self._db_path)
 
     def _wait_for_terminal(self, run_id: str, timeout: float = 2.0) -> dict:
         deadline = time.time() + timeout

@@ -200,12 +200,18 @@ class TestPhaseAwareWaitApi(unittest.TestCase):
     def setUp(self) -> None:
         self._db_fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(self._db_fd)
+        self._previous_registry = api_module.run_registry
         api_module.run_registry = RunRegistry(self._db_path)
         self.client = TestClient(app, headers=AUTH_HEADERS)
 
     def tearDown(self) -> None:
-        api_module.run_registry.close()
-        os.unlink(self._db_path)
+        try:
+            test_registry = api_module.run_registry
+            if test_registry is not self._previous_registry:
+                test_registry.close()
+        finally:
+            api_module.run_registry = self._previous_registry
+            os.unlink(self._db_path)
 
     def test_queued_to_running_phase_transition_in_history(self) -> None:
         record = api_module.run_registry.create_run()
