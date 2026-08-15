@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any, Mapping
+from urllib.parse import quote
 
 import httpx
 
@@ -255,10 +257,27 @@ def normalize_mcp_workflow_yaml(workflow_yaml: str) -> str:
 
 
 def normalize_mcp_workflow_id(workflow_id: str) -> str:
-    """Reject empty workflow IDs before path interpolation."""
-    value = "" if workflow_id is None else str(workflow_id).strip()
-    if not value:
+    """Accept only canonical registry uuid4/uuid5 workflow IDs.
+
+    Matches ``str(uuid.uuid4())`` / ``str(uuid.uuid5(...))`` as used by the
+    workflow registry (lowercase 8-4-4-4-12 with version 4 or 5). Empty
+    values and all other malformed IDs — including oversized, noncanonical,
+    slash, backslash, dot-segment, percent-encoded separator, query,
+    fragment, CR/LF/NUL, and whitespace — are rejected with fixed messages
+    that never echo the input.
+    """
+    value = "" if workflow_id is None else str(workflow_id)
+    if not value or not value.strip():
         raise ValueError("workflow_id must not be empty")
+    # Canonical uuid4/uuid5 strings are exactly 36 characters.
+    if len(value) != 36:
+        raise ValueError("workflow_id is invalid")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        raise ValueError("workflow_id is invalid") from None
+    if str(parsed) != value or parsed.version not in (4, 5):
+        raise ValueError("workflow_id is invalid")
     return value
 
 
@@ -441,12 +460,17 @@ class MissionControlClient:
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         """Fetch sanitized workflow status via GET /workflows/{workflow_id}.
 
-        Empty IDs are rejected locally. Production remains fail-closed when
-        workflow orchestration is disabled (HTTP 403). The API response is
-        already sanitized (no secrets, no child mission YAML).
+        Only canonical uuid4/uuid5 IDs are accepted. Invalid IDs are rejected
+        locally and never forwarded. The validated ID is percent-encoded as a
+        single path segment before interpolation. Production remains
+        fail-closed when workflow orchestration is disabled (HTTP 403). The
+        API response is already sanitized (no secrets, no child mission YAML).
         """
         safe_id = normalize_mcp_workflow_id(workflow_id)
-        return await self._request("GET", f"/workflows/{safe_id}")
+        return await self._request(
+            "GET",
+            f"/workflows/{quote(safe_id, safe='')}",
+        )
 
     async def list_run_notifications(
         self,

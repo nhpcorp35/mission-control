@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 import unittest
+import uuid
 from typing import Any
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
+
+import httpx
 
 # Settings are read at import time by mcp_connector.server.
 os.environ.setdefault("MISSION_CONTROL_URL", "http://mission-control.test")
@@ -31,6 +35,43 @@ YAML_WITH_SECRET = (
     "steps: []\n"
 )
 INVALID_IDEMPOTENCY_KEY = "not a valid key / secret-token"
+
+# Canonical registry forms: str(uuid.uuid4()) / str(uuid.uuid5(...)).
+CANONICAL_UUID4 = "00000000-0000-4000-8000-000000000001"
+CANONICAL_UUID5 = str(
+    uuid.uuid5(uuid.UUID("3c8b1d6e-7f21-4f0a-9e4c-2a6b8c0d1e5f"), "mc-workflow-v1")
+)
+_WORKFLOW_ID_INVALID = "workflow_id is invalid"
+# Scanner-safe malicious/malformed IDs. Fixed errors must not echo these.
+MALICIOUS_WORKFLOW_IDS = (
+    "../runs/abc",
+    "../../openapi.json",
+    "../notifications",
+    "workflows/../openapi.json",
+    "abc/def",
+    "abc\\def",
+    "id?x=1",
+    "id#frag",
+    "id\r",
+    "id\nextra",
+    "id\0",
+    "%2F",
+    "%2e%2e%2fruns%2fabc",
+    "%2E%2E%2Fnotifications",
+    "%2e%2e/%2e%2e/openapi.json",
+    "x" * 37,
+    "x" * 4096,
+    "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    "00000000000040008000000000000001",
+    "{00000000-0000-4000-8000-000000000001}",
+    "urn:uuid:00000000-0000-4000-8000-000000000001",
+    "00000000-0000-1000-8000-000000000001",
+    "00000000-0000-3000-8000-000000000001",
+    " 00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000001 ",
+    " 00000000-0000-4000-8000-000000000001 ",
+    "wf-1",
+)
 
 
 def _settings() -> Settings:
@@ -75,7 +116,28 @@ class TestNormalizeWorkflowMcpInputs(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             normalize_mcp_workflow_id("   ")
         self.assertEqual(str(ctx.exception), "workflow_id must not be empty")
-        self.assertEqual(normalize_mcp_workflow_id("  wf-1  "), "wf-1")
+        with self.assertRaises(ValueError) as ctx:
+            normalize_mcp_workflow_id("")
+        self.assertEqual(str(ctx.exception), "workflow_id must not be empty")
+        with self.assertRaises(ValueError) as ctx:
+            normalize_mcp_workflow_id("\n")
+        self.assertEqual(str(ctx.exception), "workflow_id must not be empty")
+
+    def test_id_accepts_canonical_uuid4_and_uuid5(self) -> None:
+        self.assertEqual(normalize_mcp_workflow_id(CANONICAL_UUID4), CANONICAL_UUID4)
+        self.assertEqual(normalize_mcp_workflow_id(CANONICAL_UUID5), CANONICAL_UUID5)
+        self.assertEqual(uuid.UUID(CANONICAL_UUID4).version, 4)
+        self.assertEqual(uuid.UUID(CANONICAL_UUID5).version, 5)
+
+    def test_id_rejects_malicious_and_noncanonical_without_echo(self) -> None:
+        for raw in MALICIOUS_WORKFLOW_IDS:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError) as ctx:
+                    normalize_mcp_workflow_id(raw)
+                message = str(ctx.exception)
+                self.assertEqual(message, _WORKFLOW_ID_INVALID)
+                self.assertNotIn(raw, message)
+                self.assertNotIn(repr(raw), message)
 
     def test_idempotency_key_constraints(self) -> None:
         self.assertIsNone(normalize_mcp_workflow_idempotency_key(None))
@@ -159,18 +221,87 @@ class TestWorkflowClientForwarding(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_forwards_get_workflows_id(self) -> None:
         status = {
-            "workflow_id": "wf-1",
+            "workflow_id": CANONICAL_UUID4,
             "state": "pending",
             "steps": [],
         }
+        encoded = quote(CANONICAL_UUID4, safe="")
         with patch.object(
             self.client,
             "_request",
             new=AsyncMock(return_value=status),
         ) as request:
-            result = await self.client.get_workflow("  wf-1  ")
-        request.assert_awaited_once_with("GET", "/workflows/wf-1")
+            result = await self.client.get_workflow(CANONICAL_UUID4)
+        request.assert_awaited_once_with("GET", f"/workflows/{encoded}")
+        self.assertEqual(request.await_args.args[1], f"/workflows/{CANONICAL_UUID4}")
         self.assertEqual(result, status)
+
+    async def test_malicious_ids_never_call_request(self) -> None:
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(),
+        ) as request:
+            for raw in MALICIOUS_WORKFLOW_IDS:
+                with self.subTest(raw=raw):
+                    with self.assertRaises(ValueError) as ctx:
+                        await self.client.get_workflow(raw)
+                    message = str(ctx.exception)
+                    self.assertEqual(message, _WORKFLOW_ID_INVALID)
+                    self.assertNotIn(raw, message)
+        request.assert_not_awaited()
+
+    async def test_canonical_uuid_httpx_path_does_not_collapse(self) -> None:
+        captured: dict[str, Any] = {}
+        encoded = quote(CANONICAL_UUID4, safe="")
+        expected_path = f"/workflows/{CANONICAL_UUID4}"
+
+        class _FakeAsyncClient:
+            def __init__(self, **kwargs: Any) -> None:
+                captured["base_url"] = kwargs.get("base_url")
+
+            async def __aenter__(self) -> "_FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *args: Any) -> bool:
+                return False
+
+            async def request(self, method: str, path: str, **kwargs: Any) -> _FakeResponse:
+                captured["method"] = method
+                captured["path"] = path
+                return _FakeResponse(
+                    {
+                        "workflow_id": CANONICAL_UUID4,
+                        "state": "pending",
+                        "steps": [],
+                    }
+                )
+
+        with patch(
+            "mcp_connector.client.httpx.AsyncClient",
+            _FakeAsyncClient,
+        ):
+            result = await self.client.get_workflow(CANONICAL_UUID4)
+
+        self.assertEqual(result["workflow_id"], CANONICAL_UUID4)
+        self.assertEqual(captured["method"], "GET")
+        self.assertEqual(captured["path"], expected_path)
+        self.assertEqual(captured["path"], f"/workflows/{encoded}")
+
+        base = httpx.URL(str(captured["base_url"]))
+        resolved = base.join(captured["path"])
+        self.assertEqual(resolved.path, expected_path)
+        self.assertEqual(
+            str(resolved),
+            f"http://mission-control.test/workflows/{CANONICAL_UUID4}",
+        )
+        # Contrast: unvalidated interpolation would collapse off /workflows/.
+        collapsed = base.join("/workflows/../runs/abc")
+        self.assertEqual(collapsed.path, "/runs/abc")
+        openapi_collapse = base.join("/workflows/../../openapi.json")
+        self.assertEqual(openapi_collapse.path, "/openapi.json")
+        notifications_collapse = base.join("/workflows/../notifications")
+        self.assertEqual(notifications_collapse.path, "/notifications")
 
     async def test_empty_inputs_do_not_call_request(self) -> None:
         with patch.object(
