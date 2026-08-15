@@ -79,8 +79,8 @@ _PROVENANCE_ALLOWED_KEYS = frozenset(
     }
 )
 _SECRETISH_RE = re.compile(
-    r"(?i)(token|secret|password|api[_-]?key|authorization|bearer)|"
-    r"[A-Za-z0-9_-]{24,}"
+    r"(?i)\b(token|secret|password|api[_-]?key|authorization|bearer)\b|"
+    r"\b[A-Za-z0-9_-]{24,}\b"
 )
 # Durable build provenance: full git SHA or documented short (7–12) hex only.
 _COMMIT_SHA_FULL_RE = re.compile(r"^[0-9a-f]{40}$")
