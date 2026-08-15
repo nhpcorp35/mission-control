@@ -1,17 +1,22 @@
 """Tests for Cursor Agent execution helpers."""
 
+import os
 import subprocess
 import unittest
 from unittest.mock import MagicMock, patch
 
 from mission_control.executor import (
     CURSOR_AGENT,
+    CURSOR_EXECUTION_TIMEOUT_ENV,
+    DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     EXECUTION_TIMEOUT_SECONDS,
+    MAX_EXECUTION_TIMEOUT_SECONDS,
     SPLIT_RUN_POLICY_INSTRUCTIONS,
     build_cursor_agent_command,
     build_cursor_instruction,
     build_timeout_split_guidance,
     execute_cursor_agent,
+    resolve_execution_timeout_seconds,
     run_cursor_agent,
 )
 from mission_control.run_result import (
@@ -71,28 +76,30 @@ class TestBuildCursorInstruction(unittest.TestCase):
 
     def test_split_run_policy_injected_and_timeout_split_guidance(self) -> None:
         """Every agent prompt carries split-run policy; timeouts guide splits."""
-        instruction = build_cursor_instruction(_sample_mission())
-        self.assertIn("Split-run scope policy:", instruction)
-        for line in SPLIT_RUN_POLICY_INSTRUCTIONS:
-            self.assertIn(line, instruction)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CURSOR_EXECUTION_TIMEOUT_ENV, None)
+            instruction = build_cursor_instruction(_sample_mission())
+            self.assertIn("Split-run scope policy:", instruction)
+            for line in SPLIT_RUN_POLICY_INSTRUCTIONS:
+                self.assertIn(line, instruction)
 
-        with patch(
-            "mission_control.executor.find_cursor_agent_binary",
-            return_value=CURSOR_AGENT,
-        ), patch(
-            "mission_control.executor.subprocess.Popen",
-        ) as mock_popen:
-            proc = MagicMock()
-            proc.pid = 99
-            proc.communicate.side_effect = [
-                subprocess.TimeoutExpired(
-                    cmd=[CURSOR_AGENT],
-                    timeout=EXECUTION_TIMEOUT_SECONDS,
-                ),
-                ("", ""),
-            ]
-            mock_popen.return_value = proc
-            result = execute_cursor_agent(_sample_mission())
+            with patch(
+                "mission_control.executor.find_cursor_agent_binary",
+                return_value=CURSOR_AGENT,
+            ), patch(
+                "mission_control.executor.subprocess.Popen",
+            ) as mock_popen:
+                proc = MagicMock()
+                proc.pid = 99
+                proc.communicate.side_effect = [
+                    subprocess.TimeoutExpired(
+                        cmd=[CURSOR_AGENT],
+                        timeout=EXECUTION_TIMEOUT_SECONDS,
+                    ),
+                    ("", ""),
+                ]
+                mock_popen.return_value = proc
+                result = execute_cursor_agent(_sample_mission())
 
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error or "")
@@ -362,24 +369,113 @@ class TestRunCursorAgent(unittest.TestCase):
         return_value=CURSOR_AGENT,
     )
     @patch("mission_control.executor.subprocess.Popen")
-    def test_run_timeout(self, mock_popen, _mock_binary) -> None:
+    def test_run_timeout_defaults_to_600(self, mock_popen, _mock_binary) -> None:
         proc = MagicMock()
         proc.pid = 99
         proc.communicate.side_effect = [
             subprocess.TimeoutExpired(
                 cmd=[CURSOR_AGENT],
-                timeout=EXECUTION_TIMEOUT_SECONDS,
+                timeout=DEFAULT_EXECUTION_TIMEOUT_SECONDS,
             ),
             ("", ""),
         ]
         mock_popen.return_value = proc
-        result = run_cursor_agent(_sample_mission())
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CURSOR_EXECUTION_TIMEOUT_ENV, None)
+            self.assertEqual(EXECUTION_TIMEOUT_SECONDS, 600)
+            self.assertEqual(resolve_execution_timeout_seconds(), 600)
+            result = run_cursor_agent(_sample_mission())
+            instruction = mock_popen.call_args.args[0][-1]
         self.assertFalse(result.ok)
-        self.assertIn("timed out", result.error or "")
+        self.assertIn("timed out after 600 seconds", result.error or "")
+        self.assertEqual(
+            proc.communicate.call_args_list[0].kwargs.get("timeout"),
+            600,
+        )
+        self.assertIn("600-second hard timeout", instruction)
         mock_popen.assert_called_once()
         self.assertTrue(
             mock_popen.call_args.kwargs.get("start_new_session"),
         )
+
+    @patch(
+        "mission_control.executor.find_cursor_agent_binary",
+        return_value=CURSOR_AGENT,
+    )
+    @patch("mission_control.executor.subprocess.Popen")
+    def test_run_timeout_honors_configured_1200(
+        self,
+        mock_popen,
+        _mock_binary,
+    ) -> None:
+        proc = MagicMock()
+        proc.pid = 99
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(
+                cmd=[CURSOR_AGENT],
+                timeout=1200,
+            ),
+            ("", ""),
+        ]
+        mock_popen.return_value = proc
+        with patch.dict(os.environ, {CURSOR_EXECUTION_TIMEOUT_ENV: "1200"}):
+            self.assertEqual(resolve_execution_timeout_seconds(), 1200)
+            result = run_cursor_agent(_sample_mission())
+            instruction = mock_popen.call_args.args[0][-1]
+        self.assertFalse(result.ok)
+        self.assertIn("timed out after 1200 seconds", result.error or "")
+        self.assertEqual(
+            proc.communicate.call_args_list[0].kwargs.get("timeout"),
+            1200,
+        )
+        self.assertIn("1200-second hard timeout", instruction)
+
+    def test_invalid_and_out_of_range_timeout_falls_back_to_600(self) -> None:
+        self.assertEqual(MAX_EXECUTION_TIMEOUT_SECONDS, 3600)
+        invalid_values = (
+            "",
+            "abc",
+            "12.5",
+            "0",
+            "-1",
+            str(MAX_EXECUTION_TIMEOUT_SECONDS + 1),
+            "999999",
+        )
+        for raw in invalid_values:
+            with self.subTest(raw=raw), patch.dict(
+                os.environ,
+                {CURSOR_EXECUTION_TIMEOUT_ENV: raw},
+            ):
+                self.assertEqual(resolve_execution_timeout_seconds(), 600)
+
+        proc = MagicMock()
+        proc.pid = 99
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(
+                cmd=[CURSOR_AGENT],
+                timeout=600,
+            ),
+            ("", ""),
+        ]
+        with patch(
+            "mission_control.executor.find_cursor_agent_binary",
+            return_value=CURSOR_AGENT,
+        ), patch(
+            "mission_control.executor.subprocess.Popen",
+        ) as mock_popen, patch.dict(
+            os.environ,
+            {CURSOR_EXECUTION_TIMEOUT_ENV: "not-a-number"},
+        ):
+            mock_popen.return_value = proc
+            result = run_cursor_agent(_sample_mission())
+            instruction = mock_popen.call_args.args[0][-1]
+        self.assertFalse(result.ok)
+        self.assertIn("timed out after 600 seconds", result.error or "")
+        self.assertEqual(
+            proc.communicate.call_args_list[0].kwargs.get("timeout"),
+            600,
+        )
+        self.assertIn("600-second hard timeout", instruction)
 
     @patch(
         "mission_control.executor.find_cursor_agent_binary",
@@ -414,10 +510,12 @@ class TestRunCursorAgent(unittest.TestCase):
         ]
         mock_popen.return_value = proc
 
-        with patch(
-            "mission_control.executor._terminate_process_tree",
-        ) as mock_terminate:
-            result = run_cursor_agent(_sample_mission())
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CURSOR_EXECUTION_TIMEOUT_ENV, None)
+            with patch(
+                "mission_control.executor._terminate_process_tree",
+            ) as mock_terminate:
+                result = run_cursor_agent(_sample_mission())
 
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error or "")
@@ -456,15 +554,16 @@ sys.stdout.flush()
 time.sleep(3600)
 """
 
-        original_timeout = executor_module.EXECUTION_TIMEOUT_SECONDS
         original_cleanup = executor_module.CLEANUP_TIMEOUT_SECONDS
-        executor_module.EXECUTION_TIMEOUT_SECONDS = 1
         executor_module.CLEANUP_TIMEOUT_SECONDS = 1
         mission = _sample_mission()
         mission["repository"] = {"path": "/tmp"}
         started = time.monotonic()
         try:
-            with patch(
+            with patch.dict(
+                os.environ,
+                {CURSOR_EXECUTION_TIMEOUT_ENV: "1"},
+            ), patch(
                 "mission_control.executor.find_cursor_agent_binary",
                 return_value=sys.executable,
             ), patch(
@@ -473,7 +572,6 @@ time.sleep(3600)
             ):
                 result = run_cursor_agent(mission)
         finally:
-            executor_module.EXECUTION_TIMEOUT_SECONDS = original_timeout
             executor_module.CLEANUP_TIMEOUT_SECONDS = original_cleanup
 
         elapsed = time.monotonic() - started
