@@ -1557,7 +1557,6 @@ class TestLegacyInterruptSqliteBoundary(SqliteRegistryTestCase):
                 self.registry = RunRegistry(self._db_path)
 
 
-
 class TestAppPathRecoveryNeverEmitsLegacy(unittest.TestCase):
     """App lifespan recovery path must stay guard-compatible."""
 
@@ -1606,6 +1605,41 @@ class TestAppPathRecoveryNeverEmitsLegacy(unittest.TestCase):
                 "Run interrupted by service restart.",
             )
         finally:
+            registry.close()
+            os.unlink(db_path)
+
+
+class TestStartupRequeueApiHelpers(unittest.TestCase):
+    def test_lifespan_requeue_helper_enqueues_once(self) -> None:
+        from app import api as api_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        registry = RunRegistry(db_path)
+        queued = registry.create_run(mission_yaml=_MINIMAL_MISSION_YAML)
+        queue = RunQueue()
+        executed: list[str] = []
+        done = threading.Event()
+
+        def _execute(run_id: str, mission: dict, reg: RunRegistry) -> None:
+            if reg.try_claim_run(run_id) is not None:
+                executed.append(run_id)
+                reg.update_status(run_id, RunStatus.COMPLETED)
+            done.set()
+
+        queue.configure(_execute)
+        try:
+            with patch.object(api_module, "run_registry", registry), patch.object(
+                api_module, "run_queue", queue
+            ):
+                first = api_module._requeue_persisted_queued_runs()
+                self.assertTrue(done.wait(timeout=5))
+                second = api_module._requeue_persisted_queued_runs()
+            self.assertEqual(first, 1)
+            self.assertEqual(second, 0)
+            self.assertEqual(executed, [queued.run_id])
+        finally:
+            queue.stop()
             registry.close()
             os.unlink(db_path)
 
