@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from mission_control.run_registry import (
+    EXECUTION_LEASE_GRACE_SECONDS,
     INTERRUPTED_RUN_ERROR,
+    OWNER_LOST_RUN_ERROR,
     RunRegistry,
     RunStatus,
     resolve_db_path,
@@ -70,29 +74,54 @@ class TestRegistryPersistenceAcrossInstances(SqliteRegistryTestCase):
 class TestInterruptedRunRecovery(SqliteRegistryTestCase):
     def test_unfinished_runs_are_marked_failed_on_recovery(self) -> None:
         queued = self.registry.create_run()
-        running = self.registry.create_run()
-        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        healthy = self.registry.create_run()
+        self.registry.update_status(healthy.run_id, RunStatus.RUNNING)
+        orphaned = self.registry.create_run()
+        self.registry.update_status(orphaned.run_id, RunStatus.RUNNING)
         self.registry.close()
+
+        stale_at = datetime.now(timezone.utc) - timedelta(
+            seconds=EXECUTION_LEASE_GRACE_SECONDS + 5
+        )
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
+                (stale_at.isoformat(), orphaned.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
         recovered_registry = RunRegistry(self._db_path)
         try:
             recovered = recovered_registry.recover_interrupted_runs()
-            self.assertEqual(recovered, 2)
+            self.assertEqual(recovered, 1)
 
             queued_record = recovered_registry.get_run(queued.run_id)
-            running_record = recovered_registry.get_run(running.run_id)
+            healthy_record = recovered_registry.get_run(healthy.run_id)
+            orphaned_record = recovered_registry.get_run(orphaned.run_id)
             assert queued_record is not None
-            assert running_record is not None
+            assert healthy_record is not None
+            assert orphaned_record is not None
 
-            self.assertEqual(queued_record.status, RunStatus.FAILED)
-            self.assertEqual(queued_record.error, INTERRUPTED_RUN_ERROR)
-            self.assertIsNotNone(queued_record.completed_at)
+            self.assertEqual(queued_record.status, RunStatus.QUEUED)
+            self.assertIsNone(queued_record.error)
+            self.assertNotEqual(queued_record.error, INTERRUPTED_RUN_ERROR)
+            self.assertIsNone(queued_record.completed_at)
             self.assertIsNone(queued_record.elapsed_seconds)
 
-            self.assertEqual(running_record.status, RunStatus.FAILED)
-            self.assertEqual(running_record.error, INTERRUPTED_RUN_ERROR)
-            self.assertIsNotNone(running_record.completed_at)
-            self.assertIsNotNone(running_record.elapsed_seconds)
+            self.assertEqual(healthy_record.status, RunStatus.RUNNING)
+            self.assertIsNone(healthy_record.error)
+            self.assertNotEqual(healthy_record.error, INTERRUPTED_RUN_ERROR)
+            self.assertIsNone(healthy_record.completed_at)
+
+            self.assertEqual(orphaned_record.status, RunStatus.FAILED)
+            self.assertEqual(orphaned_record.error, OWNER_LOST_RUN_ERROR)
+            self.assertNotEqual(orphaned_record.error, INTERRUPTED_RUN_ERROR)
+            self.assertIsNotNone(orphaned_record.completed_at)
+            self.assertIsNotNone(orphaned_record.elapsed_seconds)
+            self.assertIsNone(orphaned_record.execution_owner)
         finally:
             recovered_registry.close()
 

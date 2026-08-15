@@ -5,6 +5,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from fastapi.testclient import TestClient
@@ -533,7 +534,23 @@ class TestStartupRecovery(unittest.TestCase):
         client.get("/health")
 
     def test_lifespan_startup_recovers_interrupted_runs_once(self) -> None:
-        from mission_control.run_registry import INTERRUPTED_RUN_ERROR
+        from mission_control.run_registry import (
+            EXECUTION_LEASE_GRACE_SECONDS,
+            INTERRUPTED_RUN_ERROR,
+            OWNER_LOST_RUN_ERROR,
+        )
+
+        healthy = api_module.run_registry.create_run()
+        api_module.run_registry.update_status(healthy.run_id, RunStatus.RUNNING)
+        stale_at = datetime.now(timezone.utc) - timedelta(
+            seconds=EXECUTION_LEASE_GRACE_SECONDS + 5
+        )
+        with api_module.run_registry._lock:
+            api_module.run_registry._conn.execute(
+                "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
+                (stale_at.isoformat(), self._running.run_id),
+            )
+            api_module.run_registry._conn.commit()
 
         with patch.object(
             api_module.run_registry,
@@ -543,13 +560,20 @@ class TestStartupRecovery(unittest.TestCase):
             with TestClient(app, headers=AUTH_HEADERS):
                 recover_mock.assert_called_once()
                 queued = api_module.run_registry.get_run(self._queued.run_id)
+                healthy_record = api_module.run_registry.get_run(healthy.run_id)
                 running = api_module.run_registry.get_run(self._running.run_id)
                 assert queued is not None
+                assert healthy_record is not None
                 assert running is not None
-                self.assertEqual(queued.status, RunStatus.FAILED)
+                self.assertEqual(queued.status, RunStatus.QUEUED)
+                self.assertIsNone(queued.error)
+                self.assertNotEqual(queued.error, INTERRUPTED_RUN_ERROR)
+                self.assertEqual(healthy_record.status, RunStatus.RUNNING)
+                self.assertIsNone(healthy_record.error)
+                self.assertNotEqual(healthy_record.error, INTERRUPTED_RUN_ERROR)
                 self.assertEqual(running.status, RunStatus.FAILED)
-                self.assertEqual(queued.error, INTERRUPTED_RUN_ERROR)
-                self.assertEqual(running.error, INTERRUPTED_RUN_ERROR)
+                self.assertEqual(running.error, OWNER_LOST_RUN_ERROR)
+                self.assertNotEqual(running.error, INTERRUPTED_RUN_ERROR)
 
 
 if __name__ == "__main__":
