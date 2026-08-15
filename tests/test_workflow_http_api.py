@@ -8,6 +8,7 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
+import yaml
 from fastapi.testclient import TestClient
 
 import app.api as api_module
@@ -437,6 +438,19 @@ class ParseWorkflowYamlTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "invalid_yaml")
         self.assertNotIn(TEST_SECRET_VALUE, ctx.exception.message)
 
+    def test_rejects_recursive_depth_flow_sequence(self) -> None:
+        nested = "[" * 1500 + TEST_SECRET_VALUE + "]" * 1500
+        self.assertLess(len(nested.encode("utf-8")), MAX_WORKFLOW_YAML_BYTES)
+        with self.assertRaises(RecursionError):
+            yaml.safe_load(nested)
+        with self.assertRaises(WorkflowSubmitError) as ctx:
+            parse_workflow_yaml(nested)
+        self.assertEqual(ctx.exception.code, "invalid_yaml")
+        self.assertEqual(ctx.exception.message, "Workflow YAML could not be parsed")
+        self.assertNotIn(TEST_SECRET_VALUE, ctx.exception.message)
+        self.assertNotIn(nested[:32], ctx.exception.message)
+        self.assertNotIn("[" * 16, ctx.exception.message)
+
 
 class WorkflowHttpTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -565,6 +579,19 @@ class SubmitHttpTests(WorkflowHttpTestCase):
         raw = response.text
         self.assertNotIn(TEST_SECRET_VALUE, raw)
         self.assertNotIn("mission_yaml", raw)
+
+    def test_post_rejects_recursive_depth_yaml_with_sanitized_400(self) -> None:
+        nested = "[" * 1500 + TEST_SECRET_VALUE + "]" * 1500
+        self.assertLess(len(nested.encode("utf-8")), MAX_WORKFLOW_YAML_BYTES)
+        response = self._post(nested)
+        self.assertEqual(response.status_code, 400)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["code"], "invalid_yaml")
+        self.assertEqual(detail["message"], "Workflow YAML could not be parsed")
+        raw = response.text
+        self.assertNotIn(TEST_SECRET_VALUE, raw)
+        self.assertNotIn(nested[:32], raw)
+        self.assertNotIn("[" * 16, raw)
 
     def test_idempotent_replay_returns_same_id(self) -> None:
         headers = {"Idempotency-Key": "wf-replay-case-01"}

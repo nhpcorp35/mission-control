@@ -296,7 +296,9 @@ def parse_workflow_yaml(workflow_yaml: str) -> ParsedWorkflowSubmit:
 
     try:
         loaded = yaml.safe_load(raw)
-    except yaml.YAMLError:
+    except (yaml.YAMLError, RecursionError):
+        # In-limit deeply nested flow sequences can overflow the parser
+        # stack before the post-load tree-depth check runs.
         raise WorkflowSubmitError(
             "invalid_yaml",
             "Workflow YAML could not be parsed",
