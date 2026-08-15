@@ -94,9 +94,25 @@ _BUILD_MARKER_ENV_KEYS = (
 _LEGACY_INTERRUPT_INSERT_TRIGGER = "runs_block_legacy_interrupt_insert"
 _LEGACY_INTERRUPT_UPDATE_TRIGGER = "runs_block_legacy_interrupt_update"
 _LEGACY_INTERRUPT_SQL_CANON = INTERRUPTED_RUN_ERROR.replace("'", "''")
-# Match Python str.strip() for common ASCII whitespace (SQLite trim defaults
-# to space-only).
-_SQL_STRIP_CHARS = "char(9) || char(10) || char(11) || char(12) || char(13) || ' '"
+
+
+def _python_strip_whitespace_codepoints() -> tuple[int, ...]:
+    """Code points removed by ``str.strip()`` (Unicode whitespace / isspace).
+
+    BOM (U+FEFF) and zero-width lookalikes are intentionally excluded: Python
+    ``str.strip()`` does not treat them as whitespace, so SQLite must not either.
+    """
+    return tuple(i for i in range(0x110000) if chr(i).isspace())
+
+
+def _sql_trim_chars_expr(codepoints: tuple[int, ...]) -> str:
+    """Deterministic SQLite ``trim`` second-arg expression from code points."""
+    return "char(" + ", ".join(str(cp) for cp in codepoints) + ")"
+
+
+# Single canonical list: application strip() and SQLite triggers share policy.
+_PYTHON_STRIP_WHITESPACE_CODEPOINTS = _python_strip_whitespace_codepoints()
+_SQL_STRIP_CHARS = _sql_trim_chars_expr(_PYTHON_STRIP_WHITESPACE_CODEPOINTS)
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -652,7 +668,10 @@ class RunRegistry:
         """Idempotent SQLite triggers blocking legacy interrupt error writes.
 
         DROP+CREATE is safe across replicas/startup and refreshes the body when
-        the refusal message changes. Historical rows that already store the
+        the refusal message or strip charset changes. Normalization uses the
+        shared ``_SQL_STRIP_CHARS`` expression (Python ``str.strip()`` whitespace)
+        plus ``lower()`` so direct SQL matches ``strip().casefold()`` for the
+        ASCII quarantined string. Historical rows that already store the
         quarantined string remain readable; only NEW writes of that string
         (INSERT or error-changing UPDATE) are aborted atomically.
         """

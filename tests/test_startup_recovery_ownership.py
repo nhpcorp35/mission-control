@@ -28,6 +28,9 @@ from mission_control.run_registry import (
     _BUILD_FINGERPRINT_LEN,
     _LEGACY_INTERRUPT_INSERT_TRIGGER,
     _LEGACY_INTERRUPT_UPDATE_TRIGGER,
+    _PYTHON_STRIP_WHITESPACE_CODEPOINTS,
+    _SQL_STRIP_CHARS,
+    _sql_trim_chars_expr,
     bound_terminal_provenance,
     build_terminal_provenance,
     deployed_build_marker,
@@ -1108,39 +1111,195 @@ class TestLegacyInterruptSqliteBoundary(SqliteRegistryTestCase):
         finally:
             conn.close()
 
+    def test_sql_strip_chars_generated_from_canonical_python_whitespace(
+        self,
+    ) -> None:
+        """SQLite trim set must be derived from one Python strip() list."""
+        expected = tuple(i for i in range(0x110000) if chr(i).isspace())
+        self.assertEqual(_PYTHON_STRIP_WHITESPACE_CODEPOINTS, expected)
+        self.assertEqual(
+            _SQL_STRIP_CHARS,
+            _sql_trim_chars_expr(_PYTHON_STRIP_WHITESPACE_CODEPOINTS),
+        )
+        # Named families required by the quarantine contract.
+        named = {
+            0x0009,
+            0x000A,
+            0x000B,
+            0x000C,
+            0x000D,
+            0x0020,
+            0x00A0,  # NBSP
+            0x2000,
+            0x2001,
+            0x2002,
+            0x2003,  # EN/EM SPACE family
+            0x2004,
+            0x2005,
+            0x2006,
+            0x2007,  # FIGURE SPACE
+            0x2008,
+            0x2009,
+            0x200A,
+            0x2028,  # LINE SEPARATOR
+            0x2029,  # PARAGRAPH SEPARATOR
+            0x202F,  # NARROW NO-BREAK SPACE
+            0x205F,
+            0x3000,  # IDEOGRAPHIC SPACE
+        }
+        self.assertTrue(named.issubset(_PYTHON_STRIP_WHITESPACE_CODEPOINTS))
+        # BOM is not Python strip whitespace — must not enter SQLite trim set.
+        self.assertNotIn(0xFEFF, _PYTHON_STRIP_WHITESPACE_CODEPOINTS)
+
+    def _assert_app_and_sql_reject_legacy(self, variant: str) -> None:
+        self.assertTrue(is_legacy_interrupt_error(variant))
+        self.assertEqual(
+            refuse_legacy_interrupt_error(variant),
+            LEGACY_INTERRUPT_REFUSED_ERROR,
+        )
+        run = self.registry.create_run()
+        self.registry.update_status(run.run_id, RunStatus.RUNNING)
+        refused = self.registry.store_result(run.run_id, error=variant)
+        assert refused is not None
+        self.assertEqual(refused.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"UPDATE {_RUNS_TABLE} SET error = ? WHERE run_id = ?",
+                    (variant, run.run_id),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+        finally:
+            conn.close()
+        fetched = self.registry.get_run(run.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+        self.assertEqual(fetched.status, RunStatus.RUNNING)
+
+    def _assert_app_and_sql_allow_non_legacy(self, variant: str) -> None:
+        self.assertFalse(is_legacy_interrupt_error(variant))
+        self.assertEqual(refuse_legacy_interrupt_error(variant), variant)
+        run = self.registry.create_run()
+        self.registry.update_status(run.run_id, RunStatus.RUNNING)
+        stored = self.registry.store_result(run.run_id, error=variant)
+        assert stored is not None
+        self.assertEqual(stored.error, variant)
+
+        other = self.registry.create_run()
+        self.registry.update_status(other.run_id, RunStatus.RUNNING)
+        before = self.registry.get_run(other.run_id)
+        assert before is not None
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                f"UPDATE {_RUNS_TABLE} SET error = ? WHERE run_id = ?",
+                (variant, other.run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        fetched = self.registry.get_run(other.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.error, variant)
+        self.assertEqual(fetched.status, before.status)
+
+    def test_canonical_unicode_whitespace_parity_app_and_sql(self) -> None:
+        """Each Python strip() whitespace padding is refused by app and SQL."""
+        for cp in _PYTHON_STRIP_WHITESPACE_CODEPOINTS:
+            ch = chr(cp)
+            variant = f"{ch}{INTERRUPTED_RUN_ERROR}{ch}"
+            with self.subTest(codepoint=f"U+{cp:04X}", variant=variant):
+                self.assertEqual(variant.strip(), INTERRUPTED_RUN_ERROR)
+                self._assert_app_and_sql_reject_legacy(variant)
+
     def test_whitespace_case_variants_blocked_app_and_sql(self) -> None:
         variants = (
+            INTERRUPTED_RUN_ERROR,
             f"  {INTERRUPTED_RUN_ERROR}  ",
             INTERRUPTED_RUN_ERROR.upper(),
             INTERRUPTED_RUN_ERROR.swapcase(),
             f"\n{INTERRUPTED_RUN_ERROR}\t",
+            f"\u00a0{INTERRUPTED_RUN_ERROR.upper()}\u3000",
         )
         for variant in variants:
             with self.subTest(variant=variant):
-                self.assertEqual(
-                    refuse_legacy_interrupt_error(variant),
-                    LEGACY_INTERRUPT_REFUSED_ERROR,
-                )
-                run = self.registry.create_run()
-                self.registry.update_status(run.run_id, RunStatus.RUNNING)
-                refused = self.registry.store_result(run.run_id, error=variant)
-                assert refused is not None
-                self.assertEqual(refused.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+                self._assert_app_and_sql_reject_legacy(variant)
 
-                conn = sqlite3.connect(self._db_path)
-                try:
-                    with self.assertRaises(sqlite3.IntegrityError):
-                        conn.execute(
-                            f"UPDATE {_RUNS_TABLE} SET error = ? WHERE run_id = ?",
-                            (variant, run.run_id),
-                        )
-                    conn.rollback()
-                finally:
-                    conn.close()
-                fetched = self.registry.get_run(run.run_id)
-                assert fetched is not None
-                self.assertEqual(fetched.error, LEGACY_INTERRUPT_REFUSED_ERROR)
-                self.assertEqual(fetched.status, RunStatus.RUNNING)
+    def test_non_whitespace_lookalikes_not_treated_as_legacy(self) -> None:
+        """Zero-width / BOM lookalikes stay outside strip() on both layers."""
+        lookalikes = (
+            "\u200b",  # ZERO WIDTH SPACE
+            "\u200c",  # ZERO WIDTH NON-JOINER
+            "\u200d",  # ZERO WIDTH JOINER
+            "\u2060",  # WORD JOINER
+            "\ufeff",  # BOM / ZWNBSP (not Python strip whitespace)
+        )
+        for ch in lookalikes:
+            variant = f"{ch}{INTERRUPTED_RUN_ERROR}"
+            with self.subTest(codepoint=f"U+{ord(ch):04X}"):
+                self.assertNotEqual(variant.strip(), INTERRUPTED_RUN_ERROR)
+                self._assert_app_and_sql_allow_non_legacy(variant)
+
+    def test_direct_sqlite_replace_and_upsert_blocked(self) -> None:
+        """REPLACE/UPSERT writers must hit the same legacy-error guards."""
+        now = datetime.now(timezone.utc).isoformat()
+        padded = f"\u00a0{INTERRUPTED_RUN_ERROR}\u3000"
+        self.assertTrue(is_legacy_interrupt_error(padded))
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"""
+                    REPLACE INTO {_RUNS_TABLE} (
+                        run_id, status, created_at, error, phase
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "adversarial-replace-legacy",
+                        RunStatus.FAILED.value,
+                        now,
+                        padded,
+                        RunPhase.FAILED.value,
+                    ),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+
+            seed = self.registry.create_run()
+            self.registry.update_status(seed.run_id, RunStatus.RUNNING)
+            with self.assertRaises(sqlite3.IntegrityError) as ctx:
+                conn.execute(
+                    f"""
+                    INSERT INTO {_RUNS_TABLE} (
+                        run_id, status, created_at, error, phase
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        error = excluded.error,
+                        status = excluded.status,
+                        phase = excluded.phase
+                    """,
+                    (
+                        seed.run_id,
+                        RunStatus.FAILED.value,
+                        now,
+                        padded,
+                        RunPhase.FAILED.value,
+                    ),
+                )
+            self.assertIn(LEGACY_INTERRUPT_REFUSED_ERROR, str(ctx.exception))
+            conn.rollback()
+        finally:
+            conn.close()
+
+        self.assertIsNone(self.registry.get_run("adversarial-replace-legacy"))
+        after = self.registry.get_run(seed.run_id)
+        assert after is not None
+        self.assertEqual(after.status, RunStatus.RUNNING)
+        self.assertIsNone(after.error)
 
     def test_historical_legacy_error_remains_readable(self) -> None:
         historical_id = "historical-legacy-interrupt"
