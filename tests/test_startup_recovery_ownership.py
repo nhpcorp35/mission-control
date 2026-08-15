@@ -16,11 +16,19 @@ from mission_control.run_registry import (
     EXECUTION_LEASE_FUTURE_SKEW_TOLERANCE_SECONDS,
     EXECUTION_LEASE_GRACE_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS,
+    INTERRUPTED_RUN_ERROR,
+    LEGACY_INTERRUPT_REFUSED_ERROR,
+    OBSERVED_FALSE_INTERRUPT_SECONDS,
     OWNER_LOST_RUN_ERROR,
     STARTUP_RECOVERY_LEASE_NAME,
+    STARTUP_RECOVERY_POLICY_VERSION,
+    RunPhase,
     RunRegistry,
     RunStatus,
+    refuse_legacy_interrupt_error,
+    startup_recovery_policy_diagnostics,
 )
+from tests.registry_test_utils import SqliteRegistryTestCase
 
 _LEASE_TABLE = "startup_recovery_leases"
 _RUNS_TABLE = "runs"
@@ -796,6 +804,202 @@ class TestLeaseRecoveryCasAndClockHardening(unittest.TestCase):
             assert record is not None
             self.assertEqual(record.status, RunStatus.FAILED)
             self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
+        finally:
+            verify.close()
+
+
+class TestFalseInterruptProvenanceGuards(SqliteRegistryTestCase):
+    """Post-hotfix secondary-writer guards and 30s timeline regression."""
+
+    def test_observed_30s_timeline_cannot_reach_legacy_interrupt_error(
+        self,
+    ) -> None:
+        """Reproduce run 019bf53f…: created→failed in 30s must not legacy-fail.
+
+        A running run whose lease is only OBSERVED_FALSE_INTERRUPT_SECONDS old
+        (30s) is still within the 90s grace window. Recovery must leave it
+        running, and no path may attribute INTERRUPTED_RUN_ERROR.
+        """
+        self.assertLess(
+            OBSERVED_FALSE_INTERRUPT_SECONDS,
+            EXECUTION_LEASE_GRACE_SECONDS,
+        )
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        owner = self.registry.get_run(running.run_id)
+        assert owner is not None
+        self.registry.close()
+
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=OBSERVED_FALSE_INTERRUPT_SECONDS,
+        )
+
+        successor = RunRegistry(self._db_path)
+        try:
+            recovered = successor.recover_interrupted_runs()
+            self.assertEqual(recovered, 0)
+            record = successor.get_run(running.run_id)
+            assert record is not None
+            self.assertEqual(record.status, RunStatus.RUNNING)
+            self.assertIsNone(record.error)
+            self.assertNotEqual(record.error, INTERRUPTED_RUN_ERROR)
+            self.assertEqual(record.execution_owner, owner.execution_owner)
+        finally:
+            successor.close()
+
+    def test_store_result_refuses_legacy_interrupt_error(self) -> None:
+        record = self.registry.create_run()
+        self.registry.update_status(record.run_id, RunStatus.RUNNING)
+        updated = self.registry.store_result(
+            record.run_id,
+            error=INTERRUPTED_RUN_ERROR,
+        )
+        assert updated is not None
+        self.assertEqual(updated.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+        self.assertNotEqual(updated.error, INTERRUPTED_RUN_ERROR)
+        fetched = self.registry.get_run(record.run_id)
+        assert fetched is not None
+        self.assertEqual(fetched.error, LEGACY_INTERRUPT_REFUSED_ERROR)
+
+    def test_owner_lost_terminalize_attaches_provenance(self) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        before = self.registry.get_run(running.run_id)
+        assert before is not None
+        prior_owner = before.execution_owner
+        self.registry.close()
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=EXECUTION_LEASE_GRACE_SECONDS + 5,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_GIT_COMMIT_SHA": "abc123deadbeef"},
+            clear=False,
+        ):
+            successor = RunRegistry(self._db_path)
+            try:
+                self.assertEqual(successor.recover_interrupted_runs(), 1)
+                record = successor.get_run(running.run_id)
+                assert record is not None
+                self.assertEqual(record.status, RunStatus.FAILED)
+                self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
+                self.assertNotEqual(record.error, INTERRUPTED_RUN_ERROR)
+                self.assertEqual(record.phase, RunPhase.FAILED)
+                assert record.progress is not None
+                provenance = record.progress.get("provenance")
+                assert isinstance(provenance, dict)
+                self.assertEqual(
+                    provenance.get("event"), "terminalize_owner_lost"
+                )
+                self.assertEqual(
+                    provenance.get("source"),
+                    "startup_recovery.owner_lease_cas",
+                )
+                self.assertEqual(
+                    provenance.get("execution_owner"), prior_owner or "none"
+                )
+                self.assertEqual(
+                    provenance.get("policy_version"),
+                    STARTUP_RECOVERY_POLICY_VERSION,
+                )
+                self.assertEqual(
+                    provenance.get("build_marker"), "abc123deadbeef"
+                )
+                self.assertTrue(provenance.get("process_instance_id"))
+                # Public step/detail remain compatible.
+                self.assertEqual(
+                    record.progress.get("step"), RunPhase.FAILED.value
+                )
+            finally:
+                successor.close()
+
+    def test_refuse_helper_and_policy_diagnostics(self) -> None:
+        self.assertEqual(
+            refuse_legacy_interrupt_error(INTERRUPTED_RUN_ERROR),
+            LEGACY_INTERRUPT_REFUSED_ERROR,
+        )
+        self.assertEqual(refuse_legacy_interrupt_error("other"), "other")
+        self.assertIsNone(refuse_legacy_interrupt_error(None))
+        diag = startup_recovery_policy_diagnostics()
+        self.assertEqual(
+            diag["policy_version"], STARTUP_RECOVERY_POLICY_VERSION
+        )
+        self.assertTrue(str(diag["module_path"]).endswith("run_registry.py"))
+        self.assertEqual(diag["grace_seconds"], EXECUTION_LEASE_GRACE_SECONDS)
+        self.assertTrue(diag["legacy_interrupt_quarantined"])
+        self.assertEqual(diag["owner_lost_error"], OWNER_LOST_RUN_ERROR)
+        self.assertNotEqual(OWNER_LOST_RUN_ERROR, INTERRUPTED_RUN_ERROR)
+
+    def test_legacy_interrupt_constant_not_written_by_registry_source(
+        self,
+    ) -> None:
+        """Quarantine: production writers must not assign INTERRUPTED_RUN_ERROR."""
+        import pathlib
+
+        source = pathlib.Path(startup_recovery_policy_diagnostics()["module_path"]).read_text(
+            encoding="utf-8"
+        )
+        # Allow the constant definition and explicit comparisons / quarantine docs.
+        write_patterns = (
+            "error = INTERRUPTED_RUN_ERROR",
+            "error=INTERRUPTED_RUN_ERROR",
+            "error= INTERRUPTED_RUN_ERROR",
+            ",\n                        INTERRUPTED_RUN_ERROR,",
+            ", INTERRUPTED_RUN_ERROR,",
+        )
+        for pattern in write_patterns:
+            self.assertNotIn(pattern, source)
+
+    def test_concurrent_recovery_never_writes_legacy_interrupt(
+        self,
+    ) -> None:
+        running = self.registry.create_run()
+        self.registry.update_status(running.run_id, RunStatus.RUNNING)
+        self.registry.close()
+        _age_run_heartbeat(
+            self._db_path,
+            running.run_id,
+            age_seconds=EXECUTION_LEASE_GRACE_SECONDS + 5,
+        )
+
+        ctx = multiprocessing.get_context("spawn")
+        result_queue: multiprocessing.Queue = ctx.Queue()
+        start = ctx.Event()
+        ready_events = [ctx.Event() for _ in range(4)]
+        workers = [
+            ctx.Process(
+                target=_recover_worker,
+                args=(self._db_path, ready, start, result_queue),
+            )
+            for ready in ready_events
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            for ready in ready_events:
+                self.assertTrue(ready.wait(timeout=10))
+            start.set()
+            results = [result_queue.get(timeout=30) for _ in workers]
+        finally:
+            for worker in workers:
+                worker.join(timeout=30)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+
+        self.assertTrue(all(item[0] == "ok" for item in results), results)
+        verify = RunRegistry(self._db_path)
+        try:
+            record = verify.get_run(running.run_id)
+            assert record is not None
+            self.assertEqual(record.status, RunStatus.FAILED)
+            self.assertEqual(record.error, OWNER_LOST_RUN_ERROR)
+            self.assertNotEqual(record.error, INTERRUPTED_RUN_ERROR)
         finally:
             verify.close()
 
