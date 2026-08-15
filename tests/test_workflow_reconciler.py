@@ -538,6 +538,109 @@ class LifecycleTests(unittest.TestCase):
             os.unlink(wf_path)
             os.unlink(run_path)
 
+    def test_timed_out_stop_then_start_no_overlapping_loops(self) -> None:
+        """Timed-out stop keeps the worker slot; start must not overlap."""
+        wf_fd, wf_path = tempfile.mkstemp(suffix="-wf.db")
+        run_fd, run_path = tempfile.mkstemp(suffix="-run.db")
+        os.close(wf_fd)
+        os.close(run_fd)
+        wf_reg = WorkflowRegistry(wf_path)
+        run_reg = RunRegistry(run_path)
+        release_tick = threading.Event()
+        entered_tick = threading.Event()
+        loop_entries = 0
+        entries_lock = threading.Lock()
+
+        try:
+            reconciler = WorkflowReconciler(
+                workflow_registry=wf_reg,
+                run_registry=run_reg,
+                run_queue=RecordingQueue(),
+                environ=_FEATURE_ON,
+                interval_seconds=0.5,
+            )
+            original_tick = reconciler.tick_once
+
+            def blocking_tick():
+                nonlocal loop_entries
+                with entries_lock:
+                    loop_entries += 1
+                entered_tick.set()
+                # Stay inside the loop body until released so join can time out.
+                self.assertTrue(release_tick.wait(timeout=5.0))
+                return original_tick()
+
+            reconciler.tick_once = blocking_tick  # type: ignore[method-assign]
+            self.assertTrue(reconciler.start())
+            self.assertTrue(entered_tick.wait(timeout=2.0))
+            first_thread = reconciler._thread
+            self.assertIsNotNone(first_thread)
+            assert first_thread is not None
+
+            reconciler.stop(timeout=0.05)
+            # Join timed out: worker still alive and slot retained.
+            self.assertTrue(first_thread.is_alive())
+            self.assertIs(reconciler._thread, first_thread)
+            self.assertTrue(reconciler.is_running)
+            # Must refuse start while the original loop is still alive.
+            self.assertFalse(reconciler.start())
+            self.assertIs(reconciler._thread, first_thread)
+
+            with entries_lock:
+                entries_before_release = loop_entries
+            release_tick.set()
+            first_thread.join(timeout=2.0)
+            self.assertFalse(first_thread.is_alive())
+
+            # After the original worker exits, start may create exactly one
+            # replacement loop (no overlap with the dead thread).
+            self.assertTrue(reconciler.start())
+            second_thread = reconciler._thread
+            self.assertIsNotNone(second_thread)
+            assert second_thread is not None
+            self.assertIsNot(second_thread, first_thread)
+            self.assertTrue(second_thread.is_alive())
+            # Only the first blocked tick counted before release; a second
+            # overlapping loop would have incremented while first was alive.
+            self.assertEqual(entries_before_release, 1)
+
+            reconciler.stop(timeout=2.0)
+            self.assertFalse(reconciler.is_running)
+        finally:
+            release_tick.set()
+            wf_reg.close()
+            run_reg.close()
+            os.unlink(wf_path)
+            os.unlink(run_path)
+
+    def test_constructor_interval_normalized_to_minimum(self) -> None:
+        """Constructor clamps interval_seconds to the documented 0.5s floor."""
+        wf_fd, wf_path = tempfile.mkstemp(suffix="-wf.db")
+        run_fd, run_path = tempfile.mkstemp(suffix="-run.db")
+        os.close(wf_fd)
+        os.close(run_fd)
+        wf_reg = WorkflowRegistry(wf_path)
+        run_reg = RunRegistry(run_path)
+        try:
+            reconciler = WorkflowReconciler(
+                workflow_registry=wf_reg,
+                run_registry=run_reg,
+                run_queue=RecordingQueue(),
+                environ=_FEATURE_OFF,
+                interval_seconds=0.05,
+            )
+            self.assertEqual(
+                reconciler.interval_seconds, MIN_RECONCILE_INTERVAL_SECONDS
+            )
+            self.assertGreaterEqual(
+                reconciler.interval_seconds, MIN_RECONCILE_INTERVAL_SECONDS
+            )
+        finally:
+            wf_reg.close()
+            run_reg.close()
+            os.unlink(wf_path)
+            os.unlink(run_path)
+
     def test_api_lifespan_respects_feature_flag(self) -> None:
         """Req 5: lifespan does not start reconciler when flag off."""
         import app.api as api_module

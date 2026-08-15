@@ -203,10 +203,15 @@ class WorkflowReconciler:
             workflow_registry
         )
         env = self._environ
-        self._interval_seconds = (
+        raw_interval = (
             float(interval_seconds)
             if interval_seconds is not None
             else resolve_reconcile_interval_seconds(env)
+        )
+        # Normalize at construction so property/readers see the documented floor,
+        # not only the sleep path.
+        self._interval_seconds = max(
+            MIN_RECONCILE_INTERVAL_SECONDS, raw_interval
         )
         self._batch_size = (
             int(batch_size)
@@ -250,7 +255,12 @@ class WorkflowReconciler:
         self._wake.set()
 
     def start(self) -> bool:
-        """Start the background loop. Returns False if disabled or running."""
+        """Start the background loop. Returns False if disabled or running.
+
+        Idempotent and concurrency-safe with ``stop``: a still-alive worker
+        (including after a timed-out join) blocks a new start so clearing the
+        stop event cannot revive an overlapping loop.
+        """
         with self._lifecycle_lock:
             if not is_workflow_orchestration_enabled(self._environ):
                 logger.info(
@@ -260,8 +270,11 @@ class WorkflowReconciler:
                     )
                 )
                 return False
-            if self._thread is not None and self._thread.is_alive():
+            existing = self._thread
+            if existing is not None and existing.is_alive():
                 return False
+            # Drop a dead thread reference before starting a replacement.
+            self._thread = None
             self._stop.clear()
             self._wake.set()
             thread = threading.Thread(
@@ -283,15 +296,26 @@ class WorkflowReconciler:
             return True
 
     def stop(self, *, timeout: float = 5.0) -> None:
-        """Cancel the loop and await thread exit (safe if never started)."""
+        """Cancel the loop and await thread exit (safe if never started).
+
+        On join timeout the thread reference is retained so a later ``start``
+        cannot clear the stop event and overlap with the still-running loop.
+        Once that thread exits, a subsequent ``start`` may restart cleanly.
+        """
         with self._lifecycle_lock:
             self._stop.set()
             self._wake.set()
             thread = self._thread
-            self._thread = None
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
-            logger.info("workflow event=reconciler_stopped")
+        with self._lifecycle_lock:
+            # Only release the slot when this stop's thread has exited; a
+            # timed-out join keeps ``_thread`` so start() stays refused.
+            if self._thread is thread and (
+                thread is None or not thread.is_alive()
+            ):
+                self._thread = None
+                logger.info("workflow event=reconciler_stopped")
 
     def tick_once(self) -> ReconcileTickStats:
         """One bounded reconcile pass (serialized)."""
