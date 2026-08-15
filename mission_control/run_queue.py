@@ -3,6 +3,12 @@
 The queue is process-local and in-memory only. Pending and active work is
 lost if the process restarts. At most one Cursor execution runs at a time;
 additional accepted runs wait in FIFO order.
+
+``enqueue`` is idempotent per ``run_id`` against process-local queue state
+and authoritative registry status: suppress when already queued/active in
+this process, or when the registry reports running/terminal. Callers that
+need crash recovery across restarts must keep a durable dispatch intent
+outside this process-local queue.
 """
 
 from __future__ import annotations
@@ -19,6 +25,15 @@ logger = logging.getLogger(__name__)
 # execute(run_id, mission, registry)
 ExecuteFn = Callable[[str, dict, Any], None]
 
+_TERMINAL_OR_ACTIVE_REGISTRY = frozenset(
+    {
+        "running",
+        "completed",
+        "failed",
+        "timed_out",
+    }
+)
+
 
 def _registry_log_fields(registry: Any) -> tuple[int | None, int | None, list[str] | None]:
     """Best-effort registry identity/count/keys without assuming a concrete type."""
@@ -30,6 +45,23 @@ def _registry_log_fields(registry: Any) -> tuple[int | None, int | None, list[st
         count, keys = diagnostic()
         return registry_id, count, keys
     return registry_id, None, None
+
+
+def _registry_blocks_enqueue(registry: Any, run_id: str) -> bool:
+    """Return True when authoritative registry state must suppress enqueue."""
+    if registry is None:
+        return False
+    getter = getattr(registry, "get_run", None)
+    if not callable(getter):
+        return False
+    record = getter(run_id)
+    if record is None:
+        return False
+    status = getattr(record, "status", None)
+    if status is None:
+        return False
+    status_value = status.value if hasattr(status, "value") else str(status)
+    return status_value in _TERMINAL_OR_ACTIVE_REGISTRY
 
 
 class RunQueue:
@@ -52,12 +84,13 @@ class RunQueue:
     def enqueue(self, run_id: str, mission: dict, registry: Any) -> bool:
         """Accept a run for FIFO execution.
 
-        Does not start Cursor immediately when another run is already active.
-        ``registry`` is captured at enqueue time so workers stay isolated from
-        later process-global registry replacements (e.g. in tests).
-
-        Returns ``True`` when newly queued, ``False`` when ``run_id`` is
-        already pending or active (idempotent requeue after restart).
+        Returns True when newly accepted into the process-local pending
+        queue. Returns False when suppressed because the run is already
+        pending/active in this process, or registry status is
+        running/terminal. Does not start Cursor immediately when another
+        run is already active. ``registry`` is captured at enqueue time so
+        workers stay isolated from later process-global registry
+        replacements (e.g. in tests).
         """
         with self._cond:
             if self._execute_fn is None:
@@ -65,8 +98,8 @@ class RunQueue:
             if self._active_run_id == run_id:
                 logger.info(
                     (
-                        "lifecycle run_id=%s event=enqueue_deduped "
-                        "reason=active api_pid=%s"
+                        "lifecycle run_id=%s event=enqueue_suppressed "
+                        "reason=already_active api_pid=%s"
                     ),
                     run_id,
                     os.getpid(),
@@ -75,8 +108,18 @@ class RunQueue:
             if any(pending_id == run_id for pending_id, _, _ in self._pending):
                 logger.info(
                     (
-                        "lifecycle run_id=%s event=enqueue_deduped "
-                        "reason=pending api_pid=%s"
+                        "lifecycle run_id=%s event=enqueue_suppressed "
+                        "reason=already_queued api_pid=%s"
+                    ),
+                    run_id,
+                    os.getpid(),
+                )
+                return False
+            if _registry_blocks_enqueue(registry, run_id):
+                logger.info(
+                    (
+                        "lifecycle run_id=%s event=enqueue_suppressed "
+                        "reason=registry_active_or_terminal api_pid=%s"
                     ),
                     run_id,
                     os.getpid(),

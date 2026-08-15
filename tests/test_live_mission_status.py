@@ -9,7 +9,7 @@ import threading
 import time
 import unittest
 from contextlib import ExitStack, contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 from unittest.mock import patch
 
@@ -20,6 +20,9 @@ from app.api import app
 from mission_control.executor import ExecutionResult
 from mission_control.run_queue import RunQueue
 from mission_control.run_registry import (
+    EXECUTION_LEASE_GRACE_SECONDS,
+    INTERRUPTED_RUN_ERROR,
+    OWNER_LOST_RUN_ERROR,
     RunPhase,
     RunRegistry,
     RunStatus,
@@ -320,43 +323,49 @@ class TestTerminalMonotonicity(SqliteRegistryTestCase):
 
 class TestStartupRecoveryObservability(SqliteRegistryTestCase):
     def test_recover_interrupted_runs_marks_failed_phase(self) -> None:
-        from datetime import datetime, timedelta, timezone
-
-        from mission_control.run_registry import (
-            EXECUTION_LEASE_GRACE_SECONDS,
-            OWNER_LOST_RUN_ERROR,
-        )
-
         queued = self.registry.create_run()
-        running = self.registry.create_run()
-        self.registry.update_status(running.run_id, RunStatus.RUNNING)
-        self.registry.set_phase(running.run_id, RunPhase.AGENT_EXECUTION)
-
-        stale_at = (
-            datetime.now(timezone.utc)
-            - timedelta(seconds=EXECUTION_LEASE_GRACE_SECONDS + 5)
+        healthy = self.registry.create_run()
+        self.registry.update_status(healthy.run_id, RunStatus.RUNNING)
+        self.registry.set_phase(healthy.run_id, RunPhase.AGENT_EXECUTION)
+        orphaned = self.registry.create_run()
+        self.registry.update_status(orphaned.run_id, RunStatus.RUNNING)
+        self.registry.set_phase(orphaned.run_id, RunPhase.AGENT_EXECUTION)
+        stale_at = datetime.now(timezone.utc) - timedelta(
+            seconds=EXECUTION_LEASE_GRACE_SECONDS + 5
         )
         with self.registry._lock:
             self.registry._conn.execute(
                 "UPDATE runs SET heartbeat_at = ? WHERE run_id = ?",
-                (stale_at.isoformat(), running.run_id),
+                (stale_at.isoformat(), orphaned.run_id),
             )
             self.registry._conn.commit()
 
         recovered = self.registry.recover_interrupted_runs()
         self.assertEqual(recovered, 1)
 
-        queued_fetched = self.registry.get_run(queued.run_id)
-        assert queued_fetched is not None
-        self.assertEqual(queued_fetched.status, RunStatus.QUEUED)
+        queued_record = self.registry.get_run(queued.run_id)
+        healthy_record = self.registry.get_run(healthy.run_id)
+        orphaned_record = self.registry.get_run(orphaned.run_id)
+        assert queued_record is not None
+        assert healthy_record is not None
+        assert orphaned_record is not None
 
-        fetched = self.registry.get_run(running.run_id)
-        assert fetched is not None
-        self.assertEqual(fetched.status, RunStatus.FAILED)
-        self.assertEqual(fetched.phase, RunPhase.FAILED)
-        self.assertEqual(fetched.error, OWNER_LOST_RUN_ERROR)
-        assert fetched.progress is not None
-        self.assertEqual(fetched.progress["step"], "failed")
+        self.assertEqual(queued_record.status, RunStatus.QUEUED)
+        self.assertEqual(queued_record.phase, RunPhase.QUEUED)
+        self.assertIsNone(queued_record.error)
+        self.assertNotEqual(queued_record.error, INTERRUPTED_RUN_ERROR)
+
+        self.assertEqual(healthy_record.status, RunStatus.RUNNING)
+        self.assertEqual(healthy_record.phase, RunPhase.AGENT_EXECUTION)
+        self.assertIsNone(healthy_record.error)
+        self.assertNotEqual(healthy_record.error, INTERRUPTED_RUN_ERROR)
+
+        self.assertEqual(orphaned_record.status, RunStatus.FAILED)
+        self.assertEqual(orphaned_record.phase, RunPhase.FAILED)
+        self.assertEqual(orphaned_record.error, OWNER_LOST_RUN_ERROR)
+        self.assertNotEqual(orphaned_record.error, INTERRUPTED_RUN_ERROR)
+        assert orphaned_record.progress is not None
+        self.assertEqual(orphaned_record.progress["step"], "failed")
 
 
 class TestLegacySchemaMigration(unittest.TestCase):

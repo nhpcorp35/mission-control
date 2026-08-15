@@ -39,6 +39,9 @@ from mission_control.notifications import (
     verify_webhook_signature,
 )
 from mission_control.run_registry import (
+    EXECUTION_LEASE_GRACE_SECONDS,
+    INTERRUPTED_RUN_ERROR,
+    OWNER_LOST_RUN_ERROR,
     RunPhase,
     RunRegistry,
     RunStatus,
@@ -245,13 +248,29 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
         # Terminal-while-stale must not invent a paired recovery.
         self.assertNotIn("recovery", kinds)
 
-        # Interrupted-run startup recovery path (distinct from heartbeat pair).
-        from mission_control.run_registry import EXECUTION_LEASE_GRACE_SECONDS
+        # Lease-aware startup recovery (distinct from heartbeat pair).
+        # Freshly owned running leases are preserved; no recovery events.
+        healthy = self.registry.create_run()
+        self.registry.update_status(healthy.run_id, RunStatus.RUNNING)
+        recovered_healthy = self.registry.recover_interrupted_runs()
+        self.assertEqual(recovered_healthy, 0)
+        healthy_kinds = {
+            e["event_kind"]
+            for e in self.outbox.list_for_run(healthy.run_id)
+        }
+        self.assertNotIn("recovery", healthy_kinds)
+        self.assertNotIn("terminal", healthy_kinds)
+        healthy_final = self.registry.get_run(healthy.run_id)
+        assert healthy_final is not None
+        self.assertEqual(healthy_final.status, RunStatus.RUNNING)
+        self.assertIsNone(healthy_final.error)
+        self.assertNotEqual(healthy_final.error, INTERRUPTED_RUN_ERROR)
 
+        # Recovery/terminal enqueue only after a real owner-loss CAS.
         interrupted = self.registry.create_run()
         self.registry.update_status(interrupted.run_id, RunStatus.RUNNING)
         stale_at = datetime.now(timezone.utc) - timedelta(
-            seconds=EXECUTION_LEASE_GRACE_SECONDS + 30
+            seconds=EXECUTION_LEASE_GRACE_SECONDS + 5
         )
         with self.registry._lock:
             self.registry._conn.execute(
@@ -260,7 +279,7 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
             )
             self.registry._conn.commit()
         recovered = self.registry.recover_interrupted_runs()
-        self.assertGreaterEqual(recovered, 1)
+        self.assertEqual(recovered, 1)
         rec_kinds = {
             e["event_kind"]
             for e in self.outbox.list_for_run(interrupted.run_id)
@@ -270,6 +289,8 @@ class TestStaleRecoveryTerminal(unittest.TestCase):
         final = self.registry.get_run(interrupted.run_id)
         assert final is not None
         self.assertEqual(final.status, RunStatus.FAILED)
+        self.assertEqual(final.error, OWNER_LOST_RUN_ERROR)
+        self.assertNotEqual(final.error, INTERRUPTED_RUN_ERROR)
 
     def test_production_stale_healthy_recovery_terminal_sequence(self) -> None:
         """Exact production call sequence: observe stale → healthy → terminal."""

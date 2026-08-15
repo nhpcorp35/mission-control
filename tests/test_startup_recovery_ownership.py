@@ -1557,6 +1557,58 @@ class TestLegacyInterruptSqliteBoundary(SqliteRegistryTestCase):
                 self.registry = RunRegistry(self._db_path)
 
 
+class TestAppPathRecoveryNeverEmitsLegacy(unittest.TestCase):
+    """App lifespan recovery path must stay guard-compatible."""
+
+    def test_direct_and_app_style_recovery_never_write_legacy(self) -> None:
+        import app.api as api_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        registry = RunRegistry(db_path)
+        try:
+            queued = registry.create_run(mission_yaml=_MINIMAL_MISSION_YAML)
+            running = registry.create_run(mission_yaml=_MINIMAL_MISSION_YAML)
+            claimed = registry.try_claim_run(running.run_id)
+            self.assertIsNotNone(claimed)
+            # Expire the running lease so recovery terminalizes it.
+            old = (
+                datetime.now(timezone.utc) - timedelta(seconds=120)
+            ).isoformat()
+            with registry._lock:
+                registry._conn.execute(
+                    f"""
+                    UPDATE {_RUNS_TABLE}
+                    SET heartbeat_at = ?, started_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (old, old, running.run_id),
+                )
+                registry._conn.commit()
+
+            # App lifespan calls the same method on the process registry.
+            with patch.object(api_module, "run_registry", registry):
+                recovered = api_module.run_registry.recover_interrupted_runs()
+            self.assertEqual(recovered, 1)
+
+            queued_rec = registry.get_run(queued.run_id)
+            running_rec = registry.get_run(running.run_id)
+            assert queued_rec is not None and running_rec is not None
+            self.assertEqual(queued_rec.status, RunStatus.QUEUED)
+            self.assertEqual(running_rec.status, RunStatus.FAILED)
+            self.assertEqual(running_rec.error, OWNER_LOST_RUN_ERROR)
+            self.assertFalse(is_legacy_interrupt_error(running_rec.error))
+            self.assertNotEqual(running_rec.error, INTERRUPTED_RUN_ERROR)
+            # Historical reads of the quarantined constant remain possible.
+            self.assertEqual(
+                INTERRUPTED_RUN_ERROR,
+                "Run interrupted by service restart.",
+            )
+        finally:
+            registry.close()
+            os.unlink(db_path)
+
+
 class TestStartupRequeueApiHelpers(unittest.TestCase):
     def test_lifespan_requeue_helper_enqueues_once(self) -> None:
         from app import api as api_module
