@@ -631,18 +631,9 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
     def test_tool_discovery_lists_run_tools_including_structured(self) -> None:
         tools = mcp_server.mcp._tool_manager.list_tools()
         names = [tool.name for tool in tools]
-        self.assertEqual(
-            names,
-            [
-                "submit_run",
-                "submit_structured_run",
-                "get_run",
-                "list_run_notifications",
-                "wait_for_run",
-                "submit_and_wait",
-                "run_repository_command",
-            ],
-        )
+        self.assertEqual(names, list(mcp_server.EXPECTED_TOOL_NAMES))
+        self.assertIn("submit_workflow", names)
+        self.assertIn("get_workflow", names)
 
         wait_tool = next(tool for tool in tools if tool.name == "wait_for_run")
         props = wait_tool.parameters["properties"]
