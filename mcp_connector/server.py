@@ -27,6 +27,8 @@ EXPECTED_TOOL_NAMES = (
     "wait_for_run",
     "submit_and_wait",
     "run_repository_command",
+    "submit_workflow",
+    "get_workflow",
 )
 
 
@@ -59,6 +61,10 @@ mcp = FastMCP(
         "claims (platform persistence runs after the agent completes). "
         "Use list_run_notifications for bounded Phase 2C durable notification "
         "inspection (redacted; no webhook secrets). "
+        "Use submit_workflow (POST /workflows) and get_workflow "
+        "(GET /workflows/{workflow_id}) for durable workflow submit and "
+        "sanitized status. Production remains fail-closed when "
+        "MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. "
         "wait_for_run / submit_and_wait default timeout is "
         f"{MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s; requested timeouts are "
         f"honored up to {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s and never "
@@ -316,6 +322,49 @@ async def run_repository_command(
         # API already returns ok; avoid double-wrapping conflicting ok flags.
         if "ok" in result:
             return result
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def submit_workflow(
+    workflow_yaml: str,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Submit bounded workflow YAML via authenticated POST /workflows.
+
+    Production remains fail-closed when MISSION_CONTROL_WORKFLOW_ORCHESTRATION
+    is disabled (the API returns 403). Optional idempotency_key is forwarded
+    as the Idempotency-Key header. Poll get_workflow for sanitized status.
+    Status is sanitized: secrets and child mission YAML are never returned.
+    """
+    try:
+        if not workflow_yaml.strip():
+            raise ValueError("workflow_yaml must not be empty")
+
+        result = await client.submit_workflow(
+            workflow_yaml,
+            idempotency_key=idempotency_key,
+        )
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def get_workflow(workflow_id: str) -> dict[str, Any]:
+    """Retrieve sanitized durable workflow status via GET /workflows/{workflow_id}.
+
+    Production remains fail-closed when MISSION_CONTROL_WORKFLOW_ORCHESTRATION
+    is disabled (the API returns 403). Status is sanitized: never includes
+    secrets, child mission YAML, or agent stdout/stderr.
+    """
+    try:
+        if not workflow_id.strip():
+            raise ValueError("workflow_id must not be empty")
+
+        result = await client.get_workflow(workflow_id)
         return {"ok": True, **result}
     except Exception as exc:
         return _tool_error(exc)

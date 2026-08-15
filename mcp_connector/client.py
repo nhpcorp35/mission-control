@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 import httpx
@@ -238,6 +239,47 @@ def normalize_mcp_wait_cursor(cursor: str | None) -> str | None:
     """Validate optional wait cursor size before forwarding to Mission Control."""
     return normalize_monitor_cursor(cursor)
 
+
+# Workflow submit/status (POST /workflows, GET /workflows/{workflow_id}).
+# Keep aligned with mission_control.workflow_submit.parse_idempotency_key.
+MCP_WORKFLOW_MAX_IDEMPOTENCY_KEY_CHARS = 128
+_MCP_WORKFLOW_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._~:-]{1,128}$")
+
+
+def normalize_mcp_workflow_yaml(workflow_yaml: str) -> str:
+    """Reject empty workflow YAML without echoing the document."""
+    value = "" if workflow_yaml is None else str(workflow_yaml)
+    if not value.strip():
+        raise ValueError("workflow_yaml must not be empty")
+    return value
+
+
+def normalize_mcp_workflow_id(workflow_id: str) -> str:
+    """Reject empty workflow IDs before path interpolation."""
+    value = "" if workflow_id is None else str(workflow_id).strip()
+    if not value:
+        raise ValueError("workflow_id must not be empty")
+    return value
+
+
+def normalize_mcp_workflow_idempotency_key(
+    idempotency_key: str | None,
+) -> str | None:
+    """Return a validated Idempotency-Key, or None when omitted.
+
+    Empty/whitespace keys are treated as omitted. Invalid keys are rejected
+    with a message that never includes the raw key, YAML, or secrets.
+    """
+    if idempotency_key is None:
+        return None
+    key = str(idempotency_key).strip()
+    if not key:
+        return None
+    if not _MCP_WORKFLOW_IDEMPOTENCY_KEY_RE.match(key):
+        raise ValueError("idempotency_key is invalid")
+    return key
+
+
 class MissionControlClient:
     """Thin asynchronous client for the Mission Control REST API."""
 
@@ -261,16 +303,20 @@ class MissionControlClient:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         request_timeout = (
             self._settings.request_timeout_seconds
             if timeout is None
             else timeout
         )
+        request_headers = self._headers()
+        if headers:
+            request_headers.update(dict(headers))
         try:
             async with httpx.AsyncClient(
                 base_url=self._settings.mission_control_url,
-                headers=self._headers(),
+                headers=request_headers,
                 timeout=request_timeout,
             ) as client:
                 response = await client.request(
@@ -367,6 +413,40 @@ class MissionControlClient:
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/runs/{run_id}")
+
+    async def submit_workflow(
+        self,
+        workflow_yaml: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit bounded workflow YAML via authenticated POST /workflows.
+
+        Optional ``idempotency_key`` is forwarded as the ``Idempotency-Key``
+        header. Empty YAML and invalid keys are rejected locally without
+        echoing YAML or secrets. Feature-disabled production remains
+        fail-closed at the HTTP API (403).
+        """
+        yaml_text = normalize_mcp_workflow_yaml(workflow_yaml)
+        key = normalize_mcp_workflow_idempotency_key(idempotency_key)
+        extra_headers = (
+            {"Idempotency-Key": key} if key is not None else None
+        )
+        return await self._request(
+            "POST",
+            "/workflows",
+            json={"workflow_yaml": yaml_text},
+            headers=extra_headers,
+        )
+
+    async def get_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Fetch sanitized workflow status via GET /workflows/{workflow_id}.
+
+        Empty IDs are rejected locally. Production remains fail-closed when
+        workflow orchestration is disabled (HTTP 403). The API response is
+        already sanitized (no secrets, no child mission YAML).
+        """
+        safe_id = normalize_mcp_workflow_id(workflow_id)
+        return await self._request("GET", f"/workflows/{safe_id}")
 
     async def list_run_notifications(
         self,
