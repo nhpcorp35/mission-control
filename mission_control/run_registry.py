@@ -79,12 +79,24 @@ _SECRETISH_RE = re.compile(
     r"(?i)\b(token|secret|password|api[_-]?key|authorization|bearer)\b|"
     r"\b[A-Za-z0-9_-]{24,}\b"
 )
+# Durable build provenance: full git SHA or documented short (7–12) hex only.
+_COMMIT_SHA_FULL_RE = re.compile(r"^[0-9a-f]{40}$")
+_COMMIT_SHA_SHORT_RE = re.compile(r"^[0-9a-f]{7,12}$")
+_BUILD_FINGERPRINT_LEN = 12
+_BUILD_MARKER_UNKNOWN = "unknown"
 _BUILD_MARKER_ENV_KEYS = (
     "RAILWAY_GIT_COMMIT_SHA",
     "RAILWAY_GIT_COMMIT",
     "GIT_COMMIT_SHA",
     "MISSION_CONTROL_BUILD_SHA",
 )
+# Shared SQLite invariant: refuse quarantined legacy interrupt attribution.
+_LEGACY_INTERRUPT_INSERT_TRIGGER = "runs_block_legacy_interrupt_insert"
+_LEGACY_INTERRUPT_UPDATE_TRIGGER = "runs_block_legacy_interrupt_update"
+_LEGACY_INTERRUPT_SQL_CANON = INTERRUPTED_RUN_ERROR.replace("'", "''")
+# Match Python str.strip() for common ASCII whitespace (SQLite trim defaults
+# to space-only).
+_SQL_STRIP_CHARS = "char(9) || char(10) || char(11) || char(12) || char(13) || ' '"
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -181,12 +193,32 @@ def platform_progress(*, step: str, detail: str) -> dict[str, str]:
     }
 
 
+def sanitize_build_fingerprint(value: object | None) -> str | None:
+    """Accept only validated git SHA material; return a bounded non-secret fingerprint.
+
+    Full 40-hex SHAs are shortened to the first 12 hex characters. The documented
+    short fallback accepts 7–12 hex characters as-is. Arbitrary / high-entropy
+    values are rejected so they never persist as build markers.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if _COMMIT_SHA_FULL_RE.fullmatch(text):
+        return text[:_BUILD_FINGERPRINT_LEN]
+    if _COMMIT_SHA_SHORT_RE.fullmatch(text):
+        return text
+    return None
+
+
 def deployed_build_marker() -> str | None:
-    """Return a bounded non-secret deploy/build marker when the host provides one."""
+    """Return a validated deploy fingerprint when the host provides a real git SHA."""
     for key in _BUILD_MARKER_ENV_KEYS:
         raw = os.environ.get(key, "").strip()
-        if raw:
-            return _bound_text(raw, _PROVENANCE_VALUE_MAX_LEN)
+        if not raw:
+            continue
+        fingerprint = sanitize_build_fingerprint(raw)
+        if fingerprint is not None:
+            return fingerprint
     return None
 
 
@@ -201,6 +233,16 @@ def bound_terminal_provenance(
         raw = value.get(key)
         if raw is None:
             continue
+        if key == "build_marker":
+            text = str(raw).strip()
+            if text == _BUILD_MARKER_UNKNOWN:
+                cleaned[key] = _BUILD_MARKER_UNKNOWN
+                continue
+            fingerprint = sanitize_build_fingerprint(text)
+            if fingerprint is not None:
+                cleaned[key] = fingerprint
+            # Invalid / high-entropy markers are dropped (not secret-redacted).
+            continue
         text = _bound_text(_redact_progress_text(str(raw)), _PROVENANCE_VALUE_MAX_LEN)
         if text:
             cleaned[key] = text
@@ -214,7 +256,7 @@ def build_terminal_provenance(
     execution_owner: str | None,
 ) -> dict[str, str]:
     """Bounded non-secret provenance for platform-authored terminal mutations."""
-    marker = deployed_build_marker() or "unknown"
+    marker = deployed_build_marker() or _BUILD_MARKER_UNKNOWN
     owner = execution_owner or "none"
     return bound_terminal_provenance(
         {
@@ -228,11 +270,18 @@ def build_terminal_provenance(
     ) or {}
 
 
+def is_legacy_interrupt_error(error: str | None) -> bool:
+    """True when ``error`` is the quarantined restart string (strip/casefold)."""
+    if error is None:
+        return False
+    return error.strip().casefold() == INTERRUPTED_RUN_ERROR.strip().casefold()
+
+
 def refuse_legacy_interrupt_error(error: str | None) -> str | None:
     """Block quarantined service-restart attribution on any error write path."""
     if error is None:
         return None
-    if error == INTERRUPTED_RUN_ERROR:
+    if is_legacy_interrupt_error(error):
         logger.error(
             (
                 "rejected_legacy_interrupt_error policy_version=%s "
@@ -240,23 +289,31 @@ def refuse_legacy_interrupt_error(error: str | None) -> str | None:
             ),
             STARTUP_RECOVERY_POLICY_VERSION,
             _PROCESS_INSTANCE_ID,
-            deployed_build_marker() or "unknown",
+            deployed_build_marker() or _BUILD_MARKER_UNKNOWN,
         )
         return LEGACY_INTERRUPT_REFUSED_ERROR
     return error
+
+
+def startup_recovery_module_identity() -> str:
+    """Package/module identity for diagnostics (never an absolute host path)."""
+    stem = Path(__file__).stem
+    if __package__:
+        return f"{__package__}.{stem}"
+    return stem
 
 
 def startup_recovery_policy_diagnostics() -> dict[str, object]:
     """Runtime identity for loaded recovery policy (startup assertion / logs)."""
     return {
         "policy_version": STARTUP_RECOVERY_POLICY_VERSION,
-        "module_path": __file__,
+        "module_path": startup_recovery_module_identity(),
         "grace_seconds": EXECUTION_LEASE_GRACE_SECONDS,
         "observed_false_interrupt_seconds": OBSERVED_FALSE_INTERRUPT_SECONDS,
         "legacy_interrupt_quarantined": True,
         "owner_lost_error": OWNER_LOST_RUN_ERROR,
         "process_instance_id": _PROCESS_INSTANCE_ID,
-        "build_marker": deployed_build_marker() or "unknown",
+        "build_marker": deployed_build_marker() or _BUILD_MARKER_UNKNOWN,
     }
 
 
@@ -588,7 +645,57 @@ class RunRegistry:
                 self._conn.execute(
                     f"ALTER TABLE {_RUNS_TABLE} ADD COLUMN execution_owner TEXT"
                 )
+            self._install_legacy_interrupt_guards_unlocked()
             self._conn.commit()
+
+    def _install_legacy_interrupt_guards_unlocked(self) -> None:
+        """Idempotent SQLite triggers blocking legacy interrupt error writes.
+
+        DROP+CREATE is safe across replicas/startup and refreshes the body when
+        the refusal message changes. Historical rows that already store the
+        quarantined string remain readable; only NEW writes of that string
+        (INSERT or error-changing UPDATE) are aborted atomically.
+        """
+        refused = LEGACY_INTERRUPT_REFUSED_ERROR.replace("'", "''")
+        canon = _LEGACY_INTERRUPT_SQL_CANON
+        strip_chars = _SQL_STRIP_CHARS
+        self._conn.execute(
+            f"DROP TRIGGER IF EXISTS {_LEGACY_INTERRUPT_INSERT_TRIGGER}"
+        )
+        self._conn.execute(
+            f"DROP TRIGGER IF EXISTS {_LEGACY_INTERRUPT_UPDATE_TRIGGER}"
+        )
+        self._conn.execute(
+            f"""
+            CREATE TRIGGER {_LEGACY_INTERRUPT_INSERT_TRIGGER}
+            BEFORE INSERT ON {_RUNS_TABLE}
+            WHEN NEW.error IS NOT NULL
+             AND lower(trim(NEW.error, {strip_chars}))
+                 = lower(trim('{canon}', {strip_chars}))
+            BEGIN
+              SELECT RAISE(ABORT, '{refused}');
+            END
+            """
+        )
+        # Fire only when error is newly set/changed to the quarantined string so
+        # historical rows can still be updated for unrelated columns/repairs.
+        self._conn.execute(
+            f"""
+            CREATE TRIGGER {_LEGACY_INTERRUPT_UPDATE_TRIGGER}
+            BEFORE UPDATE OF error ON {_RUNS_TABLE}
+            WHEN NEW.error IS NOT NULL
+             AND lower(trim(NEW.error, {strip_chars}))
+                 = lower(trim('{canon}', {strip_chars}))
+             AND (
+                  OLD.error IS NULL
+                  OR lower(trim(OLD.error, {strip_chars}))
+                     != lower(trim(NEW.error, {strip_chars}))
+             )
+            BEGIN
+              SELECT RAISE(ABORT, '{refused}');
+            END
+            """
+        )
 
     def _execution_lease_age_seconds(
         self,
