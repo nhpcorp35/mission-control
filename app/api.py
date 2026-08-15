@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 import time
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from app.auth import require_api_key
@@ -74,6 +74,15 @@ from mission_control.mission_builder import (
     render_mission_yaml,
 )
 from mission_control.openapi_actions import build_actions_openapi
+from mission_control.workflow_submit import (
+    WorkflowAcceptedResponse,
+    WorkflowConflictError,
+    WorkflowStatusResponse,
+    WorkflowSubmitError,
+    WorkflowSubmitRequest,
+    build_workflow_status,
+    submit_workflow,
+)
 from mission_control.validator import (
     load_mission_yaml,
     validate_mission_for_execute,
@@ -1677,3 +1686,107 @@ def wait_for_run_endpoint(
         poll_interval_seconds=request.poll_interval_seconds,
         cursor=request.cursor,
     )
+
+
+def require_workflow_http_access(
+    _auth: None = Depends(require_api_key),
+) -> None:
+    """Bearer auth first; fail closed with 403 when the feature flag is off."""
+    if not is_workflow_orchestration_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Workflow orchestration is disabled",
+        )
+
+
+def _workflow_http_error(exc: WorkflowSubmitError) -> HTTPException:
+    """Map sanitized submit errors to HTTP responses (no secrets, no YAML)."""
+    status_code = 409 if isinstance(exc, WorkflowConflictError) else 400
+    if exc.code == "feature_disabled":
+        status_code = 403
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+@app.post(
+    "/workflows",
+    status_code=202,
+    operation_id="submit_workflow",
+    summary="Submit a durable workflow",
+    description=(
+        "Validate strict workflow YAML (bounded size/steps/strings/"
+        "dependencies, unknown fields rejected) and persist a pending "
+        "durable workflow. Requires bearer auth. Returns 403 while "
+        "MISSION_CONTROL_WORKFLOW_ORCHESTRATION is unset or false. "
+        "Replay identical submissions with the Idempotency-Key header. "
+        "Poll GET /workflows/{workflow_id} for sanitized status. Does not "
+        "expose secrets or child mission YAML."
+    ),
+    response_model=WorkflowAcceptedResponse,
+    responses={
+        202: {
+            "model": WorkflowAcceptedResponse,
+            "description": "Workflow accepted and persisted as pending.",
+        },
+        400: {"description": "Invalid workflow YAML or bounded-field rejection."},
+        401: {"description": "Missing or invalid bearer token."},
+        403: {"description": "Workflow orchestration feature flag is off."},
+        409: {"description": "Idempotency-Key reused with a different payload."},
+    },
+)
+def submit_workflow_endpoint(
+    request: WorkflowSubmitRequest,
+    _access: None = Depends(require_workflow_http_access),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> WorkflowAcceptedResponse:
+    try:
+        return submit_workflow(
+            request.workflow_yaml,
+            workflow_registry=workflow_registry,
+            idempotency_key=idempotency_key,
+        )
+    except WorkflowSubmitError as exc:
+        raise _workflow_http_error(exc) from None
+
+
+@app.get(
+    "/workflows/{workflow_id}",
+    response_model=WorkflowStatusResponse,
+    operation_id="get_workflow",
+    summary="Get durable workflow status",
+    description=(
+        "Return sanitized durable workflow status, policy snapshot, "
+        "declared step templates, and child-run summaries for a workflow "
+        "submitted via POST /workflows. Never includes secrets, raw child "
+        "mission YAML, or agent stdout/stderr. Requires bearer auth. "
+        "Returns 403 while MISSION_CONTROL_WORKFLOW_ORCHESTRATION is unset "
+        "or false, and 404 when the workflow_id is unknown."
+    ),
+    responses={
+        200: {
+            "model": WorkflowStatusResponse,
+            "description": "Workflow record found.",
+        },
+        401: {"description": "Missing or invalid bearer token."},
+        403: {"description": "Workflow orchestration feature flag is off."},
+        404: {"description": "Unknown workflow_id."},
+    },
+)
+def get_workflow_endpoint(
+    workflow_id: str,
+    _access: None = Depends(require_workflow_http_access),
+) -> WorkflowStatusResponse:
+    try:
+        status = build_workflow_status(
+            workflow_id,
+            workflow_registry=workflow_registry,
+            run_registry=run_registry,
+        )
+    except WorkflowSubmitError as exc:
+        raise _workflow_http_error(exc) from None
+    if status is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return status
+
