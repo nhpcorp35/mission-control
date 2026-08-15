@@ -398,6 +398,7 @@ Covered (reconciler slice):
 - Two concurrent reconcilers do not duplicate child creation/execution
 - Feature-off: no thread; enable starts; shutdown cancels/awaits
 - Interval floor, batch/time bounds, fairness, poison isolation, infra backoff
+- Dispatch redrive attempt ceiling → poison; healthy queued handoff does not burn attempts
 - Child terminals via actual `RunStatus` (`completed`/`failed`/`timed_out`)
 - Ceilings / repeated blocker / approval boundary
 - Existing materializer, registry, queue, workflow, execution-lifecycle suites

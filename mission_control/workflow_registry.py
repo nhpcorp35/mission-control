@@ -2075,8 +2075,8 @@ class WorkflowRegistry:
     ) -> list[DispatchIntentRecord]:
         """Return pending / expired-lease intents due for reconciler redrive.
 
-        Exposed for the lifespan reconciler follow-up; this slice does not
-        start a continuous worker.
+        Poisoned and acked intents are excluded. Used by the lifespan
+        ``WorkflowReconciler`` tick (feature flag off by default).
         """
         clock = now or _utc_now()
         now_s = _format_dt(clock)

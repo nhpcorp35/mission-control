@@ -30,6 +30,7 @@ from mission_control.workflow_reconciler import (
     resolve_reconcile_max_tick_seconds,
 )
 from mission_control.workflow_registry import (
+    DISPATCH_MAX_ATTEMPTS,
     DispatchIntentState,
     StepMaterializationState,
     StepStatus,
@@ -560,7 +561,30 @@ class LifecycleTests(unittest.TestCase):
         )
         api_module.workflow_reconciler = reconciler
         try:
-            with patch.dict(os.environ, _FEATURE_OFF, clear=False):
+            # Isolate from the shared production DB path. Lifespan would
+            # otherwise call recover_interrupted_runs on /data/... which
+            # rejects legacy "Run interrupted by service restart" attribution.
+            # Preserve that guard — do not invoke recovery on the shared DB.
+            with (
+                patch.object(
+                    api_module.run_registry,
+                    "recover_interrupted_runs",
+                    return_value=0,
+                ),
+                patch.object(
+                    api_module.notification_outbox,
+                    "suppress_legacy_predeploy_backlog",
+                ),
+                patch.object(
+                    api_module.notification_delivery_worker,
+                    "start",
+                ),
+                patch.object(
+                    api_module.notification_delivery_worker,
+                    "stop",
+                ),
+                patch.dict(os.environ, _FEATURE_OFF, clear=False),
+            ):
                 with TestClient(app):
                     self.assertFalse(reconciler.is_running)
             self.assertFalse(reconciler.is_running)
@@ -571,6 +595,79 @@ class LifecycleTests(unittest.TestCase):
             run_reg.close()
             os.unlink(wf_path)
             os.unlink(run_path)
+
+
+class RedriveCeilingTests(ReconcilerTestCase):
+    def test_dispatch_attempt_ceiling_poisons_and_stops_redrive(self) -> None:
+        """Req: redrive ceilings poison intents; later ticks do not re-enqueue."""
+        wf, impl = self._bootstrap_impl_materialized()
+        child_id = impl.child_run_id
+        assert child_id is not None
+        # Exhaust the durable attempt ceiling so the next claim poisons.
+        with self.workflow_registry._lock:
+            self.workflow_registry._conn.execute(
+                """
+                UPDATE workflow_dispatch_intents
+                SET state = ?,
+                    attempt_count = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    next_attempt_at = ?,
+                    last_error = 'simulated_enqueue_failure'
+                WHERE child_run_id = ?
+                """,
+                (
+                    DispatchIntentState.PENDING.value,
+                    DISPATCH_MAX_ATTEMPTS,
+                    (
+                        datetime.now(timezone.utc) - timedelta(seconds=1)
+                    ).isoformat(),
+                    child_id,
+                ),
+            )
+            self.workflow_registry._conn.commit()
+
+        before_enqueues = self.queue.run_ids.count(child_id)
+        stats = self.reconciler.tick_once()
+        self.assertGreaterEqual(stats.redrives, 1)
+        intent = self.workflow_registry.get_dispatch_intent(child_id)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.state, DispatchIntentState.POISONED)
+        self.assertEqual(intent.last_error, "dispatch_attempt_ceiling")
+        self.assertEqual(self.queue.run_ids.count(child_id), before_enqueues)
+
+        # Poisoned intents are not redrivable; a later tick must not enqueue.
+        due = self.workflow_registry.list_redrivable_dispatch_intents(limit=32)
+        self.assertFalse(any(item.child_run_id == child_id for item in due))
+        self.reconciler.tick_once()
+        self.assertEqual(self.queue.run_ids.count(child_id), before_enqueues)
+        again = self.workflow_registry.get_dispatch_intent(child_id)
+        self.assertEqual(again.state, DispatchIntentState.POISONED)
+        _ = wf
+
+    def test_healthy_queued_handoff_does_not_burn_attempt_ceiling(self) -> None:
+        """Queued registry handoff releases lease without burning attempts."""
+        wf, impl = self._bootstrap_impl_materialized()
+        child_id = impl.child_run_id
+        intent = self.workflow_registry.get_dispatch_intent(child_id)
+        self.assertIsNotNone(intent)
+        # After successful materialize while still queued, attempts stay low.
+        self.assertLess(intent.attempt_count, DISPATCH_MAX_ATTEMPTS)
+        self.assertIn(
+            intent.state,
+            {DispatchIntentState.PENDING, DispatchIntentState.LEASED},
+        )
+        run = self.run_registry.get_run(child_id)
+        self.assertEqual(run.status, RunStatus.QUEUED)
+
+        # Empty process queue + tick redrives without poisoning.
+        self.queue.calls.clear()
+        self.reconciler.tick_once()
+        intent = self.workflow_registry.get_dispatch_intent(child_id)
+        self.assertNotEqual(intent.state, DispatchIntentState.POISONED)
+        self.assertLess(intent.attempt_count, DISPATCH_MAX_ATTEMPTS)
+        self.assertEqual(self.queue.run_ids.count(child_id), 1)
+        _ = wf
 
 
 class BoundsFairnessTests(ReconcilerTestCase):
