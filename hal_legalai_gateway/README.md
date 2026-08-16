@@ -225,17 +225,92 @@ This repository does **not** auto-create a new Railway service for the gateway.
    the Bridge service path.
 6. Confirm Railway injects `RAILWAY_GIT_COMMIT_SHA`.
 7. Expose public networking; health check path is `/health`.
-8. Verify `GET /health` shows `deployed_commit_sha`, `registered_tools`, `auth.inbound=github_oauth`, and independent `downstream.*` entries.
-9. Point ChatGPT Business custom MCP at the gateway `/mcp` OAuth URL (HAL
-   LegalAI Gateway Unified). Unified is the sole LegalAI interface; keep
-   Railway and GitHub administrative plugins only.
+8. Verify `GET /health` shows canonical `identity` (`display_name` =
+   `HAL LegalAI Gateway`), `deployed_commit_sha`, `registered_tools` covering
+   case/storage/mission/workflow, `auth.inbound=github_oauth`, and independent
+   `downstream.*` entries.
+9. Point ChatGPT Business custom MCP at the **existing** gateway `/mcp`
+   OAuth URL (`GATEWAY_PUBLIC_URL` + `/mcp`). Server metadata advertises
+   **HAL LegalAI Gateway**. Keep Railway and GitHub administrative plugins
+   only. Do not create a new ChatGPT connector when tools are added — see
+   [Canonical ChatGPT plugin identity](#canonical-chatgpt-plugin-identity).
+
+## Canonical ChatGPT plugin identity
+
+The gateway advertises one frozen identity so future deployments add tools on
+the same MCP surface rather than minting `HAL LegalAI Gateway Unified` /
+`Unified1` / `Unified2` / `Unified3` server names.
+
+### Controlled by this server (stable)
+
+| Field | Value | Where |
+| --- | --- | --- |
+| Display name | `HAL LegalAI Gateway` | MCP `initialize` → `serverInfo.name`; RFC 9728 `resource_name`; FastAPI title; `GET /`, `/health`, `/registry` → `identity.display_name` |
+| Service id | `hal-legalai-gateway` | `identity.service_id` (and existing `service` field) |
+| Identity version | `1` (frozen; **not** FastMCP library version, **not** `RAILWAY_GIT_COMMIT_SHA`) | MCP `serverInfo.version`; `identity.identity_version` |
+| Public origin | existing `GATEWAY_PUBLIC_URL` | MCP `serverInfo.websiteUrl`; `identity.website_url` |
+| MCP / OAuth resource URL | `{GATEWAY_PUBLIC_URL}/mcp` | inbound Streamable HTTP path; RFC 9728 `resource` |
+| Tool catalog | namespaced `case.*`, `storage.*`, `mission.*`, `workflow.*` | MCP `tools/list`; `registered_tools`; `/registry` `tool_bindings` |
+
+Adding mission, workflow, case, or storage tools must **not** change the
+display name, identity version, OAuth resource URL, GitHub OAuth client, or
+`GATEWAY_PUBLIC_URL`. Clients recache tools from the same `/mcp` surface.
+
+GitHub OAuth, JWT/Redis/Fernet, `GATEWAY_BRIDGE_AUTHORIZATION`, and inbound
+`/mcp` vs downstream `/mcp/service` paths are unchanged.
+
+### Controlled by ChatGPT (client-side plugin record)
+
+ChatGPT stores a **separate installed-plugin / custom-connector record**:
+display label, cached `tools/list`, and its own OAuth client registration.
+Historic labels `HAL LegalAI Gateway Unified`, `Unified1`, `Unified2`, and
+`Unified3` came from ChatGPT auto-suffixing **new** connector records when
+operators recreated the plugin after capability adds. **Server metadata
+cannot rename or merge an already-installed ChatGPT record.**
+
+### Future updates (in place — do this)
+
+1. Deploy the gateway at the **same** Railway public URL. Do not change
+   `GATEWAY_PUBLIC_URL`, GitHub OAuth app credentials, or `/mcp`.
+2. Confirm `GET /health` and `GET /registry` show
+   `identity.display_name=HAL LegalAI Gateway` and the full
+   `registered_tools` catalog (case, storage, mission, workflow).
+3. In ChatGPT, open the **existing** connector whose MCP URL is that same
+   `{GATEWAY_PUBLIC_URL}/mcp`. Refresh / reconnect / re-authorize **that
+   record** so `tools/list` is recached.
+4. Verify the namespaced tools appear. Do **not** add a second connector
+   pointing at the same URL.
+
+### One-time migration off Unified / UnifiedN
+
+If ChatGPT already lists numbered Unified records:
+
+1. Identify which records use the production gateway `/mcp` URL. Keep
+   Railway and GitHub administrative plugins.
+2. Prefer refreshing **one** existing production record (step 3 above).
+   ChatGPT may keep the historic client-side label (`Unified`, `Unified1`,
+   …) even after server metadata is canonical — that label is ChatGPT's
+   record, not the server name.
+3. If ChatGPT will not recache tools on the existing record, **manually
+   recreate once**: add **one** custom MCP connector named
+   `HAL LegalAI Gateway` at the existing production `/mcp` URL, complete
+   GitHub OAuth, then confirm the catalog.
+4. After that one recreation, **ChatGPT necessarily assigns a new
+   client-side plugin record**. Delete the unused Unified / UnifiedN
+   duplicates so only one LegalAI connector remains. Do not recreate again
+   for later tool additions — use the in-place update procedure.
+
+Do not revise Question 1, contact John Cuomo, or send anything externally.
 
 ## Live operating status (accepted 2026-08-10)
 
-**Sole LegalAI ChatGPT connection:** HAL LegalAI Gateway Unified.
+**Sole LegalAI ChatGPT connection:** server identity **HAL LegalAI Gateway**
+at the existing Railway gateway `/mcp` URL. Historic ChatGPT record names
+`Unified` / `UnifiedN` were client-side suffixes, not distinct endpoints.
 
 | Fact | Value |
 | --- | --- |
+| Canonical server / plugin identity | `HAL LegalAI Gateway` |
 | Accepted LegalAI Case SHA | `49f6881c08e7e4fdf76d8500d52a27d057c0804b` |
 | Acceptance mission_id | `case00-unified-acceptance2-20260810` |
 | GitHub Actions run (success) | `31404004716` |
@@ -259,13 +334,16 @@ confirmed matching sizes/ETags. Request IDs, correlation IDs, and
 failure-stage reporting present end-to-end. Acceptance condition **passed**.
 
 **Plugin posture:** Legacy duplicate LegalAI/Bridge/Storage/Mission Control
-test plugins removed (list in `docs/HAL_OPERATOR_LOG.md`). Keep Unified as
-the sole LegalAI interface; keep Railway and GitHub administrative plugins.
-Do not revise Question 1, contact John Cuomo, or send anything externally.
+test plugins were removed (list in `docs/HAL_OPERATOR_LOG.md`). Keep a single
+LegalAI ChatGPT connector against the canonical gateway `/mcp` identity;
+keep Railway and GitHub administrative plugins. Numbered Unified records are
+ChatGPT leftovers from manual recreation — migrate once per the procedure
+above; do not recreate for each capability add.
 
 ## Non-goals
 
 - No Case-00 Q1 generation, private benchmark access, recipient-policy, or storage archive mutation inside the gateway
 - No replacement of Mission Control, bridge, or B2 business logic
 - No automatic Railway service creation from this repo alone
-- No reintroduction of legacy duplicate LegalAI ChatGPT plugins; Unified remains the sole LegalAI interface
+- No reintroduction of legacy duplicate LegalAI ChatGPT plugins; the canonical server identity remains **HAL LegalAI Gateway**
+- Server code does not rename ChatGPT installed-plugin records
