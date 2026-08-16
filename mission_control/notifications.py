@@ -33,6 +33,17 @@ state transition, so a concurrent terminal commit cannot lose to
 row/status fail closed (auditable ``skipped``, no paging). Interrupted-run
 startup ``recovery`` rows and ``terminal`` / ``phase_change`` events are
 preserved.
+
+Workflow child runs are identified only from the durable
+``workflow_steps.child_run_id`` relationship in the shared SQLite
+database (never names, prefixes, process memory, or caller flags).
+Synthetic workflow outbox ids (``workflow:<workflow_id>``) are never
+children. Child ``stale``, ``recovery``, ``phase_change``, and
+``terminal`` rows remain auditable but transition to ``skipped`` with
+``workflow_child_suppressed`` at enqueue, claim, and the same race-safe
+delivery finalization boundary so they cannot page once membership
+exists. Standalone missions and workflow-level terminal alerts are
+unchanged.
 """
 
 from __future__ import annotations
@@ -76,6 +87,8 @@ logger = logging.getLogger(__name__)
 
 _OUTBOX_TABLE = "notification_outbox"
 _STALE_EPISODE_TABLE = "notification_stale_episodes"
+# Shared SQLite table owned by WorkflowRegistry; queried, never migrated here.
+_WORKFLOW_STEPS_TABLE = "workflow_steps"
 _STALE_EPISODE_OPEN = "open"
 _STALE_EPISODE_RECOVERED = "recovered"
 _STALE_EPISODE_CLOSED_TERMINAL = "closed_terminal"
@@ -138,6 +151,8 @@ LEGACY_PREDEPLOY_BACKLOG_SUPPRESSED = "legacy_predeploy_backlog_suppressed"
 STALE_RECOVERY_TERMINAL_RUN_SUPPRESSED = "stale_recovery_terminal_run_suppressed"
 # Fail-closed disposition when runs table / run row / status cannot be read.
 STALE_RECOVERY_RUN_STATUS_UNAVAILABLE = "stale_recovery_run_status_unavailable"
+# Durable child-run phone suppression (all event kinds; history retained).
+WORKFLOW_CHILD_SUPPRESSED = "workflow_child_suppressed"
 # Paired heartbeat recovery dedupe prefix (not interrupted-run startup recovery).
 _HEARTBEAT_RECOVERY_DEDUPE_PREFIX = "recovery:stale:"
 
@@ -1478,6 +1493,18 @@ class NotificationOutbox:
         assert now is not None
         with self._lock:
             try:
+                child_skip = self._is_durable_workflow_child_unlocked(
+                    str(run_id)[:64]
+                )
+                delivery_state = (
+                    DeliveryState.SKIPPED.value
+                    if child_skip
+                    else DeliveryState.PENDING.value
+                )
+                last_error = (
+                    WORKFLOW_CHILD_SUPPRESSED if child_skip else None
+                )
+                next_attempt_at = None if child_skip else now
                 self._conn.execute(
                     f"""
                     INSERT INTO {_OUTBOX_TABLE} (
@@ -1493,7 +1520,7 @@ class NotificationOutbox:
                         delivered_at,
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?)
                     """,
                     (
                         event_id,
@@ -1501,8 +1528,9 @@ class NotificationOutbox:
                         kind,
                         str(dedupe_key)[:128],
                         json.dumps(clean, separators=(",", ":"), sort_keys=True),
-                        DeliveryState.PENDING.value,
-                        now,
+                        delivery_state,
+                        next_attempt_at,
+                        last_error,
                         now,
                         now,
                     ),
@@ -1876,6 +1904,14 @@ class NotificationOutbox:
         clean["dedupe_key"] = str(dedupe_key)[:128]
         if "occurred_at" not in clean or not clean["occurred_at"]:
             clean["occurred_at"] = now_s
+        child_skip = self._is_durable_workflow_child_unlocked(str(run_id)[:64])
+        delivery_state = (
+            DeliveryState.SKIPPED.value
+            if child_skip
+            else DeliveryState.PENDING.value
+        )
+        last_error = WORKFLOW_CHILD_SUPPRESSED if child_skip else None
+        next_attempt_at = None if child_skip else now_s
         self._conn.execute(
             f"""
             INSERT INTO {_OUTBOX_TABLE} (
@@ -1891,7 +1927,7 @@ class NotificationOutbox:
                 delivered_at,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?)
             """,
             (
                 event_id,
@@ -1899,8 +1935,9 @@ class NotificationOutbox:
                 event_kind,
                 str(dedupe_key)[:128],
                 json.dumps(clean, separators=(",", ":"), sort_keys=True),
-                DeliveryState.PENDING.value,
-                now_s,
+                delivery_state,
+                next_attempt_at,
+                last_error,
                 now_s,
                 now_s,
             ),
@@ -2242,6 +2279,42 @@ class NotificationOutbox:
             return None
         return str(row["status"])
 
+    def _workflow_steps_table_exists_unlocked(self) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 AS ok FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            """,
+            (_WORKFLOW_STEPS_TABLE,),
+        ).fetchone()
+        return row is not None
+
+    def _is_durable_workflow_child_unlocked(self, run_id: str) -> bool:
+        """True when ``workflow_steps.child_run_id`` durably names this run.
+
+        Synthetic workflow outbox identities are never children. A missing
+        ``workflow_steps`` table means standalone (not a child).
+        """
+        rid = str(run_id or "").strip()[:64]
+        if not rid or is_workflow_outbox_run_id(rid):
+            return False
+        if not self._workflow_steps_table_exists_unlocked():
+            return False
+        row = self._conn.execute(
+            f"""
+            SELECT 1 AS ok FROM {_WORKFLOW_STEPS_TABLE}
+            WHERE child_run_id = ?
+            LIMIT 1
+            """,
+            (rid,),
+        ).fetchone()
+        return row is not None
+
+    def is_durable_workflow_child_run(self, run_id: str) -> bool:
+        """Return whether ``run_id`` is a durable workflow child (locked)."""
+        with self._lock:
+            return self._is_durable_workflow_child_unlocked(run_id)
+
     def _suppress_stale_recovery_sql_params(
         self, *, now_s: str, run_id: str | None = None
     ) -> tuple[str, tuple[Any, ...]]:
@@ -2334,6 +2407,78 @@ class NotificationOutbox:
                 run_id
             )
 
+    def _suppress_workflow_child_sql_params(
+        self, *, now_s: str, run_id: str | None = None
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build UPDATE ... WHERE for durable workflow-child outbox rows."""
+        sql = f"""
+            UPDATE {_OUTBOX_TABLE}
+            SET delivery_state = ?,
+                last_error = ?,
+                claim_owner = NULL,
+                claim_expires_at = NULL,
+                next_attempt_at = NULL,
+                updated_at = ?
+            WHERE delivery_state IN (?, ?)
+              AND {_OUTBOX_TABLE}.run_id NOT LIKE ?
+              AND EXISTS (
+                SELECT 1 FROM {_WORKFLOW_STEPS_TABLE} ws
+                WHERE ws.child_run_id = {_OUTBOX_TABLE}.run_id
+              )
+        """
+        params: list[Any] = [
+            DeliveryState.SKIPPED.value,
+            WORKFLOW_CHILD_SUPPRESSED,
+            now_s,
+            DeliveryState.PENDING.value,
+            DeliveryState.IN_FLIGHT.value,
+            f"{WORKFLOW_OUTBOX_RUN_ID_PREFIX}%",
+        ]
+        if run_id is not None:
+            sql += f" AND {_OUTBOX_TABLE}.run_id = ?"
+            params.append(str(run_id)[:64])
+        return sql, tuple(params)
+
+    def _suppress_workflow_child_rows_unlocked(
+        self, *, now_s: str, run_id: str | None = None
+    ) -> int:
+        """Skip pending/in-flight child rows. Caller holds the lock.
+
+        No-op when ``workflow_steps`` is absent. Does not begin/commit.
+        """
+        if not self._workflow_steps_table_exists_unlocked():
+            return 0
+        sql, params = self._suppress_workflow_child_sql_params(
+            now_s=now_s, run_id=run_id
+        )
+        cursor = self._conn.execute(sql, params)
+        return int(cursor.rowcount or 0)
+
+    def suppress_workflow_child_outbox(self, run_id: str | None = None) -> int:
+        """Idempotently skip pending/in-flight rows for durable workflow children.
+
+        Synthetic ``workflow:`` outbox identities are never touched. History is
+        retained with ``last_error=workflow_child_suppressed``.
+        """
+        now_s = _format_dt(_utc_now())
+        assert now_s is not None
+        with self._lock:
+            try:
+                self._begin_immediate_unlocked()
+                affected = self._suppress_workflow_child_rows_unlocked(
+                    now_s=now_s, run_id=run_id
+                )
+                self._conn.commit()
+            except Exception:
+                self._rollback_unlocked()
+                raise
+        if affected:
+            logger.info(
+                "workflow child notification rows suppressed count=%s",
+                affected,
+            )
+        return affected
+
     def _heartbeat_stale_recovery_suppress_reason_unlocked(
         self, run_id: str
     ) -> str | None:
@@ -2351,7 +2496,26 @@ class NotificationOutbox:
             return STALE_RECOVERY_TERMINAL_RUN_SUPPRESSED
         return None
 
-    def _finalize_terminal_dependent_outbox_row(
+    def _claimed_row_suppress_reason_unlocked(
+        self, row: sqlite3.Row
+    ) -> str | None:
+        """Return skip reason for a claimed row, or None when delivery may proceed.
+
+        Child membership is checked first from durable ``workflow_steps``.
+        Heartbeat stale/paired recovery still fail closed on terminal/unavailable
+        run status so prior terminalization races cannot page.
+        """
+        if self._is_durable_workflow_child_unlocked(str(row["run_id"] or "")):
+            return WORKFLOW_CHILD_SUPPRESSED
+        if is_heartbeat_stale_or_paired_recovery(
+            row["event_kind"], row["dedupe_key"]
+        ):
+            return self._heartbeat_stale_recovery_suppress_reason_unlocked(
+                row["run_id"]
+            )
+        return None
+
+    def _finalize_claimed_outbox_row(
         self,
         row: sqlite3.Row,
         *,
@@ -2362,26 +2526,21 @@ class NotificationOutbox:
         delivered_at: str | None = None,
         clear_error: bool = False,
     ) -> str:
-        """Atomic terminal-dependent finalization for heartbeat stale/recovery.
+        """Atomic claimed-row finalization (child membership + terminal races).
 
-        Under one ``BEGIN IMMEDIATE`` transaction, reads canonical run status
-        and chooses the permitted CAS transition while still ``in_flight``:
+        Under one ``BEGIN IMMEDIATE`` transaction, re-reads durable child
+        membership and (for heartbeat stale/recovery) canonical run status,
+        then chooses the permitted CAS while still ``in_flight``:
 
-        - terminal or status unavailable → ``skipped`` (fail closed; no paging)
-        - else if ``active_delivery_state`` is set → that state (delivered /
-          pending retry / dead-letter)
+        - workflow child → ``skipped`` (``workflow_child_suppressed``)
+        - heartbeat stale/recovery terminal or status unavailable → ``skipped``
+        - else if ``active_delivery_state`` is set → that state
         - else → leave the claim unchanged (``active``; pre-send check)
 
         Never overwrites ``skipped`` or any non-``in_flight`` state. Returns
         ``skipped``, ``delivered``, ``pending``, ``dead``, ``active``, or
         ``cas_missed``.
         """
-        if not is_heartbeat_stale_or_paired_recovery(
-            row["event_kind"], row["dedupe_key"]
-        ):
-            raise ValueError(
-                "terminal-dependent finalize requires heartbeat stale/recovery"
-            )
         now_s = _format_dt(_utc_now())
         assert now_s is not None
         outcome = "cas_missed"
@@ -2389,9 +2548,7 @@ class NotificationOutbox:
         with self._lock:
             try:
                 self._begin_immediate_unlocked()
-                reason = self._heartbeat_stale_recovery_suppress_reason_unlocked(
-                    row["run_id"]
-                )
+                reason = self._claimed_row_suppress_reason_unlocked(row)
                 if reason is not None:
                     cursor = self._conn.execute(
                         f"""
@@ -2477,6 +2634,47 @@ class NotificationOutbox:
             )
         return outcome
 
+    def _finalize_terminal_dependent_outbox_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        active_delivery_state: str | None = None,
+        attempt_count: int | None = None,
+        next_attempt_at: str | None = None,
+        last_error: str | None = None,
+        delivered_at: str | None = None,
+        clear_error: bool = False,
+    ) -> str:
+        """Atomic terminal-dependent finalization for heartbeat stale/recovery.
+
+        Under one ``BEGIN IMMEDIATE`` transaction, reads canonical run status
+        and chooses the permitted CAS transition while still ``in_flight``:
+
+        - terminal or status unavailable → ``skipped`` (fail closed; no paging)
+        - else if ``active_delivery_state`` is set → that state (delivered /
+          pending retry / dead-letter)
+        - else → leave the claim unchanged (``active``; pre-send check)
+
+        Never overwrites ``skipped`` or any non-``in_flight`` state. Returns
+        ``skipped``, ``delivered``, ``pending``, ``dead``, ``active``, or
+        ``cas_missed``.
+        """
+        if not is_heartbeat_stale_or_paired_recovery(
+            row["event_kind"], row["dedupe_key"]
+        ):
+            raise ValueError(
+                "terminal-dependent finalize requires heartbeat stale/recovery"
+            )
+        return self._finalize_claimed_outbox_row(
+            row,
+            active_delivery_state=active_delivery_state,
+            attempt_count=attempt_count,
+            next_attempt_at=next_attempt_at,
+            last_error=last_error,
+            delivered_at=delivered_at,
+            clear_error=clear_error,
+        )
+
     def _try_suppress_claimed_stale_recovery_if_terminal(
         self, row: sqlite3.Row
     ) -> bool:
@@ -2530,10 +2728,18 @@ class NotificationOutbox:
             )
             self._conn.commit()
             reclaimed = int(cursor.rowcount or 0)
+            child_skipped = self._suppress_workflow_child_rows_unlocked(
+                now_s=now_s
+            )
         if reclaimed:
             logger.info(
                 "notification reclaimed stale in_flight count=%s",
                 reclaimed,
+            )
+        if child_skipped:
+            logger.info(
+                "workflow child notification rows suppressed count=%s",
+                child_skipped,
             )
         return reclaimed
 
@@ -2574,6 +2780,14 @@ class NotificationOutbox:
                     now_s,
                 ),
             )
+            child_skipped = self._suppress_workflow_child_rows_unlocked(
+                now_s=now_s
+            )
+            if child_skipped:
+                logger.info(
+                    "workflow child notification rows suppressed count=%s",
+                    child_skipped,
+                )
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM {_OUTBOX_TABLE}
@@ -2680,37 +2894,33 @@ class NotificationOutbox:
         )
 
     def _finalize_successful_delivery(self, row: sqlite3.Row) -> str:
-        """CAS deliver, or suppress if run became terminal mid-flight.
+        """CAS deliver, or skip if membership/terminal race forbids paging.
 
-        Heartbeat stale/paired recovery rows finalize under one
-        ``BEGIN IMMEDIATE`` that re-reads run status and either skips or
-        CAS-delivers, so a concurrent terminal transition cannot lose to
+        All claimed rows finalize under one ``BEGIN IMMEDIATE`` that re-reads
+        durable child membership and (for heartbeat stale/recovery) run status
+        so a concurrent child bind or terminal commit cannot lose to
         ``delivered``.
 
         Returns ``delivered``, ``skipped``, or ``cas_missed``.
         """
-        if is_heartbeat_stale_or_paired_recovery(
-            row["event_kind"], row["dedupe_key"]
-        ):
-            now_s = _format_dt(_utc_now())
-            assert now_s is not None
-            return self._finalize_terminal_dependent_outbox_row(
-                row,
-                active_delivery_state=DeliveryState.DELIVERED.value,
-                next_attempt_at=None,
-                delivered_at=now_s,
-                clear_error=True,
-            )
-        if self._mark_delivered(row["event_id"]):
-            return "delivered"
-        logger.info(
-            "notification deliver CAS missed event_id=%s run_id=%s "
-            "event_kind=%s (already terminalized or reclaimed)",
-            row["event_id"],
-            row["run_id"],
-            row["event_kind"],
+        now_s = _format_dt(_utc_now())
+        assert now_s is not None
+        outcome = self._finalize_claimed_outbox_row(
+            row,
+            active_delivery_state=DeliveryState.DELIVERED.value,
+            next_attempt_at=None,
+            delivered_at=now_s,
+            clear_error=True,
         )
-        return "cas_missed"
+        if outcome == "cas_missed":
+            logger.info(
+                "notification deliver CAS missed event_id=%s run_id=%s "
+                "event_kind=%s (already terminalized or reclaimed)",
+                row["event_id"],
+                row["run_id"],
+                row["event_kind"],
+            )
+        return outcome
 
     def _mark_skipped(
         self,
@@ -2775,12 +2985,12 @@ class NotificationOutbox:
         backoff_base_seconds: float,
         backoff_max_seconds: float,
     ) -> str:
-        """Retry/dead-letter finalization; terminal-dependent rows use the CAS.
+        """Retry/dead-letter finalization; suppressed rows use the CAS.
 
         Heartbeat stale/paired recovery never transitions to retry or
         dead-letter when the run is terminal or status is unavailable.
-        Returns the resulting delivery state name, ``skipped``, or
-        ``cas_missed``.
+        Workflow children skip instead of retrying. Returns the resulting
+        delivery state name, ``skipped``, or ``cas_missed``.
         """
         safe_error = redact_notification_error(error) or "delivery_failed"
         now = _utc_now()
@@ -2797,56 +3007,31 @@ class NotificationOutbox:
             next_at = _format_dt(
                 datetime.fromtimestamp(now.timestamp() + delay, tz=timezone.utc)
             )
-        if is_heartbeat_stale_or_paired_recovery(
-            row["event_kind"], row["dedupe_key"]
-        ):
-            return self._finalize_terminal_dependent_outbox_row(
-                row,
-                active_delivery_state=state,
-                attempt_count=attempt_count,
-                next_attempt_at=next_at,
-                last_error=safe_error,
-            )
-        self._mark_retry_or_dead(
-            row["event_id"],
+        return self._finalize_claimed_outbox_row(
+            row,
+            active_delivery_state=state,
             attempt_count=attempt_count,
-            error=safe_error,
-            max_attempts=max_attempts,
-            backoff_base_seconds=backoff_base_seconds,
-            backoff_max_seconds=backoff_max_seconds,
+            next_attempt_at=next_at,
+            last_error=safe_error,
         )
-        return state
 
     def _deliver_one(self, row: sqlite3.Row, config: NotificationConfig) -> None:
         """Attempt one backend delivery. Never mutates mission/run status."""
-        # Race-safe: skip obsolete heartbeat stale/recovery once run is terminal
-        # (even when delivery backends are opt-in disabled).
-        if is_heartbeat_stale_or_paired_recovery(
-            row["event_kind"], row["dedupe_key"]
-        ):
-            pre = self._finalize_terminal_dependent_outbox_row(row)
-            if pre != "active":
-                return
+        # Race-safe: skip workflow children and obsolete heartbeat stale/
+        # recovery once the run is terminal (even when backends are disabled).
+        pre = self._finalize_claimed_outbox_row(row)
+        if pre != "active":
+            return
 
         backend = resolve_delivery_backend(config)
         if backend == BACKEND_NONE:
             # Opt-in off: leave pending so inspection still works; do not HTTP.
-            # Heartbeat stale/recovery still re-check terminal status atomically.
-            if is_heartbeat_stale_or_paired_recovery(
-                row["event_kind"], row["dedupe_key"]
-            ):
-                self._finalize_terminal_dependent_outbox_row(
-                    row,
-                    active_delivery_state=DeliveryState.PENDING.value,
-                    next_attempt_at=_format_dt(_utc_now()),
-                )
-            else:
-                self._clear_claim_fields(
-                    row["event_id"],
-                    delivery_state=DeliveryState.PENDING.value,
-                    next_attempt_at=_format_dt(_utc_now()),
-                    only_if_in_flight=True,
-                )
+            # Re-check child membership and terminal status atomically.
+            self._finalize_claimed_outbox_row(
+                row,
+                active_delivery_state=DeliveryState.PENDING.value,
+                next_attempt_at=_format_dt(_utc_now()),
+            )
             return
 
         if backend == BACKEND_PUSHOVER:
