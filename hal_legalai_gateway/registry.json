@@ -79,6 +79,14 @@
         "mission.submit_and_wait",
         "mission.run_repository_command"
       ]
+    },
+    "workflow": {
+      "description": "Mission Control durable workflow submit and sanitized status tools.",
+      "downstream_service": "mission_control",
+      "tools": [
+        "workflow.submit",
+        "workflow.status"
+      ]
     }
   },
   "tool_routes": [
@@ -268,6 +276,20 @@
       "namespace": "mission",
       "downstream_service": "mission_control",
       "downstream_tool": "run_repository_command"
+    },
+    {
+      "tool": "workflow.submit",
+      "namespace": "workflow",
+      "downstream_service": "mission_control",
+      "downstream_tool": "submit_workflow",
+      "description": "Submit bounded workflow YAML to Mission Control (downstream submit_workflow). Accepts workflow_yaml and optional idempotency_key and returns the downstream structured envelope. Orchestration remains fail-closed while MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. Thin forwarder: no YAML parsing, polling, or feature enabling in the gateway."
+    },
+    {
+      "tool": "workflow.status",
+      "namespace": "workflow",
+      "downstream_service": "mission_control",
+      "downstream_tool": "get_workflow",
+      "description": "Return sanitized durable workflow and child summaries for a canonical workflow_id (downstream get_workflow). Secrets, child mission YAML, and agent stdout/stderr are never included. Orchestration remains fail-closed while MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. Thin forwarder: no polling, cancel, history, or workflow parsing in the gateway."
     }
   ]
 }
