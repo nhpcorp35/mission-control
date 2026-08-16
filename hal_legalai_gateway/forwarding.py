@@ -260,6 +260,46 @@ def _httpx_factory(
     return factory
 
 
+# FastMCP StreamableHttpTransport does ``get_http_headers() | self.headers``.
+# After that merge, keep only a case-insensitive fail-closed allowlist.
+# Service BearerAuth is applied separately via transport ``auth=`` and is not
+# copied into this mapping. Protocol headers the MCP SDK adds later onto
+# individual requests (content-type, mcp-session-id, mcp-protocol-version)
+# are not present here and must not be filtered at construction time.
+_OUTBOUND_MERGED_HEADER_ALLOWLIST = frozenset(
+    {
+        "accept",
+        "x-request-id",
+        "x-correlation-id",
+    }
+)
+
+
+def _filter_outbound_merged_headers(headers: Any) -> dict[str, str]:
+    """Keep only fail-closed allowlisted names from FastMCP's merged mapping."""
+    if not headers:
+        return {}
+    items = headers.items() if hasattr(headers, "items") else ()
+    return {
+        str(name): str(value)
+        for name, value in items
+        if str(name).lower() in _OUTBOUND_MERGED_HEADER_ALLOWLIST
+    }
+
+
+def _isolating_httpx_factory(
+    inner: Callable[..., httpx.AsyncClient],
+) -> Callable[..., httpx.AsyncClient]:
+    """Wrap a client factory so FastMCP's inbound header merge is allowlisted."""
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        if "headers" in kwargs:
+            kwargs["headers"] = _filter_outbound_merged_headers(kwargs["headers"])
+        return inner(**kwargs)
+
+    return factory
+
+
 async def forward_mcp_tool(
     *,
     binding: ToolBinding,
@@ -283,6 +323,11 @@ async def forward_mcp_tool(
     Service credentials are passed via StreamableHttpTransport ``auth=`` (raw
     token → FastMCP BearerAuth). ``httpx_client_factory`` may be overridden in
     tests (e.g. ASGI transport) without bypassing that auth path.
+
+    Inbound ``get_http_headers()`` are filtered through a fail-closed
+    allowlist after FastMCP merges them; only Accept / X-Request-ID /
+    X-Correlation-ID remain on the client defaults. Service Bearer, when
+    configured, is applied exclusively via transport ``auth=``.
     """
     started = time.perf_counter()
     request_id = get_request_id()
@@ -337,8 +382,10 @@ async def forward_mcp_tool(
 
     # Correlation headers only — never inject Authorization manually.
     # FastMCP 2.x StreamableHttpTransport accepts auth=str → BearerAuth(raw
-    # token). Manual Authorization headers can be overwritten or doubled when
-    # get_http_headers() merges inbound user OAuth into the outbound client.
+    # token) and merges get_http_headers() into the outbound client. That merge
+    # would otherwise leak inbound credentials (including unknown aliases).
+    # Allowlist the merged mapping after construction-time merge; service
+    # BearerAuth is applied by transport auth=, not by forwarding inbound OAuth.
     headers: dict[str, str] = {
         "Accept": "application/json, text/event-stream",
     }
@@ -356,9 +403,12 @@ async def forward_mcp_tool(
         if client_factory is not None:
             client = client_factory()
         else:
-            factory = httpx_client_factory or _httpx_factory(
-                connect_timeout=connect_timeout_seconds,
-                read_timeout=read_timeout_seconds,
+            factory = _isolating_httpx_factory(
+                httpx_client_factory
+                or _httpx_factory(
+                    connect_timeout=connect_timeout_seconds,
+                    read_timeout=read_timeout_seconds,
+                )
             )
             transport = StreamableHttpTransport(
                 url,

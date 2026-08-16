@@ -7,6 +7,7 @@ import json
 import os
 import unittest
 from pathlib import Path
+from typing import Any, Callable
 from unittest import mock
 
 from cryptography.fernet import Fernet
@@ -15,7 +16,13 @@ import httpx
 from fastapi.testclient import TestClient
 
 from hal_legalai_gateway import config as gateway_config
+from fastmcp.server.auth import AccessToken
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.http import set_http_request
+from starlette.requests import Request
+
 from hal_legalai_gateway.auth import (
+    SERVICE_CLIENT_ID,
     FixedTokenAuthProvider,
     ServiceTokenVerifier,
     normalize_bearer_token,
@@ -48,8 +55,10 @@ from hal_legalai_gateway.health import (
 )
 from hal_legalai_gateway.mcp_server import (
     DEFAULT_TOOL_BINDINGS,
+    bindings_from_registry,
     create_mcp_server,
     list_registered_tool_names,
+    register_forwarding_tools,
 )
 from hal_legalai_gateway.registry import (
     REQUIRED_GATEWAY_TOOLS,
@@ -77,6 +86,22 @@ REGISTRY_PATH = (
 TEST_STORAGE_ENCRYPTION_KEY = Fernet.generate_key().decode()
 TEST_GATEWAY_OAUTH_TOKEN = "test-gateway-oauth-token"
 TEST_BRIDGE_SERVICE_TOKEN = "test-bridge-service-token"
+TEST_SECRET_VALUE_WF_GW = "TEST_SECRET_VALUE_WF_GW"
+WORKFLOW_YAML_FIXTURE = (
+    "version: '1.0'\n"
+    "policy:\n"
+    "  repository_name: Mission-Control\n"
+    f"  token: {TEST_SECRET_VALUE_WF_GW}\n"
+    "steps: []\n"
+)
+WORKFLOW_IDEMPOTENCY_KEY = "wf-replay-01"
+CANONICAL_WORKFLOW_ID = "00000000-0000-4000-8000-000000000001"
+EXPECTED_NAMESPACES = REQUIRED_NAMESPACES | {"workflow"}
+FORBIDDEN_WORKFLOW_TOOLS = (
+    "workflow.wait",
+    "workflow.cancel",
+    "workflow.history",
+)
 
 REQUIRED_SECRETS = {
     "GITHUB_OAUTH_CLIENT_ID": "test-gateway-client-id",
@@ -100,7 +125,8 @@ class RegistryTests(unittest.TestCase):
     def test_bundled_registry_loads_and_has_required_namespaces(self) -> None:
         registry = load_registry(REGISTRY_PATH)
         self.assertEqual(registry.version, 2)
-        self.assertEqual(REQUIRED_NAMESPACES, set(registry.namespaces))
+        self.assertEqual(EXPECTED_NAMESPACES, set(registry.namespaces))
+        self.assertTrue(REQUIRED_NAMESPACES.issubset(set(registry.namespaces)))
         self.assertEqual(REQUIRED_SERVICES, set(registry.services))
         self.assertEqual(registry.namespaces["case"].downstream_service, "bridge")
         self.assertEqual(
@@ -109,13 +135,26 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(
             registry.namespaces["mission"].downstream_service, "mission_control"
         )
+        self.assertEqual(
+            registry.namespaces["workflow"].downstream_service,
+            "mission_control",
+        )
         self.assertIn("case.submit_case00_q1", registry.namespaces["case"].tools)
         self.assertIn(
             "storage.list_inventory", registry.namespaces["storage"].tools
         )
         self.assertIn("mission.submit", registry.namespaces["mission"].tools)
+        self.assertEqual(
+            registry.namespaces["workflow"].tools,
+            ("workflow.submit", "workflow.status"),
+        )
         present = {binding.gateway_tool for binding in registry.tool_bindings}
         self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(present))
+        self.assertIn("workflow.submit", present)
+        self.assertIn("workflow.status", present)
+        for forbidden in FORBIDDEN_WORKFLOW_TOOLS:
+            self.assertNotIn(forbidden, present)
+            self.assertNotIn(forbidden, registry.namespaces["workflow"].tools)
 
     def test_tool_routes_and_bindings_point_artifacts_independently(self) -> None:
         registry = load_registry(REGISTRY_PATH)
@@ -177,6 +216,22 @@ class RegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             registry.downstream_for_tool("case.submit_case00_q1"), "bridge"
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("workflow.submit"),
+            "submit_workflow",
+        )
+        self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("workflow.status"),
+            "get_workflow",
+        )
+        self.assertEqual(
+            registry.downstream_for_tool("workflow.submit"),
+            "mission_control",
+        )
+        self.assertEqual(
+            registry.downstream_for_tool("workflow.status"),
+            "mission_control",
         )
 
     def test_parse_registry_rejects_missing_namespace(self) -> None:
@@ -880,6 +935,8 @@ class McpRegistrationTests(unittest.TestCase):
         )
         mcp = create_mcp_server(settings, auth=_test_inbound_auth())
         names = asyncio.run(list_registered_tool_names(mcp))
+        expected = sorted(binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS)
+        self.assertEqual(names, expected)
         for required in REQUIRED_GATEWAY_TOOLS:
             self.assertIn(required, names)
         self.assertIn("case.submit_case00_q1", names)
@@ -889,6 +946,10 @@ class McpRegistrationTests(unittest.TestCase):
         self.assertIn("storage.list_acceptance_contracts", names)
         self.assertIn("storage.get_acceptance_contract_template", names)
         self.assertIn("storage.get_acceptance_contract", names)
+        self.assertIn("workflow.submit", names)
+        self.assertIn("workflow.status", names)
+        for forbidden in FORBIDDEN_WORKFLOW_TOOLS:
+            self.assertNotIn(forbidden, names)
 
     def test_case_get_artifact_filename_schema_is_question_agnostic(self) -> None:
         """Unified case.get_artifact must not hardcode a Q1-only filename enum."""
@@ -1000,13 +1061,19 @@ class ApiTests(unittest.TestCase):
         response = self.client.get("/registry")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(set(payload["namespaces"]), REQUIRED_NAMESPACES)
+        self.assertEqual(set(payload["namespaces"]), EXPECTED_NAMESPACES)
         self.assertEqual(
             payload["resolved_downstreams"]["bridge"]["base_url"],
             "https://bridge.example",
         )
         tools = {item["tool"] for item in payload["tool_bindings"]}
         self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(tools))
+        self.assertIn("workflow.submit", tools)
+        self.assertIn("workflow.status", tools)
+        self.assertEqual(
+            payload["namespaces"]["workflow"]["downstream_service"],
+            "mission_control",
+        )
 
     def test_mcp_requires_authorization(self) -> None:
         response = self.client.post(
@@ -1223,6 +1290,795 @@ class RequestContextUnitTests(unittest.TestCase):
     def test_contextvars_default_empty(self) -> None:
         self.assertIsNone(get_request_id())
         self.assertIsNone(get_correlation_id())
+
+
+class WorkflowGatewaySliceDTests(unittest.TestCase):
+    """Unified gateway workflow.submit / workflow.status thin forwarders."""
+
+    def setUp(self) -> None:
+        self.settings = load_settings(
+            environ={
+                **REQUIRED_SECRETS,
+                "GATEWAY_BRIDGE_URL": "https://bridge.example",
+                "GATEWAY_STORAGE_URL": "https://storage.example",
+                "GATEWAY_MISSION_CONTROL_URL": "https://mission.example",
+                "GATEWAY_ARTIFACTS_URL": "https://artifacts.example",
+            },
+            registry=load_registry(REGISTRY_PATH),
+        )
+        self.tokens = bind_request_ids(
+            request_id="req-workflow-1",
+            correlation_id="corr-workflow-1",
+        )
+
+    def tearDown(self) -> None:
+        reset_request_ids(self.tokens)
+
+    def _collect_tools(self, *gateway_tools: str) -> dict[str, Any]:
+        collector: dict[str, Any] = {}
+
+        class _Mcp:
+            def tool(self, *args: Any, **kwargs: Any):
+                def decorator(fn: Any) -> Any:
+                    name = kwargs.get("name") or (args[0] if args else None)
+                    if name in gateway_tools:
+                        collector[name] = fn
+                    return fn
+
+                return decorator
+
+        register_forwarding_tools(
+            _Mcp(),  # type: ignore[arg-type]
+            self.settings,
+            bindings_from_registry(self.settings.registry),
+        )
+        return collector
+
+    def test_registry_and_defaults_agree_exactly(self) -> None:
+        registry = load_registry(REGISTRY_PATH)
+        registry_ids = [
+            (
+                binding.gateway_tool,
+                binding.namespace,
+                binding.downstream_service,
+                binding.downstream_tool,
+            )
+            for binding in registry.tool_bindings
+        ]
+        default_ids = [
+            (
+                binding.gateway_tool,
+                binding.namespace,
+                binding.downstream_service,
+                binding.downstream_tool,
+            )
+            for binding in DEFAULT_TOOL_BINDINGS
+        ]
+        self.assertEqual(registry_ids, default_ids)
+        merged = bindings_from_registry(registry)
+        merged_by_name = {binding.gateway_tool: binding for binding in merged}
+        defaults_by_name = {
+            binding.gateway_tool: binding for binding in DEFAULT_TOOL_BINDINGS
+        }
+        self.assertEqual(set(merged_by_name), set(defaults_by_name))
+        for name in ("workflow.submit", "workflow.status"):
+            registry_binding = next(
+                binding
+                for binding in registry.tool_bindings
+                if binding.gateway_tool == name
+            )
+            default_binding = defaults_by_name[name]
+            self.assertEqual(registry_binding.description, default_binding.description)
+            self.assertEqual(
+                merged_by_name[name].description, default_binding.description
+            )
+            self.assertEqual(
+                registry_binding.downstream_service, "mission_control"
+            )
+            for text in (
+                registry_binding.description,
+                default_binding.description,
+            ):
+                self.assertIn("MISSION_CONTROL_WORKFLOW_ORCHESTRATION", text)
+                self.assertIn("fail-closed", text.lower())
+                self.assertNotIn("workflow.wait", text)
+                self.assertNotIn("workflow.cancel", text)
+        self.assertEqual(
+            defaults_by_name["workflow.submit"].downstream_tool,
+            "submit_workflow",
+        )
+        self.assertEqual(
+            defaults_by_name["workflow.status"].downstream_tool,
+            "get_workflow",
+        )
+        preserved_namespaces = {binding.namespace for binding in merged}
+        self.assertEqual(preserved_namespaces, EXPECTED_NAMESPACES)
+        for required in REQUIRED_GATEWAY_TOOLS:
+            self.assertIn(required, defaults_by_name)
+
+    def test_existing_namespaces_are_unchanged(self) -> None:
+        registry = load_registry(REGISTRY_PATH)
+        self.assertEqual(
+            list(registry.namespaces["case"].tools),
+            [
+                "case.submit",
+                "case.status",
+                "case.cancel",
+                "case.list_artifacts",
+                "case.submit_case00_q1",
+                "case.get_case00_q1_run",
+                "case.cancel_case00_q1_run",
+                "case.get_case00_q1_artifacts",
+                "case.get_artifact",
+                "case.get_artifacts",
+            ],
+        )
+        self.assertEqual(
+            list(registry.namespaces["mission"].tools),
+            [
+                "mission.submit",
+                "mission.submit_structured",
+                "mission.status",
+                "mission.list_notifications",
+                "mission.wait",
+                "mission.submit_and_wait",
+                "mission.run_repository_command",
+            ],
+        )
+        names = {binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS}
+        self.assertIn("mission.wait", names)
+        self.assertIn("case.get_artifact", names)
+        for forbidden in FORBIDDEN_WORKFLOW_TOOLS:
+            self.assertNotIn(forbidden, names)
+
+    def test_submit_forwards_yaml_and_optional_idempotency_key(self) -> None:
+        collector = self._collect_tools("workflow.submit")
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value={"ok": True, "result": {"workflow_id": "wf-1"}},
+        ) as forward_mock:
+            result = asyncio.run(
+                collector["workflow.submit"](
+                    WORKFLOW_YAML_FIXTURE,
+                    idempotency_key=WORKFLOW_IDEMPOTENCY_KEY,
+                )
+            )
+        self.assertTrue(result["ok"])
+        kwargs = forward_mock.await_args.kwargs
+        self.assertEqual(kwargs["binding"].gateway_tool, "workflow.submit")
+        self.assertEqual(kwargs["binding"].downstream_tool, "submit_workflow")
+        self.assertEqual(kwargs["binding"].downstream_service, "mission_control")
+        self.assertEqual(
+            kwargs["arguments"],
+            {
+                "workflow_yaml": WORKFLOW_YAML_FIXTURE,
+                "idempotency_key": WORKFLOW_IDEMPOTENCY_KEY,
+            },
+        )
+        self.assertIsNone(kwargs["authorization"])
+        self.assertFalse(kwargs["require_authorization"])
+        self.assertEqual(kwargs["mcp_path"], "/mcp")
+        self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, str(kwargs["authorization"]))
+        self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, str(kwargs["authorization"]))
+        extra = kwargs["extra_secrets"]
+        self.assertIn(WORKFLOW_YAML_FIXTURE, extra)
+        self.assertIn(WORKFLOW_IDEMPOTENCY_KEY, extra)
+
+        forward_mock.reset_mock()
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value={"ok": True, "result": {"workflow_id": "wf-2"}},
+        ) as omit_mock:
+            asyncio.run(collector["workflow.submit"](WORKFLOW_YAML_FIXTURE))
+        self.assertEqual(
+            omit_mock.await_args.kwargs["arguments"],
+            {"workflow_yaml": WORKFLOW_YAML_FIXTURE},
+        )
+        self.assertNotIn(
+            "idempotency_key", omit_mock.await_args.kwargs["arguments"]
+        )
+
+    def test_status_forwards_canonical_workflow_id(self) -> None:
+        collector = self._collect_tools("workflow.status")
+        sanitized = {
+            "ok": True,
+            "workflow_id": CANONICAL_WORKFLOW_ID,
+            "state": "pending",
+            "steps": [{"step_type": "implementation", "status": "pending"}],
+        }
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value={"ok": True, "result": sanitized},
+        ) as forward_mock:
+            result = asyncio.run(
+                collector["workflow.status"](CANONICAL_WORKFLOW_ID)
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], sanitized)
+        kwargs = forward_mock.await_args.kwargs
+        self.assertEqual(kwargs["binding"].downstream_tool, "get_workflow")
+        self.assertEqual(
+            kwargs["arguments"], {"workflow_id": CANONICAL_WORKFLOW_ID}
+        )
+        self.assertIsNone(kwargs["authorization"])
+        self.assertFalse(kwargs["require_authorization"])
+
+    def test_inbound_oauth_required_and_service_token_rejected(self) -> None:
+        collector = self._collect_tools("workflow.submit", "workflow.status")
+        unauthorized = asyncio.run(
+            collector["workflow.submit"](WORKFLOW_YAML_FIXTURE)
+        )
+        self.assertFalse(unauthorized["ok"])
+        self.assertEqual(unauthorized["failure_stage"], "auth")
+        self.assertEqual(unauthorized["gateway_tool"], "workflow.submit")
+        blob = json.dumps(unauthorized)
+        self.assertNotIn(WORKFLOW_YAML_FIXTURE, blob)
+        self.assertNotIn(TEST_SECRET_VALUE_WF_GW, blob)
+        self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
+        self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, blob)
+
+        service_token = AccessToken(
+            token=TEST_BRIDGE_SERVICE_TOKEN,
+            client_id=SERVICE_CLIENT_ID,
+            scopes=[],
+            claims={"token_use": "service", "client_id": SERVICE_CLIENT_ID},
+        )
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server.get_access_token",
+            return_value=service_token,
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+        ) as forward_mock:
+            rejected = asyncio.run(
+                collector["workflow.status"](CANONICAL_WORKFLOW_ID)
+            )
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["failure_stage"], "auth")
+        forward_mock.assert_not_awaited()
+
+    def test_disabled_feature_403_envelope_is_forwarded(self) -> None:
+        downstream = {
+            "ok": False,
+            "error": {
+                "message": "Mission Control request failed",
+                "status_code": 403,
+                "details": {"detail": "Workflow orchestration is disabled"},
+            },
+        }
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.name: str | None = None
+                self.arguments: dict[str, Any] | None = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, arguments, raise_on_error=False):
+                self.name = name
+                self.arguments = arguments
+
+                class Result:
+                    is_error = False
+                    data = downstream
+                    structured_content = downstream
+                    content = None
+
+                return Result()
+
+        client = FakeClient()
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=ToolBinding(
+                    gateway_tool="workflow.submit",
+                    namespace="workflow",
+                    downstream_service="mission_control",
+                    downstream_tool="submit_workflow",
+                ),
+                arguments={
+                    "workflow_yaml": WORKFLOW_YAML_FIXTURE,
+                    "idempotency_key": WORKFLOW_IDEMPOTENCY_KEY,
+                },
+                base_url="https://mission.example",
+                authorization=None,
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                require_authorization=False,
+                client_factory=lambda: client,
+                extra_secrets=(WORKFLOW_YAML_FIXTURE, WORKFLOW_IDEMPOTENCY_KEY),
+            )
+        )
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["failure_stage"])
+        self.assertEqual(client.name, "submit_workflow")
+        self.assertEqual(
+            client.arguments["workflow_yaml"], WORKFLOW_YAML_FIXTURE
+        )
+        self.assertEqual(payload["result"]["error"]["status_code"], 403)
+        self.assertEqual(
+            payload["result"]["error"]["details"]["detail"],
+            "Workflow orchestration is disabled",
+        )
+        self.assertEqual(payload["request_id"], "req-workflow-1")
+        self.assertEqual(payload["correlation_id"], "corr-workflow-1")
+        blob = json.dumps(payload)
+        self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
+        self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, blob)
+
+    def test_malicious_downstream_errors_are_redacted(self) -> None:
+        malicious_message = (
+            f"failed yaml={WORKFLOW_YAML_FIXTURE} "
+            f"idempotency_key={WORKFLOW_IDEMPOTENCY_KEY} "
+            f"api_key=TEST_MC_API_KEY_NOT_REAL "
+            "Authorization: Bearer TEST_OAUTH_SESSION_TOKEN_NOT_REAL "
+            "child_mission_yaml: create_files: true\nstdout: leaked-out "
+            "stderr: leaked-err exception: secret-bearing-trace"
+        )
+
+        class FakeResult:
+            is_error = True
+            data = None
+            structured_content = {
+                "error_code": "orchestration_disabled",
+                "message": malicious_message,
+            }
+            content = None
+
+        class OkClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, *args, **kwargs):
+                return FakeResult()
+
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=ToolBinding(
+                    gateway_tool="workflow.status",
+                    namespace="workflow",
+                    downstream_service="mission_control",
+                    downstream_tool="get_workflow",
+                ),
+                arguments={"workflow_id": CANONICAL_WORKFLOW_ID},
+                base_url="https://mission.example",
+                authorization=None,
+                connect_timeout_seconds=1.0,
+                read_timeout_seconds=2.0,
+                require_authorization=False,
+                client_factory=OkClient,
+                extra_secrets=(
+                    WORKFLOW_YAML_FIXTURE,
+                    WORKFLOW_IDEMPOTENCY_KEY,
+                    TEST_SECRET_VALUE_WF_GW,
+                    "TEST_MC_API_KEY_NOT_REAL",
+                    "TEST_OAUTH_SESSION_TOKEN_NOT_REAL",
+                    TEST_BRIDGE_SERVICE_TOKEN,
+                    TEST_GATEWAY_OAUTH_TOKEN,
+                    *self.settings.secret_values_for_redaction(),
+                ),
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_TOOL)
+        blob = json.dumps(payload)
+        self.assertNotIn(WORKFLOW_YAML_FIXTURE, blob)
+        self.assertNotIn(TEST_SECRET_VALUE_WF_GW, blob)
+        self.assertNotIn(WORKFLOW_IDEMPOTENCY_KEY, blob)
+        self.assertNotIn("TEST_MC_API_KEY_NOT_REAL", blob)
+        self.assertNotIn("TEST_OAUTH_SESSION_TOKEN_NOT_REAL", blob)
+        self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
+        self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, blob)
+        self.assertNotIn("Bearer ", blob)
+        self.assertNotIn(
+            REQUIRED_SECRETS["GITHUB_OAUTH_CLIENT_SECRET"], blob
+        )
+
+        collector = self._collect_tools("workflow.submit")
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value=payload,
+        ):
+            wrapped = asyncio.run(
+                collector["workflow.submit"](
+                    WORKFLOW_YAML_FIXTURE,
+                    idempotency_key=WORKFLOW_IDEMPOTENCY_KEY,
+                )
+            )
+        wrapped_blob = json.dumps(wrapped)
+        self.assertNotIn(WORKFLOW_YAML_FIXTURE, wrapped_blob)
+        self.assertNotIn(TEST_SECRET_VALUE_WF_GW, wrapped_blob)
+        self.assertNotIn("leaked-out", wrapped_blob)
+        self.assertNotIn("leaked-err", wrapped_blob)
+        self.assertNotIn("secret-bearing-trace", wrapped_blob)
+        self.assertEqual(
+            wrapped["error"]["message"], "downstream tool returned an error"
+        )
+
+    def test_timeout_does_not_echo_yaml_or_secrets(self) -> None:
+        class BoomClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, *args, **kwargs):
+                raise httpx.ReadTimeout(
+                    f"slow yaml={WORKFLOW_YAML_FIXTURE} "
+                    f"Bearer {TEST_GATEWAY_OAUTH_TOKEN} "
+                    f"api_key={TEST_SECRET_VALUE_WF_GW}"
+                )
+
+        payload = asyncio.run(
+            forward_mcp_tool(
+                binding=ToolBinding(
+                    gateway_tool="workflow.submit",
+                    namespace="workflow",
+                    downstream_service="mission_control",
+                    downstream_tool="submit_workflow",
+                ),
+                arguments={
+                    "workflow_yaml": WORKFLOW_YAML_FIXTURE,
+                    "idempotency_key": WORKFLOW_IDEMPOTENCY_KEY,
+                },
+                base_url="https://mission.example",
+                authorization=None,
+                connect_timeout_seconds=0.2,
+                read_timeout_seconds=0.2,
+                require_authorization=False,
+                client_factory=BoomClient,
+                extra_secrets=(
+                    WORKFLOW_YAML_FIXTURE,
+                    WORKFLOW_IDEMPOTENCY_KEY,
+                    TEST_SECRET_VALUE_WF_GW,
+                    TEST_GATEWAY_OAUTH_TOKEN,
+                ),
+            )
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["failure_stage"], STAGE_TIMEOUT)
+        blob = json.dumps(payload)
+        self.assertNotIn(WORKFLOW_YAML_FIXTURE, blob)
+        self.assertNotIn(TEST_SECRET_VALUE_WF_GW, blob)
+        self.assertNotIn(WORKFLOW_IDEMPOTENCY_KEY, blob)
+        self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, blob)
+        self.assertEqual(payload["request_id"], "req-workflow-1")
+        self.assertEqual(payload["correlation_id"], "corr-workflow-1")
+
+        collector = self._collect_tools("workflow.submit")
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value=payload,
+        ):
+            wrapped = asyncio.run(
+                collector["workflow.submit"](
+                    WORKFLOW_YAML_FIXTURE,
+                    idempotency_key=WORKFLOW_IDEMPOTENCY_KEY,
+                )
+            )
+        wrapped_blob = json.dumps(wrapped)
+        self.assertEqual(
+            wrapped["error"]["message"], "downstream tool returned an error"
+        )
+        self.assertNotIn("Bearer", wrapped_blob)
+        self.assertNotIn(WORKFLOW_YAML_FIXTURE, wrapped_blob)
+        self.assertNotIn(TEST_SECRET_VALUE_WF_GW, wrapped_blob)
+
+    def test_mission_control_authorization_resolver_stays_isolated(self) -> None:
+        self.assertIsNone(
+            resolve_authorization_for_service(
+                downstream_service="mission_control",
+                bridge_authorization=f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+            )
+        )
+        self.assertEqual(
+            resolve_authorization_for_service(
+                downstream_service="bridge",
+                bridge_authorization=f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+            ),
+            f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+        )
+
+
+INBOUND_OAUTH_TOKEN = "inbound-gateway-oauth-session-token"
+INBOUND_SESSION_COOKIE = "mcp_sid=inbound-session-cookie"
+INBOUND_X_API_KEY = "inbound-x-api-key-value"
+INBOUND_GITHUB_TOKEN = "inbound-x-github-token-value"
+INBOUND_RUNNER_SESSION = "inbound-x-runner-session-value"
+_SAFE_OUTBOUND_FACTORY_HEADER_NAMES = frozenset(
+    {"accept", "x-request-id", "x-correlation-id"}
+)
+_INBOUND_CREDENTIAL_ALIASES = (
+    INBOUND_OAUTH_TOKEN,
+    INBOUND_SESSION_COOKIE,
+    INBOUND_X_API_KEY,
+    INBOUND_GITHUB_TOKEN,
+    INBOUND_RUNNER_SESSION,
+)
+
+
+def _inbound_oauth_request() -> Request:
+    """Starlette request carrying inbound OAuth/session credential headers."""
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "https",
+            "path": "/mcp",
+            "raw_path": b"/mcp",
+            "query_string": b"",
+            "headers": [
+                (b"authorization", f"Bearer {INBOUND_OAUTH_TOKEN}".encode()),
+                (b"cookie", INBOUND_SESSION_COOKIE.encode()),
+                (b"x-api-key", INBOUND_X_API_KEY.encode()),
+                (b"x-github-token", INBOUND_GITHUB_TOKEN.encode()),
+                (b"x-runner-session", INBOUND_RUNNER_SESSION.encode()),
+                (b"host", b"gateway.example"),
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": ("gateway.example", 443),
+        }
+    )
+
+
+class OutboundHeaderIsolationTests(unittest.TestCase):
+    """Live Streamable HTTP construction must not inherit inbound credentials."""
+
+    def setUp(self) -> None:
+        self.settings = load_settings(
+            environ={
+                **REQUIRED_SECRETS,
+                "GATEWAY_BRIDGE_URL": "https://bridge.example",
+                "GATEWAY_STORAGE_URL": "https://storage.example",
+                "GATEWAY_MISSION_CONTROL_URL": "https://mission.example",
+                "GATEWAY_ARTIFACTS_URL": "https://artifacts.example",
+            },
+            registry=load_registry(REGISTRY_PATH),
+        )
+        self.tokens = bind_request_ids(
+            request_id="req-isolate-1",
+            correlation_id="corr-isolate-1",
+        )
+
+    def tearDown(self) -> None:
+        reset_request_ids(self.tokens)
+
+    def _collect_tools(self, *gateway_tools: str) -> dict[str, Any]:
+        collector: dict[str, Any] = {}
+
+        class _Mcp:
+            def tool(self, *args: Any, **kwargs: Any):
+                def decorator(fn: Any) -> Any:
+                    name = kwargs.get("name") or (args[0] if args else None)
+                    if name in gateway_tools:
+                        collector[name] = fn
+                    return fn
+
+                return decorator
+
+        register_forwarding_tools(
+            _Mcp(),  # type: ignore[arg-type]
+            self.settings,
+            bindings_from_registry(self.settings.registry),
+        )
+        return collector
+
+    def _capturing_httpx_factory(self) -> tuple[
+        Callable[..., httpx.AsyncClient],
+        list[httpx.Request],
+        list[dict[str, str]],
+    ]:
+        captured_requests: list[httpx.Request] = []
+        captured_factory_headers: list[dict[str, str]] = []
+
+        def factory(**kwargs: Any) -> httpx.AsyncClient:
+            raw = kwargs.get("headers") or {}
+            captured_factory_headers.append(
+                {str(name): str(value) for name, value in dict(raw).items()}
+            )
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                captured_requests.append(request)
+                return httpx.Response(
+                    400,
+                    json={"error": "captured"},
+                    headers={"Content-Type": "application/json"},
+                )
+
+            filtered = dict(kwargs)
+            filtered.pop("transport", None)
+            return httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                **filtered,
+            )
+
+        return factory, captured_requests, captured_factory_headers
+
+    def _assert_inbound_headers_reachable(self, inbound: dict[str, str]) -> None:
+        self.assertEqual(
+            inbound.get("authorization"),
+            f"Bearer {INBOUND_OAUTH_TOKEN}",
+        )
+        self.assertEqual(inbound.get("cookie"), INBOUND_SESSION_COOKIE)
+        self.assertEqual(inbound.get("x-api-key"), INBOUND_X_API_KEY)
+        self.assertEqual(inbound.get("x-github-token"), INBOUND_GITHUB_TOKEN)
+        self.assertEqual(inbound.get("x-runner-session"), INBOUND_RUNNER_SESSION)
+
+    def _assert_credential_aliases_absent(self, blob: str, names: set[str]) -> None:
+        for alias in _INBOUND_CREDENTIAL_ALIASES:
+            self.assertNotIn(alias, blob)
+        self.assertNotIn("cookie", names)
+        self.assertNotIn("set-cookie", names)
+        self.assertNotIn("x-api-key", names)
+        self.assertNotIn("x-github-token", names)
+        self.assertNotIn("x-runner-session", names)
+
+    def _assert_factory_headers_allowlisted(
+        self,
+        factory_headers: dict[str, str],
+    ) -> None:
+        names = {name.lower() for name in factory_headers}
+        self.assertTrue(
+            names <= _SAFE_OUTBOUND_FACTORY_HEADER_NAMES,
+            msg=(
+                f"factory header names {sorted(names)} are not a subset of "
+                f"{sorted(_SAFE_OUTBOUND_FACTORY_HEADER_NAMES)}"
+            ),
+        )
+        values = " ".join(str(value) for value in factory_headers.values())
+        self._assert_credential_aliases_absent(values, names)
+        self.assertNotIn("authorization", names)
+
+    def _assert_inbound_credentials_absent(
+        self,
+        request: httpx.Request,
+        *,
+        factory_headers: dict[str, str] | None = None,
+    ) -> None:
+        blob = " ".join(str(value) for value in request.headers.values())
+        names = {name.lower() for name in request.headers.keys()}
+        self._assert_credential_aliases_absent(blob, names)
+        authorization = request.headers.get("authorization") or ""
+        self.assertNotIn(INBOUND_OAUTH_TOKEN, authorization)
+        if factory_headers is not None:
+            self._assert_factory_headers_allowlisted(factory_headers)
+
+    def test_workflow_submit_outbound_strips_inbound_oauth_session_headers(
+        self,
+    ) -> None:
+        collector = self._collect_tools("workflow.submit")
+        factory, captured_requests, captured_factory_headers = (
+            self._capturing_httpx_factory()
+        )
+        real_forward = forward_mcp_tool
+
+        async def forward_with_capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            kwargs["httpx_client_factory"] = factory
+            kwargs["connect_timeout_seconds"] = 0.5
+            kwargs["read_timeout_seconds"] = 0.5
+            return await real_forward(*args, **kwargs)
+
+        async def _run() -> dict[str, Any]:
+            with set_http_request(_inbound_oauth_request()):
+                inbound = get_http_headers()
+                self._assert_inbound_headers_reachable(inbound)
+                with mock.patch(
+                    "hal_legalai_gateway.mcp_server._require_gateway_principal",
+                    return_value="nhpcorp35",
+                ), mock.patch(
+                    "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+                    side_effect=forward_with_capture,
+                ):
+                    return await collector["workflow.submit"](WORKFLOW_YAML_FIXTURE)
+
+        asyncio.run(_run())
+        self.assertTrue(captured_requests)
+        self.assertTrue(captured_factory_headers)
+        for factory_headers in captured_factory_headers:
+            self._assert_factory_headers_allowlisted(factory_headers)
+            self._assert_inbound_credentials_absent(
+                captured_requests[0], factory_headers=factory_headers
+            )
+        for request in captured_requests:
+            self._assert_inbound_credentials_absent(request)
+            names = {name.lower() for name in request.headers.keys()}
+            self.assertNotIn("authorization", names)
+            self.assertEqual(request.headers.get("x-request-id"), "req-isolate-1")
+            self.assertEqual(
+                request.headers.get("x-correlation-id"), "corr-isolate-1"
+            )
+        blob = json.dumps(
+            [dict(request.headers) for request in captured_requests]
+        )
+        for alias in _INBOUND_CREDENTIAL_ALIASES:
+            self.assertNotIn(alias, blob)
+        self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
+        self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, blob)
+
+    def test_bridge_outbound_keeps_only_service_bearer(self) -> None:
+        factory, captured_requests, captured_factory_headers = (
+            self._capturing_httpx_factory()
+        )
+
+        async def _run() -> dict[str, Any]:
+            with set_http_request(_inbound_oauth_request()):
+                inbound = get_http_headers()
+                self._assert_inbound_headers_reachable(inbound)
+                return await forward_mcp_tool(
+                    binding=ToolBinding(
+                        gateway_tool="storage.list_inventory",
+                        namespace="storage",
+                        downstream_service="storage",
+                        downstream_tool="list_case00_storage",
+                    ),
+                    arguments={"category": "all", "max_keys": 5},
+                    base_url="https://bridge.example",
+                    authorization=f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+                    connect_timeout_seconds=0.5,
+                    read_timeout_seconds=0.5,
+                    require_authorization=True,
+                    httpx_client_factory=factory,
+                    extra_secrets=(
+                        TEST_BRIDGE_SERVICE_TOKEN,
+                        INBOUND_OAUTH_TOKEN,
+                        INBOUND_X_API_KEY,
+                        INBOUND_GITHUB_TOKEN,
+                        INBOUND_RUNNER_SESSION,
+                    ),
+                )
+
+        asyncio.run(_run())
+        self.assertTrue(captured_requests)
+        self.assertTrue(captured_factory_headers)
+        for request in captured_requests:
+            self._assert_inbound_credentials_absent(request)
+            self.assertEqual(
+                request.headers.get("authorization"),
+                f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+            )
+            names = {name.lower() for name in request.headers.keys()}
+            self.assertIn("authorization", names)
+            self.assertNotIn("cookie", names)
+            self.assertNotIn("x-api-key", names)
+            self.assertNotIn("x-github-token", names)
+            self.assertNotIn("x-runner-session", names)
+        for factory_headers in captured_factory_headers:
+            self._assert_factory_headers_allowlisted(factory_headers)
+        blob = " ".join(
+            " ".join(str(value) for value in request.headers.values())
+            for request in captured_requests
+        )
+        for alias in _INBOUND_CREDENTIAL_ALIASES:
+            self.assertNotIn(alias, blob)
 
 
 if __name__ == "__main__":

@@ -280,6 +280,36 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_tool="run_repository_command",
         description="Run an allowlisted repository command via Mission Control.",
     ),
+    ToolBinding(
+        gateway_tool="workflow.submit",
+        namespace="workflow",
+        downstream_service="mission_control",
+        downstream_tool="submit_workflow",
+        description=(
+            "Submit bounded workflow YAML to Mission Control (downstream "
+            "submit_workflow). Accepts workflow_yaml and optional "
+            "idempotency_key and returns the downstream structured envelope. "
+            "Orchestration remains fail-closed while "
+            "MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. Thin "
+            "forwarder: no YAML parsing, polling, or feature enabling in "
+            "the gateway."
+        ),
+    ),
+    ToolBinding(
+        gateway_tool="workflow.status",
+        namespace="workflow",
+        downstream_service="mission_control",
+        downstream_tool="get_workflow",
+        description=(
+            "Return sanitized durable workflow and child summaries for a "
+            "canonical workflow_id (downstream get_workflow). Secrets, "
+            "child mission YAML, and agent stdout/stderr are never included. "
+            "Orchestration remains fail-closed while "
+            "MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. Thin "
+            "forwarder: no polling, cancel, history, or workflow parsing in "
+            "the gateway."
+        ),
+    ),
 )
 
 
@@ -321,6 +351,55 @@ def build_inbound_auth_provider(settings: GatewaySettings) -> AuthProvider:
     )
 
 
+def _extra_secrets_for_forward(
+    settings: GatewaySettings,
+    arguments: dict[str, Any],
+) -> tuple[str, ...]:
+    """Configured secrets plus argument values that must never be echoed."""
+    extra = list(settings.secret_values_for_redaction())
+    for key in ("workflow_yaml", "idempotency_key"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            extra.append(value)
+    return tuple(extra)
+
+
+def _sanitize_workflow_gateway_error(
+    gateway_tool: str,
+    envelope: dict[str, Any],
+) -> dict[str, Any]:
+    """Drop residual secret-bearing gateway error text for workflow tools."""
+    if not gateway_tool.startswith("workflow."):
+        return envelope
+    error = envelope.get("error")
+    if not isinstance(error, dict):
+        return envelope
+    message = error.get("message")
+    if not isinstance(message, str) or not message:
+        return envelope
+    lowered = message.lower()
+    markers = (
+        "stdout",
+        "stderr",
+        "authorization",
+        "api_key",
+        "api-key",
+        "bearer ",
+        "workflow_yaml",
+        "mission_yaml",
+        "idempotency",
+        "child mission",
+        "child_mission",
+    )
+    if any(marker in lowered for marker in markers):
+        sanitized = dict(envelope)
+        sanitized_error = dict(error)
+        sanitized_error["message"] = "downstream tool returned an error"
+        sanitized["error"] = sanitized_error
+        return sanitized
+    return envelope
+
+
 def _require_gateway_principal(settings: GatewaySettings) -> str | None:
     """Return authorized GitHub login, or None when the caller is not allowed."""
     token = get_access_token()
@@ -352,9 +431,10 @@ def create_mcp_server(
         "HAL LegalAI Gateway",
         instructions=(
             "Thin authenticated router for LegalAI namespaces (case, storage, "
-            "mission). Tools forward to independently deployed Bridge, Storage, "
-            "artifact, and Mission Control MCP servers. No Case-00 generation, "
-            "archive mutation, or mission execution logic runs inside the gateway."
+            "mission, workflow). Tools forward to independently deployed "
+            "Bridge, Storage, artifact, and Mission Control MCP servers. No "
+            "Case-00 generation, archive mutation, mission execution, or "
+            "workflow orchestration logic runs inside the gateway."
         ),
         auth=auth_provider,
         mask_error_details=True,
@@ -413,7 +493,7 @@ def register_forwarding_tools(
             downstream_service=binding.downstream_service,
             bridge_authorization=settings.bridge_authorization,
         )
-        return await forward_mcp_tool(
+        envelope = await forward_mcp_tool(
             binding=binding,
             arguments=arguments,
             base_url=downstream.base_url,
@@ -422,8 +502,9 @@ def register_forwarding_tools(
             read_timeout_seconds=settings.read_timeout_seconds,
             mcp_path=settings.mcp_path_for_service(binding.downstream_service),
             require_authorization=require_auth,
-            extra_secrets=settings.secret_values_for_redaction(),
+            extra_secrets=_extra_secrets_for_forward(settings, arguments),
         )
+        return _sanitize_workflow_gateway_error(binding.gateway_tool, envelope)
 
     # --- case ---
     @mcp.tool(name="case.submit", description=by_name["case.submit"].description)
@@ -862,6 +943,27 @@ def register_forwarding_tools(
         if allowed_env_names is not None:
             args["allowed_env_names"] = allowed_env_names
         return await _forward("mission.run_repository_command", args)
+
+    # --- workflow ---
+    @mcp.tool(
+        name="workflow.submit",
+        description=by_name["workflow.submit"].description,
+    )
+    async def workflow_submit(
+        workflow_yaml: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {"workflow_yaml": workflow_yaml}
+        if idempotency_key is not None:
+            args["idempotency_key"] = idempotency_key
+        return await _forward("workflow.submit", args)
+
+    @mcp.tool(
+        name="workflow.status",
+        description=by_name["workflow.status"].description,
+    )
+    async def workflow_status(workflow_id: str) -> dict[str, Any]:
+        return await _forward("workflow.status", {"workflow_id": workflow_id})
 
     logger.info(
         "registered gateway MCP tools count=%s names=%s",
