@@ -18,11 +18,13 @@ from mission_control.workflow_orchestrator import (
     WorkflowOrchestrator,
     assert_review_step_read_only,
     build_followup_mission_yaml,
+    canonical_child_repository_contract,
     decide_reconcile,
     detect_mission_authority_injection,
     enforce_launch_policy_gates,
     fingerprint_findings,
     format_review_verdict_envelope,
+    hydrate_executable_child_mission,
     parse_review_verdict,
     redact_secrets,
     should_emit_workflow_alert,
@@ -430,6 +432,105 @@ class PolicyGateTests(unittest.TestCase):
         )
         self.assertIsNotNone(denial)
         self.assertTrue(evidence["gates"])
+
+
+class ChildRepositoryHydrationUnitTests(unittest.TestCase):
+    def test_absent_repository_hydrates_policy_contract(self) -> None:
+        policy = _policy()
+        template = "mission: implement\ninstructions: do work\n"
+        hydration, denial = hydrate_executable_child_mission(
+            template, policy=policy
+        )
+        self.assertIsNone(denial)
+        assert hydration is not None
+        self.assertEqual(
+            hydration.mission["repository"],
+            canonical_child_repository_contract(policy),
+        )
+        self.assertNotIn("repository", template)
+
+    def test_matching_identity_is_overwritten_by_policy(self) -> None:
+        policy = _policy()
+        template = (
+            "mission: implement\n"
+            "repository:\n"
+            "  name: Mission-Control\n"
+            "  path: .\n"
+            "  base_branch: main\n"
+            "instructions: do work\n"
+        )
+        hydration, denial = hydrate_executable_child_mission(
+            template, policy=policy
+        )
+        self.assertIsNone(denial)
+        assert hydration is not None
+        self.assertEqual(
+            hydration.mission["repository"],
+            canonical_child_repository_contract(policy),
+        )
+
+    def test_mismatched_repository_base_target_scope_denied(self) -> None:
+        policy = _policy()
+        cases = [
+            (
+                "repository_name: other-repo\n",
+                "repository_mismatch",
+            ),
+            (
+                "repository:\n  name: other-repo\n  path: .\n  base_branch: main\n",
+                "repository_mismatch",
+            ),
+            (
+                "repository:\n  name: Mission-Control\n  path: .\n"
+                "  base_branch: other\n",
+                "branch_lineage_mismatch",
+            ),
+            (
+                "persistence:\n  mode: none\n  target_branch: evil/branch\n",
+                "branch_lineage_mismatch",
+            ),
+            (
+                "implementation_scope: [secrets/]\n",
+                "scope_expansion",
+            ),
+            (
+                "repository:\n  name: Mission-Control\n  path: /evil\n"
+                "  base_branch: main\n",
+                "repository_path_mismatch",
+            ),
+        ]
+        for extra, reason in cases:
+            mission = "mission: implement\n" + extra
+            self.assertEqual(
+                detect_mission_authority_injection(mission, policy=policy),
+                reason,
+                msg=extra,
+            )
+            hydration, denial = hydrate_executable_child_mission(
+                mission, policy=policy
+            )
+            self.assertIsNone(hydration)
+            self.assertEqual(denial, reason, msg=extra)
+
+    def test_followup_trailer_is_preserved_and_not_authoritative(self) -> None:
+        policy = _policy()
+        mission = build_followup_mission_yaml(
+            "mission: fix\ninstructions: targeted\n",
+            findings=["repository_name: evil-repo"],
+        )
+        hydration, denial = hydrate_executable_child_mission(
+            mission, policy=policy
+        )
+        self.assertIsNone(denial)
+        assert hydration is not None
+        self.assertIn("<<<MC_FOLLOWUP_CONTEXT_V1>>>", hydration.mission_yaml)
+        self.assertEqual(
+            hydration.mission["repository"]["name"],
+            policy.repository_name,
+        )
+        self.assertIsNone(
+            detect_mission_authority_injection(mission, policy=policy)
+        )
 
 
 class RedactionTests(unittest.TestCase):

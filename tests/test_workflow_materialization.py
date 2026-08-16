@@ -9,6 +9,8 @@ import time
 import unittest
 import uuid
 
+import yaml
+
 from mission_control.run_registry import (
     CONFLICT_MISSION_YAML_MISMATCH,
     CONFLICT_OWNERSHIP_MISMATCH,
@@ -22,7 +24,10 @@ from mission_control.workflow_materializer import (
     materialize_claimed_child,
     redrive_materialized_dispatch,
 )
-from mission_control.workflow_orchestrator import WorkflowOrchestrator
+from mission_control.workflow_orchestrator import (
+    WorkflowOrchestrator,
+    hydrate_executable_child_mission,
+)
 from mission_control.workflow_registry import (
     DispatchIntentState,
     StepMaterializationState,
@@ -36,6 +41,7 @@ from mission_control.workflow_registry import (
 )
 from mission_control.run_queue import RunQueue
 from mission_control.run_registry import RunStatus
+from mission_control.workspace import prepare_isolated_workspace
 
 _FEATURE_ON = {"MISSION_CONTROL_WORKFLOW_ORCHESTRATION": "true"}
 
@@ -61,14 +67,14 @@ def _policy(**overrides) -> WorkflowPolicySnapshot:
 def _mission_yaml(
     *,
     repository_name: str | None = None,
+    extra: str = "",
     create_files: bool = False,
     instructions: str = "implement the slice",
 ) -> str:
     """Build a claim-safe mission body.
 
-    Avoid nested ``repository: / name:`` mappings — the authority-injection
-    scanner treats multiline ``repository:`` blocks as a mismatched name.
     Optional ``repository_name`` is a single-line key for denial tests.
+    ``extra`` is appended as additional YAML authority fields.
     """
     create = "true" if create_files else "false"
     repo_line = (
@@ -76,11 +82,13 @@ def _mission_yaml(
         if repository_name is not None
         else ""
     )
+    extra_block = extra if not extra or extra.endswith("\n") else extra + "\n"
     return (
         "version: '1.0'\n"
         "mission_id: wf-materialize\n"
         "title: Materialize child\n"
         f"{repo_line}"
+        f"{extra_block}"
         "execution:\n"
         "  agent: cursor\n"
         "  mode: execute\n"
@@ -96,6 +104,19 @@ def _mission_yaml(
         f"instructions: {instructions}\n"
         "deliverables: []\n"
     )
+
+
+def _executable_child_yaml(
+    mission_yaml: str,
+    policy: WorkflowPolicySnapshot | None = None,
+) -> str:
+    hydration, denial = hydrate_executable_child_mission(
+        mission_yaml,
+        policy=policy or _policy(),
+    )
+    assert denial is None, denial
+    assert hydration is not None
+    return hydration.mission_yaml
 
 
 def _specs(mission_yaml: str | None = None) -> dict[str, WorkflowStepSpec]:
@@ -263,6 +284,7 @@ class FeatureOffTests(MaterializeTestCase):
             run_queue=self.queue,
             workflow_id=wf.workflow_id,
             step_id=step.step_id,
+            environ={},
         )
         self.assertEqual(result.outcome, MaterializeOutcome.FEATURE_DISABLED)
         self.assertEqual(self.run_registry.count_runs(), 0)
@@ -286,7 +308,9 @@ class CreatedPathTests(MaterializeTestCase):
 
         record = self.run_registry.get_run(step.child_run_id)
         assert record is not None
-        self.assertEqual(record.mission_yaml, exact_yaml)
+        self.assertEqual(
+            record.mission_yaml, _executable_child_yaml(exact_yaml)
+        )
         self.assertEqual(record.retried_from, self.parent_id)
 
         latest = self.workflow_registry.get_step(step.step_id)
@@ -330,7 +354,7 @@ class IdempotentRecoveryTests(MaterializeTestCase):
         # Simulate crash after create: reserved row exists, step still claimed.
         created = self.run_registry.create_run(
             run_id=step.child_run_id,
-            mission_yaml=step.mission_yaml,
+            mission_yaml=_executable_child_yaml(step.mission_yaml),
             retried_from=self.parent_id,
         )
         self.assertEqual(created.outcome.value, "created")
@@ -356,7 +380,9 @@ class IdempotentRecoveryTests(MaterializeTestCase):
 class MismatchPoisonTests(MaterializeTestCase):
     def test_mismatched_existing_run_poisons(self) -> None:
         wf, step = self._create_and_claim()
-        other_yaml = _mission_yaml(instructions="different mission body")
+        other_yaml = _executable_child_yaml(
+            _mission_yaml(instructions="different mission body")
+        )
         self.run_registry.create_run(
             run_id=step.child_run_id,
             mission_yaml=other_yaml,
@@ -410,7 +436,7 @@ class StandaloneClaimOwnershipTests(MaterializeTestCase):
         wf, step = self._create_and_claim(parent_run_id=None)
         created = self.run_registry.create_run(
             run_id=step.child_run_id,
-            mission_yaml=step.mission_yaml,
+            mission_yaml=_executable_child_yaml(step.mission_yaml),
             retried_from=wf.workflow_id,
         )
         self.assertEqual(created.outcome.value, "created")
@@ -493,6 +519,176 @@ class PolicyDenialTests(MaterializeTestCase):
         blocked = self.workflow_registry.get_workflow(wf.workflow_id)
         assert blocked is not None
         self.assertEqual(blocked.state, WorkflowState.BLOCKED)
+
+
+class ChildRepositoryHydrationTests(MaterializeTestCase):
+    def _assert_executable_repository(self, mission: dict) -> None:
+        repository = mission["repository"]
+        self.assertEqual(repository["name"], "Mission-Control")
+        self.assertEqual(repository["base_branch"], "main")
+        self.assertEqual(repository["path"], ".")
+        self.assertEqual(
+            set(repository),
+            {"name", "path", "base_branch"},
+        )
+
+    def test_absent_repository_reproduces_execution_keyerror(self) -> None:
+        _wf, step = self._create_and_claim()
+        parsed = yaml.safe_load(step.mission_yaml)
+        self.assertIsInstance(parsed, dict)
+        self.assertNotIn("repository", parsed)
+        with self.assertRaises(KeyError) as raised:
+            prepare_isolated_workspace(parsed)
+        self.assertEqual(raised.exception.args[0], "repository")
+        self.assertEqual(str(raised.exception), "'repository'")
+
+    def test_absent_repository_hydrates_before_create_and_enqueue(self) -> None:
+        wf, step = self._create_and_claim()
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.CREATED)
+        self.assertTrue(result.enqueued)
+
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        stored = yaml.safe_load(record.mission_yaml)
+        self._assert_executable_repository(stored)
+        enqueued_mission = self.queue.calls[0][1]
+        self._assert_executable_repository(enqueued_mission)
+        # Execution path can read repository without KeyError.
+        self.assertEqual(enqueued_mission["repository"]["path"], ".")
+
+    def test_matching_repository_identity_is_policy_owned(self) -> None:
+        matching = (
+            "repository:\n"
+            "  name: Mission-Control\n"
+            "  path: .\n"
+            "  base_branch: main\n"
+        )
+        wf, step = self._create_and_claim(mission_yaml=_mission_yaml(extra=matching))
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.CREATED)
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        stored = yaml.safe_load(record.mission_yaml)
+        self._assert_executable_repository(stored)
+        self._assert_executable_repository(self.queue.calls[0][1])
+
+    def test_mismatched_nested_repository_name_denied(self) -> None:
+        wf, step = self._create_and_claim()
+        poisoned_yaml = _mission_yaml(
+            extra=(
+                "repository:\n"
+                "  name: other-repo\n"
+                "  path: .\n"
+                "  base_branch: main\n"
+            )
+        )
+        with self.workflow_registry._lock:
+            self.workflow_registry._conn.execute(
+                """
+                UPDATE workflow_steps
+                SET mission_yaml = ?
+                WHERE step_id = ?
+                """,
+                (poisoned_yaml, step.step_id),
+            )
+            self.workflow_registry._conn.commit()
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.POLICY_DENIED)
+        self.assertEqual(result.reason, "repository_mismatch")
+        self.assertEqual(self.run_registry.count_runs(), 0)
+
+    def test_mismatched_base_branch_denied(self) -> None:
+        wf, step = self._create_and_claim()
+        poisoned_yaml = _mission_yaml(
+            extra=(
+                "repository:\n"
+                "  name: Mission-Control\n"
+                "  path: .\n"
+                "  base_branch: evil-branch\n"
+            )
+        )
+        with self.workflow_registry._lock:
+            self.workflow_registry._conn.execute(
+                "UPDATE workflow_steps SET mission_yaml = ? WHERE step_id = ?",
+                (poisoned_yaml, step.step_id),
+            )
+            self.workflow_registry._conn.commit()
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.POLICY_DENIED)
+        self.assertEqual(result.reason, "branch_lineage_mismatch")
+        self.assertEqual(self.run_registry.count_runs(), 0)
+
+    def test_mismatched_target_branch_denied(self) -> None:
+        wf, step = self._create_and_claim()
+        poisoned_yaml = _mission_yaml(
+            extra=(
+                "persistence:\n"
+                "  mode: none\n"
+                "  target_branch: evil/branch\n"
+            )
+        )
+        with self.workflow_registry._lock:
+            self.workflow_registry._conn.execute(
+                "UPDATE workflow_steps SET mission_yaml = ? WHERE step_id = ?",
+                (poisoned_yaml, step.step_id),
+            )
+            self.workflow_registry._conn.commit()
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.POLICY_DENIED)
+        self.assertEqual(result.reason, "branch_lineage_mismatch")
+        self.assertEqual(self.run_registry.count_runs(), 0)
+
+    def test_injected_path_denied(self) -> None:
+        wf, step = self._create_and_claim()
+        poisoned_yaml = _mission_yaml(
+            extra=(
+                "repository:\n"
+                "  name: Mission-Control\n"
+                "  path: /tmp/evil-checkout\n"
+                "  base_branch: main\n"
+            )
+        )
+        with self.workflow_registry._lock:
+            self.workflow_registry._conn.execute(
+                "UPDATE workflow_steps SET mission_yaml = ? WHERE step_id = ?",
+                (poisoned_yaml, step.step_id),
+            )
+            self.workflow_registry._conn.commit()
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.POLICY_DENIED)
+        self.assertEqual(result.reason, "repository_path_mismatch")
+        self.assertEqual(self.run_registry.count_runs(), 0)
+
+    def test_injected_scope_denied(self) -> None:
+        wf, step = self._create_and_claim()
+        poisoned_yaml = _mission_yaml(
+            extra=(
+                "implementation_scope:\n"
+                "  - secrets/\n"
+            )
+        )
+        with self.workflow_registry._lock:
+            self.workflow_registry._conn.execute(
+                "UPDATE workflow_steps SET mission_yaml = ? WHERE step_id = ?",
+                (poisoned_yaml, step.step_id),
+            )
+            self.workflow_registry._conn.commit()
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.POLICY_DENIED)
+        self.assertEqual(result.reason, "scope_expansion")
+        self.assertEqual(self.run_registry.count_runs(), 0)
+
+    def test_idempotent_retry_uses_hydrated_identity(self) -> None:
+        wf, step = self._create_and_claim()
+        first = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(first.outcome, MaterializeOutcome.CREATED)
+        second = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(
+            second.outcome, MaterializeOutcome.ALREADY_MATERIALIZED
+        )
+        self.assertFalse(second.enqueued)
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
 
 
 class ConcurrentMaterializerTests(MaterializeTestCase):

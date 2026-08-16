@@ -19,6 +19,7 @@ from mission_control.workflow_materializer import (
 )
 from mission_control.workflow_orchestrator import (
     format_review_verdict_envelope,
+    hydrate_executable_child_mission,
 )
 from mission_control.workflow_reconciler import (
     DEFAULT_RECONCILE_INTERVAL_SECONDS,
@@ -453,9 +454,15 @@ class StartupRecoveryTests(ReconcilerTestCase):
         self.assertTrue(claim.ok)
         step = claim.step
         assert step is not None
+        hydration, denial = hydrate_executable_child_mission(
+            step.mission_yaml,
+            policy=wf.policy_snapshot,
+        )
+        self.assertIsNone(denial)
+        assert hydration is not None
         created = self.run_registry.create_run(
             run_id=step.child_run_id,
-            mission_yaml=step.mission_yaml,
+            mission_yaml=hydration.mission_yaml,
             retried_from=wf.workflow_id,
         )
         self.assertEqual(created.outcome.value, "created")

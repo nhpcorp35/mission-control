@@ -15,6 +15,8 @@ Security contract (hardened):
 - Follow-up mission context is opaque, bounded, redacted JSON — never
   raw YAML interpolation of findings/prior output.
 - Policy gates run transactionally inside every child-launch claim.
+- Child templates may omit ``repository``; executable children receive the
+  complete repository contract from the immutable policy snapshot only.
 """
 
 from __future__ import annotations
@@ -28,6 +30,10 @@ import logging
 import re
 from typing import Any, Mapping
 
+import yaml
+
+from mission_control.mission_builder import DEFAULT_REPOSITORY_PATH
+from mission_control.workspace import normalize_submit_repository_path
 from mission_control.workflow_registry import (
     ACTIONABLE_WORKFLOW_ALERT_STATES,
     StepMaterializationState,
@@ -135,6 +141,14 @@ class OrchestratorDecision:
     # Notification
     suppress_child_terminal_alert: bool = False
     emit_workflow_alert: bool = False
+
+
+@dataclass(frozen=True)
+class ChildMissionHydration:
+    """Executable child mission after policy repository hydration."""
+
+    mission: dict[str, Any]
+    mission_yaml: str
 
 
 def redact_secrets(text: str) -> str:
@@ -336,6 +350,196 @@ def assert_review_step_read_only(mission_yaml: str) -> str | None:
     return None
 
 
+_CANONICAL_REPOSITORY_KEYS = frozenset({"name", "path", "base_branch"})
+_AUTHORITY_ALIAS_KEYS = (
+    "repository_name",
+    "base_branch",
+    "target_branch",
+    "implementation_scope",
+    "scope",
+    "branch",
+)
+
+
+def _optional_nonempty_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _split_followup_trailer(mission_yaml: str) -> tuple[str, str]:
+    text = mission_yaml or ""
+    begin = text.find(_FOLLOWUP_BEGIN)
+    if begin == -1:
+        return text, ""
+    return text[:begin], text[begin:]
+
+
+def canonical_child_repository_contract(
+    policy: WorkflowPolicySnapshot,
+) -> dict[str, str]:
+    """Return the policy-owned executable ``repository`` mapping."""
+    return {
+        "name": policy.repository_name,
+        "path": DEFAULT_REPOSITORY_PATH,
+        "base_branch": policy.base_branch,
+    }
+
+
+def inspect_child_repository_authority(
+    data: Mapping[str, Any],
+    *,
+    policy: WorkflowPolicySnapshot,
+) -> str | None:
+    """Return a denial when child YAML tries to override workflow authority.
+
+    Policy is the sole source of repository name, base branch, target branch,
+    implementation scope, and workspace path. Absent fields are allowed and
+    hydrated later; mismatches and injected extras fail closed.
+    """
+    raw_repo = data.get("repository")
+    repo_map: Mapping[str, Any]
+    if raw_repo is None:
+        repo_map = {}
+    elif isinstance(raw_repo, str):
+        if raw_repo.strip() != policy.repository_name:
+            return "repository_mismatch"
+        repo_map = {"name": raw_repo.strip()}
+    elif isinstance(raw_repo, Mapping):
+        extra = [key for key in raw_repo.keys() if key not in _CANONICAL_REPOSITORY_KEYS]
+        if extra:
+            return "scope_or_repo_change_not_authorized"
+        repo_map = raw_repo
+    else:
+        return "repository_mismatch"
+
+    names: list[str] = []
+    top_name = _optional_nonempty_str(data.get("repository_name"))
+    if top_name is not None:
+        names.append(top_name)
+    nested_name = repo_map.get("name")
+    if nested_name is not None:
+        parsed_name = _optional_nonempty_str(nested_name)
+        if parsed_name is None:
+            return "repository_mismatch"
+        names.append(parsed_name)
+    for name in names:
+        if name != policy.repository_name:
+            return "repository_mismatch"
+
+    path = repo_map.get("path")
+    if path is not None:
+        parsed_path = _optional_nonempty_str(path)
+        if parsed_path is None or parsed_path not in {".", "./"}:
+            return "repository_path_mismatch"
+
+    bases: list[str] = []
+    nested_base = repo_map.get("base_branch")
+    if nested_base is not None:
+        parsed_base = _optional_nonempty_str(nested_base)
+        if parsed_base is None:
+            return "branch_lineage_mismatch"
+        bases.append(parsed_base)
+    top_base = _optional_nonempty_str(data.get("base_branch"))
+    if top_base is not None:
+        bases.append(top_base)
+    for base in bases:
+        if base != policy.base_branch:
+            return "branch_lineage_mismatch"
+
+    targets: list[str] = []
+    for key in ("target_branch", "branch"):
+        parsed_target = _optional_nonempty_str(data.get(key))
+        if parsed_target is not None:
+            targets.append(parsed_target)
+    persistence = data.get("persistence")
+    if isinstance(persistence, Mapping):
+        parsed_target = _optional_nonempty_str(persistence.get("target_branch"))
+        if parsed_target is not None:
+            targets.append(parsed_target)
+    allowed_branches = {policy.target_branch, policy.base_branch}
+    for target in targets:
+        if target not in allowed_branches:
+            return "branch_lineage_mismatch"
+
+    scope = data.get("implementation_scope")
+    if scope is None:
+        scope = data.get("scope")
+    if scope is not None:
+        if isinstance(scope, str):
+            requested = [scope]
+        elif isinstance(scope, (list, tuple)):
+            requested = [str(item) for item in scope]
+        else:
+            return "scope_expansion"
+        denial = validate_followup_against_policy(
+            policy=policy,
+            repository_name=policy.repository_name,
+            target_branch=policy.target_branch,
+            requested_scope=requested,
+        )
+        if denial:
+            return denial
+    return None
+
+
+def hydrate_executable_child_mission(
+    mission_yaml: str,
+    *,
+    policy: WorkflowPolicySnapshot,
+) -> tuple[ChildMissionHydration | None, str | None]:
+    """Hydrate a child mission with a validated policy repository contract.
+
+    Child templates may omit ``repository``. The immutable workflow policy is
+    the sole authority for name, path, base branch, target branch, and scope.
+    Returns ``(hydration, None)`` on success or ``(None, denial_reason)``.
+    """
+    body, trailer = _split_followup_trailer(mission_yaml)
+    try:
+        parsed = yaml.safe_load(body)
+    except yaml.YAMLError:
+        return None, "invalid_mission_yaml"
+    if not isinstance(parsed, dict):
+        return None, "invalid_mission_yaml"
+
+    denial = inspect_child_repository_authority(parsed, policy=policy)
+    if denial:
+        return None, denial
+
+    hydrated = dict(parsed)
+    hydrated["repository"] = canonical_child_repository_contract(policy)
+    for alias in _AUTHORITY_ALIAS_KEYS:
+        hydrated.pop(alias, None)
+    persistence = hydrated.get("persistence")
+    if isinstance(persistence, Mapping):
+        persistence_copy = dict(persistence)
+        persistence_copy["target_branch"] = policy.target_branch
+        hydrated["persistence"] = persistence_copy
+
+    normalized_path, path_error = normalize_submit_repository_path(hydrated)
+    if path_error is not None or not normalized_path:
+        return None, path_error or "repository_path_mismatch"
+    if normalized_path != DEFAULT_REPOSITORY_PATH:
+        return None, "repository_path_mismatch"
+    hydrated["repository"] = canonical_child_repository_contract(policy)
+
+    dumped = yaml.safe_dump(
+        hydrated,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+    if not dumped.endswith("\n"):
+        dumped += "\n"
+    executable_yaml = dumped
+    if trailer:
+        executable_yaml = dumped.rstrip() + "\n" + trailer
+        if not executable_yaml.endswith("\n"):
+            executable_yaml += "\n"
+    return ChildMissionHydration(mission=hydrated, mission_yaml=executable_yaml), None
+
+
 def detect_mission_authority_injection(
     mission_yaml: str,
     *,
@@ -348,10 +552,7 @@ def detect_mission_authority_injection(
     auto-followups unless the immutable policy snapshot explicitly allows it.
     """
     # Strip opaque follow-up context trailer before scanning.
-    scan_target = mission_yaml or ""
-    begin = scan_target.find(_FOLLOWUP_BEGIN)
-    if begin != -1:
-        scan_target = scan_target[:begin]
+    scan_target, _trailer = _split_followup_trailer(mission_yaml)
     lowered = scan_target.lower()
 
     if re.search(
@@ -382,9 +583,22 @@ def detect_mission_authority_injection(
         r"(?im)^\s*allow_secret_changes\s*:\s*true\b", scan_target
     ) and not policy.allow_secret_changes:
         return "secret_changes_not_authorized"
-    # Repository / branch keys in mission YAML cannot override snapshot.
+
+    parsed: Any = None
+    try:
+        parsed = yaml.safe_load(scan_target)
+    except yaml.YAMLError:
+        parsed = None
+    if isinstance(parsed, dict):
+        structured = inspect_child_repository_authority(parsed, policy=policy)
+        if structured:
+            return structured
+        return None
+
+    # Unparseable templates: keep a conservative line scan, but do not treat a
+    # nested ``repository:`` mapping key as a repository name.
     repo_m = re.search(
-        r"(?im)^\s*(?:repository(?:\.name)?|repository_name)\s*:\s*[\"']?([^\s\"']+)",
+        r"(?im)^\s*(?:repository\.name|repository_name)\s*:\s*[\"']?([^\s\"']+)",
         scan_target,
     )
     if repo_m and repo_m.group(1) != policy.repository_name:
@@ -1697,18 +1911,22 @@ __all__ = [
     "ChildRunView",
     "DecisionAction",
     "OrchestratorDecision",
+    "ChildMissionHydration",
     "ReviewVerdict",
     "ReviewVerdictKind",
     "WorkflowOrchestrator",
     "assert_review_step_read_only",
     "bound_context_field",
     "build_followup_mission_yaml",
+    "canonical_child_repository_contract",
     "canonicalize_finding",
     "decide_reconcile",
     "detect_mission_authority_injection",
     "enforce_launch_policy_gates",
     "fingerprint_findings",
     "format_review_verdict_envelope",
+    "hydrate_executable_child_mission",
+    "inspect_child_repository_authority",
     "is_workflow_orchestration_enabled",
     "parse_review_verdict",
     "redact_secrets",
