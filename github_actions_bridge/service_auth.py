@@ -17,16 +17,29 @@ import hashlib
 import logging
 import secrets
 from typing import Any
+from urllib.parse import urlparse
 
 from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
 from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
+from mcp.server.auth.routes import (
+    build_resource_metadata_url,
+    create_protected_resource_routes,
+)
 from starlette.authentication import AuthenticationBackend
 from starlette.requests import HTTPConnection
+from starlette.routing import Route
 
 SERVICE_CLIENT_ID = "hal-gateway-service"
 BRIDGE_SERVICE_TOKEN_ENV = "BRIDGE_SERVICE_TOKEN"
 DEFAULT_PUBLIC_MCP_PATH = "/mcp"
 DEFAULT_SERVICE_MCP_PATH = "/mcp/service"
+# ChatGPT plugin identity for the existing bridge-backed record. Resource URL
+# stays {BRIDGE_PUBLIC_URL}/mcp — only the human-readable RFC 9728 name is
+# stamped so in-place Refresh keeps binding to this origin.
+CANONICAL_GATEWAY_DISPLAY_NAME = "HAL LegalAI Gateway"
+PLUGIN_REFRESH_PROTECTED_RESOURCE_PATH = (
+    "/.well-known/oauth-protected-resource" + DEFAULT_PUBLIC_MCP_PATH
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,3 +285,70 @@ def compose_dual_mcp_http_app(
         Middleware(AuthContextMiddleware),
     ]
     return Starlette(routes=routes, lifespan=lifespan, middleware=middleware)
+
+
+def plugin_refresh_mcp_url(public_url: str) -> str:
+    """Exact Streamable HTTP URL ChatGPT Refresh recaches for this plugin."""
+    return f"{public_url.rstrip('/')}{DEFAULT_PUBLIC_MCP_PATH}"
+
+
+def plugin_refresh_protected_resource_path() -> str:
+    """RFC 9728 metadata path for the public ``/mcp`` resource."""
+    return PLUGIN_REFRESH_PROTECTED_RESOURCE_PATH
+
+
+def replace_canonical_protected_resource_routes(
+    provider: AuthProvider,
+    routes: list[Any],
+) -> list[Any]:
+    """Stamp RFC 9728 ``resource_name`` without changing the resource URL."""
+    resource_url = getattr(provider, "_resource_url", None)
+    if resource_url is None:
+        return routes
+    issuer = getattr(provider, "issuer_url", None) or getattr(
+        provider, "base_url", None
+    )
+    if issuer is None:
+        return routes
+    metadata_path = urlparse(str(build_resource_metadata_url(resource_url))).path
+    kept = [
+        route
+        for route in routes
+        if not (
+            isinstance(route, Route) and getattr(route, "path", None) == metadata_path
+        )
+    ]
+    registration = getattr(provider, "client_registration_options", None)
+    scopes = None
+    if registration is not None:
+        scopes = getattr(registration, "valid_scopes", None)
+    if not scopes:
+        scopes = list(getattr(provider, "required_scopes", None) or [])
+    named = create_protected_resource_routes(
+        resource_url=resource_url,
+        authorization_servers=[issuer],
+        scopes_supported=list(scopes) if scopes else None,
+        resource_name=CANONICAL_GATEWAY_DISPLAY_NAME,
+    )
+    return kept + list(named)
+
+
+def stamp_canonical_protected_resource_identity(
+    provider: AuthProvider,
+) -> AuthProvider:
+    """Ensure OAuth protected-resource metadata names HAL LegalAI Gateway.
+
+    FastMCP's GitHubProvider omits ``resource_name``. ChatGPT Refresh uses MCP
+    ``tools/list`` plus this RFC 9728 field; the resource URL (plugin key) is
+    left unchanged so the existing bridge-backed record can recache in place.
+    """
+    original_get_routes = provider.get_routes
+
+    def get_routes(mcp_path: str | None = None) -> list[Any]:
+        return replace_canonical_protected_resource_routes(
+            provider,
+            original_get_routes(mcp_path),
+        )
+
+    provider.get_routes = get_routes  # type: ignore[method-assign]
+    return provider
