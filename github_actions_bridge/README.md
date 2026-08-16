@@ -76,9 +76,74 @@ Independent `verify_acceptance_contract` and `list_acceptance_contracts`
 confirm objects by key/size/`contract_sha256`/`object_sha256` metadata without
 returning contract contents. Credentials are never accepted or logged.
 
-Mission Control remains unchanged and is not used by this bridge.
+Mission Control remains unchanged for the original GitHub Actions tools.
+Namespaced `mission.*` / `workflow.*` catalog tools on public `/mcp` are a
+thin compatibility forward to the canonical HAL LegalAI Gateway MCP (or, when
+that URL is unset, Mission Control MCP — the same downstream the gateway
+already uses). No mission YAML parsing or workflow orchestration runs here.
 
 ## Authentication (two MCP surfaces)
+
+| Path | Audience | Auth |
+| --- | --- | --- |
+| `POST/GET /mcp` | Direct ChatGPT / operator clients | FastMCP `GitHubProvider` OAuth (unchanged) |
+| `POST/GET /mcp/service` | HAL LegalAI Gateway only | `BRIDGE_SERVICE_TOKEN` via FastMCP 2.x `TokenVerifier` (static bearer). Fail closed. **No** GitHub OAuth discovery on this path. |
+
+Do **not** put a composite OAuth+service verifier on the public `/mcp` route.
+Gateway must call `/mcp/service` with `GATEWAY_BRIDGE_AUTHORIZATION` matching
+`BRIDGE_SERVICE_TOKEN` (with or without a `Bearer ` prefix). Inbound user OAuth
+session tokens must never be forwarded downstream.
+
+When `BRIDGE_SERVICE_TOKEN` is unset, `/mcp/service` rejects all credentials
+(fail closed). Public `/mcp` OAuth behavior is unchanged.
+
+### ChatGPT plugin Refresh (bridge-backed HAL LegalAI Gateway record)
+
+The unnumbered ChatGPT connector named **HAL LegalAI Gateway** is keyed to this
+bridge origin, not the separate `hal-legalai-gateway` Railway service. Do
+**not** delete or recreate that record. One-click Refresh recaches `tools/list`
+from the same OAuth-protected MCP URL.
+
+| Discovery field | Value (must stay unchanged) |
+| --- | --- |
+| Plugin / MCP resource | `https://hal-github-actions-bridge-production.up.railway.app/mcp` |
+| RFC 9728 metadata | `https://hal-github-actions-bridge-production.up.railway.app/.well-known/oauth-protected-resource/mcp` |
+| OAuth authorization server | `https://hal-github-actions-bridge-production.up.railway.app/.well-known/oauth-authorization-server` |
+| RFC 9728 `resource` | the `/mcp` URL above |
+| RFC 9728 `resource_name` | `HAL LegalAI Gateway` |
+
+**One-click Refresh verification**
+
+1. Deploy this bridge at the existing `BRIDGE_PUBLIC_URL` (do not change
+   domain, GitHub OAuth app, secrets, or `/mcp`).
+2. Confirm `GET /health` (no auth) reports `catalog_identity=HAL LegalAI Gateway`,
+   `plugin_refresh_mcp_url` ending in `/mcp`, legacy tools (`submit_run`,
+   `submit_case00`, `list_case00_storage`, …), and canonical names
+   `mission.submit`, `workflow.submit`, `workflow.status`, `case.submit` /
+   `case.get_artifact`, `storage.list_inventory`.
+3. In ChatGPT, open **developer information** for the existing connector whose
+   MCP URL is `https://hal-github-actions-bridge-production.up.railway.app/mcp`
+   (display label **HAL LegalAI Gateway**). Use in-place **Refresh**. Do not
+   reconnect a new URL and do not add a second connector.
+4. If Refresh asks to re-authorize GitHub OAuth, complete it against this same
+   origin. The OAuth resource URL must remain `{BRIDGE_PUBLIC_URL}/mcp`.
+5. Start a **new chat** bound to that same connector. Confirm `tools/list`
+   includes namespaced `case.*`, `storage.*`, `mission.submit`,
+   `workflow.submit`, and `workflow.status` **and** the original proof / Case-00
+   / storage tool names.
+6. Fail closed: unauthenticated `/mcp` stays 401; `/mcp/service` still requires
+   `BRIDGE_SERVICE_TOKEN` and must not grow GitHub OAuth discovery.
+
+Optional `HAL_LEGALAI_GATEWAY_URL` (canonical gateway origin) plus existing
+`BRIDGE_SERVICE_TOKEN` forwards namespaced mission/workflow calls to gateway
+`/mcp`. When that URL is unset, those tools forward to Mission Control MCP at
+`MISSION_CONTROL_MCP_URL` (default
+`https://mission-control-mcp-production.up.railway.app/mcp`). Downstream and
+auth failures return `ok=false` with a `failure_stage`; inbound OAuth is never
+copied downstream. Case/storage namespaced tools alias local implementations so
+they do not round-trip through the gateway (avoids a Bridge→Gateway→Bridge loop).
+
+### Railway / cutover verification
 
 | Path | Audience | Auth |
 | --- | --- | --- |
