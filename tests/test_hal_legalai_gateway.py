@@ -1810,6 +1810,18 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
 INBOUND_OAUTH_TOKEN = "inbound-gateway-oauth-session-token"
 INBOUND_SESSION_COOKIE = "mcp_sid=inbound-session-cookie"
 INBOUND_X_API_KEY = "inbound-x-api-key-value"
+INBOUND_GITHUB_TOKEN = "inbound-x-github-token-value"
+INBOUND_RUNNER_SESSION = "inbound-x-runner-session-value"
+_SAFE_OUTBOUND_FACTORY_HEADER_NAMES = frozenset(
+    {"accept", "x-request-id", "x-correlation-id"}
+)
+_INBOUND_CREDENTIAL_ALIASES = (
+    INBOUND_OAUTH_TOKEN,
+    INBOUND_SESSION_COOKIE,
+    INBOUND_X_API_KEY,
+    INBOUND_GITHUB_TOKEN,
+    INBOUND_RUNNER_SESSION,
+)
 
 
 def _inbound_oauth_request() -> Request:
@@ -1828,6 +1840,8 @@ def _inbound_oauth_request() -> Request:
                 (b"authorization", f"Bearer {INBOUND_OAUTH_TOKEN}".encode()),
                 (b"cookie", INBOUND_SESSION_COOKIE.encode()),
                 (b"x-api-key", INBOUND_X_API_KEY.encode()),
+                (b"x-github-token", INBOUND_GITHUB_TOKEN.encode()),
+                (b"x-runner-session", INBOUND_RUNNER_SESSION.encode()),
                 (b"host", b"gateway.example"),
             ],
             "client": ("127.0.0.1", 50000),
@@ -1909,6 +1923,41 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
 
         return factory, captured_requests, captured_factory_headers
 
+    def _assert_inbound_headers_reachable(self, inbound: dict[str, str]) -> None:
+        self.assertEqual(
+            inbound.get("authorization"),
+            f"Bearer {INBOUND_OAUTH_TOKEN}",
+        )
+        self.assertEqual(inbound.get("cookie"), INBOUND_SESSION_COOKIE)
+        self.assertEqual(inbound.get("x-api-key"), INBOUND_X_API_KEY)
+        self.assertEqual(inbound.get("x-github-token"), INBOUND_GITHUB_TOKEN)
+        self.assertEqual(inbound.get("x-runner-session"), INBOUND_RUNNER_SESSION)
+
+    def _assert_credential_aliases_absent(self, blob: str, names: set[str]) -> None:
+        for alias in _INBOUND_CREDENTIAL_ALIASES:
+            self.assertNotIn(alias, blob)
+        self.assertNotIn("cookie", names)
+        self.assertNotIn("set-cookie", names)
+        self.assertNotIn("x-api-key", names)
+        self.assertNotIn("x-github-token", names)
+        self.assertNotIn("x-runner-session", names)
+
+    def _assert_factory_headers_allowlisted(
+        self,
+        factory_headers: dict[str, str],
+    ) -> None:
+        names = {name.lower() for name in factory_headers}
+        self.assertTrue(
+            names <= _SAFE_OUTBOUND_FACTORY_HEADER_NAMES,
+            msg=(
+                f"factory header names {sorted(names)} are not a subset of "
+                f"{sorted(_SAFE_OUTBOUND_FACTORY_HEADER_NAMES)}"
+            ),
+        )
+        values = " ".join(str(value) for value in factory_headers.values())
+        self._assert_credential_aliases_absent(values, names)
+        self.assertNotIn("authorization", names)
+
     def _assert_inbound_credentials_absent(
         self,
         request: httpx.Request,
@@ -1917,22 +1966,11 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
     ) -> None:
         blob = " ".join(str(value) for value in request.headers.values())
         names = {name.lower() for name in request.headers.keys()}
-        self.assertNotIn(INBOUND_OAUTH_TOKEN, blob)
-        self.assertNotIn(INBOUND_SESSION_COOKIE, blob)
-        self.assertNotIn(INBOUND_X_API_KEY, blob)
-        self.assertNotIn("cookie", names)
-        self.assertNotIn("set-cookie", names)
-        self.assertNotIn("x-api-key", names)
+        self._assert_credential_aliases_absent(blob, names)
         authorization = request.headers.get("authorization") or ""
         self.assertNotIn(INBOUND_OAUTH_TOKEN, authorization)
         if factory_headers is not None:
-            lowered = {name.lower(): value for name, value in factory_headers.items()}
-            self.assertNotIn("authorization", lowered)
-            self.assertNotIn("cookie", lowered)
-            self.assertNotIn("x-api-key", lowered)
-            self.assertNotIn(INBOUND_OAUTH_TOKEN, " ".join(lowered.values()))
-            self.assertNotIn(INBOUND_SESSION_COOKIE, " ".join(lowered.values()))
-            self.assertNotIn(INBOUND_X_API_KEY, " ".join(lowered.values()))
+            self._assert_factory_headers_allowlisted(factory_headers)
 
     def test_workflow_submit_outbound_strips_inbound_oauth_session_headers(
         self,
@@ -1952,12 +1990,7 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
         async def _run() -> dict[str, Any]:
             with set_http_request(_inbound_oauth_request()):
                 inbound = get_http_headers()
-                self.assertEqual(
-                    inbound.get("authorization"),
-                    f"Bearer {INBOUND_OAUTH_TOKEN}",
-                )
-                self.assertEqual(inbound.get("cookie"), INBOUND_SESSION_COOKIE)
-                self.assertEqual(inbound.get("x-api-key"), INBOUND_X_API_KEY)
+                self._assert_inbound_headers_reachable(inbound)
                 with mock.patch(
                     "hal_legalai_gateway.mcp_server._require_gateway_principal",
                     return_value="nhpcorp35",
@@ -1971,6 +2004,7 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
         self.assertTrue(captured_requests)
         self.assertTrue(captured_factory_headers)
         for factory_headers in captured_factory_headers:
+            self._assert_factory_headers_allowlisted(factory_headers)
             self._assert_inbound_credentials_absent(
                 captured_requests[0], factory_headers=factory_headers
             )
@@ -1985,9 +2019,8 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
         blob = json.dumps(
             [dict(request.headers) for request in captured_requests]
         )
-        self.assertNotIn(INBOUND_OAUTH_TOKEN, blob)
-        self.assertNotIn(INBOUND_SESSION_COOKIE, blob)
-        self.assertNotIn(INBOUND_X_API_KEY, blob)
+        for alias in _INBOUND_CREDENTIAL_ALIASES:
+            self.assertNotIn(alias, blob)
         self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
         self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, blob)
 
@@ -1999,12 +2032,7 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
         async def _run() -> dict[str, Any]:
             with set_http_request(_inbound_oauth_request()):
                 inbound = get_http_headers()
-                self.assertEqual(
-                    inbound.get("authorization"),
-                    f"Bearer {INBOUND_OAUTH_TOKEN}",
-                )
-                self.assertEqual(inbound.get("cookie"), INBOUND_SESSION_COOKIE)
-                self.assertEqual(inbound.get("x-api-key"), INBOUND_X_API_KEY)
+                self._assert_inbound_headers_reachable(inbound)
                 return await forward_mcp_tool(
                     binding=ToolBinding(
                         gateway_tool="storage.list_inventory",
@@ -2023,11 +2051,14 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
                         TEST_BRIDGE_SERVICE_TOKEN,
                         INBOUND_OAUTH_TOKEN,
                         INBOUND_X_API_KEY,
+                        INBOUND_GITHUB_TOKEN,
+                        INBOUND_RUNNER_SESSION,
                     ),
                 )
 
         asyncio.run(_run())
         self.assertTrue(captured_requests)
+        self.assertTrue(captured_factory_headers)
         for request in captured_requests:
             self._assert_inbound_credentials_absent(request)
             self.assertEqual(
@@ -2038,18 +2069,16 @@ class OutboundHeaderIsolationTests(unittest.TestCase):
             self.assertIn("authorization", names)
             self.assertNotIn("cookie", names)
             self.assertNotIn("x-api-key", names)
+            self.assertNotIn("x-github-token", names)
+            self.assertNotIn("x-runner-session", names)
         for factory_headers in captured_factory_headers:
-            lowered = {name.lower() for name in factory_headers}
-            self.assertNotIn("authorization", lowered)
-            self.assertNotIn("cookie", lowered)
-            self.assertNotIn("x-api-key", lowered)
+            self._assert_factory_headers_allowlisted(factory_headers)
         blob = " ".join(
             " ".join(str(value) for value in request.headers.values())
             for request in captured_requests
         )
-        self.assertNotIn(INBOUND_OAUTH_TOKEN, blob)
-        self.assertNotIn(INBOUND_SESSION_COOKIE, blob)
-        self.assertNotIn(INBOUND_X_API_KEY, blob)
+        for alias in _INBOUND_CREDENTIAL_ALIASES:
+            self.assertNotIn(alias, blob)
 
 
 if __name__ == "__main__":
