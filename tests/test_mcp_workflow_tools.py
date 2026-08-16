@@ -236,6 +236,28 @@ class TestWorkflowClientForwarding(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.await_args.args[1], f"/workflows/{CANONICAL_UUID4}")
         self.assertEqual(result, status)
 
+    async def test_cancel_forwards_post_workflows_id_cancel(self) -> None:
+        status = {
+            "workflow_id": CANONICAL_UUID4,
+            "state": "cancelled",
+            "steps": [],
+        }
+        encoded = quote(CANONICAL_UUID4, safe="")
+        with patch.object(
+            self.client,
+            "_request",
+            new=AsyncMock(return_value=status),
+        ) as request:
+            result = await self.client.cancel_workflow(CANONICAL_UUID4)
+        request.assert_awaited_once_with(
+            "POST", f"/workflows/{encoded}/cancel"
+        )
+        self.assertEqual(
+            request.await_args.args[1],
+            f"/workflows/{CANONICAL_UUID4}/cancel",
+        )
+        self.assertEqual(result, status)
+
     async def test_malicious_ids_never_call_request(self) -> None:
         with patch.object(
             self.client,
@@ -246,6 +268,11 @@ class TestWorkflowClientForwarding(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(raw=raw):
                     with self.assertRaises(ValueError) as ctx:
                         await self.client.get_workflow(raw)
+                    message = str(ctx.exception)
+                    self.assertEqual(message, _WORKFLOW_ID_INVALID)
+                    self.assertNotIn(raw, message)
+                    with self.assertRaises(ValueError) as ctx:
+                        await self.client.cancel_workflow(raw)
                     message = str(ctx.exception)
                     self.assertEqual(message, _WORKFLOW_ID_INVALID)
                     self.assertNotIn(raw, message)
@@ -313,6 +340,8 @@ class TestWorkflowClientForwarding(unittest.IsolatedAsyncioTestCase):
                 await self.client.submit_workflow("\n  ")
             with self.assertRaises(ValueError):
                 await self.client.get_workflow("  ")
+            with self.assertRaises(ValueError):
+                await self.client.cancel_workflow("  ")
             with self.assertRaises(ValueError) as ctx:
                 await self.client.submit_workflow(
                     YAML_WITH_SECRET,
@@ -432,6 +461,24 @@ class TestWorkflowMcpTools(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["workflow_id"], "wf-1")
         self.assertEqual(result["state"], "running")
 
+    async def test_cancel_tool_success_shape(self) -> None:
+        payload = {
+            "workflow_id": "wf-1",
+            "state": "cancelled",
+            "steps": [],
+        }
+        with patch.object(
+            mcp_server.client,
+            "cancel_workflow",
+            new=AsyncMock(return_value=payload),
+        ) as cancel:
+            result = await mcp_server.cancel_workflow("wf-1")
+        cancel.assert_awaited_once_with("wf-1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["workflow_id"], "wf-1")
+        self.assertEqual(result["state"], "cancelled")
+        self.assertNotIn("error", result)
+
     async def test_validation_errors_match_tool_error_shape(self) -> None:
         empty_yaml = await mcp_server.submit_workflow("  ")
         self.assertEqual(
@@ -450,6 +497,10 @@ class TestWorkflowMcpTools(unittest.IsolatedAsyncioTestCase):
         empty_id = await mcp_server.get_workflow("\n")
         self.assertFalse(empty_id["ok"])
         self.assertIn("workflow_id", empty_id["error"]["message"])
+
+        empty_cancel = await mcp_server.cancel_workflow("\n")
+        self.assertFalse(empty_cancel["ok"])
+        self.assertIn("workflow_id", empty_cancel["error"]["message"])
 
         bad_key = await mcp_server.submit_workflow(
             YAML_WITH_SECRET,
@@ -489,6 +540,16 @@ class TestWorkflowMcpTools(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["error"]["status_code"], 403)
         _assert_no_raw_yaml_or_secrets(status)
 
+        with patch.object(
+            mcp_server.client,
+            "cancel_workflow",
+            new=AsyncMock(side_effect=feature_off),
+        ):
+            cancelled = await mcp_server.cancel_workflow("wf-1")
+        self.assertFalse(cancelled["ok"])
+        self.assertEqual(cancelled["error"]["status_code"], 403)
+        _assert_no_raw_yaml_or_secrets(cancelled)
+
 
 class TestWorkflowToolDiscovery(unittest.TestCase):
     def test_expected_tools_include_workflow_surface(self) -> None:
@@ -497,6 +558,7 @@ class TestWorkflowToolDiscovery(unittest.TestCase):
         self.assertEqual(names, list(mcp_server.EXPECTED_TOOL_NAMES))
         self.assertIn("submit_workflow", names)
         self.assertIn("get_workflow", names)
+        self.assertIn("cancel_workflow", names)
 
         submit = next(t for t in tools if t.name == "submit_workflow")
         submit_props = submit.parameters["properties"]
@@ -517,12 +579,21 @@ class TestWorkflowToolDiscovery(unittest.TestCase):
         self.assertIn("sanitized", get_desc)
         self.assertIn("GET /workflows/{workflow_id}", get_desc)
 
+        cancel_tool = next(t for t in tools if t.name == "cancel_workflow")
+        self.assertEqual(cancel_tool.parameters["required"], ["workflow_id"])
+        cancel_desc = cancel_tool.description or ""
+        self.assertIn("MISSION_CONTROL_WORKFLOW_ORCHESTRATION", cancel_desc)
+        self.assertIn("fail-closed", cancel_desc)
+        self.assertIn("sanitized", cancel_desc)
+        self.assertIn("POST /workflows/{workflow_id}/cancel", cancel_desc)
+
         instructions = str(getattr(mcp_server.mcp, "instructions", "") or "")
         if not instructions:
             mcp_inner = getattr(mcp_server.mcp, "_mcp_server", None)
             instructions = str(getattr(mcp_inner, "instructions", "") or "")
         self.assertIn("submit_workflow", instructions)
         self.assertIn("get_workflow", instructions)
+        self.assertIn("cancel_workflow", instructions)
         self.assertIn("MISSION_CONTROL_WORKFLOW_ORCHESTRATION", instructions)
         self.assertIn("fail-closed", instructions)
         self.assertIn("sanitized", instructions)

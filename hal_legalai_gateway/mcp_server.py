@@ -316,6 +316,21 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
             "the gateway."
         ),
     ),
+    ToolBinding(
+        gateway_tool="workflow.cancel",
+        namespace="workflow",
+        downstream_service="mission_control",
+        downstream_tool="cancel_workflow",
+        description=(
+            "Cancel a durable Mission Control workflow (downstream "
+            "cancel_workflow). Returns the sanitized durable status "
+            "envelope. Secrets, child mission YAML, and agent "
+            "stdout/stderr are never included. Orchestration remains "
+            "fail-closed while MISSION_CONTROL_WORKFLOW_ORCHESTRATION is "
+            "disabled. Thin forwarder: no polling, history, or workflow "
+            "parsing in the gateway."
+        ),
+    ),
 )
 
 # Canonical ChatGPT / MCP plugin identity. Frozen across capability additions
@@ -1060,6 +1075,13 @@ def register_forwarding_tools(
     )
     async def workflow_status(workflow_id: str) -> dict[str, Any]:
         return await _forward("workflow.status", {"workflow_id": workflow_id})
+
+    @mcp.tool(
+        name="workflow.cancel",
+        description=by_name["workflow.cancel"].description,
+    )
+    async def workflow_cancel(workflow_id: str) -> dict[str, Any]:
+        return await _forward("workflow.cancel", {"workflow_id": workflow_id})
 
     logger.info(
         "registered gateway MCP tools count=%s names=%s",

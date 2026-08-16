@@ -106,7 +106,6 @@ CANONICAL_WORKFLOW_ID = "00000000-0000-4000-8000-000000000001"
 EXPECTED_NAMESPACES = REQUIRED_NAMESPACES | {"workflow"}
 FORBIDDEN_WORKFLOW_TOOLS = (
     "workflow.wait",
-    "workflow.cancel",
     "workflow.history",
 )
 
@@ -153,12 +152,13 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("mission.submit", registry.namespaces["mission"].tools)
         self.assertEqual(
             registry.namespaces["workflow"].tools,
-            ("workflow.submit", "workflow.status"),
+            ("workflow.submit", "workflow.status", "workflow.cancel"),
         )
         present = {binding.gateway_tool for binding in registry.tool_bindings}
         self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(present))
         self.assertIn("workflow.submit", present)
         self.assertIn("workflow.status", present)
+        self.assertIn("workflow.cancel", present)
         for forbidden in FORBIDDEN_WORKFLOW_TOOLS:
             self.assertNotIn(forbidden, present)
             self.assertNotIn(forbidden, registry.namespaces["workflow"].tools)
@@ -233,11 +233,19 @@ class RegistryTests(unittest.TestCase):
             "get_workflow",
         )
         self.assertEqual(
+            registry.downstream_tool_for_gateway_tool("workflow.cancel"),
+            "cancel_workflow",
+        )
+        self.assertEqual(
             registry.downstream_for_tool("workflow.submit"),
             "mission_control",
         )
         self.assertEqual(
             registry.downstream_for_tool("workflow.status"),
+            "mission_control",
+        )
+        self.assertEqual(
+            registry.downstream_for_tool("workflow.cancel"),
             "mission_control",
         )
 
@@ -955,6 +963,7 @@ class McpRegistrationTests(unittest.TestCase):
         self.assertIn("storage.get_acceptance_contract", names)
         self.assertIn("workflow.submit", names)
         self.assertIn("workflow.status", names)
+        self.assertIn("workflow.cancel", names)
         for forbidden in FORBIDDEN_WORKFLOW_TOOLS:
             self.assertNotIn(forbidden, names)
 
@@ -1156,6 +1165,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(tools))
         self.assertIn("workflow.submit", tools)
         self.assertIn("workflow.status", tools)
+        self.assertIn("workflow.cancel", tools)
         self.assertEqual(
             payload["namespaces"]["workflow"]["downstream_service"],
             "mission_control",
@@ -1416,7 +1426,7 @@ class RequestContextUnitTests(unittest.TestCase):
 
 
 class WorkflowGatewaySliceDTests(unittest.TestCase):
-    """Unified gateway workflow.submit / workflow.status thin forwarders."""
+    """Unified gateway workflow.submit / workflow.status / workflow.cancel thin forwarders."""
 
     def setUp(self) -> None:
         self.settings = load_settings(
@@ -1506,6 +1516,16 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
                 self.assertIn("fail-closed", text.lower())
                 self.assertNotIn("workflow.wait", text)
                 self.assertNotIn("workflow.cancel", text)
+        cancel_binding = defaults_by_name["workflow.cancel"]
+        self.assertEqual(cancel_binding.downstream_tool, "cancel_workflow")
+        self.assertEqual(cancel_binding.downstream_service, "mission_control")
+        self.assertIn(
+            "MISSION_CONTROL_WORKFLOW_ORCHESTRATION", cancel_binding.description
+        )
+        self.assertIn("fail-closed", cancel_binding.description.lower())
+        self.assertIn("cancel_workflow", cancel_binding.description)
+        self.assertNotIn("workflow.wait", cancel_binding.description)
+        self.assertNotIn("workflow.history", cancel_binding.description)
         self.assertEqual(
             defaults_by_name["workflow.submit"].downstream_tool,
             "submit_workflow",
@@ -1638,8 +1658,41 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
         self.assertIsNone(kwargs["authorization"])
         self.assertFalse(kwargs["require_authorization"])
 
+    def test_cancel_forwards_canonical_workflow_id(self) -> None:
+        collector = self._collect_tools("workflow.cancel")
+        sanitized = {
+            "ok": True,
+            "workflow_id": CANONICAL_WORKFLOW_ID,
+            "state": "cancelled",
+            "steps": [{"step_type": "implementation", "status": "cancelled"}],
+        }
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value={"ok": True, "result": sanitized},
+        ) as forward_mock:
+            result = asyncio.run(
+                collector["workflow.cancel"](CANONICAL_WORKFLOW_ID)
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], sanitized)
+        kwargs = forward_mock.await_args.kwargs
+        self.assertEqual(kwargs["binding"].gateway_tool, "workflow.cancel")
+        self.assertEqual(kwargs["binding"].downstream_tool, "cancel_workflow")
+        self.assertEqual(kwargs["binding"].downstream_service, "mission_control")
+        self.assertEqual(
+            kwargs["arguments"], {"workflow_id": CANONICAL_WORKFLOW_ID}
+        )
+        self.assertIsNone(kwargs["authorization"])
+        self.assertFalse(kwargs["require_authorization"])
+
     def test_inbound_oauth_required_and_service_token_rejected(self) -> None:
-        collector = self._collect_tools("workflow.submit", "workflow.status")
+        collector = self._collect_tools(
+            "workflow.submit", "workflow.status", "workflow.cancel"
+        )
         unauthorized = asyncio.run(
             collector["workflow.submit"](WORKFLOW_YAML_FIXTURE)
         )
@@ -1666,7 +1719,7 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
             new_callable=mock.AsyncMock,
         ) as forward_mock:
             rejected = asyncio.run(
-                collector["workflow.status"](CANONICAL_WORKFLOW_ID)
+                collector["workflow.cancel"](CANONICAL_WORKFLOW_ID)
             )
         self.assertFalse(rejected["ok"])
         self.assertEqual(rejected["failure_stage"], "auth")

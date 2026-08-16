@@ -21,6 +21,7 @@ from mission_control.run_registry import RunRegistry
 from mission_control.workflow_registry import (
     StepType,
     WorkflowRegistry,
+    WorkflowState,
 )
 from mission_control.workflow_submit import (
     MAX_DEPENDENCIES_PER_STEP,
@@ -28,6 +29,7 @@ from mission_control.workflow_submit import (
     MAX_WORKFLOW_YAML_BYTES,
     WorkflowConflictError,
     WorkflowSubmitError,
+    cancel_workflow,
     parse_idempotency_key,
     parse_workflow_yaml,
     submit_workflow,
@@ -504,6 +506,17 @@ class FeatureGateHttpTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 403)
 
+    def test_cancel_feature_off_returns_403(self) -> None:
+        with patch.dict(os.environ, _FEATURE_OFF, clear=False):
+            response = self.client.post(
+                "/workflows/00000000-0000-4000-8000-000000000001/cancel"
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            response.json()["detail"],
+            "Workflow orchestration is disabled",
+        )
+
     def test_unauthenticated_post_returns_401_even_when_flag_off(self) -> None:
         with patch.dict(os.environ, _FEATURE_OFF, clear=False):
             response = self.unauth.post(
@@ -516,6 +529,13 @@ class FeatureGateHttpTests(unittest.TestCase):
         with patch.dict(os.environ, _FEATURE_ON, clear=False):
             response = self.unauth.get(
                 "/workflows/00000000-0000-4000-8000-000000000001"
+            )
+        self.assertEqual(response.status_code, 401)
+
+    def test_unauthenticated_cancel_returns_401(self) -> None:
+        with patch.dict(os.environ, _FEATURE_ON, clear=False):
+            response = self.unauth.post(
+                "/workflows/00000000-0000-4000-8000-000000000001/cancel"
             )
         self.assertEqual(response.status_code, 401)
 
@@ -741,6 +761,97 @@ class StatusHttpTests(WorkflowHttpTestCase):
         self.assertIn("[redacted]", body["error"])
 
 
+class CancelHttpTests(WorkflowHttpTestCase):
+    def test_cancel_pending_returns_sanitized_status(self) -> None:
+        created = self._post().json()
+        workflow_id = created["workflow_id"]
+        response = self.client.post(f"/workflows/{workflow_id}/cancel")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["workflow_id"], workflow_id)
+        self.assertEqual(body["state"], "cancelled")
+        self.assertIsNotNone(body["completed_at"])
+        self.assertEqual(body["last_decision_action"], "cancel")
+        self.assertNotIn("mission_yaml", response.text)
+        self.assertNotIn("stdout", response.text)
+        self.assertNotIn(TEST_SECRET_VALUE, response.text)
+        record = api_module.workflow_registry.get_workflow(workflow_id)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.state, WorkflowState.CANCELLED)
+
+    def test_cancel_unknown_workflow_404(self) -> None:
+        response = self.client.post(
+            "/workflows/00000000-0000-4000-8000-000000000099/cancel"
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Workflow not found")
+
+    def test_cancel_already_cancelled_returns_409(self) -> None:
+        created = self._post().json()
+        workflow_id = created["workflow_id"]
+        first = self.client.post(f"/workflows/{workflow_id}/cancel")
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(f"/workflows/{workflow_id}/cancel")
+        self.assertEqual(second.status_code, 409)
+        detail = second.json()["detail"]
+        self.assertEqual(detail["code"], "workflow_already_cancelled")
+        self.assertNotIn(TEST_SECRET_VALUE, second.text)
+
+    def test_cancel_other_terminal_returns_409(self) -> None:
+        created = self._post().json()
+        workflow_id = created["workflow_id"]
+        record = api_module.workflow_registry.get_workflow(workflow_id)
+        assert record is not None
+        failed = api_module.workflow_registry.apply_cas_transition(
+            workflow_id=workflow_id,
+            expected_version=record.version,
+            to_state=WorkflowState.FAILED,
+            reason="error",
+            workflow_updates={"error": "boom"},
+        )
+        self.assertTrue(failed.ok)
+        response = self.client.post(f"/workflows/{workflow_id}/cancel")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["code"], "workflow_terminal")
+        latched = api_module.workflow_registry.get_workflow(workflow_id)
+        assert latched is not None
+        self.assertEqual(latched.state, WorkflowState.FAILED)
+
+    def test_cancel_latches_cas_against_revival(self) -> None:
+        created = self._post().json()
+        workflow_id = created["workflow_id"]
+        response = self.client.post(f"/workflows/{workflow_id}/cancel")
+        self.assertEqual(response.status_code, 200)
+        record = api_module.workflow_registry.get_workflow(workflow_id)
+        assert record is not None
+        revived = api_module.workflow_registry.apply_cas_transition(
+            workflow_id=workflow_id,
+            expected_version=record.version,
+            to_state=WorkflowState.RUNNING,
+            reason="child_status",
+            detail={"child_status": "running"},
+        )
+        self.assertFalse(revived.ok)
+        self.assertEqual(revived.error, "workflow_terminal")
+        latched = api_module.workflow_registry.get_workflow(workflow_id)
+        assert latched is not None
+        self.assertEqual(latched.state, WorkflowState.CANCELLED)
+        status = self.client.get(f"/workflows/{workflow_id}")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["state"], "cancelled")
+
+    def test_cancel_helper_feature_disabled(self) -> None:
+        with self.assertRaises(WorkflowSubmitError) as ctx:
+            cancel_workflow(
+                "00000000-0000-4000-8000-000000000001",
+                workflow_registry=api_module.workflow_registry,
+                run_registry=api_module.run_registry,
+                environ=_FEATURE_OFF,
+            )
+        self.assertEqual(ctx.exception.code, "feature_disabled")
+
+
 class OpenApiWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         app.openapi_schema = None
@@ -755,6 +866,8 @@ class OpenApiWorkflowTests(unittest.TestCase):
         self.assertIn("post", self.raw["paths"]["/workflows"])
         self.assertIn("/workflows/{workflow_id}", self.raw["paths"])
         self.assertIn("get", self.raw["paths"]["/workflows/{workflow_id}"])
+        self.assertIn("/workflows/{workflow_id}/cancel", self.raw["paths"])
+        self.assertIn("post", self.raw["paths"]["/workflows/{workflow_id}/cancel"])
 
     def test_operation_ids(self) -> None:
         self.assertEqual(
@@ -764,6 +877,12 @@ class OpenApiWorkflowTests(unittest.TestCase):
         self.assertEqual(
             self.raw["paths"]["/workflows/{workflow_id}"]["get"]["operationId"],
             "get_workflow",
+        )
+        self.assertEqual(
+            self.raw["paths"]["/workflows/{workflow_id}/cancel"]["post"][
+                "operationId"
+            ],
+            "cancel_workflow",
         )
 
     def test_actions_schema_includes_workflow_operations(self) -> None:
@@ -777,6 +896,12 @@ class OpenApiWorkflowTests(unittest.TestCase):
             ],
             "get_workflow",
         )
+        self.assertEqual(
+            self.actions["paths"]["/workflows/{workflow_id}/cancel"]["post"][
+                "operationId"
+            ],
+            "cancel_workflow",
+        )
 
     def test_bearer_security_declared(self) -> None:
         self.assertEqual(
@@ -788,6 +913,12 @@ class OpenApiWorkflowTests(unittest.TestCase):
             [{"HTTPBearer": []}],
         )
         self.assertEqual(
+            self.raw["paths"]["/workflows/{workflow_id}/cancel"]["post"][
+                "security"
+            ],
+            [{"HTTPBearer": []}],
+        )
+        self.assertEqual(
             self.actions["paths"]["/workflows"]["post"]["security"],
             [{"HTTPBearer": []}],
         )
@@ -796,6 +927,7 @@ class OpenApiWorkflowTests(unittest.TestCase):
         for path, method in (
             ("/workflows", "post"),
             ("/workflows/{workflow_id}", "get"),
+            ("/workflows/{workflow_id}/cancel", "post"),
         ):
             description = self.actions["paths"][path][method]["description"]
             self.assertLess(len(description), MAX_OPERATION_DESCRIPTION_LENGTH)
@@ -809,6 +941,9 @@ class OpenApiWorkflowTests(unittest.TestCase):
         self.assertIn("submit_workflow", {
             schema["paths"]["/workflows"]["post"]["operationId"],
             schema["paths"]["/workflows/{workflow_id}"]["get"]["operationId"],
+            schema["paths"]["/workflows/{workflow_id}/cancel"]["post"][
+                "operationId"
+            ],
         })
 
 

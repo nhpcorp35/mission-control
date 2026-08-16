@@ -820,6 +820,33 @@ class StateMachineTransitionTests(WorkflowRegistryTestCase):
         self.assertTrue(
             all(d.action is not DecisionAction.LAUNCH_CHILD for d in applied)
         )
+        already = self.registry.cancel_workflow(wf.workflow_id)
+        self.assertFalse(already.ok)
+        self.assertEqual(already.error, "workflow_already_cancelled")
+        revived = self.registry.apply_cas_transition(
+            workflow_id=wf.workflow_id,
+            expected_version=result.workflow.version,
+            to_state=WorkflowState.RUNNING,
+            reason="child_status",
+        )
+        self.assertFalse(revived.ok)
+        self.assertEqual(revived.error, "workflow_terminal")
+        latched = self.registry.get_workflow(wf.workflow_id)
+        self.assertEqual(latched.state, WorkflowState.CANCELLED)
+
+        failed = self._create()
+        self.registry.apply_cas_transition(
+            workflow_id=failed.workflow_id,
+            expected_version=failed.version,
+            to_state=WorkflowState.FAILED,
+            reason="error",
+        )
+        other = self.registry.cancel_workflow(failed.workflow_id)
+        self.assertFalse(other.ok)
+        self.assertEqual(other.error, "workflow_terminal")
+        missing = self.registry.cancel_workflow("missing-workflow")
+        self.assertFalse(missing.ok)
+        self.assertEqual(missing.error, "workflow_not_found")
 
     def test_budget_ceilings_off_by_one(self) -> None:
         # child_run_count: max=1 → first launch ok; second denied.

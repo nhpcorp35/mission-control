@@ -29,6 +29,7 @@ EXPECTED_TOOL_NAMES = (
     "run_repository_command",
     "submit_workflow",
     "get_workflow",
+    "cancel_workflow",
 )
 
 
@@ -61,10 +62,12 @@ mcp = FastMCP(
         "claims (platform persistence runs after the agent completes). "
         "Use list_run_notifications for bounded Phase 2C durable notification "
         "inspection (redacted; no webhook secrets). "
-        "Use submit_workflow (POST /workflows) and get_workflow "
-        "(GET /workflows/{workflow_id}) for durable workflow submit and "
-        "sanitized status. Production remains fail-closed when "
-        "MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. "
+        "Use submit_workflow (POST /workflows), get_workflow "
+        "(GET /workflows/{workflow_id}), and cancel_workflow "
+        "(POST /workflows/{workflow_id}/cancel) for durable workflow "
+        "submit, sanitized status, and cancellation. Production remains "
+        "fail-closed when MISSION_CONTROL_WORKFLOW_ORCHESTRATION is "
+        "disabled. "
         "wait_for_run / submit_and_wait default timeout is "
         f"{MCP_WAIT_DEFAULT_TIMEOUT_SECONDS:g}s; requested timeouts are "
         f"honored up to {MCP_WAIT_MAX_TIMEOUT_SECONDS:g}s and never "
@@ -365,6 +368,25 @@ async def get_workflow(workflow_id: str) -> dict[str, Any]:
             raise ValueError("workflow_id must not be empty")
 
         result = await client.get_workflow(workflow_id)
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+@mcp.tool()
+async def cancel_workflow(workflow_id: str) -> dict[str, Any]:
+    """Cancel a durable workflow via POST /workflows/{workflow_id}/cancel.
+
+    Production remains fail-closed when MISSION_CONTROL_WORKFLOW_ORCHESTRATION
+    is disabled (the API returns 403). Uses registry cancellation semantics.
+    Status is sanitized: never includes secrets, child mission YAML, or
+    agent stdout/stderr.
+    """
+    try:
+        if not workflow_id.strip():
+            raise ValueError("workflow_id must not be empty")
+
+        result = await client.cancel_workflow(workflow_id)
         return {"ok": True, **result}
     except Exception as exc:
         return _tool_error(exc)
