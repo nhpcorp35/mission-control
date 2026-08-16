@@ -3,7 +3,10 @@
 Claim-to-create protocol (deterministic; SQLite is the correctness boundary):
 
 1. Load claimed step + exact stored ``mission_yaml`` (never regenerate).
-2. Reject missing parent / ownership before any reserved create.
+2. Resolve durable ``retried_from`` ownership before any reserved create:
+   claimed ``parent_run_id`` when present, otherwise ``workflow_id`` for
+   HTTP/MCP submits that have no parent run. Reject only when neither is
+   a usable identity.
 3. Re-run launch policy, permissions, ceiling, and authority gates.
 4. ``RunRegistry.create_run(run_id=child_run_id, …)`` with canonical
    ``retried_from`` ownership (created | recovered_idempotently | conflict).
@@ -328,10 +331,20 @@ def _resolve_step(
 
 
 def _ownership_for_step(step: WorkflowStepRecord) -> str | None:
-    """Canonical RunRegistry ownership from the claimed step parent binding."""
+    """Canonical RunRegistry ownership for reserved child create.
+
+    Prefer the claimed parent binding. HTTP/MCP workflows omit
+    ``parent_run_id``; ``workflow_id`` is then the durable ``retried_from``
+    identity so reserved creates stay idempotent across retries.
+    """
+    parent = normalize_ownership_id(step.parent_run_id)
+    fallback = (
+        None if parent is not None else normalize_ownership_id(step.workflow_id)
+    )
     try:
         return resolve_run_registry_ownership(
-            parent_run_id=step.parent_run_id,
+            parent_run_id=parent,
+            retried_from=fallback,
         )
     except ValueError:
         return None
