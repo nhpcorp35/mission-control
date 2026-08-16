@@ -122,6 +122,37 @@ def _mcp_session(client: TestClient, path: str, authorization: str | None):
     return init, headers
 
 
+def _tools_list_names(client: TestClient, path: str, headers: dict[str, str]) -> list[str]:
+    """Collect tool names from the actual JSON-RPC tools/list catalog."""
+    names: list[str] = []
+    cursor = None
+    request_id = 2
+    for _ in range(16):
+        params: dict = {} if cursor is None else {"cursor": cursor}
+        listed = client.post(
+            path,
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/list",
+                "params": params,
+            },
+        )
+        if listed.status_code != 200:
+            raise AssertionError(
+                f"tools/list returned HTTP {listed.status_code}: {listed.text}"
+            )
+        payload = listed.json()
+        result = payload.get("result") or {}
+        names.extend(tool["name"] for tool in result.get("tools") or [])
+        cursor = result.get("nextCursor")
+        if not cursor:
+            return names
+        request_id += 1
+    raise AssertionError("tools/list pagination exceeded 16 pages")
+
+
 class PluginRefreshUrlTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -171,6 +202,11 @@ class CanonicalCatalogRegistrationTests(unittest.TestCase):
             "storage.list_inventory",
         ):
             self.assertIn(name, required)
+
+    def test_plugin_instructions_advertise_canonical_workflow_tools(self) -> None:
+        instructions = str(getattr(self.server.mcp, "instructions", "") or "")
+        for name in ("workflow.submit", "workflow.cancel", "workflow.status"):
+            self.assertIn(name, instructions)
 
     def test_registered_tools_include_canonical_and_legacy(self) -> None:
         names = asyncio.run(self.server.list_registered_tool_names())
@@ -454,13 +490,7 @@ class PublicMcpRefreshHttpTests(unittest.TestCase):
             json={"jsonrpc": "2.0", "method": "notifications/initialized"},
         )
         self.assertIn(note.status_code, {200, 202})
-        listed = self.client.post(
-            "/mcp",
-            headers=headers,
-            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        )
-        self.assertEqual(listed.status_code, 200)
-        names = [tool["name"] for tool in listed.json()["result"]["tools"]]
+        names = _tools_list_names(self.client, "/mcp", headers)
         for required in (
             "mission.submit",
             "workflow.submit",
@@ -476,6 +506,32 @@ class PublicMcpRefreshHttpTests(unittest.TestCase):
             self.assertIn(required, names, msg=required)
         namespaces = {name.split(".", 1)[0] for name in names if "." in name}
         self.assertTrue({"case", "storage", "mission", "workflow"}.issubset(namespaces))
+
+    def test_public_mcp_tools_list_includes_canonical_workflow_tools(self) -> None:
+        """Unnumbered plugin Refresh recaches public /mcp tools/list."""
+        init, headers = _mcp_session(
+            self.client,
+            "/mcp",
+            f"Bearer {OAUTH_TOKEN}",
+        )
+        self.assertEqual(init.status_code, 200)
+        session_id = init.headers.get("mcp-session-id")
+        self.assertTrue(session_id)
+        headers = dict(headers)
+        headers["mcp-session-id"] = session_id
+        note = self.client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        self.assertIn(note.status_code, {200, 202})
+        names = _tools_list_names(self.client, "/mcp", headers)
+        for required in (
+            "workflow.submit",
+            "workflow.cancel",
+            "workflow.status",
+        ):
+            self.assertIn(required, names, msg=required)
 
     def test_public_mcp_requires_auth(self) -> None:
         init, _ = _mcp_session(self.client, "/mcp", None)

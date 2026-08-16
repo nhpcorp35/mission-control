@@ -526,7 +526,9 @@ mcp = FastMCP(
         "generation_manifest.json and model_input_audit.json). Case-00 storage tools "
         "expose allowlisted inventory metadata, archive a fixed attorney-feedback "
         "package, and archive one DOCX review packet under canonical B2 prefixes "
-        "without accepting bucket or key inputs."
+        "without accepting bucket or key inputs. Namespaced canonical catalog "
+        "tools recached by the unnumbered HAL LegalAI Gateway plugin include "
+        "mission.submit, workflow.submit, workflow.cancel, and workflow.status."
     ),
     auth=oauth_auth_provider,
 )
