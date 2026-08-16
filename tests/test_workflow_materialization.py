@@ -389,20 +389,84 @@ class MismatchPoisonTests(MaterializeTestCase):
         self.assertEqual(poisoned.state, WorkflowState.BLOCKED)
 
 
-class MissingParentTests(MaterializeTestCase):
-    def test_missing_parent_binding_rejects_before_create(self) -> None:
+class StandaloneClaimOwnershipTests(MaterializeTestCase):
+    def test_standalone_claim_uses_workflow_id_as_retried_from(self) -> None:
         wf, step = self._create_and_claim(parent_run_id=None)
+        self.assertIsNone(step.parent_run_id)
         result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(result.outcome, MaterializeOutcome.CREATED)
+        self.assertTrue(result.enqueued)
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        self.assertEqual(record.retried_from, wf.workflow_id)
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
+        latest = self.workflow_registry.get_step(step.step_id)
+        assert latest is not None
         self.assertEqual(
-            result.outcome, MaterializeOutcome.MISSING_PARENT_BINDING
+            latest.materialization_state, StepMaterializationState.MATERIALIZED
         )
-        self.assertEqual(self.run_registry.count_runs(), 0)
-        self.assertEqual(self.queue.calls, [])
+
+    def test_standalone_crash_after_create_recovers_idempotently(self) -> None:
+        wf, step = self._create_and_claim(parent_run_id=None)
+        created = self.run_registry.create_run(
+            run_id=step.child_run_id,
+            mission_yaml=step.mission_yaml,
+            retried_from=wf.workflow_id,
+        )
+        self.assertEqual(created.outcome.value, "created")
         latest = self.workflow_registry.get_step(step.step_id)
         assert latest is not None
         self.assertEqual(
             latest.materialization_state, StepMaterializationState.CLAIMED
         )
+
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(
+            result.outcome, MaterializeOutcome.RECOVERED_IDEMPOTENTLY
+        )
+        self.assertTrue(result.enqueued)
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        self.assertEqual(record.retried_from, wf.workflow_id)
+        bound = self.workflow_registry.get_step(step.step_id)
+        assert bound is not None
+        self.assertEqual(
+            bound.materialization_state, StepMaterializationState.MATERIALIZED
+        )
+
+    def test_standalone_crash_hook_after_create_then_retry(self) -> None:
+        wf, step = self._create_and_claim(parent_run_id=None)
+
+        def boom() -> None:
+            raise RuntimeError("crash_after_create")
+
+        with self.assertRaises(RuntimeError):
+            self._materialize(
+                wf.workflow_id,
+                step.step_id,
+                hooks=MaterializeCrashHooks(after_create=boom),
+            )
+        self.assertEqual(self.run_registry.count_runs(), 1)
+        self.assertEqual(self.queue.calls, [])
+
+        result = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(
+            result.outcome, MaterializeOutcome.RECOVERED_IDEMPOTENTLY
+        )
+        self.assertTrue(result.enqueued)
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
+
+    def test_standalone_idempotent_retry_does_not_duplicate_enqueue(self) -> None:
+        wf, step = self._create_and_claim(parent_run_id=None)
+        first = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(first.outcome, MaterializeOutcome.CREATED)
+        second = self._materialize(wf.workflow_id, step.step_id)
+        self.assertEqual(
+            second.outcome, MaterializeOutcome.ALREADY_MATERIALIZED
+        )
+        self.assertFalse(second.enqueued)
+        self._assert_one_row_at_most_one_enqueue(step.child_run_id)
 
 
 class PolicyDenialTests(MaterializeTestCase):

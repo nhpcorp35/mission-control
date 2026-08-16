@@ -192,15 +192,16 @@ class ReconcilerTestCase(unittest.TestCase):
         os.unlink(self._wf_path)
         os.unlink(self._run_path)
 
-    def _create_workflow(self, **policy_overrides):
+    def _create_workflow(self, parent_run_id: str | None | object = ..., **policy_overrides):
         specs = _specs()
+        parent = self.parent_id if parent_run_id is ... else parent_run_id
         return self.workflow_registry.create_workflow(
             policy=_policy(**policy_overrides),
             implementation=specs["implementation"],
             review=specs["review"],
             fix=specs["fix"],
             re_review=specs["re_review"],
-            parent_run_id=self.parent_id,
+            parent_run_id=parent,
         )
 
     def _complete_child(
@@ -398,6 +399,88 @@ class StartupRecoveryTests(ReconcilerTestCase):
         steps = self.workflow_registry.list_steps(wf.workflow_id)
         self.assertEqual(steps[0].status, StepStatus.COMPLETED)
         self.assertEqual(steps[1].step_type, StepType.REVIEW)
+
+    def test_recovers_standalone_claimed_unmaterialized_step(self) -> None:
+        """HTTP/MCP workflow without parent_run_id materializes on tick."""
+        wf = self._create_workflow(parent_run_id=None)
+        claim = self.workflow_registry.claim_child_launch(
+            workflow_id=wf.workflow_id,
+            expected_version=wf.version,
+            step_type=StepType.IMPLEMENTATION,
+            mission_yaml=_specs()["implementation"].mission_yaml,
+            cycle=0,
+            attempt=1,
+            parent_run_id=None,
+        )
+        self.assertTrue(claim.ok)
+        step = claim.step
+        assert step is not None
+        self.assertIsNone(step.parent_run_id)
+        self.assertIsNone(self.run_registry.get_run(step.child_run_id))
+
+        stats = self.reconciler.tick_once()
+        self.assertGreaterEqual(stats.materializations, 1)
+        latest = self.workflow_registry.get_step(step.step_id)
+        assert latest is not None
+        self.assertEqual(
+            latest.materialization_state,
+            StepMaterializationState.MATERIALIZED,
+        )
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        self.assertEqual(record.retried_from, wf.workflow_id)
+        self.assertEqual(self.queue.run_ids.count(step.child_run_id), 1)
+        intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
+        self.assertIsNotNone(intent)
+
+        self.reconciler.tick_once()
+        self.assertEqual(self.queue.run_ids.count(step.child_run_id), 1)
+
+    def test_standalone_crash_after_create_recovers_without_duplicate(
+        self,
+    ) -> None:
+        """Create succeeded, mark/enqueue did not; first-pass materialize recovers."""
+        wf = self._create_workflow(parent_run_id=None)
+        claim = self.workflow_registry.claim_child_launch(
+            workflow_id=wf.workflow_id,
+            expected_version=wf.version,
+            step_type=StepType.IMPLEMENTATION,
+            mission_yaml=_specs()["implementation"].mission_yaml,
+            cycle=0,
+            attempt=1,
+            parent_run_id=None,
+        )
+        self.assertTrue(claim.ok)
+        step = claim.step
+        assert step is not None
+        created = self.run_registry.create_run(
+            run_id=step.child_run_id,
+            mission_yaml=step.mission_yaml,
+            retried_from=wf.workflow_id,
+        )
+        self.assertEqual(created.outcome.value, "created")
+        self.assertIsNone(
+            self.workflow_registry.get_dispatch_intent(step.child_run_id)
+        )
+
+        stats = self.reconciler.tick_once()
+        self.assertGreaterEqual(stats.materializations, 1)
+        latest = self.workflow_registry.get_step(step.step_id)
+        assert latest is not None
+        self.assertEqual(
+            latest.materialization_state,
+            StepMaterializationState.MATERIALIZED,
+        )
+        intent = self.workflow_registry.get_dispatch_intent(step.child_run_id)
+        self.assertIsNotNone(intent)
+        self.assertEqual(self.queue.run_ids.count(step.child_run_id), 1)
+        record = self.run_registry.get_run(step.child_run_id)
+        assert record is not None
+        self.assertEqual(record.retried_from, wf.workflow_id)
+
+        self.reconciler.tick_once()
+        self.assertEqual(self.queue.run_ids.count(step.child_run_id), 1)
+        self.assertEqual(self.run_registry.count_runs(), 1)
 
     def test_recovers_partial_transition_mark_without_followup_claim(
         self,

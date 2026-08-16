@@ -23,6 +23,7 @@ from typing import Any, Mapping
 from mission_control.run_registry import RunRecord, RunRegistry, RunStatus
 from mission_control.workflow_materializer import (
     MaterializeOutcome,
+    MaterializeResult,
     SupportsEnqueue,
     materialize_claimed_child,
     redrive_materialized_dispatch,
@@ -182,6 +183,10 @@ def _is_execution_observed(record: RunRecord | None) -> bool:
 
 class WorkflowReconciler:
     """Background worker: observe terminals, claim/materialize, redrive.
+
+    Existing CLAIMED steps are materialized before orchestrator decisions so
+    crash-after-create cannot MARK_STEP without a dispatch intent. Newly
+    claimed steps are materialized afterward, then pending intents redrive.
 
     Start only when the workflow feature flag is explicitly enabled.
     ``tick_once`` is the deterministic unit used by tests and the loop.
@@ -474,6 +479,47 @@ class WorkflowReconciler:
         self._fairness_cursor = (start + 1) % n
         return ordered
 
+    def _note_materialize_counters(
+        self, result: MaterializeResult, out: dict[str, int]
+    ) -> None:
+        if result.outcome not in {
+            MaterializeOutcome.FEATURE_DISABLED,
+            MaterializeOutcome.NOT_FOUND,
+            MaterializeOutcome.NOT_CLAIMED,
+            MaterializeOutcome.WORKFLOW_TERMINAL,
+        }:
+            out["materializations"] += 1
+        if result.dispatch_state == "acked" or (
+            result.outcome is MaterializeOutcome.ALREADY_MATERIALIZED
+            and result.reason == "dispatch_acked"
+        ):
+            out["finalized"] += 1
+
+    def _materialize_claimed_steps(
+        self,
+        workflow_id: str,
+        steps: list[WorkflowStepRecord],
+        *,
+        deadline: float,
+        out: dict[str, int],
+    ) -> None:
+        for step in steps:
+            if time.monotonic() >= deadline:
+                break
+            if step.status is StepStatus.CLAIMED and (
+                step.materialization_state
+                is StepMaterializationState.CLAIMED
+            ):
+                result = materialize_claimed_child(
+                    workflow_registry=self._workflow_registry,
+                    run_registry=self._run_registry,
+                    run_queue=self._run_queue,
+                    workflow_id=workflow_id,
+                    step_id=step.step_id,
+                    environ=self._environ,
+                )
+                self._note_materialize_counters(result, out)
+
     def _reconcile_one(
         self, workflow_id: str, *, deadline: float
     ) -> dict[str, int]:
@@ -483,6 +529,13 @@ class WorkflowReconciler:
             "redrives": 0,
             "finalized": 0,
         }
+        # Existing claims first: reserved create + dispatch intent before any
+        # orchestrator MARK_STEP that would skip mark_step_materialized.
+        steps = self._workflow_registry.list_steps(workflow_id)
+        self._materialize_claimed_steps(
+            workflow_id, steps, deadline=deadline, out=out
+        )
+
         steps = self._workflow_registry.list_steps(workflow_id)
         child_runs = self._child_runs_for_steps(steps)
         applied = self._orchestrator.reconcile_workflow(
@@ -492,7 +545,7 @@ class WorkflowReconciler:
         )
         out["decisions"] = len(applied)
 
-        # Refresh steps after claim / mark mutations.
+        # Newly claimed this tick, then redrive pending materialized handoff.
         steps = self._workflow_registry.list_steps(workflow_id)
         for step in steps:
             if time.monotonic() >= deadline:
@@ -509,19 +562,7 @@ class WorkflowReconciler:
                     step_id=step.step_id,
                     environ=self._environ,
                 )
-                if result.outcome not in {
-                    MaterializeOutcome.FEATURE_DISABLED,
-                    MaterializeOutcome.NOT_FOUND,
-                    MaterializeOutcome.NOT_CLAIMED,
-                    MaterializeOutcome.WORKFLOW_TERMINAL,
-                }:
-                    out["materializations"] += 1
-                if result.dispatch_state == "acked" or (
-                    result.outcome
-                    is MaterializeOutcome.ALREADY_MATERIALIZED
-                    and result.reason == "dispatch_acked"
-                ):
-                    out["finalized"] += 1
+                self._note_materialize_counters(result, out)
                 continue
 
             if (
