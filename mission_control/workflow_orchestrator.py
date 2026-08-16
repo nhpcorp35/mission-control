@@ -820,14 +820,19 @@ def _budget_violation(
 
     Semantics (inclusive ceilings):
     - wall-clock: elapsed >= max_wall_clock_seconds
-    - estimated credit: credit_units_used >= max_credit_units
+    - estimated credit: credit_units_used > max_credit_units
+      Equality is not exhaustion. Units are reserved when a child is
+      authorized/claimed, so a queued or running child that consumed the
+      final unit must be allowed to finish. New children are still denied
+      by ``_would_exceed_child_budget``
+      (credit_units_used + unit > max).
     - actual credit: when credit_usage_actual is not None,
       credit_usage_actual >= max_credit_units
     Child-run ceiling is enforced at launch boundaries via
     ``_would_exceed_child_budget`` (child_run_count + 1 > max).
     """
     policy = workflow.policy_snapshot
-    if workflow.credit_units_used >= policy.max_credit_units:
+    if workflow.credit_units_used > policy.max_credit_units:
         return WorkflowState.BUDGET_EXHAUSTED
     if (
         workflow.credit_usage_actual is not None

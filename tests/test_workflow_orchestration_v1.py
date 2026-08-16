@@ -905,6 +905,135 @@ class StateMachineTransitionTests(WorkflowRegistryTestCase):
             )
         )
 
+    def test_authorized_final_child_at_credit_ceiling_is_not_exhausted(
+        self,
+    ) -> None:
+        """Exact credit ceiling must not terminate an already-authorized child.
+
+        After the first child completes and the second reserved unit is
+        claimed (2/2), a queued or running review must keep running, then
+        reconcile to the child's terminal result. A further child is still
+        fail-closed.
+        """
+        wf = self._create(max_credit_units=2, max_child_runs=8)
+        self.orch.reconcile_workflow(wf.workflow_id, child_runs={})
+        impl = self.registry.list_steps(wf.workflow_id)[0]
+        impl_done = ChildRunView(
+            run_id=impl.child_run_id, status="completed"
+        )
+        self.orch.reconcile_workflow(
+            wf.workflow_id,
+            child_runs={impl.child_run_id: impl_done},
+        )
+        review = [
+            s
+            for s in self.registry.list_steps(wf.workflow_id)
+            if s.step_type is StepType.REVIEW
+        ][0]
+        at_ceiling = self.registry.get_workflow(wf.workflow_id)
+        self.assertEqual(at_ceiling.credit_units_used, 2)
+        self.assertEqual(at_ceiling.policy_snapshot.max_credit_units, 2)
+        self.assertEqual(at_ceiling.child_run_count, 2)
+        self.assertEqual(at_ceiling.state, WorkflowState.RUNNING)
+
+        children = {
+            impl.child_run_id: impl_done,
+            review.child_run_id: ChildRunView(
+                run_id=review.child_run_id, status="queued"
+            ),
+        }
+        queued_applied = self.orch.reconcile_workflow(
+            wf.workflow_id, child_runs=children
+        )
+        self.assertFalse(
+            any(
+                d.to_state is WorkflowState.BUDGET_EXHAUSTED
+                for d in queued_applied
+            )
+        )
+        self.assertEqual(
+            self.registry.get_workflow(wf.workflow_id).state,
+            WorkflowState.RUNNING,
+        )
+
+        children[review.child_run_id] = ChildRunView(
+            run_id=review.child_run_id, status="running"
+        )
+        running_applied = self.orch.reconcile_workflow(
+            wf.workflow_id, child_runs=children
+        )
+        self.assertFalse(
+            any(
+                d.to_state is WorkflowState.BUDGET_EXHAUSTED
+                for d in running_applied
+            )
+        )
+        self.assertFalse(
+            any(
+                d.action is DecisionAction.LAUNCH_CHILD
+                for d in running_applied
+            )
+        )
+        self.assertEqual(
+            self.registry.get_workflow(wf.workflow_id).state,
+            WorkflowState.RUNNING,
+        )
+
+        children[review.child_run_id] = ChildRunView(
+            run_id=review.child_run_id,
+            status="completed",
+            stdout=_merge_ready(),
+        )
+        self.orch.reconcile_workflow(wf.workflow_id, child_runs=children)
+        completed = self.registry.get_workflow(wf.workflow_id)
+        self.assertEqual(completed.state, WorkflowState.NEEDS_APPROVAL)
+        self.assertEqual(completed.credit_units_used, 2)
+        self.assertEqual(len(self.registry.list_steps(wf.workflow_id)), 2)
+
+        # Completing review as blocked would request a fix; that extra
+        # child exceeds the reserved credit ceiling and must fail closed.
+        wf_block = self._create(max_credit_units=2, max_child_runs=8)
+        self.orch.reconcile_workflow(wf_block.workflow_id, child_runs={})
+        impl_b = self.registry.list_steps(wf_block.workflow_id)[0]
+        impl_b_done = ChildRunView(
+            run_id=impl_b.child_run_id, status="completed"
+        )
+        self.orch.reconcile_workflow(
+            wf_block.workflow_id,
+            child_runs={impl_b.child_run_id: impl_b_done},
+        )
+        review_b = [
+            s
+            for s in self.registry.list_steps(wf_block.workflow_id)
+            if s.step_type is StepType.REVIEW
+        ][0]
+        blocked_children = {
+            impl_b.child_run_id: impl_b_done,
+            review_b.child_run_id: ChildRunView(
+                run_id=review_b.child_run_id,
+                status="completed",
+                stdout=_blocked("needs a fix child"),
+            ),
+        }
+        blocked_applied = self.orch.reconcile_workflow(
+            wf_block.workflow_id, child_runs=blocked_children
+        )
+        self.assertTrue(
+            any(
+                d.to_state is WorkflowState.BUDGET_EXHAUSTED
+                for d in blocked_applied
+            )
+        )
+        blocked_final = self.registry.get_workflow(wf_block.workflow_id)
+        self.assertEqual(blocked_final.state, WorkflowState.BUDGET_EXHAUSTED)
+        self.assertEqual(blocked_final.credit_units_used, 2)
+        self.assertFalse(
+            any(
+                s.step_type is StepType.FIX
+                for s in self.registry.list_steps(wf_block.workflow_id)
+            )
+        )
+
     def test_actual_credit_ceiling(self) -> None:
         wf = self._create(max_credit_units=5, max_child_runs=8)
         self.orch.reconcile_workflow(wf.workflow_id, child_runs={})
