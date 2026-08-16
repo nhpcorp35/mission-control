@@ -20,6 +20,8 @@ from starlette.requests import HTTPConnection
 from hal_legalai_gateway.config import GatewaySettings, load_settings
 from hal_legalai_gateway.health import aggregate_health
 from hal_legalai_gateway.mcp_server import (
+    CANONICAL_GATEWAY_DISPLAY_NAME,
+    canonical_gateway_identity,
     create_mcp_server,
     list_registered_tool_names,
 )
@@ -134,13 +136,15 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     _auth_override = auth_override
 
     application = FastAPI(
-        title="HAL LegalAI Gateway",
+        title=CANONICAL_GATEWAY_DISPLAY_NAME,
         description=(
             "Thin authenticated interface consolidation for LegalAI downstream "
-            "MCP services. Phase 2 exposes namespaced case/storage/mission tools "
-            "that forward to Bridge, Storage, artifact retrieval, and Mission "
-            "Control. Downstream business logic remains separately deployed. "
-            "Inbound /mcp uses GitHub OAuth for ChatGPT Business custom MCP."
+            "MCP services. Phase 2 exposes namespaced case/storage/mission/"
+            "workflow tools that forward to Bridge, Storage, artifact "
+            "retrieval, and Mission Control. Downstream business logic remains "
+            "separately deployed. Inbound /mcp uses GitHub OAuth for ChatGPT "
+            "Business custom MCP. Canonical plugin identity is "
+            f"{CANONICAL_GATEWAY_DISPLAY_NAME}."
         ),
         version="0.2.0",
         lifespan=lifespan,
@@ -157,9 +161,13 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/")
     async def root(request: Request) -> dict[str, Any]:
         settings = get_settings()
+        identity = canonical_gateway_identity(
+            public_url=settings.gateway_public_url
+        )
         return {
-            "service": "hal-legalai-gateway",
+            "service": identity["service_id"],
             "phase": 2,
+            "identity": identity,
             "deployed_commit_sha": settings.deployed_commit_sha,
             "request_id": getattr(request.state, "request_id", get_request_id()),
             "correlation_id": getattr(
@@ -182,6 +190,9 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         """Return the machine-readable logical registry (no live secrets)."""
         settings = get_settings()
         payload = settings.registry.as_public_dict()
+        payload["identity"] = canonical_gateway_identity(
+            public_url=settings.gateway_public_url
+        )
         payload["request_id"] = get_request_id()
         payload["correlation_id"] = get_correlation_id()
         payload["resolved_downstreams"] = {
@@ -221,6 +232,9 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             "inbound": "github_oauth",
             "downstream_bridge": "service_credential",
         }
+        payload["identity"] = canonical_gateway_identity(
+            public_url=settings.gateway_public_url
+        )
         return JSONResponse(payload)
 
     return application

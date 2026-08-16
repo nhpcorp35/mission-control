@@ -54,8 +54,15 @@ from hal_legalai_gateway.health import (
     probe_downstream,
 )
 from hal_legalai_gateway.mcp_server import (
+    CANONICAL_GATEWAY_DISPLAY_NAME,
+    CANONICAL_GATEWAY_IDENTITY_VERSION,
+    CANONICAL_GATEWAY_INSTRUCTIONS,
+    CANONICAL_GATEWAY_SERVICE_ID,
+    CANONICAL_INBOUND_MCP_PATH,
     DEFAULT_TOOL_BINDINGS,
     bindings_from_registry,
+    build_inbound_auth_provider,
+    canonical_gateway_identity,
     create_mcp_server,
     list_registered_tool_names,
     register_forwarding_tools,
@@ -978,6 +985,85 @@ class McpRegistrationTests(unittest.TestCase):
         self.assertIn("generation_manifest.json", binding.description)
 
 
+def _gateway_settings(**url_overrides: str):
+    environ = {
+        **REQUIRED_SECRETS,
+        "GATEWAY_BRIDGE_URL": "https://bridge.example",
+        "GATEWAY_STORAGE_URL": "https://storage.example",
+        "GATEWAY_MISSION_CONTROL_URL": "https://mission.example",
+        "GATEWAY_ARTIFACTS_URL": "https://artifacts.example",
+        **url_overrides,
+    }
+    return load_settings(environ=environ, registry=load_registry(REGISTRY_PATH))
+
+
+class CanonicalIdentityTests(unittest.TestCase):
+    """Lock update-safe MCP/OAuth identity and the complete namespaced catalog."""
+
+    def test_canonical_identity_rejects_unified_suffixes_and_library_version(self) -> None:
+        identity = canonical_gateway_identity(public_url="https://gateway.example/")
+        self.assertEqual(identity["display_name"], "HAL LegalAI Gateway")
+        self.assertEqual(identity["service_id"], CANONICAL_GATEWAY_SERVICE_ID)
+        self.assertEqual(identity["identity_version"], CANONICAL_GATEWAY_IDENTITY_VERSION)
+        self.assertEqual(identity["mcp_path"], CANONICAL_INBOUND_MCP_PATH)
+        self.assertEqual(identity["website_url"], "https://gateway.example")
+        self.assertEqual(identity["mcp_url"], "https://gateway.example/mcp")
+        self.assertEqual(identity["resource"], identity["mcp_url"])
+        self.assertEqual(identity["resource_name"], CANONICAL_GATEWAY_DISPLAY_NAME)
+        self.assertNotRegex(identity["display_name"], r"Unified\d*$")
+        self.assertNotIn("Unified", identity["display_name"])
+        import fastmcp
+
+        self.assertNotEqual(identity["identity_version"], fastmcp.__version__)
+
+    def test_create_mcp_server_pins_identity_and_complete_tool_catalog(self) -> None:
+        settings = _gateway_settings()
+        mcp = create_mcp_server(settings, auth=_test_inbound_auth())
+        self.assertEqual(mcp.name, CANONICAL_GATEWAY_DISPLAY_NAME)
+        self.assertEqual(mcp.version, CANONICAL_GATEWAY_IDENTITY_VERSION)
+        self.assertEqual(mcp.website_url, "https://gateway.example")
+        self.assertEqual(mcp.instructions, CANONICAL_GATEWAY_INSTRUCTIONS)
+
+        names = asyncio.run(list_registered_tool_names(mcp))
+        expected = sorted(binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS)
+        self.assertEqual(names, expected)
+        by_namespace: dict[str, list[str]] = {}
+        for binding in DEFAULT_TOOL_BINDINGS:
+            by_namespace.setdefault(binding.namespace, []).append(binding.gateway_tool)
+        self.assertEqual(
+            set(by_namespace),
+            {"case", "storage", "mission", "workflow"},
+        )
+        for namespace, tools in by_namespace.items():
+            self.assertTrue(tools, msg=f"{namespace} must expose tools")
+            for tool in tools:
+                self.assertIn(tool, names)
+        self.assertTrue(REQUIRED_GATEWAY_TOOLS.issubset(set(names)))
+        for forbidden in FORBIDDEN_WORKFLOW_TOOLS:
+            self.assertNotIn(forbidden, names)
+
+    def test_oauth_protected_resource_metadata_uses_canonical_resource_name(self) -> None:
+        from starlette.applications import Starlette
+        from starlette.testclient import TestClient as StarletteClient
+
+        settings = _gateway_settings()
+        provider = build_inbound_auth_provider(settings)
+        routes = provider.get_routes(CANONICAL_INBOUND_MCP_PATH)
+        app = Starlette(routes=list(routes))
+        with StarletteClient(app) as client:
+            response = client.get("/.well-known/oauth-protected-resource/mcp")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload.get("resource_name"), CANONICAL_GATEWAY_DISPLAY_NAME)
+        self.assertEqual(str(payload.get("resource")).rstrip("/"), "https://gateway.example/mcp")
+        servers = payload.get("authorization_servers") or []
+        self.assertTrue(servers)
+        self.assertTrue(
+            str(servers[0]).startswith("https://gateway.example"),
+            msg=servers,
+        )
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.env = {
@@ -1117,6 +1203,43 @@ class ApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload.get("jsonrpc"), "2.0")
         self.assertIn("result", payload)
+        server_info = payload["result"]["serverInfo"]
+        self.assertEqual(server_info["name"], CANONICAL_GATEWAY_DISPLAY_NAME)
+        self.assertEqual(server_info["version"], CANONICAL_GATEWAY_IDENTITY_VERSION)
+        website = server_info.get("websiteUrl") or server_info.get("website_url")
+        self.assertEqual(str(website).rstrip("/"), "https://gateway.example")
+
+    def test_http_surfaces_canonical_identity_and_tool_catalog(self) -> None:
+        expected_tools = sorted(
+            binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS
+        )
+        identity = canonical_gateway_identity(public_url="https://gateway.example")
+        for path in ("/", "/health", "/registry"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, msg=path)
+            payload = response.json()
+            self.assertEqual(payload["identity"], identity, msg=path)
+            self.assertEqual(
+                payload["identity"]["display_name"],
+                "HAL LegalAI Gateway",
+                msg=path,
+            )
+            self.assertNotIn("Unified", payload["identity"]["display_name"])
+            if path in {"/", "/health"}:
+                self.assertEqual(
+                    sorted(payload["registered_tools"]),
+                    expected_tools,
+                    msg=path,
+                )
+        registry = self.client.get("/registry").json()
+        catalog = {item["tool"] for item in registry["tool_bindings"]}
+        self.assertEqual(catalog, set(expected_tools))
+        self.assertEqual(set(registry["namespaces"]), EXPECTED_NAMESPACES)
+        for namespace in ("case", "storage", "mission", "workflow"):
+            self.assertTrue(
+                registry["namespaces"][namespace]["tools"],
+                msg=namespace,
+            )
 
     def test_health_reports_auth_mode_without_secrets(self) -> None:
         response = self.client.get("/health")

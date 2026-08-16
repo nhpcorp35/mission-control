@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
 from fastmcp.server.dependencies import get_access_token
+from mcp.server.auth.routes import (
+    build_resource_metadata_url,
+    create_protected_resource_routes,
+)
+from starlette.routing import Route
 
 from hal_legalai_gateway.auth import (
     build_github_oauth_provider,
@@ -312,6 +318,98 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
     ),
 )
 
+# Canonical ChatGPT / MCP plugin identity. Frozen across capability additions
+# and Railway deploys. ChatGPT's installed-plugin display name is a separate
+# client-side record and is not renamed by this metadata.
+CANONICAL_GATEWAY_DISPLAY_NAME = "HAL LegalAI Gateway"
+CANONICAL_GATEWAY_SERVICE_ID = "hal-legalai-gateway"
+CANONICAL_GATEWAY_IDENTITY_VERSION = "1"
+CANONICAL_INBOUND_MCP_PATH = "/mcp"
+CANONICAL_GATEWAY_INSTRUCTIONS = (
+    "Thin authenticated router for LegalAI namespaces (case, storage, "
+    "mission, workflow). Tools forward to independently deployed "
+    "Bridge, Storage, artifact, and Mission Control MCP servers. No "
+    "Case-00 generation, archive mutation, mission execution, or "
+    "workflow orchestration logic runs inside the gateway."
+)
+
+
+def canonical_gateway_identity(*, public_url: str) -> dict[str, str]:
+    """Stable public identity advertised to MCP/OAuth clients.
+
+    ``mcp_url`` / ``resource`` use the existing inbound ``/mcp`` path on
+    ``GATEWAY_PUBLIC_URL``. Adding tools must not change these values.
+    """
+    base = public_url.rstrip("/")
+    mcp_url = f"{base}{CANONICAL_INBOUND_MCP_PATH}"
+    return {
+        "display_name": CANONICAL_GATEWAY_DISPLAY_NAME,
+        "service_id": CANONICAL_GATEWAY_SERVICE_ID,
+        "identity_version": CANONICAL_GATEWAY_IDENTITY_VERSION,
+        "mcp_path": CANONICAL_INBOUND_MCP_PATH,
+        "website_url": base,
+        "mcp_url": mcp_url,
+        "resource": mcp_url,
+        "resource_name": CANONICAL_GATEWAY_DISPLAY_NAME,
+    }
+
+
+def replace_canonical_protected_resource_routes(
+    provider: AuthProvider,
+    routes: list[Any],
+) -> list[Any]:
+    """Stamp RFC 9728 ``resource_name`` without changing the resource URL."""
+    resource_url = getattr(provider, "_resource_url", None)
+    if resource_url is None:
+        return routes
+    issuer = getattr(provider, "issuer_url", None) or getattr(
+        provider, "base_url", None
+    )
+    if issuer is None:
+        return routes
+    metadata_path = urlparse(str(build_resource_metadata_url(resource_url))).path
+    kept = [
+        route
+        for route in routes
+        if not (
+            isinstance(route, Route) and getattr(route, "path", None) == metadata_path
+        )
+    ]
+    registration = getattr(provider, "client_registration_options", None)
+    scopes = None
+    if registration is not None:
+        scopes = getattr(registration, "valid_scopes", None)
+    if not scopes:
+        scopes = list(getattr(provider, "required_scopes", None) or [])
+    named = create_protected_resource_routes(
+        resource_url=resource_url,
+        authorization_servers=[issuer],
+        scopes_supported=list(scopes) if scopes else None,
+        resource_name=CANONICAL_GATEWAY_DISPLAY_NAME,
+    )
+    return kept + list(named)
+
+
+def stamp_canonical_protected_resource_identity(
+    provider: AuthProvider,
+) -> AuthProvider:
+    """Ensure OAuth protected-resource metadata carries the canonical name.
+
+    FastMCP's GitHubProvider/OAuthProxy omits ``resource_name``. ChatGPT uses
+    MCP ``serverInfo.name`` plus this RFC 9728 field as human-readable identity;
+    the resource URL (plugin key) is left unchanged.
+    """
+    original_get_routes = provider.get_routes
+
+    def get_routes(mcp_path: str | None = None) -> list[Any]:
+        return replace_canonical_protected_resource_routes(
+            provider,
+            original_get_routes(mcp_path),
+        )
+
+    provider.get_routes = get_routes  # type: ignore[method-assign]
+    return provider
+
 
 def bindings_from_registry(registry: GatewayRegistry) -> tuple[ToolBinding, ...]:
     """Prefer registry tool_bindings when present; else built-in settled defaults.
@@ -340,7 +438,7 @@ def bindings_from_registry(registry: GatewayRegistry) -> tuple[ToolBinding, ...]
 
 def build_inbound_auth_provider(settings: GatewaySettings) -> AuthProvider:
     """ChatGPT-compatible GitHub OAuth (same FastMCP pattern as the Bridge)."""
-    return build_github_oauth_provider(
+    provider = build_github_oauth_provider(
         client_id=settings.github_oauth_client_id,
         client_secret=settings.github_oauth_client_secret,
         public_url=settings.gateway_public_url,
@@ -349,6 +447,7 @@ def build_inbound_auth_provider(settings: GatewaySettings) -> AuthProvider:
         redis_port=settings.redis_port,
         storage_encryption_key=settings.storage_encryption_key,
     )
+    return stamp_canonical_protected_resource_identity(provider)
 
 
 def _extra_secrets_for_forward(
@@ -426,16 +525,13 @@ def create_mcp_server(
     Downstream Bridge/Storage/Artifacts calls use the dedicated service credential
     from settings — never the inbound OAuth session token.
     """
+    identity = canonical_gateway_identity(public_url=settings.gateway_public_url)
     auth_provider = auth if auth is not None else build_inbound_auth_provider(settings)
     mcp = FastMCP(
-        "HAL LegalAI Gateway",
-        instructions=(
-            "Thin authenticated router for LegalAI namespaces (case, storage, "
-            "mission, workflow). Tools forward to independently deployed "
-            "Bridge, Storage, artifact, and Mission Control MCP servers. No "
-            "Case-00 generation, archive mutation, mission execution, or "
-            "workflow orchestration logic runs inside the gateway."
-        ),
+        identity["display_name"],
+        instructions=CANONICAL_GATEWAY_INSTRUCTIONS,
+        version=identity["identity_version"],
+        website_url=identity["website_url"],
         auth=auth_provider,
         mask_error_details=True,
         stateless_http=True,
