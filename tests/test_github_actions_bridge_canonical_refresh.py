@@ -165,6 +165,7 @@ class CanonicalCatalogRegistrationTests(unittest.TestCase):
             "mission.submit",
             "workflow.submit",
             "workflow.status",
+            "workflow.cancel",
             "case.submit",
             "case.get_artifact",
             "storage.list_inventory",
@@ -367,6 +368,49 @@ class CanonicalForwardTargetTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["failure_stage"], "connect")
 
+    def test_forward_cancel_uses_downstream_tool_on_mission_control(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def call_tool(self, name, arguments, raise_on_error=False):
+                calls.append((name, dict(arguments)))
+                return SimpleNamespace(
+                    is_error=False,
+                    data={"ok": True, "state": "cancelled"},
+                    structured_content=None,
+                    content=None,
+                )
+
+        self.server._canonical_forward_test_hooks["target"] = {
+            "kind": "mission_control",
+            "base_url": "https://mission-control-mcp.example",
+            "mcp_path": "/mcp",
+            "use_canonical_names": False,
+            "require_authorization": False,
+        }
+        self.server._canonical_forward_test_hooks["client_factory"] = lambda: _Client()
+        result = asyncio.run(
+            self.server.forward_canonical_catalog_tool(
+                "workflow.cancel",
+                "cancel_workflow",
+                {"workflow_id": "00000000-0000-4000-8000-000000000001"},
+            )
+        )
+        self.assertEqual(calls, [
+            (
+                "cancel_workflow",
+                {"workflow_id": "00000000-0000-4000-8000-000000000001"},
+            )
+        ])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["state"], "cancelled")
+
 
 class PublicMcpRefreshHttpTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -421,6 +465,7 @@ class PublicMcpRefreshHttpTests(unittest.TestCase):
             "mission.submit",
             "workflow.submit",
             "workflow.status",
+            "workflow.cancel",
             "case.submit",
             "case.get_artifact",
             "storage.list_inventory",

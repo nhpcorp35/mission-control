@@ -76,6 +76,11 @@ _ACTIONS_OPERATION_DESCRIPTIONS: dict[str, str] = {
         "Never includes secrets or child mission YAML. Feature-gated; "
         "bearer auth required. 403 while orchestration is disabled."
     ),
+    "cancel_workflow": (
+        "Cancel a non-terminal durable workflow. Returns sanitized status. "
+        "404 if unknown, 409 if already cancelled or otherwise terminal. "
+        "Feature-gated; bearer auth required."
+    ),
 }
 
 

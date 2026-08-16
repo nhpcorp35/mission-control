@@ -81,11 +81,12 @@
       ]
     },
     "workflow": {
-      "description": "Mission Control durable workflow submit and sanitized status tools.",
+      "description": "Mission Control durable workflow submit, sanitized status, and cancel tools.",
       "downstream_service": "mission_control",
       "tools": [
         "workflow.submit",
-        "workflow.status"
+        "workflow.status",
+        "workflow.cancel"
       ]
     }
   },
@@ -290,6 +291,13 @@
       "downstream_service": "mission_control",
       "downstream_tool": "get_workflow",
       "description": "Return sanitized durable workflow and child summaries for a canonical workflow_id (downstream get_workflow). Secrets, child mission YAML, and agent stdout/stderr are never included. Orchestration remains fail-closed while MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. Thin forwarder: no polling, cancel, history, or workflow parsing in the gateway."
+    },
+    {
+      "tool": "workflow.cancel",
+      "namespace": "workflow",
+      "downstream_service": "mission_control",
+      "downstream_tool": "cancel_workflow",
+      "description": "Cancel a durable Mission Control workflow (downstream cancel_workflow). Returns the sanitized durable status envelope. Secrets, child mission YAML, and agent stdout/stderr are never included. Orchestration remains fail-closed while MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. Thin forwarder: no polling, history, or workflow parsing in the gateway."
     }
   ]
 }

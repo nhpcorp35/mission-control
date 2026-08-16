@@ -47,6 +47,7 @@ class TestMcpFastMcpCompat(unittest.TestCase):
         self.assertEqual(registered, expected)
         self.assertIn("submit_workflow", expected)
         self.assertIn("get_workflow", expected)
+        self.assertIn("cancel_workflow", expected)
 
     def test_create_http_app_exposes_mcp_routes(self) -> None:
         """App factory still builds FastMCP HTTP routes (no live listen).

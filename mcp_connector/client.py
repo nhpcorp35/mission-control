@@ -472,6 +472,21 @@ class MissionControlClient:
             f"/workflows/{quote(safe_id, safe='')}",
         )
 
+    async def cancel_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Cancel a workflow via POST /workflows/{workflow_id}/cancel.
+
+        Only canonical uuid4/uuid5 IDs are accepted. Invalid IDs are rejected
+        locally and never forwarded. The validated ID is percent-encoded as a
+        single path segment before interpolation. Production remains
+        fail-closed when workflow orchestration is disabled (HTTP 403). The
+        API response is already sanitized (no secrets, no child mission YAML).
+        """
+        safe_id = normalize_mcp_workflow_id(workflow_id)
+        return await self._request(
+            "POST",
+            f"/workflows/{quote(safe_id, safe='')}/cancel",
+        )
+
     async def list_run_notifications(
         self,
         run_id: str,

@@ -1,4 +1,4 @@
-"""Authenticated HTTP submit/status helpers for durable workflow orchestration.
+"""Authenticated HTTP submit/status/cancel helpers for durable workflow orchestration.
 
 Slice A control surface: parse strict workflow YAML, persist through
 ``WorkflowRegistry.create_workflow``, and project sanitized status. Child
@@ -464,6 +464,48 @@ def build_workflow_status(
         policy=WorkflowPolicyPublicModel(**policy.to_dict()),
         step_templates=_step_templates(workflow.step_specs),
         steps=steps,
+    )
+
+
+_CANCEL_CONFLICT_MESSAGES = {
+    "workflow_already_cancelled": "Workflow is already cancelled",
+    "workflow_terminal": "Workflow is already terminal",
+    "version_conflict": "Workflow version conflict",
+}
+
+
+def cancel_workflow(
+    workflow_id: str,
+    *,
+    workflow_registry: WorkflowRegistry,
+    run_registry: RunRegistry,
+    environ: dict[str, str] | None = None,
+) -> WorkflowStatusResponse | None:
+    """Cancel a non-terminal workflow and return sanitized status.
+
+    Returns None when ``workflow_id`` is unknown. Already-cancelled and
+    other terminal workflows raise ``WorkflowConflictError`` with stable
+    codes. Success uses the same sanitized projection as GET status.
+    """
+    require_workflow_orchestration_enabled(environ)
+    result = workflow_registry.cancel_workflow(str(workflow_id))
+    if result.error == "workflow_not_found" or (
+        not result.ok and result.workflow is None
+    ):
+        return None
+    if not result.ok:
+        code = result.error or "workflow_terminal"
+        message = _CANCEL_CONFLICT_MESSAGES.get(
+            code, "Workflow could not be cancelled"
+        )
+        if code in _CANCEL_CONFLICT_MESSAGES:
+            raise WorkflowConflictError(code, message)
+        raise WorkflowSubmitError(code, message)
+    return build_workflow_status(
+        workflow_id,
+        workflow_registry=workflow_registry,
+        run_registry=run_registry,
+        environ=environ,
     )
 
 

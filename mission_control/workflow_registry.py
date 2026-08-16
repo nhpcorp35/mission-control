@@ -2148,14 +2148,15 @@ class WorkflowRegistry:
                     is_terminal_workflow_state(workflow.state)
                     and to_state is not workflow.state
                 ):
-                    # Allow cancel only from non-terminal; reject other mutations.
-                    if workflow.state is not WorkflowState.CANCELLED:
-                        self._conn.rollback()
-                        return CasResult(
-                            ok=False,
-                            workflow=workflow,
-                            error="workflow_terminal",
-                        )
+                    # Terminal states, including cancelled, are latched.
+                    # Later CAS must not revive a cancelled workflow or
+                    # mark it running after operator cancel.
+                    self._conn.rollback()
+                    return CasResult(
+                        ok=False,
+                        workflow=workflow,
+                        error="workflow_terminal",
+                    )
 
                 now = _utc_now()
                 new_version = workflow.version + 1
@@ -2385,6 +2386,12 @@ class WorkflowRegistry:
             workflow = self._fetch_workflow_unlocked(workflow_id)
         if workflow is None:
             return CasResult(ok=False, workflow=None, error="workflow_not_found")
+        if workflow.state is WorkflowState.CANCELLED:
+            return CasResult(
+                ok=False,
+                workflow=workflow,
+                error="workflow_already_cancelled",
+            )
         if is_terminal_workflow_state(workflow.state):
             return CasResult(
                 ok=False, workflow=workflow, error="workflow_terminal"

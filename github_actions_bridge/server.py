@@ -120,6 +120,7 @@ REQUIRED_CANONICAL_CATALOG_TOOLS = frozenset(
         "mission.status",
         "workflow.submit",
         "workflow.status",
+        "workflow.cancel",
     }
 )
 CANONICAL_CATALOG_NAMESPACES = frozenset({"case", "storage", "mission", "workflow"})
@@ -2138,6 +2139,19 @@ async def canonical_workflow_submit(
 async def canonical_workflow_status(workflow_id: str) -> dict[str, Any]:
     return await _call_canonical_forward(
         "workflow.status", "get_workflow", {"workflow_id": workflow_id}
+    )
+
+
+@mcp.tool(
+    name="workflow.cancel",
+    description=(
+        "Cancel a durable workflow (canonical catalog; thin forward to "
+        "HAL LegalAI Gateway / Mission Control cancel_workflow)."
+    ),
+)
+async def canonical_workflow_cancel(workflow_id: str) -> dict[str, Any]:
+    return await _call_canonical_forward(
+        "workflow.cancel", "cancel_workflow", {"workflow_id": workflow_id}
     )
 
 

@@ -81,6 +81,7 @@ from mission_control.workflow_submit import (
     WorkflowSubmitError,
     WorkflowSubmitRequest,
     build_workflow_status,
+    cancel_workflow,
     submit_workflow,
 )
 from mission_control.validator import (
@@ -1780,6 +1781,50 @@ def get_workflow_endpoint(
 ) -> WorkflowStatusResponse:
     try:
         status = build_workflow_status(
+            workflow_id,
+            workflow_registry=workflow_registry,
+            run_registry=run_registry,
+        )
+    except WorkflowSubmitError as exc:
+        raise _workflow_http_error(exc) from None
+    if status is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return status
+
+
+@app.post(
+    "/workflows/{workflow_id}/cancel",
+    response_model=WorkflowStatusResponse,
+    operation_id="cancel_workflow",
+    summary="Cancel a durable workflow",
+    description=(
+        "Cancel a non-terminal durable workflow submitted via POST "
+        "/workflows. Uses registry CAS cancellation semantics and returns "
+        "the same sanitized status as GET /workflows/{workflow_id}. "
+        "Requires bearer auth. Returns 403 while "
+        "MISSION_CONTROL_WORKFLOW_ORCHESTRATION is unset or false, 404 "
+        "when the workflow_id is unknown, and 409 when the workflow is "
+        "already cancelled or otherwise terminal."
+    ),
+    responses={
+        200: {
+            "model": WorkflowStatusResponse,
+            "description": "Workflow cancelled; sanitized status.",
+        },
+        401: {"description": "Missing or invalid bearer token."},
+        403: {"description": "Workflow orchestration feature flag is off."},
+        404: {"description": "Unknown workflow_id."},
+        409: {
+            "description": "Workflow is already cancelled or otherwise terminal."
+        },
+    },
+)
+def cancel_workflow_endpoint(
+    workflow_id: str,
+    _access: None = Depends(require_workflow_http_access),
+) -> WorkflowStatusResponse:
+    try:
+        status = cancel_workflow(
             workflow_id,
             workflow_registry=workflow_registry,
             run_registry=run_registry,

@@ -634,6 +634,7 @@ class TestWaitForRunMcpTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names, list(mcp_server.EXPECTED_TOOL_NAMES))
         self.assertIn("submit_workflow", names)
         self.assertIn("get_workflow", names)
+        self.assertIn("cancel_workflow", names)
 
         wait_tool = next(tool for tool in tools if tool.name == "wait_for_run")
         props = wait_tool.parameters["properties"]
