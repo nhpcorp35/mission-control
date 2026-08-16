@@ -260,6 +260,53 @@ def _httpx_factory(
     return factory
 
 
+# FastMCP StreamableHttpTransport does ``get_http_headers() | self.headers``.
+# Inbound Authorization / Cookie / X-API-Key (and equivalents) must not leave
+# the gateway. Strip them from the merged dict after that merge; service
+# BearerAuth is applied separately via transport ``auth=``.
+_INBOUND_CREDENTIAL_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "x-api_key",
+        "x-auth-token",
+        "x-access-token",
+        "x-csrf-token",
+        "x-session-id",
+        "x-session-token",
+    }
+)
+
+
+def _strip_inbound_credential_headers(headers: Any) -> dict[str, str]:
+    """Drop inbound credential/session headers from a merged header mapping."""
+    if not headers:
+        return {}
+    items = headers.items() if hasattr(headers, "items") else ()
+    return {
+        str(name): str(value)
+        for name, value in items
+        if str(name).lower() not in _INBOUND_CREDENTIAL_HEADER_NAMES
+    }
+
+
+def _isolating_httpx_factory(
+    inner: Callable[..., httpx.AsyncClient],
+) -> Callable[..., httpx.AsyncClient]:
+    """Wrap a client factory so FastMCP's inbound header merge is stripped."""
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        if "headers" in kwargs:
+            kwargs["headers"] = _strip_inbound_credential_headers(kwargs["headers"])
+        return inner(**kwargs)
+
+    return factory
+
+
 async def forward_mcp_tool(
     *,
     binding: ToolBinding,
@@ -283,6 +330,10 @@ async def forward_mcp_tool(
     Service credentials are passed via StreamableHttpTransport ``auth=`` (raw
     token → FastMCP BearerAuth). ``httpx_client_factory`` may be overridden in
     tests (e.g. ASGI transport) without bypassing that auth path.
+
+    Inbound ``get_http_headers()`` credentials are stripped from the outbound
+    client after FastMCP merges them; only correlation headers and, when
+    configured, the dedicated service Bearer remain.
     """
     started = time.perf_counter()
     request_id = get_request_id()
@@ -337,8 +388,10 @@ async def forward_mcp_tool(
 
     # Correlation headers only — never inject Authorization manually.
     # FastMCP 2.x StreamableHttpTransport accepts auth=str → BearerAuth(raw
-    # token). Manual Authorization headers can be overwritten or doubled when
-    # get_http_headers() merges inbound user OAuth into the outbound client.
+    # token) and merges get_http_headers() into the outbound client. That merge
+    # would otherwise leak inbound Authorization / Cookie / X-API-Key. Strip
+    # those after the merge via the isolating httpx factory; service BearerAuth
+    # is reapplied by transport auth=, not by forwarding inbound OAuth.
     headers: dict[str, str] = {
         "Accept": "application/json, text/event-stream",
     }
@@ -356,9 +409,12 @@ async def forward_mcp_tool(
         if client_factory is not None:
             client = client_factory()
         else:
-            factory = httpx_client_factory or _httpx_factory(
-                connect_timeout=connect_timeout_seconds,
-                read_timeout=read_timeout_seconds,
+            factory = _isolating_httpx_factory(
+                httpx_client_factory
+                or _httpx_factory(
+                    connect_timeout=connect_timeout_seconds,
+                    read_timeout=read_timeout_seconds,
+                )
             )
             transport = StreamableHttpTransport(
                 url,

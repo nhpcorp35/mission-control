@@ -7,7 +7,7 @@ import json
 import os
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest import mock
 
 from cryptography.fernet import Fernet
@@ -17,6 +17,9 @@ from fastapi.testclient import TestClient
 
 from hal_legalai_gateway import config as gateway_config
 from fastmcp.server.auth import AccessToken
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.http import set_http_request
+from starlette.requests import Request
 
 from hal_legalai_gateway.auth import (
     SERVICE_CLIENT_ID,
@@ -1802,6 +1805,251 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
             ),
             f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
         )
+
+
+INBOUND_OAUTH_TOKEN = "inbound-gateway-oauth-session-token"
+INBOUND_SESSION_COOKIE = "mcp_sid=inbound-session-cookie"
+INBOUND_X_API_KEY = "inbound-x-api-key-value"
+
+
+def _inbound_oauth_request() -> Request:
+    """Starlette request carrying inbound OAuth/session credential headers."""
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "https",
+            "path": "/mcp",
+            "raw_path": b"/mcp",
+            "query_string": b"",
+            "headers": [
+                (b"authorization", f"Bearer {INBOUND_OAUTH_TOKEN}".encode()),
+                (b"cookie", INBOUND_SESSION_COOKIE.encode()),
+                (b"x-api-key", INBOUND_X_API_KEY.encode()),
+                (b"host", b"gateway.example"),
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": ("gateway.example", 443),
+        }
+    )
+
+
+class OutboundHeaderIsolationTests(unittest.TestCase):
+    """Live Streamable HTTP construction must not inherit inbound credentials."""
+
+    def setUp(self) -> None:
+        self.settings = load_settings(
+            environ={
+                **REQUIRED_SECRETS,
+                "GATEWAY_BRIDGE_URL": "https://bridge.example",
+                "GATEWAY_STORAGE_URL": "https://storage.example",
+                "GATEWAY_MISSION_CONTROL_URL": "https://mission.example",
+                "GATEWAY_ARTIFACTS_URL": "https://artifacts.example",
+            },
+            registry=load_registry(REGISTRY_PATH),
+        )
+        self.tokens = bind_request_ids(
+            request_id="req-isolate-1",
+            correlation_id="corr-isolate-1",
+        )
+
+    def tearDown(self) -> None:
+        reset_request_ids(self.tokens)
+
+    def _collect_tools(self, *gateway_tools: str) -> dict[str, Any]:
+        collector: dict[str, Any] = {}
+
+        class _Mcp:
+            def tool(self, *args: Any, **kwargs: Any):
+                def decorator(fn: Any) -> Any:
+                    name = kwargs.get("name") or (args[0] if args else None)
+                    if name in gateway_tools:
+                        collector[name] = fn
+                    return fn
+
+                return decorator
+
+        register_forwarding_tools(
+            _Mcp(),  # type: ignore[arg-type]
+            self.settings,
+            bindings_from_registry(self.settings.registry),
+        )
+        return collector
+
+    def _capturing_httpx_factory(self) -> tuple[
+        Callable[..., httpx.AsyncClient],
+        list[httpx.Request],
+        list[dict[str, str]],
+    ]:
+        captured_requests: list[httpx.Request] = []
+        captured_factory_headers: list[dict[str, str]] = []
+
+        def factory(**kwargs: Any) -> httpx.AsyncClient:
+            raw = kwargs.get("headers") or {}
+            captured_factory_headers.append(
+                {str(name): str(value) for name, value in dict(raw).items()}
+            )
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                captured_requests.append(request)
+                return httpx.Response(
+                    400,
+                    json={"error": "captured"},
+                    headers={"Content-Type": "application/json"},
+                )
+
+            filtered = dict(kwargs)
+            filtered.pop("transport", None)
+            return httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                **filtered,
+            )
+
+        return factory, captured_requests, captured_factory_headers
+
+    def _assert_inbound_credentials_absent(
+        self,
+        request: httpx.Request,
+        *,
+        factory_headers: dict[str, str] | None = None,
+    ) -> None:
+        blob = " ".join(str(value) for value in request.headers.values())
+        names = {name.lower() for name in request.headers.keys()}
+        self.assertNotIn(INBOUND_OAUTH_TOKEN, blob)
+        self.assertNotIn(INBOUND_SESSION_COOKIE, blob)
+        self.assertNotIn(INBOUND_X_API_KEY, blob)
+        self.assertNotIn("cookie", names)
+        self.assertNotIn("set-cookie", names)
+        self.assertNotIn("x-api-key", names)
+        authorization = request.headers.get("authorization") or ""
+        self.assertNotIn(INBOUND_OAUTH_TOKEN, authorization)
+        if factory_headers is not None:
+            lowered = {name.lower(): value for name, value in factory_headers.items()}
+            self.assertNotIn("authorization", lowered)
+            self.assertNotIn("cookie", lowered)
+            self.assertNotIn("x-api-key", lowered)
+            self.assertNotIn(INBOUND_OAUTH_TOKEN, " ".join(lowered.values()))
+            self.assertNotIn(INBOUND_SESSION_COOKIE, " ".join(lowered.values()))
+            self.assertNotIn(INBOUND_X_API_KEY, " ".join(lowered.values()))
+
+    def test_workflow_submit_outbound_strips_inbound_oauth_session_headers(
+        self,
+    ) -> None:
+        collector = self._collect_tools("workflow.submit")
+        factory, captured_requests, captured_factory_headers = (
+            self._capturing_httpx_factory()
+        )
+        real_forward = forward_mcp_tool
+
+        async def forward_with_capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            kwargs["httpx_client_factory"] = factory
+            kwargs["connect_timeout_seconds"] = 0.5
+            kwargs["read_timeout_seconds"] = 0.5
+            return await real_forward(*args, **kwargs)
+
+        async def _run() -> dict[str, Any]:
+            with set_http_request(_inbound_oauth_request()):
+                inbound = get_http_headers()
+                self.assertEqual(
+                    inbound.get("authorization"),
+                    f"Bearer {INBOUND_OAUTH_TOKEN}",
+                )
+                self.assertEqual(inbound.get("cookie"), INBOUND_SESSION_COOKIE)
+                self.assertEqual(inbound.get("x-api-key"), INBOUND_X_API_KEY)
+                with mock.patch(
+                    "hal_legalai_gateway.mcp_server._require_gateway_principal",
+                    return_value="nhpcorp35",
+                ), mock.patch(
+                    "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+                    side_effect=forward_with_capture,
+                ):
+                    return await collector["workflow.submit"](WORKFLOW_YAML_FIXTURE)
+
+        asyncio.run(_run())
+        self.assertTrue(captured_requests)
+        self.assertTrue(captured_factory_headers)
+        for factory_headers in captured_factory_headers:
+            self._assert_inbound_credentials_absent(
+                captured_requests[0], factory_headers=factory_headers
+            )
+        for request in captured_requests:
+            self._assert_inbound_credentials_absent(request)
+            names = {name.lower() for name in request.headers.keys()}
+            self.assertNotIn("authorization", names)
+            self.assertEqual(request.headers.get("x-request-id"), "req-isolate-1")
+            self.assertEqual(
+                request.headers.get("x-correlation-id"), "corr-isolate-1"
+            )
+        blob = json.dumps(
+            [dict(request.headers) for request in captured_requests]
+        )
+        self.assertNotIn(INBOUND_OAUTH_TOKEN, blob)
+        self.assertNotIn(INBOUND_SESSION_COOKIE, blob)
+        self.assertNotIn(INBOUND_X_API_KEY, blob)
+        self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
+        self.assertNotIn(TEST_GATEWAY_OAUTH_TOKEN, blob)
+
+    def test_bridge_outbound_keeps_only_service_bearer(self) -> None:
+        factory, captured_requests, captured_factory_headers = (
+            self._capturing_httpx_factory()
+        )
+
+        async def _run() -> dict[str, Any]:
+            with set_http_request(_inbound_oauth_request()):
+                inbound = get_http_headers()
+                self.assertEqual(
+                    inbound.get("authorization"),
+                    f"Bearer {INBOUND_OAUTH_TOKEN}",
+                )
+                self.assertEqual(inbound.get("cookie"), INBOUND_SESSION_COOKIE)
+                self.assertEqual(inbound.get("x-api-key"), INBOUND_X_API_KEY)
+                return await forward_mcp_tool(
+                    binding=ToolBinding(
+                        gateway_tool="storage.list_inventory",
+                        namespace="storage",
+                        downstream_service="storage",
+                        downstream_tool="list_case00_storage",
+                    ),
+                    arguments={"category": "all", "max_keys": 5},
+                    base_url="https://bridge.example",
+                    authorization=f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+                    connect_timeout_seconds=0.5,
+                    read_timeout_seconds=0.5,
+                    require_authorization=True,
+                    httpx_client_factory=factory,
+                    extra_secrets=(
+                        TEST_BRIDGE_SERVICE_TOKEN,
+                        INBOUND_OAUTH_TOKEN,
+                        INBOUND_X_API_KEY,
+                    ),
+                )
+
+        asyncio.run(_run())
+        self.assertTrue(captured_requests)
+        for request in captured_requests:
+            self._assert_inbound_credentials_absent(request)
+            self.assertEqual(
+                request.headers.get("authorization"),
+                f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}",
+            )
+            names = {name.lower() for name in request.headers.keys()}
+            self.assertIn("authorization", names)
+            self.assertNotIn("cookie", names)
+            self.assertNotIn("x-api-key", names)
+        for factory_headers in captured_factory_headers:
+            lowered = {name.lower() for name in factory_headers}
+            self.assertNotIn("authorization", lowered)
+            self.assertNotIn("cookie", lowered)
+            self.assertNotIn("x-api-key", lowered)
+        blob = " ".join(
+            " ".join(str(value) for value in request.headers.values())
+            for request in captured_requests
+        )
+        self.assertNotIn(INBOUND_OAUTH_TOKEN, blob)
+        self.assertNotIn(INBOUND_SESSION_COOKIE, blob)
+        self.assertNotIn(INBOUND_X_API_KEY, blob)
 
 
 if __name__ == "__main__":
