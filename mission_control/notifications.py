@@ -4,6 +4,11 @@ Opt-in generic HMAC webhook and native Pushover delivery for phase_change,
 stale, recovery, and terminal events only (never heartbeats). Failures never
 mutate mission status. Network delivery stays off request/wait/status paths.
 
+Orchestrated workflows enqueue one durable ``terminal`` row with a
+namespaced outbox identity (``workflow:<workflow_id>`` +
+``workflow-terminal:<state>``) so they cannot collide with standalone run
+terminals. Payloads are allowlisted workflow fields only.
+
 Pushover phone alerts are tuned for one audible notification per normal
 mission: routine ``phase_change`` events remain durable for inspection but are
 intentionally skipped for the native Pushover backend (webhook delivery of
@@ -45,7 +50,7 @@ import socket
 import sqlite3
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 from urllib.parse import urlparse
 import uuid
 
@@ -152,8 +157,18 @@ _PAYLOAD_ALLOWED_KEYS = frozenset(
         "heartbeat_health",
         "occurred_at",
         "dedupe_key",
+        "workflow_id",
+        "child_run_count",
+        "fix_cycle_count",
+        "credit_units_used",
     }
 )
+_PAYLOAD_COUNT_KEYS = frozenset(
+    {"child_run_count", "fix_cycle_count", "credit_units_used"}
+)
+_PAYLOAD_COUNT_MAX = 1_000_000
+WORKFLOW_OUTBOX_RUN_ID_PREFIX = "workflow:"
+WORKFLOW_TERMINAL_DEDUPE_PREFIX = "workflow-terminal:"
 _INSPECT_ALLOWED_KEYS = frozenset(
     {
         "event_id",
@@ -322,6 +337,50 @@ def _format_dt(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.astimezone(timezone.utc).isoformat()
+
+
+class WorkflowTerminalSource(Protocol):
+    """Minimal workflow view needed to enqueue a terminal notification."""
+
+    workflow_id: str
+    state: Any
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    fix_cycle_count: int
+    child_run_count: int
+    credit_units_used: int
+
+
+def _workflow_state_value(state: Any) -> str:
+    if hasattr(state, "value"):
+        return str(state.value)
+    return str(state)
+
+
+def _bounded_count(raw: Any) -> int:
+    if isinstance(raw, bool):
+        return 0
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(value, _PAYLOAD_COUNT_MAX))
+
+
+def workflow_terminal_run_id(workflow_id: str) -> str:
+    """Stable outbox ``run_id`` that cannot collide with mission run UUIDs."""
+    return f"{WORKFLOW_OUTBOX_RUN_ID_PREFIX}{str(workflow_id).strip()}"[:64]
+
+
+def workflow_terminal_dedupe_key(state: str) -> str:
+    """Durable unique key for one workflow terminal row (restart-stable)."""
+    return f"{WORKFLOW_TERMINAL_DEDUPE_PREFIX}{str(state).strip()[:48]}"[:128]
+
+
+def is_workflow_outbox_run_id(run_id: str | None) -> bool:
+    return str(run_id or "").startswith(WORKFLOW_OUTBOX_RUN_ID_PREFIX)
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -739,10 +798,25 @@ def _bounded_httpx_timeout(timeout_seconds: float) -> httpx.Timeout:
     )
 
 
-def format_pushover_title(event_kind: str) -> str:
+def format_pushover_title(
+    event_kind: str,
+    *,
+    payload: Mapping[str, Any] | None = None,
+) -> str:
     """Concise title identifying Mission Control and severity."""
     kind = str(event_kind or "event").strip().lower() or "event"
-    if kind == NotificationEventKind.TERMINAL.value:
+    clean = (
+        sanitize_notification_payload(payload) if payload is not None else {}
+    )
+    workflowish = bool(clean.get("workflow_id")) or is_workflow_outbox_run_id(
+        str(clean.get("run_id") or "")
+    )
+    if workflowish:
+        if kind == NotificationEventKind.TERMINAL.value:
+            severity = "workflow terminal"
+        else:
+            severity = f"workflow {kind[:24]}"
+    elif kind == NotificationEventKind.TERMINAL.value:
         severity = "terminal"
     elif kind == NotificationEventKind.STALE.value:
         severity = "stale"
@@ -758,6 +832,24 @@ def format_pushover_title(event_kind: str) -> str:
 def format_pushover_message(payload: Mapping[str, Any]) -> str:
     """Concise body with run identity, phase/status, and safe progress only."""
     clean = sanitize_notification_payload(payload)
+    workflow_id = clean.get("workflow_id")
+    if workflow_id:
+        parts = [
+            f"workflow={workflow_id}",
+            f"kind={clean.get('event_kind') or 'event'}",
+            f"status={clean.get('status') or 'unknown'}",
+        ]
+        occurred = clean.get("occurred_at")
+        if occurred:
+            parts.append(f"occurred_at={str(occurred)[:64]}")
+        for count_key, label in (
+            ("child_run_count", "child_runs"),
+            ("fix_cycle_count", "fix_cycles"),
+            ("credit_units_used", "credits"),
+        ):
+            if count_key in clean and clean[count_key] is not None:
+                parts.append(f"{label}={clean[count_key]}")
+        return "; ".join(parts)[:PUSHOVER_MESSAGE_MAX_CHARS]
     parts = [
         f"run={clean.get('run_id') or 'unknown'}",
         f"kind={clean.get('event_kind') or 'event'}",
@@ -1059,16 +1151,63 @@ def sanitize_notification_payload(
         if raw is None:
             payload[key] = None
             continue
+        if key in _PAYLOAD_COUNT_KEYS:
+            payload[key] = _bounded_count(raw)
+            continue
         text = str(raw)
         if key == "dedupe_key":
             payload[key] = text[:128]
-        elif key in {"run_id", "event_kind", "status", "phase", "heartbeat_health"}:
+        elif key in {
+            "run_id",
+            "event_kind",
+            "status",
+            "phase",
+            "heartbeat_health",
+            "workflow_id",
+        }:
             payload[key] = text[:64]
         elif key == "occurred_at":
             payload[key] = text[:64]
         else:
             payload[key] = text[:160]
     return payload
+
+
+def build_workflow_terminal_payload(
+    workflow: WorkflowTerminalSource,
+    *,
+    event_kind: NotificationEventKind | str = NotificationEventKind.TERMINAL,
+    occurred_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Build an allowlisted workflow terminal payload (no YAML/errors/secrets)."""
+    kind = (
+        event_kind.value
+        if isinstance(event_kind, NotificationEventKind)
+        else str(event_kind)
+    )
+    state_value = _workflow_state_value(workflow.state)
+    run_id = workflow_terminal_run_id(workflow.workflow_id)
+    dedupe = workflow_terminal_dedupe_key(state_value)
+    clock = (
+        occurred_at
+        or getattr(workflow, "completed_at", None)
+        or getattr(workflow, "updated_at", None)
+        or _utc_now()
+    )
+    return sanitize_notification_payload(
+        {
+            "run_id": run_id,
+            "event_kind": kind,
+            "status": state_value[:64],
+            "phase": "workflow",
+            "workflow_id": str(workflow.workflow_id)[:64],
+            "occurred_at": _format_dt(clock),
+            "dedupe_key": dedupe,
+            "child_run_count": workflow.child_run_count,
+            "fix_cycle_count": workflow.fix_cycle_count,
+            "credit_units_used": workflow.credit_units_used,
+        }
+    )
 
 
 def build_event_payload(
@@ -1485,6 +1624,34 @@ class NotificationOutbox:
             dedupe_key=dedupe,
             occurred_at=record.completed_at,
             heartbeat_health=HeartbeatHealth.TERMINAL.value,
+        )
+
+    def maybe_enqueue_workflow_terminal(
+        self, workflow: WorkflowTerminalSource
+    ) -> EnqueueResult:
+        """Enqueue one durable terminal event for a terminal workflow.
+
+        Identity is namespaced so it cannot collide with standalone run
+        ``terminal`` rows. Repeats/restarts hit the same unique
+        ``(run_id, event_kind, dedupe_key)``. Callers should enqueue
+        *before* ``WorkflowRegistry.mark_notification_emitted``.
+        """
+        from mission_control.workflow_registry import is_terminal_workflow_state
+
+        if not is_terminal_workflow_state(workflow.state):
+            return EnqueueResult(
+                created=False,
+                event_id=None,
+                skipped_reason="not_terminal",
+            )
+        payload = build_workflow_terminal_payload(workflow)
+        state_value = _workflow_state_value(workflow.state)
+        return self.enqueue(
+            run_id=workflow_terminal_run_id(workflow.workflow_id),
+            event_kind=NotificationEventKind.TERMINAL,
+            dedupe_key=workflow_terminal_dedupe_key(state_value),
+            payload=payload,
+            occurred_at=getattr(workflow, "completed_at", None),
         )
 
     def maybe_enqueue_recovery(self, record: RunRecord) -> EnqueueResult:
@@ -2824,7 +2991,7 @@ class NotificationOutbox:
             payload = sanitize_notification_payload(
                 json.loads(row["payload_json"])
             )
-            title = format_pushover_title(event_kind)
+            title = format_pushover_title(event_kind, payload=payload)
             message = format_pushover_message(payload)
             form = build_pushover_form(
                 user_key=user_key,

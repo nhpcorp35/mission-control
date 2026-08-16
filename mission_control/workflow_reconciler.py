@@ -33,15 +33,21 @@ from mission_control.workflow_orchestrator import (
 )
 from mission_control.workflow_registry import (
     DEFAULT_RECONCILE_INTERVAL_SECONDS,
+    TERMINAL_WORKFLOW_STATES,
     StepMaterializationState,
     StepStatus,
     WORKFLOW_ORCHESTRATION_ENV,
     WORKFLOW_RECONCILE_INTERVAL_ENV,
+    WorkflowRecord,
     WorkflowRegistry,
     WorkflowStepRecord,
+    is_terminal_workflow_state,
     is_workflow_orchestration_enabled,
     resolve_reconcile_interval_seconds,
 )
+
+# Instance flag so two reconcilers sharing a registry cannot wrap twice.
+_WORKFLOW_TERMINAL_LATCH_ATTR = "_mission_control_workflow_terminal_latch"
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +238,7 @@ class WorkflowReconciler:
         self._poison: dict[str, _PoisonState] = {}
         self._infra_backoff_seconds = 0.0
         self.counters = WorkflowReconcilerCounters()
+        self._install_enqueue_before_notification_latch()
 
     @property
     def is_running(self) -> bool:
@@ -420,6 +427,12 @@ class WorkflowReconciler:
                 logger.info("workflow event=reconciler_redrive_error")
 
         if stats.infra_error is None:
+            self._emit_unnotified_terminal_workflows(
+                exclude_ids=processed_ids,
+                remaining=max(0, self._batch_size),
+            )
+
+        if stats.infra_error is None:
             self._infra_backoff_seconds = 0.0
 
         self.counters.ticks += 1
@@ -545,6 +558,7 @@ class WorkflowReconciler:
                     and result.reason == "dispatch_acked"
                 ):
                     out["finalized"] += 1
+        self._emit_durable_workflow_terminal(workflow_id)
         return out
 
     def _redrive_due_intents(
@@ -613,6 +627,107 @@ class WorkflowReconciler:
                 continue
             views[child_run_id] = child_run_view_from_record(record)
         return views
+
+    def _install_enqueue_before_notification_latch(self) -> None:
+        """Enqueue the durable terminal row before the registry latch CAS.
+
+        Orchestrator still calls ``mark_notification_emitted``; wrapping
+        that API keeps enqueue/mark restart-safe without schema changes.
+        """
+        registry = self._workflow_registry
+        if getattr(registry, _WORKFLOW_TERMINAL_LATCH_ATTR, False):
+            return
+        original = registry.mark_notification_emitted
+        reconciler = self
+
+        def mark_notification_emitted(
+            workflow_id: str, *, expected_version: int
+        ):
+            workflow = registry.get_workflow(workflow_id)
+            reconciler._enqueue_workflow_terminal(workflow)
+            return original(
+                workflow_id, expected_version=expected_version
+            )
+
+        registry.mark_notification_emitted = mark_notification_emitted
+        setattr(registry, _WORKFLOW_TERMINAL_LATCH_ATTR, True)
+
+    def _notification_outbox(self):
+        return self._run_registry._get_notification_outbox()
+
+    def _enqueue_workflow_terminal(
+        self, workflow: WorkflowRecord | None
+    ) -> None:
+        if workflow is None:
+            return
+        if not is_terminal_workflow_state(workflow.state):
+            return
+        self._notification_outbox().maybe_enqueue_workflow_terminal(workflow)
+
+    def _emit_durable_workflow_terminal(self, workflow_id: str) -> None:
+        """Enqueue first, then latch. Safe after restarts and races."""
+        workflow = self._workflow_registry.get_workflow(workflow_id)
+        if workflow is None:
+            return
+        if not is_terminal_workflow_state(workflow.state):
+            return
+        self._enqueue_workflow_terminal(workflow)
+        latest = self._workflow_registry.get_workflow(workflow_id)
+        if latest is None or latest.notification_emitted:
+            return
+        self._workflow_registry.mark_notification_emitted(
+            workflow_id,
+            expected_version=latest.version,
+        )
+
+    def _unnotified_terminal_workflow_ids(self, *, limit: int) -> list[str]:
+        """Discover terminal workflows whose alert latch is still clear."""
+        if limit <= 0:
+            return []
+        states = tuple(sorted(TERMINAL_WORKFLOW_STATES))
+        placeholders = ",".join("?" for _ in states)
+        try:
+            conn = sqlite3.connect(self._workflow_registry.db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 5000")
+                rows = conn.execute(
+                    f"""
+                    SELECT workflow_id FROM workflows
+                    WHERE notification_emitted = 0
+                      AND state IN ({placeholders})
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                    """,
+                    (*states, int(limit)),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return []
+        return [str(row["workflow_id"]) for row in rows]
+
+    def _emit_unnotified_terminal_workflows(
+        self, *, exclude_ids: set[str], remaining: int
+    ) -> None:
+        if remaining <= 0:
+            return
+        for workflow_id in self._unnotified_terminal_workflow_ids(
+            limit=remaining
+        ):
+            if workflow_id in exclude_ids:
+                continue
+            try:
+                self._emit_durable_workflow_terminal(workflow_id)
+            except Exception:  # noqa: BLE001 — isolate per workflow
+                self._note_poison(workflow_id)
+                logger.info(
+                    (
+                        "workflow event=reconciler_workflow_error "
+                        "workflow_id=%s phase=terminal_notify"
+                    ),
+                    workflow_id,
+                )
 
     def _is_poison_skipped(self, workflow_id: str) -> bool:
         state = self._poison.get(workflow_id)
