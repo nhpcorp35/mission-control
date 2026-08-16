@@ -42,18 +42,11 @@ class TestMcpFastMcpCompat(unittest.TestCase):
         from mcp_connector import server as mcp_server
 
         self.assertIsInstance(mcp_server.mcp, FastMCP)
-        self.assertEqual(
-            list(mcp_server.EXPECTED_TOOL_NAMES),
-            [
-                "submit_run",
-                "submit_structured_run",
-                "get_run",
-                "list_run_notifications",
-                "wait_for_run",
-                "submit_and_wait",
-                "run_repository_command",
-            ],
-        )
+        expected = list(mcp_server.EXPECTED_TOOL_NAMES)
+        registered = [tool.name for tool in mcp_server.mcp._tool_manager.list_tools()]
+        self.assertEqual(registered, expected)
+        self.assertIn("submit_workflow", expected)
+        self.assertIn("get_workflow", expected)
 
     def test_create_http_app_exposes_mcp_routes(self) -> None:
         """App factory still builds FastMCP HTTP routes (no live listen).
