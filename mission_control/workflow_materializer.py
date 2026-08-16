@@ -2,17 +2,21 @@
 
 Claim-to-create protocol (deterministic; SQLite is the correctness boundary):
 
-1. Load claimed step + exact stored ``mission_yaml`` (never regenerate).
+1. Load claimed step + stored ``mission_yaml`` (never regenerate follow-up
+   context; repository identity is hydrated from the policy snapshot).
 2. Resolve durable ``retried_from`` ownership before any reserved create:
    claimed ``parent_run_id`` when present, otherwise ``workflow_id`` for
    HTTP/MCP submits that have no parent run. Reject only when neither is
    a usable identity.
 3. Re-run launch policy, permissions, ceiling, and authority gates.
-4. ``RunRegistry.create_run(run_id=child_run_id, …)`` with canonical
+4. Hydrate a complete executable ``repository`` contract from the immutable
+   ``WorkflowPolicySnapshot`` (policy is the only name/path/base/target/scope
+   authority). Child templates may omit ``repository``; mismatches fail closed.
+5. ``RunRegistry.create_run(run_id=child_run_id, …)`` with canonical
    ``retried_from`` ownership (created | recovered_idempotently | conflict).
-5. ``WorkflowRegistry.mark_step_materialized`` (CAS) after a matching create;
+6. ``WorkflowRegistry.mark_step_materialized`` (CAS) after a matching create;
    the mark transaction also persists a unique pending dispatch intent.
-6. Claim/lease → idempotent ``RunQueue.enqueue`` (process-local only). Durable
+7. Claim/lease → idempotent ``RunQueue.enqueue`` (process-local only). Durable
    dispatch ack is **execution-observed**: finalize only when authoritative
    ``RunRegistry`` status is ``running`` or terminal. Enqueue acceptance alone
    must never ack — process death would otherwise lose queue memory while the
@@ -62,6 +66,7 @@ from mission_control.run_registry import (
 )
 from mission_control.workflow_orchestrator import (
     enforce_launch_policy_gates,
+    hydrate_executable_child_mission,
 )
 from mission_control.workflow_registry import (
     DISPATCH_BACKOFF_BASE_SECONDS,
@@ -363,6 +368,50 @@ def _execution_observed(record: RunRecord | None) -> bool:
     status = record.status
     value = status.value if hasattr(status, "value") else str(status)
     return value == "running"
+
+
+def _hydrate_executable_child(
+    *,
+    workflow: WorkflowRecord,
+    mission_yaml: str,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Return ``(mission, executable_yaml, denial)`` from policy + template."""
+    hydration, denial = hydrate_executable_child_mission(
+        mission_yaml,
+        policy=workflow.policy_snapshot,
+    )
+    if denial is not None or hydration is None:
+        return None, None, denial or "invalid_mission_yaml"
+    return hydration.mission, hydration.mission_yaml, None
+
+
+def _fail_hydrate(
+    workflow_registry: WorkflowRegistry,
+    *,
+    workflow: WorkflowRecord,
+    step: WorkflowStepRecord,
+    denial: str,
+    policy_audit: dict[str, Any] | None = None,
+) -> MaterializeResult:
+    """Fail closed when executable repository hydration is denied."""
+    poisoned = _poison_or_fail(
+        workflow_registry,
+        workflow=workflow,
+        step=step,
+        reason=denial,
+        policy_audit=policy_audit,
+    )
+    if denial == "invalid_mission_yaml":
+        return poisoned
+    if poisoned.outcome is MaterializeOutcome.CONFLICT:
+        return MaterializeResult(
+            outcome=MaterializeOutcome.POLICY_DENIED,
+            child_run_id=step.child_run_id,
+            step_id=step.step_id,
+            reason=denial,
+            policy_audit=policy_audit,
+        )
+    return poisoned
 
 
 def _verify_existing_run(
@@ -795,13 +844,16 @@ def redrive_materialized_dispatch(
             step=step,
             reason="missing_mission_yaml",
         )
-    mission = _parse_exact_mission(mission_yaml)
-    if mission is None:
-        return _poison_or_fail(
+    mission, _executable_yaml, hydrate_denial = _hydrate_executable_child(
+        workflow=workflow,
+        mission_yaml=mission_yaml,
+    )
+    if hydrate_denial is not None or mission is None:
+        return _fail_hydrate(
             workflow_registry,
             workflow=workflow,
             step=step,
-            reason="invalid_mission_yaml",
+            denial=hydrate_denial or "invalid_mission_yaml",
         )
 
     return _handoff_dispatch(
@@ -835,9 +887,9 @@ def materialize_claimed_child(
 ) -> MaterializeResult:
     """Materialize one claimed workflow child into RunRegistry + queue.
 
-    Uses the exact stored step ``mission_yaml`` and caller-reserved
-    ``child_run_id``. Persists a unique dispatch intent with the
-    materialization mark, then performs leased idempotent handoff.
+    Uses stored step ``mission_yaml`` plus the policy repository contract
+    and caller-reserved ``child_run_id``. Persists a unique dispatch intent
+    with the materialization mark, then performs leased idempotent handoff.
     """
     if not is_workflow_orchestration_enabled(
         dict(environ) if environ is not None else None
@@ -877,7 +929,8 @@ def materialize_claimed_child(
             reason="missing_child_run_id",
         )
 
-    # Exact stored YAML only — never interpolate or rebuild.
+    # Stored YAML plus policy repository hydration — never trust the child
+    # template to supply name, path, base branch, target branch, or scope.
     mission_yaml = step.mission_yaml
     if mission_yaml is None or str(mission_yaml).strip() == "":
         return _poison_or_fail(
@@ -920,9 +973,21 @@ def materialize_claimed_child(
                 step=step,
                 reason="materialized_without_run",
             )
+        mission, executable_yaml, hydrate_denial = _hydrate_executable_child(
+            workflow=workflow,
+            mission_yaml=mission_yaml,
+        )
+        if hydrate_denial is not None or mission is None or executable_yaml is None:
+            workflow = workflow_registry.get_workflow(workflow_id) or workflow
+            return _fail_hydrate(
+                workflow_registry,
+                workflow=workflow,
+                step=step,
+                denial=hydrate_denial or "invalid_mission_yaml",
+            )
         mismatch = _verify_existing_run(
             existing,
-            mission_yaml=mission_yaml,
+            mission_yaml=executable_yaml,
             ownership=ownership,
         )
         if mismatch:
@@ -933,15 +998,6 @@ def materialize_claimed_child(
                 step=step,
                 reason=mismatch,
                 detail={"conflict_class": mismatch},
-            )
-        mission = _parse_exact_mission(mission_yaml)
-        if mission is None:
-            workflow = workflow_registry.get_workflow(workflow_id) or workflow
-            return _poison_or_fail(
-                workflow_registry,
-                workflow=workflow,
-                step=step,
-                reason="invalid_mission_yaml",
             )
         handoff = _handoff_dispatch(
             workflow_registry=workflow_registry,
@@ -1061,14 +1117,17 @@ def materialize_claimed_child(
             policy_audit=policy_audit,
         )
 
-    mission = _parse_exact_mission(mission_yaml)
-    if mission is None:
+    mission, executable_yaml, hydrate_denial = _hydrate_executable_child(
+        workflow=workflow,
+        mission_yaml=mission_yaml,
+    )
+    if hydrate_denial is not None or mission is None or executable_yaml is None:
         workflow = workflow_registry.get_workflow(workflow_id) or workflow
-        return _poison_or_fail(
+        return _fail_hydrate(
             workflow_registry,
             workflow=workflow,
             step=step,
-            reason="invalid_mission_yaml",
+            denial=hydrate_denial or "invalid_mission_yaml",
             policy_audit=policy_audit,
         )
 
@@ -1077,7 +1136,7 @@ def materialize_claimed_child(
 
     create_result = run_registry.create_run(
         run_id=step.child_run_id,
-        mission_yaml=mission_yaml,
+        mission_yaml=executable_yaml,
         retried_from=ownership,
     )
     assert isinstance(create_result, ReservedRunCreateResult)
@@ -1134,7 +1193,7 @@ def materialize_claimed_child(
             if existing is not None:
                 mismatch = _verify_existing_run(
                     existing,
-                    mission_yaml=mission_yaml,
+                    mission_yaml=executable_yaml,
                     ownership=ownership,
                 )
                 if mismatch is None:
