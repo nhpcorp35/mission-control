@@ -1572,13 +1572,16 @@ def verify_retrieved_acceptance_contract(
     expected_size: object = None,
     stored_contract_sha256: object = None,
     stored_object_sha256: object = None,
+    resolved_object_key: object = None,
 ) -> dict[str, Any]:
     """Fail-closed verified read of one acceptance_contract.v1 object.
 
     Checks canonical key/identity, byte size, embedded content_sha256 /
-    contract_sha256, and independently computed object_sha256 (against B2
-    metadata when present). Returns safe metadata plus the structured contract
-    only after every check passes. Never returns unrelated objects.
+    contract_sha256, and independently computes object_sha256. Stored contract
+    metadata remains mandatory; legacy objects may omit only object_sha256
+    metadata, in which case the exact downloaded bytes still supply that digest.
+    Returns safe metadata plus the structured contract only after every check
+    passes. Never returns unrelated objects.
     """
     requested = resolve_acceptance_contract_retrieval_key(
         benchmark_id=benchmark_id,
@@ -1587,6 +1590,8 @@ def verify_retrieved_acceptance_contract(
         version=version,
     )
     object_key = requested["object_key"]
+    if resolved_object_key is not None:
+        object_key = validate_acceptance_contract_object_key(resolved_object_key)
 
     if not isinstance(payload, (bytes, bytearray)):
         _reject("payload", "bytes", payload)
@@ -1610,21 +1615,16 @@ def verify_retrieved_acceptance_contract(
             )
 
     object_sha256 = compute_acceptance_object_sha256(body)
-    if stored_object_sha256 is None or stored_object_sha256 == "":
-        _reject(
-            "stored_object_sha256",
-            "non-empty 64-character lowercase hex SHA-256 from B2 metadata",
-            stored_object_sha256,
+    if stored_object_sha256 not in (None, ""):
+        stored_object = validate_sha256_hex(
+            stored_object_sha256, label="stored_object_sha256"
         )
-    stored_object = validate_sha256_hex(
-        stored_object_sha256, label="stored_object_sha256"
-    )
-    if stored_object != object_sha256:
-        _reject(
-            "object_sha256",
-            "equal to independently computed object digest",
-            stored_object,
-        )
+        if stored_object != object_sha256:
+            _reject(
+                "object_sha256",
+                "equal to independently computed object digest",
+                stored_object,
+            )
 
     identity = parse_acceptance_contract_v1(body)
 
@@ -1634,7 +1634,13 @@ def verify_retrieved_acceptance_contract(
             f"equal to canonical key {object_key!r}",
             identity["object_key"],
         )
-    if identity["benchmark_id"] != requested["benchmark_id"]:
+    benchmark_matches = identity["benchmark_id"] == requested["benchmark_id"]
+    if resolved_object_key is not None:
+        benchmark_matches = (
+            identity["benchmark_id"].casefold()
+            == requested["benchmark_id"].casefold()
+        )
+    if not benchmark_matches:
         _reject(
             "$.identity.benchmark_id",
             f"equal to requested benchmark_id {requested['benchmark_id']!r}",

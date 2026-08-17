@@ -2332,6 +2332,105 @@ class AcceptanceContractRetrievalTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.path, "$.content_sha256")
 
+    def test_legacy_missing_object_metadata_is_verified_from_payload(self) -> None:
+        doc, payload, _meta = self._valid_payload_and_meta()
+        result = verify_retrieved_acceptance_contract(
+            payload=payload,
+            expected_size=len(payload),
+            stored_contract_sha256=_meta["contract_sha256"],
+            stored_object_sha256=None,
+            **self._identity(),
+        )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["object_key"], doc["object_key"])
+
+    def test_present_object_metadata_mismatch_still_fails_closed(self) -> None:
+        _doc, payload, meta = self._valid_payload_and_meta()
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            verify_retrieved_acceptance_contract(
+                payload=payload,
+                expected_size=len(payload),
+                stored_contract_sha256=meta["contract_sha256"],
+                stored_object_sha256="0" * 64,
+                **self._identity(),
+            )
+        self.assertEqual(ctx.exception.path, "object_sha256")
+
+    def test_case_variant_benchmark_resolves_unique_legacy_key(self) -> None:
+        server = _import_bridge_server()
+        identity = self._identity()
+        doc, payload, meta = self._valid_payload_and_meta()
+        object_key = str(doc["object_key"])
+        client = mock.Mock()
+
+        def _head_object(*, Bucket: str, Key: str) -> dict[str, object]:
+            del Bucket
+            if Key != object_key:
+                raise server.ClientError(
+                    {"Error": {"Code": "404", "Message": "Not Found"}},
+                    "HeadObject",
+                )
+            return {
+                "ContentLength": len(payload),
+                "ETag": '"legacy"',
+                "Metadata": {"contract_sha256": meta["contract_sha256"]},
+            }
+
+        class _Body:
+            def read(self, _n: int) -> bytes:
+                return payload
+
+            def close(self) -> None:
+                return None
+
+        client.head_object.side_effect = _head_object
+        client.list_objects_v2.return_value = {
+            "Contents": [{"Key": object_key}],
+            "IsTruncated": False,
+        }
+        client.get_object.return_value = {"Body": _Body()}
+        requested = {**identity, "benchmark_id": identity["benchmark_id"].upper()}
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(server, "_require_allowed_user", return_value="tester"):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    result = asyncio.run(server.get_acceptance_contract.fn(**requested))
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["object_key"], object_key)
+        client.get_object.assert_called_once_with(
+            Bucket=CANONICAL_LEGALAI_BUCKET, Key=object_key
+        )
+
+    def test_case_variant_benchmark_ambiguity_fails_closed(self) -> None:
+        server = _import_bridge_server()
+        identity = self._identity()
+        requested = {**identity, "benchmark_id": identity["benchmark_id"].upper()}
+        key = canonical_acceptance_contract_object_key(**identity)
+        client = mock.Mock()
+        client.head_object.side_effect = server.ClientError(
+            {"Error": {"Code": "404", "Message": "Not Found"}},
+            "HeadObject",
+        )
+        client.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": key},
+                {
+                    "Key": key.replace(
+                        identity["benchmark_id"],
+                        identity["benchmark_id"].upper(),
+                    )
+                },
+            ],
+            "IsTruncated": False,
+        }
+        with mock.patch.object(server, "B2_BUCKET", CANONICAL_LEGALAI_BUCKET):
+            with mock.patch.object(
+                server, "_require_allowed_user", return_value="tester"
+            ):
+                with mock.patch.object(server, "_b2_client", return_value=client):
+                    with self.assertRaisesRegex(ValueError, "ambiguous"):
+                        asyncio.run(server.get_acceptance_contract.fn(**requested))
+        client.get_object.assert_not_called()
+
     def test_object_corruption_hash_mismatch_fail_closed(self) -> None:
         _doc, payload, meta = self._valid_payload_and_meta()
         corrupted = payload + b" "
