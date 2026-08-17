@@ -82,6 +82,26 @@ class GenerateAndEvaluateWorkflowTests(unittest.TestCase):
         self.assertTrue(
             (run_dir / "case00_attorney_feedback_eval_summary.txt").is_file()
         )
+        packet_path = run_dir / "case00_attorney_review_packet.md"
+        self.assertTrue(packet_path.is_file())
+        self.assertEqual(result["attorney_review_packet"], str(packet_path.resolve()))
+        self.assertEqual(
+            result["files"]["case00_attorney_review_packet.md"],
+            str(packet_path.resolve()),
+        )
+        self.assertEqual(
+            result["generation"]["files"]["case00_attorney_review_packet.md"],
+            str(packet_path.resolve()),
+        )
+        self.assertEqual(
+            result["evaluation"]["review_packet"],
+            str(packet_path.resolve()),
+        )
+        packet = packet_path.read_text(encoding="utf-8")
+        self.assertIn("## 3. Proposed Answer", packet)
+        self.assertIn("## 4. Material Propositions", packet)
+        self.assertIn("## 10. Attorney Decision Checklist", packet)
+        self.assertIn("NOT ATTORNEY-APPROVED", packet)
         eval_payload = json.loads(
             (run_dir / "case00_attorney_feedback_eval.json").read_text(encoding="utf-8")
         )
@@ -91,6 +111,35 @@ class GenerateAndEvaluateWorkflowTests(unittest.TestCase):
             "candidate_vs_reference_diagnostics",
             eval_payload["questions"][0],
         )
+
+    def test_candidate_artifact_error_code_is_preserved(self):
+        generation = {
+            "candidate_directory": str(self.out_root),
+            "files": {},
+        }
+        eval_paths = {
+            "json": self.out_root / "case00_attorney_feedback_eval.json",
+            "summary": self.out_root / "case00_attorney_feedback_eval_summary.txt",
+        }
+        with (
+            mock.patch.object(WF.GEN, "run_generation", return_value=generation),
+            mock.patch.object(
+                WF, "load_candidates_from_directory", return_value={"Q1": "Answer."}
+            ),
+            mock.patch.object(WF, "evaluate_case00", return_value={}),
+            mock.patch.object(
+                WF, "write_evaluation_outputs", return_value=eval_paths
+            ),
+        ):
+            with self.assertRaises(WF.WorkflowError) as ctx:
+                WF.run_workflow(
+                    case_root=self.case_root,
+                    question_id="Q1",
+                    required_commit=self.required_commit,
+                    output_dir=self.out_root,
+                    authorization_acknowledgement=CLI.AUTHORIZATION_ACK,
+                )
+        self.assertEqual(ctx.exception.code, "CANDIDATE_ARTIFACT_MISSING")
 
     def test_machine_readable_error_on_auth_failure(self):
         code = WF.main(

@@ -35,6 +35,10 @@ from case00_attorney_eval.evaluate import (  # noqa: E402
     format_human_summary,
     write_evaluation_outputs,
 )
+from case00_attorney_eval.review_packet import (  # noqa: E402
+    PACKET_FILENAME,
+    write_attorney_review_packet,
+)
 
 
 def _load_generation_cli():
@@ -209,6 +213,28 @@ def run_workflow(
             json_path=candidate_dir / "case00_attorney_feedback_eval.json",
             summary_path=candidate_dir / "case00_attorney_feedback_eval_summary.txt",
         )
+        candidate_json_path = next(
+            (
+                Path(path_text)
+                for name, path_text in files.items()
+                if name.endswith("_candidate_answer.json")
+            ),
+            None,
+        )
+        if candidate_json_path is None:
+            raise WorkflowError(
+                "Candidate JSON path missing from generation result",
+                code="CANDIDATE_ARTIFACT_MISSING",
+                generation=gen_result,
+            )
+        review_packet_path = write_attorney_review_packet(
+            candidate_json_path,
+            eval_result,
+            output_path=candidate_dir / PACKET_FILENAME,
+            generation=gen_result,
+        )
+    except WorkflowError:
+        raise
     except FileNotFoundError as exc:
         raise WorkflowError(
             str(exc),
@@ -222,15 +248,23 @@ def run_workflow(
             generation=gen_result,
         ) from exc
 
+    workflow_files = dict(files)
+    workflow_files[PACKET_FILENAME] = str(review_packet_path)
+    gen_result = dict(gen_result)
+    gen_result["files"] = workflow_files
+
     return {
         "ok": True,
         "question_id": question_id,
         "required_commit": required_commit,
         "run_dir": str(candidate_dir.resolve()),
+        "attorney_review_packet": str(review_packet_path),
+        "files": workflow_files,
         "generation": gen_result,
         "evaluation": {
             "json": str(eval_paths["json"]),
             "summary": str(eval_paths["summary"]),
+            "review_packet": str(review_packet_path),
             "summary_text": format_human_summary(eval_result),
             "result": eval_result,
         },
