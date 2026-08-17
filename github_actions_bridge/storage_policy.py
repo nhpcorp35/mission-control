@@ -1577,11 +1577,11 @@ def verify_retrieved_acceptance_contract(
     """Fail-closed verified read of one acceptance_contract.v1 object.
 
     Checks canonical key/identity, byte size, embedded content_sha256 /
-    contract_sha256, and independently computes object_sha256. When B2 digest
-    metadata is present it must match; legacy objects without that metadata are
-    verified from their embedded digest and exact bytes. Returns safe metadata
-    plus the structured contract only after every check passes. Never returns
-    unrelated objects.
+    contract_sha256, and independently computes object_sha256. Stored contract
+    metadata remains mandatory; legacy objects may omit only object_sha256
+    metadata, in which case the exact downloaded bytes still supply that digest.
+    Returns safe metadata plus the structured contract only after every check
+    passes. Never returns unrelated objects.
     """
     requested = resolve_acceptance_contract_retrieval_key(
         benchmark_id=benchmark_id,
@@ -1665,16 +1665,21 @@ def verify_retrieved_acceptance_contract(
             identity["version"],
         )
 
-    if stored_contract_sha256 not in (None, ""):
-        stored_contract = validate_sha256_hex(
-            stored_contract_sha256, label="stored_contract_sha256"
+    if stored_contract_sha256 is None or stored_contract_sha256 == "":
+        _reject(
+            "stored_contract_sha256",
+            "non-empty 64-character lowercase hex SHA-256 from B2 metadata",
+            stored_contract_sha256,
         )
-        if stored_contract != identity["contract_sha256"]:
-            _reject(
-                "contract_sha256",
-                "equal to recomputed contract_sha256 / $.content_sha256",
-                stored_contract,
-            )
+    stored_contract = validate_sha256_hex(
+        stored_contract_sha256, label="stored_contract_sha256"
+    )
+    if stored_contract != identity["contract_sha256"]:
+        _reject(
+            "contract_sha256",
+            "equal to recomputed contract_sha256 / $.content_sha256",
+            stored_contract,
+        )
 
     # Structured contract only after fail-closed verification (do not log body).
     try:
