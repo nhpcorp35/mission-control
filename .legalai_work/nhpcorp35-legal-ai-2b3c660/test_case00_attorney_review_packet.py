@@ -30,6 +30,10 @@ class AttorneyReviewPacketTests(unittest.TestCase):
             "propositions": [{
                 "proposition_id": "P1",
                 "text": "Alpha LLC is the plaintiff.",
+                "classification": "record_fact",
+                "confidence": 0.91,
+                "rationale": "The filed caption expressly identifies the party.",
+                "polarity": "supporting",
                 "nyscef_document_number": 101,
                 "pdf_page": 4,
                 "source_excerpt": "Plaintiff Alpha LLC",
@@ -115,6 +119,13 @@ class AttorneyReviewPacketTests(unittest.TestCase):
         for heading in headings:
             self.assertIn(heading, packet)
         self.assertIn("Alpha LLC is the plaintiff.", packet)
+        self.assertIn("Classification:** record_fact", packet)
+        self.assertIn("Proposition confidence:** 0.91", packet)
+        self.assertIn(
+            "The filed caption expressly identifies the party.", packet
+        )
+        self.assertIn("Polarity:** supporting", packet)
+        self.assertIn("Plaintiff Alpha LLC", packet)
         self.assertIn("Defendant role not addressed.", packet)
         self.assertIn("Provisional comparison only.", packet)
         self.assertIn(
@@ -145,6 +156,13 @@ class AttorneyReviewPacketTests(unittest.TestCase):
             "Page:",
         ):
             self.assertIn(expected, packet)
+
+    def test_candidate_review_requirement_cannot_be_downgraded(self):
+        candidate = self._candidate()
+        evaluation = self._evaluation()
+        evaluation["questions"][0]["flags"]["requires_attorney_review"] = False
+        packet = render_attorney_review_packet(candidate, evaluation)
+        self.assertIn("Requires attorney review:** Yes", packet)
 
     def test_checklist_is_rendered(self):
         packet = render_attorney_review_packet(
