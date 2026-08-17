@@ -112,8 +112,7 @@ def _render_items(value: Any) -> list[str]:
     for item in items:
         text = _item_text(item)
         locator = _locators(item)
-        lines.append(f"- {text}" + (f"  
-  **Source:** {locator}" if locator else ""))
+        lines.append(f"- {text}" + (f"  \\n  **Source:** {locator}" if locator else ""))
     return lines
 
 
@@ -256,8 +255,7 @@ def render_attorney_review_packet(
         "  ",
         "",
     ]
-    return "
-".join(lines)
+    return "\\n".join(lines)
 
 
 def write_attorney_review_packet(
