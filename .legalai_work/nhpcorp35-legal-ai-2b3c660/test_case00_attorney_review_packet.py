@@ -49,6 +49,11 @@ class AttorneyReviewPacketTests(unittest.TestCase):
             "unresolved_questions": [
                 "Whether the later filing changes the procedural posture."
             ],
+            "documents_pages_reviewed": [{
+                "source_filename": "complaint.pdf",
+                "pdf_page_number": 9,
+                "source_path": "/case/filings/complaint.pdf",
+            }],
             "review_scope": "Confirm the pleaded role against the complete docket.",
         }
 
@@ -121,6 +126,8 @@ class AttorneyReviewPacketTests(unittest.TestCase):
             "nyscef-101-page-0004",
             "Source path:",
             "/case/filings/complaint.pdf",
+            "complaint.pdf",
+            "PDF page: `9`",
             "Document:",
             "Page:",
         ):
