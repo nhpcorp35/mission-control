@@ -101,7 +101,12 @@ def _item_text(item: Any) -> str:
     omitted = {key for key, _ in _LOCATOR_LABELS}
     omitted.update({"source", "locator", "document", "filing", "page"})
     remainder = {k: v for k, v in item.items() if k not in omitted}
-    return _scalar(remainder) if remainder else "Evidence item"
+    if not remainder:
+        return "Evidence item"
+    return "; ".join(
+        f"{str(key).replace('_', ' ')}: {_scalar(value)}"
+        for key, value in remainder.items()
+    )
 
 
 def _render_items(value: Any) -> list[str]:
@@ -204,6 +209,10 @@ def render_attorney_review_packet(
         "## 5. Supporting Evidence",
         "",
         *_render_items(candidate.get("supporting_evidence")),
+        "",
+        "### Documents / Pages Reviewed",
+        "",
+        *_render_items(candidate.get("documents_pages_reviewed")),
         "",
         "## 6. Contrary Evidence and Contradictions",
         "",
