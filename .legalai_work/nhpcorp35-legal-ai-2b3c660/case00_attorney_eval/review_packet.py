@@ -164,15 +164,18 @@ def render_attorney_review_packet(
     reference = evaluated.get("reference_answer_status") or {}
     flags = evaluated.get("flags") or {}
     confidence = candidate.get("confidence")
+    attorney_review = (
+        candidate.get("attorney_review")
+        if isinstance(candidate.get("attorney_review"), Mapping)
+        else {}
+    )
     limitations = _first(
         candidate,
         "limitations",
         "review_scope",
     )
     if limitations is None:
-        limitations = (candidate.get("attorney_review") or {}).get("limitations") if isinstance(
-            candidate.get("attorney_review"), Mapping
-        ) else None
+        limitations = attorney_review.get("limitations")
 
     lines = [
         "# Case-00 Attorney Cognition Review Packet v1",
@@ -250,6 +253,9 @@ def render_attorney_review_packet(
         f"- **Candidate confidence:** {_scalar(confidence) if confidence is not None else 'Not available'}",
         f"- **Requires attorney review:** {_scalar(flags.get('requires_attorney_review', True))}",
         f"- **Review scope / limitations:** {_scalar(limitations) if limitations not in (None, '') else _NONE}",
+        f"- **Attorney review notes:** {_scalar(attorney_review.get('review_notes')) if attorney_review.get('review_notes') not in (None, '') else _NONE}",
+        f"- **Legal conclusions labeled:** {_scalar(attorney_review.get('legal_conclusions_labeled')) if attorney_review.get('legal_conclusions_labeled') is not None else 'Not available'}",
+        f"- **Coverage conclusion:** {_scalar(attorney_review.get('coverage_conclusion')) if attorney_review.get('coverage_conclusion') not in (None, '') else _NONE}",
         "- **Boundary:** Provisional reference material, if present, is not attorney-approved.",
         "- **Scope:** Verify the answer against the cited record, contrary evidence, unresolved issues, and applicable procedural posture before relying on it.",
         "",
