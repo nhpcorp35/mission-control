@@ -55,6 +55,12 @@ class AttorneyReviewPacketTests(unittest.TestCase):
                 "source_path": "/case/filings/complaint.pdf",
             }],
             "review_scope": "Confirm the pleaded role against the complete docket.",
+            "attorney_review": {
+                "requires_attorney_review": True,
+                "review_notes": "Verify the party roles against the complete docket.",
+                "legal_conclusions_labeled": True,
+                "coverage_conclusion": "Retrieved evidence is not the complete record.",
+            },
         }
 
     def _evaluation(self) -> dict:
@@ -111,6 +117,13 @@ class AttorneyReviewPacketTests(unittest.TestCase):
         self.assertIn("Alpha LLC is the plaintiff.", packet)
         self.assertIn("Defendant role not addressed.", packet)
         self.assertIn("Provisional comparison only.", packet)
+        self.assertIn(
+            "Verify the party roles against the complete docket.", packet
+        )
+        self.assertIn("Legal conclusions labeled:** Yes", packet)
+        self.assertIn(
+            "Retrieved evidence is not the complete record.", packet
+        )
         self.assertIn("NOT ATTORNEY-APPROVED", packet)
 
     def test_evidence_locators_are_visible_next_to_evidence(self):
