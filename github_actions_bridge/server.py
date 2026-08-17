@@ -1379,9 +1379,39 @@ async def get_acceptance_contract(
         contract_id=contract_id,
         version=version,
     )
-    object_key = requested["object_key"]
     client = _b2_client()
+    object_key = requested["object_key"]
     head = _head_acceptance_contract_metadata(client, object_key)
+    if (
+        head is None
+        and requested["benchmark_id"] != requested["benchmark_id"].casefold()
+    ):
+        response = client.list_objects_v2(
+            Bucket=B2_BUCKET, Prefix=ACCEPTANCE_CONTRACT_PREFIX, MaxKeys=200
+        )
+        if response.get("IsTruncated"):
+            raise ValueError(
+                "acceptance-contract lookup is ambiguous: listing truncated"
+            )
+        suffix = (
+            f"/{requested['question_id']}/{requested['contract_id']}"
+            f"/v{requested['version']}/acceptance_contract.json"
+        )
+        candidates = [
+            str(item.get("Key", ""))
+            for item in response.get("Contents", [])
+            if str(item.get("Key", "")).startswith(ACCEPTANCE_CONTRACT_PREFIX)
+            and str(item.get("Key", "")).endswith(suffix)
+            and str(item.get("Key", ""))[
+                len(ACCEPTANCE_CONTRACT_PREFIX) : -len(suffix)
+            ].casefold()
+            == requested["benchmark_id"].casefold()
+        ]
+        if len(candidates) > 1:
+            raise ValueError("acceptance-contract lookup is ambiguous")
+        if candidates:
+            object_key = candidates[0]
+            head = _head_acceptance_contract_metadata(client, object_key)
     if head is None:
         return {
             "ok": False,
@@ -1427,6 +1457,7 @@ async def get_acceptance_contract(
         expected_size=size,
         stored_contract_sha256=head.get("contract_sha256"),
         stored_object_sha256=head.get("object_sha256"),
+        resolved_object_key=object_key,
     )
     return {
         **verified,
