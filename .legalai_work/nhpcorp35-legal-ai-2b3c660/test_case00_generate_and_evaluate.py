@@ -112,6 +112,35 @@ class GenerateAndEvaluateWorkflowTests(unittest.TestCase):
             eval_payload["questions"][0],
         )
 
+    def test_candidate_artifact_error_code_is_preserved(self):
+        generation = {
+            "candidate_directory": str(self.out_root),
+            "files": {},
+        }
+        eval_paths = {
+            "json": self.out_root / "case00_attorney_feedback_eval.json",
+            "summary": self.out_root / "case00_attorney_feedback_eval_summary.txt",
+        }
+        with (
+            mock.patch.object(WF.GEN, "run_generation", return_value=generation),
+            mock.patch.object(
+                WF, "load_candidates_from_directory", return_value={"Q1": "Answer."}
+            ),
+            mock.patch.object(WF, "evaluate_case00", return_value={}),
+            mock.patch.object(
+                WF, "write_evaluation_outputs", return_value=eval_paths
+            ),
+        ):
+            with self.assertRaises(WF.WorkflowError) as ctx:
+                WF.run_workflow(
+                    case_root=self.case_root,
+                    question_id="Q1",
+                    required_commit=self.required_commit,
+                    output_dir=self.out_root,
+                    authorization_acknowledgement=CLI.AUTHORIZATION_ACK,
+                )
+        self.assertEqual(ctx.exception.code, "CANDIDATE_ARTIFACT_MISSING")
+
     def test_machine_readable_error_on_auth_failure(self):
         code = WF.main(
             [
