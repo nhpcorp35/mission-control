@@ -2332,12 +2332,12 @@ class AcceptanceContractRetrievalTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.path, "$.content_sha256")
 
-    def test_legacy_missing_object_metadata_is_verified_from_payload(self) -> None:
+    def test_legacy_missing_digest_metadata_is_verified_from_payload(self) -> None:
         doc, payload, _meta = self._valid_payload_and_meta()
         result = verify_retrieved_acceptance_contract(
             payload=payload,
             expected_size=len(payload),
-            stored_contract_sha256=_meta["contract_sha256"],
+            stored_contract_sha256=None,
             stored_object_sha256=None,
             **self._identity(),
         )
@@ -2356,10 +2356,22 @@ class AcceptanceContractRetrievalTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.path, "object_sha256")
 
+    def test_present_contract_metadata_mismatch_still_fails_closed(self) -> None:
+        _doc, payload, meta = self._valid_payload_and_meta()
+        with self.assertRaises(AcceptanceContractValidationError) as ctx:
+            verify_retrieved_acceptance_contract(
+                payload=payload,
+                expected_size=len(payload),
+                stored_contract_sha256="0" * 64,
+                stored_object_sha256=meta["object_sha256"],
+                **self._identity(),
+            )
+        self.assertEqual(ctx.exception.path, "contract_sha256")
+
     def test_case_variant_benchmark_resolves_unique_legacy_key(self) -> None:
         server = _import_bridge_server()
         identity = self._identity()
-        doc, payload, meta = self._valid_payload_and_meta()
+        doc, payload, _meta = self._valid_payload_and_meta()
         object_key = str(doc["object_key"])
         client = mock.Mock()
 
@@ -2373,7 +2385,7 @@ class AcceptanceContractRetrievalTests(unittest.TestCase):
             return {
                 "ContentLength": len(payload),
                 "ETag": '"legacy"',
-                "Metadata": {"contract_sha256": meta["contract_sha256"]},
+                "Metadata": {},
             }
 
         class _Body:
