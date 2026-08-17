@@ -233,6 +233,8 @@ def run_workflow(
             output_path=candidate_dir / PACKET_FILENAME,
             generation=gen_result,
         )
+    except WorkflowError:
+        raise
     except FileNotFoundError as exc:
         raise WorkflowError(
             str(exc),
