@@ -121,6 +121,33 @@ def _render_items(value: Any) -> list[str]:
     return lines
 
 
+def _render_propositions(value: Any) -> list[str]:
+    items = _as_items(value)
+    if not items:
+        return [_NONE]
+    lines: list[str] = []
+    metadata = (
+        ("classification", "Classification"),
+        ("confidence", "Proposition confidence"),
+        ("rationale", "Rationale"),
+        ("polarity", "Polarity"),
+        ("source_excerpt", "Source excerpt"),
+    )
+    for item in items:
+        if not isinstance(item, Mapping):
+            lines.append(f"- {_scalar(item)}")
+            continue
+        lines.append(f"- {_item_text(item)}")
+        for key, label in metadata:
+            value = item.get(key)
+            if value not in (None, "", [], {}):
+                lines.append(f"  - **{label}:** {_scalar(value)}")
+        locator = _locators(item)
+        if locator:
+            lines.append(f"  - **Source:** {locator}")
+    return lines
+
+
 def _render_mapping(mapping: Any) -> list[str]:
     if not isinstance(mapping, Mapping) or not mapping:
         return [_NONE]
@@ -176,6 +203,10 @@ def render_attorney_review_packet(
     )
     if limitations is None:
         limitations = attorney_review.get("limitations")
+    requires_attorney_review = bool(
+        attorney_review.get("requires_attorney_review", True)
+        or flags.get("requires_attorney_review", True)
+    )
 
     lines = [
         "# Case-00 Attorney Cognition Review Packet v1",
@@ -207,7 +238,7 @@ def render_attorney_review_packet(
         "",
         "## 4. Material Propositions",
         "",
-        *_render_items(candidate.get("propositions")),
+        *_render_propositions(candidate.get("propositions")),
         "",
         "## 5. Supporting Evidence",
         "",
@@ -251,7 +282,7 @@ def render_attorney_review_packet(
         "## 9. Confidence, Limitations, and Attorney-Review Scope",
         "",
         f"- **Candidate confidence:** {_scalar(confidence) if confidence is not None else 'Not available'}",
-        f"- **Requires attorney review:** {_scalar(flags.get('requires_attorney_review', True))}",
+        f"- **Requires attorney review:** {_scalar(requires_attorney_review)}",
         f"- **Review scope / limitations:** {_scalar(limitations) if limitations not in (None, '') else _NONE}",
         f"- **Attorney review notes:** {_scalar(attorney_review.get('review_notes')) if attorney_review.get('review_notes') not in (None, '') else _NONE}",
         f"- **Legal conclusions labeled:** {_scalar(attorney_review.get('legal_conclusions_labeled')) if attorney_review.get('legal_conclusions_labeled') is not None else 'Not available'}",
