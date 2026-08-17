@@ -2332,12 +2332,12 @@ class AcceptanceContractRetrievalTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.path, "$.content_sha256")
 
-    def test_legacy_missing_metadata_is_verified_from_payload(self) -> None:
+    def test_legacy_missing_object_metadata_is_verified_from_payload(self) -> None:
         doc, payload, _meta = self._valid_payload_and_meta()
         result = verify_retrieved_acceptance_contract(
             payload=payload,
             expected_size=len(payload),
-            stored_contract_sha256=None,
+            stored_contract_sha256=_meta["contract_sha256"],
             stored_object_sha256=None,
             **self._identity(),
         )
@@ -2359,7 +2359,7 @@ class AcceptanceContractRetrievalTests(unittest.TestCase):
     def test_case_variant_benchmark_resolves_unique_legacy_key(self) -> None:
         server = _import_bridge_server()
         identity = self._identity()
-        doc, payload, _meta = self._valid_payload_and_meta()
+        doc, payload, meta = self._valid_payload_and_meta()
         object_key = str(doc["object_key"])
         client = mock.Mock()
 
@@ -2373,7 +2373,7 @@ class AcceptanceContractRetrievalTests(unittest.TestCase):
             return {
                 "ContentLength": len(payload),
                 "ETag": '"legacy"',
-                "Metadata": {},
+                "Metadata": {"contract_sha256": meta["contract_sha256"]},
             }
 
         class _Body:
