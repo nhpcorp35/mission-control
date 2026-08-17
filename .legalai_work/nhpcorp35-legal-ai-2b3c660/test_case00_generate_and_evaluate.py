@@ -82,6 +82,26 @@ class GenerateAndEvaluateWorkflowTests(unittest.TestCase):
         self.assertTrue(
             (run_dir / "case00_attorney_feedback_eval_summary.txt").is_file()
         )
+        packet_path = run_dir / "case00_attorney_review_packet.md"
+        self.assertTrue(packet_path.is_file())
+        self.assertEqual(result["attorney_review_packet"], str(packet_path.resolve()))
+        self.assertEqual(
+            result["files"]["case00_attorney_review_packet.md"],
+            str(packet_path.resolve()),
+        )
+        self.assertEqual(
+            result["generation"]["files"]["case00_attorney_review_packet.md"],
+            str(packet_path.resolve()),
+        )
+        self.assertEqual(
+            result["evaluation"]["review_packet"],
+            str(packet_path.resolve()),
+        )
+        packet = packet_path.read_text(encoding="utf-8")
+        self.assertIn("## 3. Proposed Answer", packet)
+        self.assertIn("## 4. Material Propositions", packet)
+        self.assertIn("## 10. Attorney Decision Checklist", packet)
+        self.assertIn("NOT ATTORNEY-APPROVED", packet)
         eval_payload = json.loads(
             (run_dir / "case00_attorney_feedback_eval.json").read_text(encoding="utf-8")
         )
