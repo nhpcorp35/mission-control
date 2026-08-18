@@ -482,6 +482,7 @@ CASE_ARTIFACT_SHARED_FILENAMES = frozenset(
     {
         "generation_manifest.json",
         "model_input_audit.json",
+        "case00_attorney_review_packet.md",
     }
 )
 CASE_ARTIFACT_CANDIDATE_JSON_LIMIT = 1_000_000
@@ -523,7 +524,8 @@ mcp = FastMCP(
         "fail closed. Use get_case_artifact to read one allowlisted, "
         "mission-correlated artifact after a successful Case-00 run "
         "(Q<N>_candidate_answer.json|.md for that mission's question, plus "
-        "generation_manifest.json and model_input_audit.json). Case-00 storage tools "
+        "generation_manifest.json, model_input_audit.json, and "
+        "case00_attorney_review_packet.md). Case-00 storage tools "
         "expose allowlisted inventory metadata, archive a fixed attorney-feedback "
         "package, and archive one DOCX review packet under canonical B2 prefixes "
         "without accepting bucket or key inputs. Namespaced canonical catalog "
@@ -765,6 +767,18 @@ def allowed_case_artifact_filenames(question_token: str) -> frozenset[str]:
             f"{question_id}_candidate_answer.md",
         }
     ) | CASE_ARTIFACT_SHARED_FILENAMES
+
+
+def case00_durable_objects_complete(
+    objects: list[Any], question_token: str
+) -> bool:
+    """Require exactly one object for every allowlisted durable filename."""
+    filenames = [
+        item.get("filename") if isinstance(item, dict) else None
+        for item in objects
+    ]
+    required = allowed_case_artifact_filenames(question_token)
+    return len(filenames) == len(required) and set(filenames) == required
 
 
 def assert_safe_case_artifact_basename(filename: str) -> str:
@@ -1753,7 +1767,9 @@ async def _verify_case00_artifacts(mission_id: str) -> dict[str, Any]:
 
     durable = payload.get("durable_artifacts") or {}
     objects = durable.get("objects") or []
-    if not payload.get("ok") or len(objects) != 4:
+    if not payload.get("ok") or not case00_durable_objects_complete(
+        objects, question_token
+    ):
         return {
             "ok": False,
             "mission_id": mission_id,
@@ -1793,7 +1809,7 @@ async def _verify_case00_artifacts(mission_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def get_case00_q1_artifacts(mission_id: str) -> dict[str, Any]:
-    """Return and independently HEAD-verify the four durable Case-00 Q1 B2 objects."""
+    """Return and independently HEAD-verify five durable Case-00 Q1 B2 objects."""
     _require_allowed_user()
     return await _verify_case00_artifacts(mission_id)
 
@@ -1815,7 +1831,8 @@ async def get_case_artifact(
     Question is taken from the Bridge Case-00 run / verified B2 object set.
     Allowed basenames are exactly ``Q<N>_candidate_answer.json``,
     ``Q<N>_candidate_answer.md`` for that mission's question, plus
-    ``generation_manifest.json`` and ``model_input_audit.json``.
+    ``generation_manifest.json``, ``model_input_audit.json``, and
+    ``case00_attorney_review_packet.md``.
     """
     _require_allowed_user()
     filename = assert_safe_case_artifact_basename(filename)
@@ -1859,7 +1876,9 @@ async def get_case_artifact(
 
     durable = payload.get("durable_artifacts") or {}
     objects = durable.get("objects") or []
-    if not payload.get("ok") or len(objects) != 4:
+    if not payload.get("ok") or not case00_durable_objects_complete(
+        objects, question_token
+    ):
         return {
             "ok": False,
             "mission_id": mission_id,
