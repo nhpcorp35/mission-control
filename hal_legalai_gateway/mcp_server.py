@@ -101,7 +101,7 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         namespace="case",
         downstream_service="bridge",
         downstream_tool="get_case00_q1_artifacts",
-        description="HEAD-verify the four durable Case-00 Q1 B2 objects.",
+        description="HEAD-verify the five durable Case-00 Q1 B2 objects.",
     ),
     ToolBinding(
         gateway_tool="case.get_artifact",
@@ -112,7 +112,8 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
             "Read one allowlisted B2 artifact for a successful Case-00 mission. "
             "Filename must be exactly Q<N>_candidate_answer.json|.md for the "
             "mission's question (from Bridge run / verified B2 objects), or "
-            "generation_manifest.json / model_input_audit.json."
+            "generation_manifest.json / model_input_audit.json / "
+            "case00_attorney_review_packet.md."
         ),
     ),
     ToolBinding(
@@ -692,7 +693,8 @@ def register_forwarding_tools(
 
         ``filename`` must be a bare basename: ``Q<N>_candidate_answer.json`` or
         ``.md`` for the mission's actual question, or one of the shared
-        ``generation_manifest.json`` / ``model_input_audit.json`` files.
+        ``generation_manifest.json`` / ``model_input_audit.json`` /
+        ``case00_attorney_review_packet.md`` files.
         Downstream Bridge enforces question correlation and rejects traversal.
         """
         return await _forward(

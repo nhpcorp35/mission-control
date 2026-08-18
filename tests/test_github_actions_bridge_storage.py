@@ -1302,6 +1302,7 @@ class Case00GenericWorkflowTests(unittest.TestCase):
                     "Q1_candidate_answer.md",
                     "generation_manifest.json",
                     "model_input_audit.json",
+                    "case00_attorney_review_packet.md",
                 }
             ),
         )
@@ -1313,6 +1314,7 @@ class Case00GenericWorkflowTests(unittest.TestCase):
                     "Q2_candidate_answer.md",
                     "generation_manifest.json",
                     "model_input_audit.json",
+                    "case00_attorney_review_packet.md",
                 }
             ),
         )
@@ -1327,6 +1329,22 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.server.assert_safe_case_artifact_basename("")
 
+    def test_case00_durable_objects_require_exact_allowlisted_set(self) -> None:
+        filenames = sorted(self.server.allowed_case_artifact_filenames("q1"))
+        objects = [{"filename": filename} for filename in filenames]
+
+        self.assertTrue(
+            self.server.case00_durable_objects_complete(objects, "q1")
+        )
+        self.assertFalse(
+            self.server.case00_durable_objects_complete(objects[:-1], "q1")
+        )
+        self.assertFalse(
+            self.server.case00_durable_objects_complete(
+                objects[:-1] + [{"filename": filenames[0]}], "q1"
+            )
+        )
+
     def _synthetic_case_artifact_bundle(self, question_id: str, mission_id: str):
         """Synthetic Bridge zip + B2 bodies — no private benchmark content."""
         token = question_id.lower()
@@ -1340,6 +1358,10 @@ class Case00GenericWorkflowTests(unittest.TestCase):
             (f"{question_id}_candidate_answer.md", b"# synthetic candidate\n"),
             ("generation_manifest.json", b'{"synthetic_manifest":true}'),
             ("model_input_audit.json", b'{"synthetic_audit":true}'),
+            (
+                "case00_attorney_review_packet.md",
+                b"# Synthetic attorney review packet\n",
+            ),
         ]
         objects = []
         bodies: dict[str, bytes] = {}
@@ -1472,6 +1494,14 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(shared["ok"])
         self.assertEqual(shared["filename"], "generation_manifest.json")
+        packet, _ = self._run_get_case_artifact(
+            mission_id="mission-artifact-q1-packet",
+            filename="case00_attorney_review_packet.md",
+            question_id="Q1",
+        )
+        self.assertTrue(packet["ok"])
+        self.assertEqual(packet["content_type"], "text/markdown")
+        self.assertIn("Synthetic attorney review packet", packet["content"])
 
     def test_get_case_artifact_q2_retrieval(self) -> None:
         result, _bundle = self._run_get_case_artifact(
