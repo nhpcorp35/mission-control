@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import os
@@ -547,6 +548,60 @@ class BridgeOperationalIntegrityTests(unittest.TestCase):
             )
         )
         self.assertIn("archive_case00_review_packet", payload["registered_tools"])
+
+
+class Case00QuestionRetrievalTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = _import_bridge_server()
+
+    def _read_question(self, question_id: str, packet: bytes):
+        class FakeBody:
+            def read(self, _n: int = -1) -> bytes:
+                return packet
+
+            def close(self) -> None:
+                return None
+
+        client = mock.Mock()
+        client.head_object.return_value = {"ContentLength": len(packet)}
+        client.get_object.return_value = {"Body": FakeBody()}
+        with mock.patch.object(
+            self.server, "_require_allowed_user", return_value="nhpcorp35"
+        ), mock.patch.object(self.server, "_b2_client", return_value=client), mock.patch.object(
+            self.server,
+            "CANONICAL_CASE00_ATTORNEY_PACKET_SIZE",
+            len(packet),
+        ), mock.patch.object(
+            self.server,
+            "CANONICAL_CASE00_ATTORNEY_PACKET_SHA256",
+            hashlib.sha256(packet).hexdigest(),
+        ):
+            return asyncio.run(self.server.get_case00_question.fn(question_id))
+
+    def test_returns_only_requested_verified_heading(self) -> None:
+        packet = b"# Packet\n\n## Q2. What relief is requested?\n\nprivate body\n\n## Q3. What occurred next?\n"
+        result = self._read_question("Q3", packet)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["question_id"], "Q3")
+        self.assertEqual(result["question_text"], "What occurred next?")
+        self.assertNotIn("private body", result["question_text"])
+
+    def test_missing_question_is_safe_and_non_mutating(self) -> None:
+        result = self._read_question("Q3", b"## Q2. What relief is requested?\n")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "question_not_found")
+
+    def test_invalid_question_id_fails_before_b2_access(self) -> None:
+        with (
+            mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ),
+            mock.patch.object(self.server, "_b2_client") as b2,
+        ):
+            with self.assertRaises(ValueError):
+                asyncio.run(self.server.get_case00_question.fn("../Q3"))
+        b2.assert_not_called()
 
 
 class Case00RefResolutionTests(unittest.TestCase):

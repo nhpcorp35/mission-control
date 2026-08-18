@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -72,6 +73,22 @@ CASE00_BENCHMARK_ID = "Case-00-Triborough"
 _CASE00_QUESTION_ID_RE = re.compile(r"^Q[1-9]\d*$")
 _CASE00_QUESTION_TOKEN_RE = re.compile(r"^q[1-9]\d*$")
 
+# The single private packet that defines canonical Case-00 question headings.
+# Retrieval is intentionally bounded to this key and verified before parsing.
+CANONICAL_CASE00_ATTORNEY_PACKET_KEY = (
+    "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/"
+    "attorney-reviews/review-20260802-2122f82dafe3/"
+    "attorney_review_packet_02-original.md"
+)
+CANONICAL_CASE00_ATTORNEY_PACKET_SIZE = 57278
+CANONICAL_CASE00_ATTORNEY_PACKET_SHA256 = (
+    "ce7e3a25b22ec23822aec4dcd317b1df38ce6c85b59f684f45f3bdb811316d86"
+)
+MAX_CASE00_QUESTION_HEADING_CHARS = 2000
+_CASE00_PACKET_QUESTION_HEADING_RE = re.compile(
+    r"^## (Q[1-9]\d*)\.\s+(.+?)\s*$", re.MULTILINE
+)
+
 # Explicit deployment provenance only — never infer or fabricate a SHA.
 DEPLOYED_COMMIT_SHA_ENV = "RAILWAY_GIT_COMMIT_SHA"
 UNKNOWN_DEPLOYED_COMMIT_SHA = "unknown"
@@ -100,6 +117,7 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "list_acceptance_contracts",
         "get_acceptance_contract_template",
         "get_acceptance_contract",
+        "get_case00_question",
     }
 )
 
@@ -1121,6 +1139,72 @@ def _b2_client():
         aws_access_key_id=os.environ["B2_KEY_ID"],
         aws_secret_access_key=os.environ["B2_APPLICATION_KEY"],
     )
+
+
+@mcp.tool()
+async def get_case00_question(question_id: str) -> dict[str, Any]:
+    """Read one verified question heading from the fixed canonical Case-00 packet.
+
+    This is a read-only, allowlisted B2 retrieval. It returns only the requested
+    ``## QN.`` heading, never the full attorney packet or an arbitrary object.
+    """
+    _require_allowed_user()
+    qid = str(question_id or "").strip()
+    if not _CASE00_QUESTION_ID_RE.fullmatch(qid):
+        raise ValueError("question_id must match Q followed by a positive integer")
+
+    client = _b2_client()
+    head = client.head_object(
+        Bucket=B2_BUCKET, Key=CANONICAL_CASE00_ATTORNEY_PACKET_KEY
+    )
+    actual_size = head.get("ContentLength")
+    if actual_size != CANONICAL_CASE00_ATTORNEY_PACKET_SIZE:
+        raise ValueError("canonical Case-00 attorney packet size mismatch")
+
+    response = client.get_object(
+        Bucket=B2_BUCKET, Key=CANONICAL_CASE00_ATTORNEY_PACKET_KEY
+    )
+    stream = response["Body"]
+    try:
+        body = stream.read(CANONICAL_CASE00_ATTORNEY_PACKET_SIZE + 1)
+    finally:
+        stream.close()
+    if len(body) != CANONICAL_CASE00_ATTORNEY_PACKET_SIZE:
+        raise ValueError("canonical Case-00 attorney packet body size mismatch")
+    if hashlib.sha256(body).hexdigest() != CANONICAL_CASE00_ATTORNEY_PACKET_SHA256:
+        raise ValueError("canonical Case-00 attorney packet sha256 mismatch")
+    try:
+        packet = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("canonical Case-00 attorney packet is not UTF-8") from exc
+
+    headings: dict[str, str] = {}
+    for found_id, heading in _CASE00_PACKET_QUESTION_HEADING_RE.findall(packet):
+        if found_id in headings:
+            raise ValueError(
+                "canonical Case-00 attorney packet has duplicate question headings"
+            )
+        headings[found_id] = heading.strip()
+    question_text = headings.get(qid)
+    if not question_text:
+        return {
+            "ok": False,
+            "question_id": qid,
+            "object_key": CANONICAL_CASE00_ATTORNEY_PACKET_KEY,
+            "size": CANONICAL_CASE00_ATTORNEY_PACKET_SIZE,
+            "sha256": CANONICAL_CASE00_ATTORNEY_PACKET_SHA256,
+            "error": "question_not_found",
+        }
+    if len(question_text) > MAX_CASE00_QUESTION_HEADING_CHARS:
+        raise ValueError("canonical Case-00 question heading exceeds size limit")
+    return {
+        "ok": True,
+        "question_id": qid,
+        "question_text": question_text,
+        "object_key": CANONICAL_CASE00_ATTORNEY_PACKET_KEY,
+        "size": CANONICAL_CASE00_ATTORNEY_PACKET_SIZE,
+        "sha256": CANONICAL_CASE00_ATTORNEY_PACKET_SHA256,
+    }
 
 
 @mcp.tool()

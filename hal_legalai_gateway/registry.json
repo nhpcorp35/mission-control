@@ -57,6 +57,7 @@
       "downstream_service": "storage",
       "tools": [
         "storage.list_inventory",
+        "storage.get_case00_question",
         "storage.archive_feedback",
         "storage.archive_review_packet",
         "storage.archive_acceptance_contract",
@@ -174,6 +175,13 @@
       "namespace": "storage",
       "downstream_service": "storage",
       "downstream_tool": "list_case00_storage"
+    },
+    {
+      "tool": "storage.get_case00_question",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "get_case00_question",
+      "description": "Read one requested Q<N> heading from the fixed, integrity-verified canonical Case-00 attorney packet in B2. Read-only; never returns the full packet or accepts an object key."
     },
     {
       "tool": "storage.archive_feedback",

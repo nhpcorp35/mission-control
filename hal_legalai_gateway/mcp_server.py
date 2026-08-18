@@ -131,6 +131,17 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="List allowlisted Case-00 B2 object metadata under a canonical prefix.",
     ),
     ToolBinding(
+        gateway_tool="storage.get_case00_question",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="get_case00_question",
+        description=(
+            "Read one requested Q<N> heading from the fixed, integrity-verified "
+            "canonical Case-00 attorney packet in B2. Read-only; never returns "
+            "the full packet or accepts an object key."
+        ),
+    ),
+    ToolBinding(
         gateway_tool="storage.archive_feedback",
         namespace="storage",
         downstream_service="storage",
@@ -725,6 +736,15 @@ def register_forwarding_tools(
         return await _forward(
             "storage.list_inventory",
             {"category": category, "max_keys": max_keys},
+        )
+
+    @mcp.tool(
+        name="storage.get_case00_question",
+        description=by_name["storage.get_case00_question"].description,
+    )
+    async def storage_get_case00_question(question_id: str) -> dict[str, Any]:
+        return await _forward(
+            "storage.get_case00_question", {"question_id": question_id}
         )
 
     @mcp.tool(
