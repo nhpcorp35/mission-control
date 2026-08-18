@@ -992,6 +992,7 @@ class McpRegistrationTests(unittest.TestCase):
         )
         self.assertIn("Q<N>", binding.description)
         self.assertIn("generation_manifest.json", binding.description)
+        self.assertIn("case00_attorney_review_packet.md", binding.description)
 
 
 def _gateway_settings(**url_overrides: str):
