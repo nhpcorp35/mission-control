@@ -593,7 +593,12 @@ class Case00QuestionRetrievalTests(unittest.TestCase):
         self.assertEqual(result["error"], "question_not_found")
 
     def test_invalid_question_id_fails_before_b2_access(self) -> None:
-        with mock.patch.object(self.server, "_b2_client") as b2:
+        with (
+            mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ),
+            mock.patch.object(self.server, "_b2_client") as b2,
+        ):
             with self.assertRaises(ValueError):
                 asyncio.run(self.server.get_case00_question.fn("../Q3"))
         b2.assert_not_called()
