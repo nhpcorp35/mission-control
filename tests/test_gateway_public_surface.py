@@ -73,13 +73,18 @@ class GatewayPublicSurfaceTests(unittest.TestCase):
 
     def test_readiness_requires_submit_and_cancel(self) -> None:
         self.assertTrue(
-            {"case.submit", "case.cancel"}.issubset(REQUIRED_PUBLIC_TOOL_NAMES)
+            {
+                "case.submit",
+                "case.status",
+                "case.cancel",
+                "case.list_artifacts",
+            }.issubset(REQUIRED_PUBLIC_TOOL_NAMES)
         )
         parity = required_tool_parity(
-            sorted(REQUIRED_PUBLIC_TOOL_NAMES - {"case.cancel"})
+            sorted(REQUIRED_PUBLIC_TOOL_NAMES - {"case.status"})
         )
         self.assertFalse(parity["ok"])
-        self.assertEqual(parity["missing_tools"], ["case.cancel"])
+        self.assertEqual(parity["missing_tools"], ["case.status"])
 
     def test_contract_lookup_forwards_unprefixed_version_exactly(self) -> None:
         forward = mock.AsyncMock(return_value={"ok": True})
