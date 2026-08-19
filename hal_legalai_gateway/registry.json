@@ -181,7 +181,7 @@
       "namespace": "storage",
       "downstream_service": "storage",
       "downstream_tool": "get_case00_question",
-      "description": "Read one requested ## QN. section from the fixed, integrity-verified canonical Case-00 benchmark source in B2. Read-only; never returns the full packet or accepts an object key."
+      "contract_schema": "schemas/storage.get_case00_question.v1.json"
     },
     {
       "tool": "storage.archive_feedback",

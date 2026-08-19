@@ -20,6 +20,13 @@ from hal_legalai_gateway.auth import (
     is_service_access_token,
 )
 from hal_legalai_gateway.config import GatewaySettings
+from hal_legalai_gateway.case00_question_contract import (
+    Case00QuestionContractError,
+    contract_violation_response,
+    load_case00_question_contract,
+    validate_public_input,
+    validate_public_output,
+)
 from hal_legalai_gateway.forwarding import (
     ToolBinding,
     forward_mcp_tool,
@@ -32,6 +39,8 @@ from hal_legalai_gateway.readonly_plan_normalization import (
 from hal_legalai_gateway.registry import GatewayRegistry
 
 logger = logging.getLogger(__name__)
+
+_CASE00_QUESTION_CONTRACT = load_case00_question_contract()
 
 # Settled gateway surface (Phase 2). Downstream tool names stay on the services.
 DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
@@ -131,15 +140,11 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="List allowlisted Case-00 B2 object metadata under a canonical prefix.",
     ),
     ToolBinding(
-        gateway_tool="storage.get_case00_question",
-        namespace="storage",
-        downstream_service="storage",
-        downstream_tool="get_case00_question",
-        description=(
-            "Read one requested ``## QN.`` section from the fixed, integrity-verified "
-            "canonical Case-00 benchmark source in B2. Read-only; never returns "
-            "the full packet or accepts an object key."
-        ),
+        gateway_tool=_CASE00_QUESTION_CONTRACT.gateway_tool,
+        namespace=_CASE00_QUESTION_CONTRACT.namespace,
+        downstream_service=_CASE00_QUESTION_CONTRACT.downstream_service,
+        downstream_tool=_CASE00_QUESTION_CONTRACT.downstream_tool,
+        description=_CASE00_QUESTION_CONTRACT.description,
     ),
     ToolBinding(
         gateway_tool="storage.archive_feedback",
@@ -743,9 +748,30 @@ def register_forwarding_tools(
         description=by_name["storage.get_case00_question"].description,
     )
     async def storage_get_case00_question(question_id: str) -> dict[str, Any]:
-        return await _forward(
-            "storage.get_case00_question", {"question_id": question_id}
+        try:
+            validated = validate_public_input({"question_id": question_id})
+        except Case00QuestionContractError:
+            return contract_violation_response(
+                question_id=question_id,
+                stage="invalid_input",
+            )
+
+        envelope = await _forward(
+            _CASE00_QUESTION_CONTRACT.gateway_tool, validated
         )
+        if not envelope.get("ok"):
+            return contract_violation_response(
+                question_id=validated["question_id"],
+                stage="upstream_unavailable",
+            )
+        result = envelope.get("result")
+        try:
+            return validate_public_output(result)
+        except Case00QuestionContractError:
+            return contract_violation_response(
+                question_id=validated["question_id"],
+                stage="contract_violation",
+            )
 
     @mcp.tool(
         name="storage.archive_feedback",

@@ -5,6 +5,7 @@ on:
     paths:
       - "github_actions_bridge/**"
       - "hal_legalai_gateway/**"
+      - "tests/test_case00_question_contract.py"
       - "tests/test_github_actions_bridge_storage.py"
       - ".github/workflows/case00-question-retrieval.yml"
 
@@ -17,4 +18,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -r requirements.txt -r github_actions_bridge/requirements.txt -r hal_legalai_gateway/requirements.txt
-      - run: python -m unittest -v tests.test_github_actions_bridge_storage tests.test_hal_legalai_gateway
+      - run: python -m unittest -v tests.test_case00_question_contract tests.test_github_actions_bridge_storage tests.test_hal_legalai_gateway

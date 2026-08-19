@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from hal_legalai_gateway.case00_question_contract import (
+    GATEWAY_TOOL as CASE00_QUESTION_GATEWAY_TOOL,
+    load_case00_question_contract,
+    resolve_registry_case00_binding,
+)
 from hal_legalai_gateway.forwarding import ToolBinding
 
 REGISTRY_FILENAME = "registry.json"
@@ -323,16 +328,32 @@ def parse_registry(document: dict[str, Any]) -> GatewayRegistry:
             raise RuntimeError(
                 f"{context}.downstream_service '{downstream}' is not defined"
             )
+        gateway_tool = _require_str(raw, "tool", context=context)
+        contract_schema = raw.get("contract_schema")
+        if contract_schema is not None:
+            if not isinstance(contract_schema, str) or not contract_schema.strip():
+                raise RuntimeError(
+                    f"{context}.contract_schema must be a non-empty string when present"
+                )
+        description = str(raw.get("description") or "")
+        if gateway_tool == CASE00_QUESTION_GATEWAY_TOOL:
+            contract = load_case00_question_contract()
+            description = contract.description
+            if contract_schema is None:
+                raise RuntimeError(
+                    f"{context} must declare contract_schema for "
+                    f"{CASE00_QUESTION_GATEWAY_TOOL}"
+                )
         tool_bindings.append(
             ToolBinding(
-                gateway_tool=_require_str(raw, "tool", context=context),
+                gateway_tool=gateway_tool,
                 namespace=namespace,
                 downstream_service=downstream,
                 downstream_tool=_require_str(
                     raw, "downstream_tool", context=context
                 ),
                 notes=str(raw.get("notes") or ""),
-                description=str(raw.get("description") or ""),
+                description=description,
             )
         )
 
@@ -344,6 +365,8 @@ def parse_registry(document: dict[str, Any]) -> GatewayRegistry:
                 "registry.tool_bindings missing required gateway tools: "
                 + ", ".join(sorted(missing_required))
             )
+
+    resolve_registry_case00_binding(document)
 
     return GatewayRegistry(
         version=version,

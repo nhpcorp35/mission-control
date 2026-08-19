@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hal.nhpcorp.dev/mcp/contracts/storage.get_case00_question.v1.json",
+  "title": "storage.get_case00_question",
+  "description": "Read one requested ## QN. section from the fixed, integrity-verified canonical Case-00 benchmark source in B2. Read-only; never returns the full packet or accepts an object key.",
+  "x-hal-contract-version": "1.0.0",
+  "x-hal-mcp-tool": "storage.get_case00_question",
+  "x-hal-downstream-tool": "get_case00_question",
+  "x-hal-namespace": "storage",
+  "x-hal-downstream-service": "storage",
+  "x-hal-benchmark-id": "Case-00-Triborough",
+  "$defs": {
+    "question_id": {
+      "type": "string",
+      "pattern": "^Q[1-9]\\d*$"
+    },
+    "sha256_hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question_id"],
+      "properties": {
+        "question_id": {
+          "$ref": "#/$defs/question_id"
+        }
+      }
+    },
+    "success_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "benchmark_id",
+        "question_id",
+        "question_text",
+        "source_object_key",
+        "sha256"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "benchmark_id": {
+          "const": "Case-00-Triborough"
+        },
+        "question_id": {
+          "$ref": "#/$defs/question_id"
+        },
+        "question_text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_object_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256_hex"
+        }
+      }
+    },
+    "not_found_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "benchmark_id",
+        "question_id",
+        "error",
+        "source_object_key",
+        "sha256"
+      ],
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "benchmark_id": {
+          "const": "Case-00-Triborough"
+        },
+        "question_id": {
+          "$ref": "#/$defs/question_id"
+        },
+        "error": {
+          "const": "not_found"
+        },
+        "source_object_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256_hex"
+        }
+      }
+    },
+    "public_output": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/success_output"
+        },
+        {
+          "$ref": "#/$defs/not_found_output"
+        }
+      ]
+    }
+  }
+}
