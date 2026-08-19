@@ -1,0 +1,49 @@
+name: Gateway deployment readiness
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hal_legalai_gateway/**"
+      - ".github/workflows/gateway-deploy-readiness.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-deployed-gateway:
+    name: Verify deployed Gateway commit and public catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GATEWAY_READY_URL: https://hal-legalai-gateway-production.up.railway.app/ready
+      EXPECTED_COMMIT_SHA: ${{ github.sha }}
+    steps:
+      - name: Wait for the exact deployment and required public tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 30); do
+            response="$(curl --fail --silent --show-error "$GATEWAY_READY_URL" || true)"
+            if [ -n "$response" ]; then
+              deployed_sha="$(jq -r '.deployed_commit_sha // empty' <<<"$response")"
+              parity_ok="$(jq -r '.required_tool_parity.ok // false' <<<"$response")"
+              if [ "$deployed_sha" = "$EXPECTED_COMMIT_SHA" ] && [ "$parity_ok" = "true" ]; then
+                jq -e '
+                  .required_tool_parity.required_tools
+                  | index("case.submit")
+                  and index("case.status")
+                  and index("case.cancel")
+                  and index("case.list_artifacts")
+                ' <<<"$response" >/dev/null
+                echo "Gateway deployment readiness verified."
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+
+          echo "Gateway did not report the expected deployed commit and complete public tool catalog."
+          exit 1
