@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hal.nhpcorp.dev/mcp/contracts/case.submit.v1.json",
+  "title": "case.submit",
+  "description": "Dispatch a Case-00-Triborough Q1–Q3 generation run via direct GitHub workflow_dispatch at a verified nhpcorp35/legal-ai commit SHA. Requires idempotency_key; never invokes Mission Control or Cursor execution.",
+  "x-hal-contract-version": "1.0.0",
+  "x-hal-mcp-tool": "case.submit",
+  "x-hal-downstream-tool": "case.submit",
+  "x-hal-namespace": "case",
+  "x-hal-downstream-service": "gateway",
+  "x-hal-benchmark-id": "Case-00-Triborough",
+  "$defs": {
+    "question_id": {
+      "type": "string",
+      "enum": ["Q1", "Q2", "Q3"]
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._~:-]{1,128}$"
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit_sha",
+        "benchmark_id",
+        "question_id",
+        "idempotency_key",
+        "authorization_confirmed"
+      ],
+      "properties": {
+        "commit_sha": {
+          "$ref": "#/$defs/commit_sha"
+        },
+        "benchmark_id": {
+          "const": "Case-00-Triborough"
+        },
+        "question_id": {
+          "$ref": "#/$defs/question_id"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/idempotency_key"
+        },
+        "authorization_confirmed": {
+          "const": true
+        }
+      }
+    },
+    "success_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "run_id",
+        "workflow_run_id",
+        "commit_sha",
+        "question_id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "commit_sha": {
+          "$ref": "#/$defs/commit_sha"
+        },
+        "question_id": {
+          "$ref": "#/$defs/question_id"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/idempotency_key"
+        }
+      }
+    },
+    "failure_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "error"],
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
+        },
+        "question_id": {
+          "$ref": "#/$defs/question_id"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "maxLength": 128
+        }
+      }
+    },
+    "public_output": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/success_output"
+        },
+        {
+          "$ref": "#/$defs/failure_output"
+        }
+      ]
+    }
+  }
+}
