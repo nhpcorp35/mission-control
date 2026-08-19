@@ -579,18 +579,39 @@ class Case00QuestionRetrievalTests(unittest.TestCase):
         ):
             return asyncio.run(self.server.get_case00_question.fn(question_id))
 
-    def test_returns_only_requested_verified_heading(self) -> None:
-        packet = b"# Packet\n\n## Q2. What relief is requested?\n\nprivate body\n\n## Q3. What occurred next?\n"
+    def test_q3_returns_verified_section_with_required_shape(self) -> None:
+        packet = (
+            b"# Packet\n\n"
+            b"## Q2. What relief is requested?\n\nprivate q2 body\n\n"
+            b"## Q3. Which insurance policies are at issue?\n\n"
+            b"private q3 body\n\n"
+            b"## Q4. What grounds do the insurers assert?\n"
+        )
         result = self._read_question("Q3", packet)
         self.assertTrue(result["ok"])
+        self.assertEqual(result["benchmark_id"], "Case-00-Triborough")
         self.assertEqual(result["question_id"], "Q3")
-        self.assertEqual(result["question_text"], "What occurred next?")
-        self.assertNotIn("private body", result["question_text"])
+        self.assertTrue(result["question_text"].startswith("## Q3."))
+        self.assertIn("private q3 body", result["question_text"])
+        self.assertNotIn("private q2 body", result["question_text"])
+        self.assertEqual(
+            result["source_object_key"],
+            self.server.CANONICAL_CASE00_ATTORNEY_PACKET_KEY,
+        )
+        self.assertEqual(
+            result["sha256"],
+            hashlib.sha256(packet).hexdigest(),
+        )
+        self.assertNotIn("object_key", result)
+        self.assertNotIn("size", result)
 
     def test_missing_question_is_safe_and_non_mutating(self) -> None:
         result = self._read_question("Q3", b"## Q2. What relief is requested?\n")
         self.assertFalse(result["ok"])
-        self.assertEqual(result["error"], "question_not_found")
+        self.assertEqual(result["error"], "not_found")
+        self.assertEqual(result["benchmark_id"], "Case-00-Triborough")
+        self.assertEqual(result["question_id"], "Q3")
+        self.assertNotIn("question_text", result)
 
     def test_invalid_question_id_fails_before_b2_access(self) -> None:
         with (

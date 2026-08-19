@@ -73,7 +73,7 @@ CASE00_BENCHMARK_ID = "Case-00-Triborough"
 _CASE00_QUESTION_ID_RE = re.compile(r"^Q[1-9]\d*$")
 _CASE00_QUESTION_TOKEN_RE = re.compile(r"^q[1-9]\d*$")
 
-# The single private packet that defines canonical Case-00 question headings.
+# Canonical Case-00 benchmark source document (single verified attorney packet).
 # Retrieval is intentionally bounded to this key and verified before parsing.
 CANONICAL_CASE00_ATTORNEY_PACKET_KEY = (
     "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/"
@@ -84,9 +84,10 @@ CANONICAL_CASE00_ATTORNEY_PACKET_SIZE = 57278
 CANONICAL_CASE00_ATTORNEY_PACKET_SHA256 = (
     "ce7e3a25b22ec23822aec4dcd317b1df38ce6c85b59f684f45f3bdb811316d86"
 )
-MAX_CASE00_QUESTION_HEADING_CHARS = 2000
-_CASE00_PACKET_QUESTION_HEADING_RE = re.compile(
-    r"^## (Q[1-9]\d*)\.\s+(.+?)\s*$", re.MULTILINE
+MAX_CASE00_QUESTION_SECTION_CHARS = 20_000
+_CASE00_PACKET_QUESTION_SECTION_RE = re.compile(
+    r"^## (Q[1-9]\d*)\.\s*(.*?)(?=^## Q[1-9]\d*\.|\Z)",
+    re.MULTILINE | re.DOTALL,
 )
 
 # Explicit deployment provenance only — never infer or fabricate a SHA.
@@ -1141,18 +1142,21 @@ def _b2_client():
     )
 
 
-@mcp.tool()
-async def get_case00_question(question_id: str) -> dict[str, Any]:
-    """Read one verified question heading from the fixed canonical Case-00 packet.
+def _parse_case00_question_sections(packet: str) -> dict[str, str]:
+    """Extract ``## QN.`` sections from the canonical Case-00 source document."""
+    sections: dict[str, str] = {}
+    for match in _CASE00_PACKET_QUESTION_SECTION_RE.finditer(packet):
+        found_id = match.group(1)
+        if found_id in sections:
+            raise ValueError(
+                "canonical Case-00 attorney packet has duplicate question headings"
+            )
+        sections[found_id] = match.group(0).strip()
+    return sections
 
-    This is a read-only, allowlisted B2 retrieval. It returns only the requested
-    ``## QN.`` heading, never the full attorney packet or an arbitrary object.
-    """
-    _require_allowed_user()
-    qid = str(question_id or "").strip()
-    if not _CASE00_QUESTION_ID_RE.fullmatch(qid):
-        raise ValueError("question_id must match Q followed by a positive integer")
 
+def _load_verified_case00_benchmark_source() -> str:
+    """Fetch and verify the canonical Case-00 benchmark source from B2."""
     client = _b2_client()
     head = client.head_object(
         Bucket=B2_BUCKET, Key=CANONICAL_CASE00_ATTORNEY_PACKET_KEY
@@ -1174,36 +1178,45 @@ async def get_case00_question(question_id: str) -> dict[str, Any]:
     if hashlib.sha256(body).hexdigest() != CANONICAL_CASE00_ATTORNEY_PACKET_SHA256:
         raise ValueError("canonical Case-00 attorney packet sha256 mismatch")
     try:
-        packet = body.decode("utf-8")
+        return body.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("canonical Case-00 attorney packet is not UTF-8") from exc
 
-    headings: dict[str, str] = {}
-    for found_id, heading in _CASE00_PACKET_QUESTION_HEADING_RE.findall(packet):
-        if found_id in headings:
-            raise ValueError(
-                "canonical Case-00 attorney packet has duplicate question headings"
-            )
-        headings[found_id] = heading.strip()
-    question_text = headings.get(qid)
+
+@mcp.tool()
+async def get_case00_question(question_id: str) -> dict[str, Any]:
+    """Read one verified ``## QN.`` section from the canonical Case-00 source.
+
+    This is a read-only, allowlisted B2 retrieval. It returns only the requested
+    question section, never the full attorney packet or an arbitrary object.
+    """
+    _require_allowed_user()
+    qid = str(question_id or "").strip()
+    if not _CASE00_QUESTION_ID_RE.fullmatch(qid):
+        raise ValueError("question_id must match Q followed by a positive integer")
+
+    packet = _load_verified_case00_benchmark_source()
+    sections = _parse_case00_question_sections(packet)
+    question_text = sections.get(qid)
+    provenance = {
+        "benchmark_id": CASE00_BENCHMARK_ID,
+        "source_object_key": CANONICAL_CASE00_ATTORNEY_PACKET_KEY,
+        "sha256": CANONICAL_CASE00_ATTORNEY_PACKET_SHA256,
+    }
     if not question_text:
         return {
             "ok": False,
             "question_id": qid,
-            "object_key": CANONICAL_CASE00_ATTORNEY_PACKET_KEY,
-            "size": CANONICAL_CASE00_ATTORNEY_PACKET_SIZE,
-            "sha256": CANONICAL_CASE00_ATTORNEY_PACKET_SHA256,
-            "error": "question_not_found",
+            "error": "not_found",
+            **provenance,
         }
-    if len(question_text) > MAX_CASE00_QUESTION_HEADING_CHARS:
-        raise ValueError("canonical Case-00 question heading exceeds size limit")
+    if len(question_text) > MAX_CASE00_QUESTION_SECTION_CHARS:
+        raise ValueError("canonical Case-00 question section exceeds size limit")
     return {
         "ok": True,
         "question_id": qid,
         "question_text": question_text,
-        "object_key": CANONICAL_CASE00_ATTORNEY_PACKET_KEY,
-        "size": CANONICAL_CASE00_ATTORNEY_PACKET_SIZE,
-        "sha256": CANONICAL_CASE00_ATTORNEY_PACKET_SHA256,
+        **provenance,
     }
 
 

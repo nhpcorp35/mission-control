@@ -136,8 +136,8 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         downstream_service="storage",
         downstream_tool="get_case00_question",
         description=(
-            "Read one requested Q<N> heading from the fixed, integrity-verified "
-            "canonical Case-00 attorney packet in B2. Read-only; never returns "
+            "Read one requested ``## QN.`` section from the fixed, integrity-verified "
+            "canonical Case-00 benchmark source in B2. Read-only; never returns "
             "the full packet or accepts an object key."
         ),
     ),
