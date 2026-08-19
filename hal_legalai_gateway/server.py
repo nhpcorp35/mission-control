@@ -34,6 +34,25 @@ from hal_legalai_gateway.request_context import (
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_PUBLIC_TOOL_NAMES = frozenset(
+    {
+        "storage.get_acceptance_contract",
+        "storage.archive_acceptance_contract",
+        "case.submit",
+    }
+)
+
+
+def required_tool_parity(registered_tools: list[str]) -> dict[str, Any]:
+    """Return a stable, non-sensitive public-tool parity record."""
+    actual = set(registered_tools)
+    missing = sorted(REQUIRED_PUBLIC_TOOL_NAMES - actual)
+    return {
+        "ok": not missing,
+        "required_tools": sorted(REQUIRED_PUBLIC_TOOL_NAMES),
+        "missing_tools": missing,
+    }
+
 _settings: GatewaySettings | None = None
 _mcp: FastMCP | None = None
 _registered_tools: list[str] = []
@@ -235,7 +254,25 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         payload["identity"] = canonical_gateway_identity(
             public_url=settings.gateway_public_url
         )
+        payload["required_tool_parity"] = required_tool_parity(tools)
         return JSONResponse(payload)
+
+    @application.get("/ready")
+    async def ready() -> JSONResponse:
+        """Deployment readiness: fail closed on public-tool registration drift."""
+        tools = list(_registered_tools)
+        if not tools and _mcp is not None:
+            tools = await list_registered_tool_names(_mcp)
+        parity = required_tool_parity(tools)
+        status_code = 200 if parity["ok"] else 503
+        return JSONResponse(
+            {
+                "service": "hal-legalai-gateway",
+                "deployed_commit_sha": get_settings().deployed_commit_sha,
+                "required_tool_parity": parity,
+            },
+            status_code=status_code,
+        )
 
     return application
 
