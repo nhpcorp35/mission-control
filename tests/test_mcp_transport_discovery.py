@@ -136,8 +136,17 @@ class TestMcpTransportDiscovery(unittest.TestCase):
     def test_create_http_app_exposes_mcp_and_sse_routes(self) -> None:
         app = mcp_server.create_http_app()
         paths = {getattr(route, "path", None) for route in app.routes}
+        self.assertIn("/health", paths)
         self.assertIn("/mcp", paths)
         self.assertIn("/sse", paths)
+
+    def test_health_endpoint_is_reachable(self) -> None:
+        response = httpx.get(f"{self.server.base_url}/health", timeout=2.0)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"status": "ok", "service": "mission-control-mcp"},
+        )
 
     def test_streamable_http_jsonrpc_lists_expected_tools(self) -> None:
         names = _jsonrpc_tools_list(self.server.base_url)
