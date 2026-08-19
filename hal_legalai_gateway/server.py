@@ -39,6 +39,7 @@ REQUIRED_PUBLIC_TOOL_NAMES = frozenset(
         "storage.get_acceptance_contract",
         "storage.archive_acceptance_contract",
         "case.submit",
+        "case.cancel",
     }
 )
 
@@ -86,10 +87,8 @@ def get_settings() -> GatewaySettings:
         _settings = load_settings()
     return _settings
 
-
 def get_mcp() -> FastMCP | None:
     return _mcp
-
 
 def reset_settings_for_tests() -> None:
     """Clear cached settings / MCP state (test helper)."""
@@ -99,7 +98,6 @@ def reset_settings_for_tests() -> None:
     _registered_tools = []
     _mcp_http_app = None
     _auth_override = None
-
 
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
