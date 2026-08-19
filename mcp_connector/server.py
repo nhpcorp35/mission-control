@@ -7,6 +7,8 @@ from typing import Any, TypedDict
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from mcp_connector.client import (
     MCP_NOTIFICATION_DEFAULT_LIMIT,
@@ -402,7 +404,12 @@ def create_http_app() -> Starlette:
     streamable_app = mcp.streamable_http_app()
     sse_app = mcp.sse_app()
 
-    routes = list(streamable_app.routes)
+    async def health(_request: Any) -> JSONResponse:
+        """Return a lightweight Railway/Gateway liveness response."""
+        return JSONResponse({"status": "ok", "service": "mission-control-mcp"})
+
+    routes = [Route("/health", endpoint=health, methods=["GET"])]
+    routes.extend(streamable_app.routes)
     seen_paths = {getattr(route, "path", None) for route in routes}
     for route in sse_app.routes:
         path = getattr(route, "path", None)
