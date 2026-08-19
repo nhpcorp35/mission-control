@@ -21,6 +21,7 @@ from hal_legalai_gateway.auth import (
     is_service_access_token,
 )
 from hal_legalai_gateway.config import GatewaySettings
+from hal_legalai_gateway.health import aggregate_health
 from hal_legalai_gateway.case00_question_contract import (
     Case00QuestionContractError,
     contract_violation_response,
@@ -658,6 +659,39 @@ def register_forwarding_tools(
             extra_secrets=_extra_secrets_for_forward(settings, arguments),
         )
         return _sanitize_workflow_gateway_error(binding.gateway_tool, envelope)
+
+    # --- gateway diagnostics ---
+    @mcp.tool(
+        name="gateway.health",
+        description=(
+            "Read-only Gateway health: deployed commit, registered public tools, "
+            "and independently probed downstream capability status. Never returns "
+            "credentials or OAuth token data."
+        ),
+    )
+    async def gateway_health() -> dict[str, Any]:
+        registered_tools = sorted(
+            set(by_name) | {"gateway.health", "gateway.auth_status"}
+        )
+        return await aggregate_health(settings, registered_tools=registered_tools)
+
+    @mcp.tool(
+        name="gateway.auth_status",
+        description=(
+            "Read-only OAuth authorization diagnostic. Returns only whether the "
+            "current session is authenticated and authorized; never returns a "
+            "token, claim value, or credential."
+        ),
+    )
+    async def gateway_auth_status() -> dict[str, Any]:
+        token = get_access_token()
+        return {
+            "ok": True,
+            "authenticated": token is not None,
+            "authorized": _require_gateway_principal(settings) is not None,
+            "service_id": CANONICAL_GATEWAY_SERVICE_ID,
+            "identity_version": CANONICAL_GATEWAY_IDENTITY_VERSION,
+        }
 
     # --- case ---
     @mcp.tool(
