@@ -950,7 +950,10 @@ class McpRegistrationTests(unittest.TestCase):
         )
         mcp = create_mcp_server(settings, auth=_test_inbound_auth())
         names = asyncio.run(list_registered_tool_names(mcp))
-        expected = sorted(binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS)
+        expected = sorted(
+            {binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS}
+            | {"gateway.health", "gateway.auth_status"}
+        )
         self.assertEqual(names, expected)
         for required in REQUIRED_GATEWAY_TOOLS:
             self.assertIn(required, names)
@@ -1035,7 +1038,10 @@ class CanonicalIdentityTests(unittest.TestCase):
         self.assertEqual(mcp.instructions, CANONICAL_GATEWAY_INSTRUCTIONS)
 
         names = asyncio.run(list_registered_tool_names(mcp))
-        expected = sorted(binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS)
+        expected = sorted(
+            {binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS}
+            | {"gateway.health", "gateway.auth_status"}
+        )
         self.assertEqual(names, expected)
         by_namespace: dict[str, list[str]] = {}
         for binding in DEFAULT_TOOL_BINDINGS:
@@ -1222,8 +1228,12 @@ class ApiTests(unittest.TestCase):
 
     def test_http_surfaces_canonical_identity_and_tool_catalog(self) -> None:
         expected_tools = sorted(
-            binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS
+            {binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS}
+            | {"gateway.health", "gateway.auth_status"}
         )
+        registry_tools = {
+            binding.gateway_tool for binding in DEFAULT_TOOL_BINDINGS
+        }
         identity = canonical_gateway_identity(public_url="https://gateway.example")
         for path in ("/", "/health", "/registry"):
             response = self.client.get(path)
@@ -1244,7 +1254,7 @@ class ApiTests(unittest.TestCase):
                 )
         registry = self.client.get("/registry").json()
         catalog = {item["tool"] for item in registry["tool_bindings"]}
-        self.assertEqual(catalog, set(expected_tools))
+        self.assertEqual(catalog, registry_tools)
         self.assertEqual(set(registry["namespaces"]), EXPECTED_NAMESPACES)
         for namespace in ("case", "storage", "mission", "workflow"):
             self.assertTrue(

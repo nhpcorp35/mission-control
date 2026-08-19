@@ -71,6 +71,32 @@ class GatewayPublicSurfaceTests(unittest.TestCase):
             bindings_from_registry(self.settings.registry),
         )
 
+    def test_gateway_diagnostics_are_registered_and_safe(self) -> None:
+        self.assertIn("gateway.health", self.mcp.tools)
+        self.assertIn("gateway.auth_status", self.mcp.tools)
+
+        health = mock.AsyncMock(return_value={"ok": True, "status": "ok"})
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server.aggregate_health",
+            health,
+        ):
+            result = asyncio.run(self.mcp.tools["gateway.health"]())
+
+        self.assertEqual(result, {"ok": True, "status": "ok"})
+        registered_tools = health.await_args.kwargs["registered_tools"]
+        self.assertIn("gateway.health", registered_tools)
+        self.assertIn("gateway.auth_status", registered_tools)
+
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server.get_access_token",
+            return_value=None,
+        ):
+            auth_status = asyncio.run(self.mcp.tools["gateway.auth_status"]())
+
+        self.assertEqual(auth_status["authenticated"], False)
+        self.assertEqual(auth_status["authorized"], False)
+        self.assertNotIn("token", auth_status)
+
     def test_readiness_requires_submit_and_cancel(self) -> None:
         self.assertTrue(
             {
