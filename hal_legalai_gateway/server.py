@@ -39,7 +39,9 @@ REQUIRED_PUBLIC_TOOL_NAMES = frozenset(
         "storage.get_acceptance_contract",
         "storage.archive_acceptance_contract",
         "case.submit",
+        "case.status",
         "case.cancel",
+        "case.list_artifacts",
     }
 )
 

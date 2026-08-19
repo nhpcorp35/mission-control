@@ -1545,6 +1545,7 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
         self.assertEqual(
             list(registry.namespaces["case"].tools),
             [
+                "case.resolve_commit",
                 "case.submit",
                 "case.status",
                 "case.cancel",
