@@ -40,6 +40,7 @@
       "description": "LegalAI case workflow tools (question-agnostic Case-00 and Q1-specific).",
       "downstream_service": "bridge",
       "tools": [
+        "case.resolve_commit",
         "case.submit",
         "case.status",
         "case.cancel",
@@ -106,6 +107,14 @@
     }
   ],
   "tool_bindings": [
+    {
+      "tool": "case.resolve_commit",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "resolve_commit",
+      "description": "Read-only resolver for nhpcorp35/legal-ai commits. Accepts ref exactly main or a lowercase 40-character SHA. Returns immutable commit_sha; rejects repository, URL, path, and owner input.",
+      "notes": "Gateway-native read-only resolver; does not forward downstream."
+    },
     {
       "tool": "case.submit",
       "namespace": "case",

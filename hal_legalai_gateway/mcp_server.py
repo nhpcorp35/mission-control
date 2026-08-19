@@ -27,6 +27,13 @@ from hal_legalai_gateway.case00_question_contract import (
     validate_public_input,
     validate_public_output,
 )
+from hal_legalai_gateway.case_resolve_commit import (
+    CaseResolveCommitContractError,
+    ERROR_UNAUTHORIZED,
+    failure_response,
+    resolve_legalai_commit,
+    validate_public_input as validate_resolve_commit_input,
+)
 from hal_legalai_gateway.forwarding import (
     ToolBinding,
     forward_mcp_tool,
@@ -44,6 +51,19 @@ _CASE00_QUESTION_CONTRACT = load_case00_question_contract()
 
 # Settled gateway surface (Phase 2). Downstream tool names stay on the services.
 DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
+    ToolBinding(
+        gateway_tool="case.resolve_commit",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="resolve_commit",
+        description=(
+            "Read-only resolver for nhpcorp35/legal-ai commits. Accepts ref "
+            "exactly main or a lowercase 40-character SHA. Returns immutable "
+            "commit_sha for the fixed repository; rejects repository, URL, "
+            "path, and owner input."
+        ),
+        notes="Gateway-native read-only resolver; does not forward downstream.",
+    ),
     ToolBinding(
         gateway_tool="case.submit",
         namespace="case",
@@ -635,6 +655,19 @@ def register_forwarding_tools(
         return _sanitize_workflow_gateway_error(binding.gateway_tool, envelope)
 
     # --- case ---
+    @mcp.tool(
+        name="case.resolve_commit",
+        description=by_name["case.resolve_commit"].description,
+    )
+    async def case_resolve_commit(ref: str) -> dict[str, Any]:
+        if _require_gateway_principal(settings) is None:
+            return failure_response(error=ERROR_UNAUTHORIZED)
+        try:
+            validated = validate_resolve_commit_input({"ref": ref})
+        except CaseResolveCommitContractError:
+            return failure_response(error="invalid_ref", ref=ref)
+        return await resolve_legalai_commit(validated["ref"])
+
     @mcp.tool(name="case.submit", description=by_name["case.submit"].description)
     async def case_submit(
         commit_sha: str,
