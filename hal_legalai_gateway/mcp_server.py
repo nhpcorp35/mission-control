@@ -608,7 +608,12 @@ def register_forwarding_tools(
     """Register one FastMCP tool per settled gateway binding."""
     by_name = {binding.gateway_tool: binding for binding in bindings}
 
-    async def _forward(gateway_tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _forward(
+        gateway_tool: str,
+        arguments: dict[str, Any],
+        *,
+        read_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         binding = by_name[gateway_tool]
         if _require_gateway_principal(settings) is None:
             return {
@@ -653,7 +658,11 @@ def register_forwarding_tools(
             base_url=downstream.base_url,
             authorization=authorization,
             connect_timeout_seconds=settings.connect_timeout_seconds,
-            read_timeout_seconds=settings.read_timeout_seconds,
+            read_timeout_seconds=(
+                settings.read_timeout_seconds
+                if read_timeout_seconds is None
+                else read_timeout_seconds
+            ),
             mcp_path=settings.mcp_path_for_service(binding.downstream_service),
             require_authorization=require_auth,
             extra_secrets=_extra_secrets_for_forward(settings, arguments),
@@ -1150,14 +1159,37 @@ def register_forwarding_tools(
             mission_yaml,
             gateway_tool="mission.submit_and_wait",
         )
+        submitted = await _forward(
+            "mission.submit",
+            {"mission_yaml": normalized.mission_yaml},
+        )
+        if not submitted.get("ok"):
+            return submitted
+
+        run_id = str((submitted.get("result") or {}).get("run_id") or "").strip()
+        if not run_id:
+            return submitted
+
         args: dict[str, Any] = {
-            "mission_yaml": normalized.mission_yaml,
+            "run_id": run_id,
             "timeout_seconds": timeout_seconds,
             "poll_interval_seconds": poll_interval_seconds,
         }
         if cursor is not None:
             args["cursor"] = cursor
-        return await _forward("mission.submit_and_wait", args)
+        # Mission Control permits waits up to one hour. Keep the gateway read
+        # budget above the requested wait so transport overhead cannot erase a
+        # successfully accepted run's correlation ID.
+        wait_budget = min(max(float(timeout_seconds), 0.1), 3600.0) + 30.0
+        waited = await _forward(
+            "mission.wait",
+            args,
+            read_timeout_seconds=max(settings.read_timeout_seconds, wait_budget),
+        )
+        if waited.get("ok"):
+            return waited
+        waited["run_id"] = run_id
+        return waited
 
     @mcp.tool(
         name="mission.run_repository_command",
