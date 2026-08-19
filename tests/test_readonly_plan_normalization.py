@@ -764,16 +764,38 @@ class IntegrationNormalizationAndEligibilityTests(unittest.TestCase):
         ), mock.patch(
             "hal_legalai_gateway.mcp_server.forward_mcp_tool",
             new_callable=mock.AsyncMock,
-            return_value={"ok": True},
+            side_effect=(
+                {"ok": True, "result": {"run_id": "run-123"}},
+                {"ok": True, "result": {"run_id": "run-123"}},
+            ),
         ) as forward_mock:
             collector = self._register_and_collect(("mission.submit_and_wait",))
             self.assertIn("mission.submit_and_wait", collector)
             asyncio.run(collector["mission.submit_and_wait"](raw))
-            forward_mock.assert_awaited()
-            kwargs = forward_mock.await_args.kwargs
-            forwarded_yaml = kwargs["arguments"]["mission_yaml"]
+            self.assertEqual(forward_mock.await_count, 2)
+            submitted, waited = forward_mock.await_args_list
+            forwarded_yaml = submitted.kwargs["arguments"]["mission_yaml"]
             self.assertEqual(_mode_from_yaml(forwarded_yaml), "execute")
             self.assertNotEqual(forwarded_yaml, raw)
+            self.assertEqual(waited.kwargs["arguments"]["run_id"], "run-123")
+
+    def test_mission_submit_and_wait_preserves_run_id_on_wait_failure(self) -> None:
+        raw = _safe_readonly_plan_yaml()
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="tester",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            side_effect=(
+                {"ok": True, "result": {"run_id": "run-123"}},
+                {"ok": False, "failure_stage": "timeout", "error": {}},
+            ),
+        ):
+            collector = self._register_and_collect(("mission.submit_and_wait",))
+            result = asyncio.run(collector["mission.submit_and_wait"](raw))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["run_id"], "run-123")
 
     def test_submit_tools_forward_write_capable_yaml_unchanged(self) -> None:
         """Write-capable plan YAML is forwarded byte-for-byte on both tools."""
