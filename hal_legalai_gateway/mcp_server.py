@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -48,6 +49,8 @@ from hal_legalai_gateway.registry import GatewayRegistry
 logger = logging.getLogger(__name__)
 
 _CASE00_QUESTION_CONTRACT = load_case00_question_contract()
+
+_CANONICAL_ACCEPTANCE_CONTRACT_VERSION = re.compile(r"[0-9]+\\.[0-9]+\\.[0-9]+")
 
 # Settled gateway surface (Phase 2). Downstream tool names stay on the services.
 DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
@@ -231,9 +234,11 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description=(
             "Fetch and verify one acceptance_contract.v1 JSON object from "
             "canonical B2 using bounded identity fields only (benchmark_id, "
-            "question_id, contract_id, version). Server generates the key and "
-            "fail-closed verifies schema, identity, size, and hashes before "
-            "returning safe metadata plus structured contract."
+            "question_id, contract_id, version). version must be an "
+            "unprefixed semantic version such as 1.0.0 (not v1.0.0). Server "
+            "generates the key and fail-closed verifies schema, identity, "
+            "size, and hashes before returning safe metadata plus structured "
+            "contract."
         ),
     ),
     ToolBinding(
@@ -939,17 +944,22 @@ def register_forwarding_tools(
         contract_id: str,
         version: str,
     ) -> dict[str, Any]:
-        # Storage composes its B2 key as `v{version}`. The public contract
-        # version is canonical `v1.0.0`, so remove exactly the presentation
-        # prefix at this adapter boundary to prevent a `vv1.0.0` lookup.
-        downstream_version = version[1:] if version.startswith("v") else version
+        if not _CANONICAL_ACCEPTANCE_CONTRACT_VERSION.fullmatch(version):
+            return {
+                "ok": False,
+                "error": "invalid_version",
+                "message": (
+                    "version must be an unprefixed semantic version such as "
+                    "1.0.0"
+                ),
+            }
         return await _forward(
             "storage.get_acceptance_contract",
             {
                 "benchmark_id": benchmark_id,
                 "question_id": question_id,
                 "contract_id": contract_id,
-                "version": downstream_version,
+                "version": version,
             },
         )
 
