@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 
 from app.cursor_cli import cursor_cli_env, find_cursor_agent_binary
 
@@ -116,6 +117,35 @@ def _close_process_pipes(proc: subprocess.Popen[str]) -> None:
             stream.close()
         except OSError:
             pass
+
+
+_CANCEL_POLL_SECONDS = 0.5
+
+
+def _communicate_with_cancellation(
+    proc: subprocess.Popen[str],
+    *,
+    timeout_seconds: int,
+    run_id: str | None,
+) -> tuple[str, str, bool]:
+    """Wait for subprocess completion; return (stdout, stderr, cancelled)."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(proc.args, timeout_seconds)
+        try:
+            stdout, stderr = proc.communicate(timeout=min(_CANCEL_POLL_SECONDS, remaining))
+            return stdout or "", stderr or "", False
+        except subprocess.TimeoutExpired:
+            if run_id is None:
+                continue
+            from mission_control.run_cancellation import active_execution_registry
+
+            if active_execution_registry.get(run_id) is not proc:
+                continue
+            # Subprocess still running; loop until deadline or external kill.
+            continue
 
 _NO_RECURSIVE_MISSIONS = (
     "Do not submit recursive Mission Control missions.",
@@ -520,6 +550,10 @@ def _run_cursor_agent(
         child_pid,
         mission_id,
     )
+    if run_id is not None:
+        from mission_control.run_cancellation import active_execution_registry
+
+        active_execution_registry.register(run_id, proc)
     logger.info(
         (
             "lifecycle run_id=%s event=subprocess_wait_start "
@@ -531,71 +565,91 @@ def _run_cursor_agent(
         timeout_seconds,
     )
 
+    cancelled = False
     try:
-        stdout, stderr = proc.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as timed_out:
-        _terminate_process_tree(proc)
         try:
-            stdout, stderr = proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            # Grandchildren (or a stuck agent) still hold pipes open. Do not
-            # block the run worker indefinitely — return with partial output.
-            stdout = _decode_pipe_output(timed_out.stdout)
-            stderr = _decode_pipe_output(timed_out.stderr)
-            _close_process_pipes(proc)
+            stdout, stderr, cancelled = _communicate_with_cancellation(
+                proc,
+                timeout_seconds=timeout_seconds,
+                run_id=run_id,
+            )
+        except subprocess.TimeoutExpired as timed_out:
+            _terminate_process_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                # Grandchildren (or a stuck agent) still hold pipes open. Do not
+                # block the run worker indefinitely — return with partial output.
+                stdout = _decode_pipe_output(timed_out.stdout)
+                stderr = _decode_pipe_output(timed_out.stderr)
+                _close_process_pipes(proc)
+                logger.error(
+                    (
+                        "lifecycle run_id=%s event=subprocess_cleanup_timeout "
+                        "api_pid=%s child_pid=%s cleanup_timeout_seconds=%s"
+                    ),
+                    run_label,
+                    os.getpid(),
+                    child_pid,
+                    CLEANUP_TIMEOUT_SECONDS,
+                )
             logger.error(
                 (
-                    "lifecycle run_id=%s event=subprocess_cleanup_timeout "
-                    "api_pid=%s child_pid=%s cleanup_timeout_seconds=%s"
+                    "lifecycle run_id=%s event=subprocess_completed "
+                    "api_pid=%s child_pid=%s returncode=timeout "
+                    "mission_id=%s timeout_seconds=%s"
                 ),
                 run_label,
                 os.getpid(),
                 child_pid,
-                CLEANUP_TIMEOUT_SECONDS,
+                mission_id,
+                timeout_seconds,
             )
-        logger.error(
-            (
-                "lifecycle run_id=%s event=subprocess_completed "
-                "api_pid=%s child_pid=%s returncode=timeout "
-                "mission_id=%s timeout_seconds=%s"
-            ),
-            run_label,
-            os.getpid(),
-            child_pid,
-            mission_id,
-            timeout_seconds,
-        )
-        logger.error(
-            "Cursor mission timed out: mission_id=%s timeout_seconds=%s",
-            mission_id,
-            timeout_seconds,
-        )
+            logger.error(
+                "Cursor mission timed out: mission_id=%s timeout_seconds=%s",
+                mission_id,
+                timeout_seconds,
+            )
 
+            return ExecutionResult(
+                ok=False,
+                stdout=stdout or "",
+                stderr=stderr or "",
+                error=(
+                    "cursor-agent timed out after "
+                    f"{timeout_seconds} seconds"
+                ),
+                command=command_evidence,
+                timeout_split_guidance=build_timeout_split_guidance(
+                    timeout_stage="agent_execution",
+                ),
+            )
+        except Exception:
+            logger.exception(
+                (
+                    "lifecycle run_id=%s event=exception "
+                    "api_pid=%s child_pid=%s stage=subprocess_wait mission_id=%s"
+                ),
+                run_label,
+                os.getpid(),
+                child_pid,
+                mission_id,
+            )
+            raise
+    finally:
+        if run_id is not None:
+            from mission_control.run_cancellation import active_execution_registry
+
+            active_execution_registry.unregister(run_id)
+
+    if cancelled:
         return ExecutionResult(
             ok=False,
             stdout=stdout or "",
             stderr=stderr or "",
-            error=(
-                "cursor-agent timed out after "
-                f"{timeout_seconds} seconds"
-            ),
+            error="Run cancelled during agent execution",
             command=command_evidence,
-            timeout_split_guidance=build_timeout_split_guidance(
-                timeout_stage="agent_execution",
-            ),
         )
-    except Exception:
-        logger.exception(
-            (
-                "lifecycle run_id=%s event=exception "
-                "api_pid=%s child_pid=%s stage=subprocess_wait mission_id=%s"
-            ),
-            run_label,
-            os.getpid(),
-            child_pid,
-            mission_id,
-        )
-        raise
 
     stdout = stdout or ""
     stderr = stderr or ""

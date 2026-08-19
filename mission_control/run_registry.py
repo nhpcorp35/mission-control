@@ -122,6 +122,7 @@ TERMINAL_STATUSES = frozenset(
         "completed",
         "failed",
         "timed_out",
+        "cancelled",
     }
 )
 
@@ -137,6 +138,7 @@ class RunStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
 
 
 class RunPhase(str, Enum):
@@ -1940,6 +1942,7 @@ class RunRegistry:
                 RunStatus.COMPLETED,
                 RunStatus.FAILED,
                 RunStatus.TIMED_OUT,
+                RunStatus.CANCELLED,
             ):
                 record.completed_at = now
                 if record.started_at is not None:
@@ -2100,6 +2103,165 @@ class RunRegistry:
             record.heartbeat_at = _utc_now()
             self._persist_record(record)
             return record
+
+    def list_active_runs(self) -> list[RunRecord]:
+        """Return queued and running runs for watchdog/operator inspection."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT *
+                FROM {_RUNS_TABLE}
+                WHERE status IN (?, ?)
+                ORDER BY started_at ASC, created_at ASC
+                """,
+                (RunStatus.QUEUED.value, RunStatus.RUNNING.value),
+            ).fetchall()
+            return [_row_to_record(row) for row in rows]
+
+    def cancel_run(
+        self,
+        run_id: str,
+        *,
+        error: str,
+        diagnostics: dict[str, str] | None = None,
+        source: str = "operator",
+    ) -> RunRecord | None:
+        """CAS-cancel a non-terminal run (idempotent when already terminal)."""
+        return self._terminalize_non_terminal_run(
+            run_id,
+            to_status=RunStatus.CANCELLED,
+            error=error,
+            event="cancel",
+            source=source,
+            diagnostics=diagnostics,
+        )
+
+    def terminalize_stale_heartbeat(
+        self,
+        run_id: str,
+        *,
+        error: str,
+        diagnostics: dict[str, str] | None = None,
+        source: str = "heartbeat_watchdog",
+        recovery_at: datetime | None = None,
+    ) -> RunRecord | None:
+        """CAS-fail a non-terminal run for stale/absent heartbeat."""
+        return self._terminalize_non_terminal_run(
+            run_id,
+            to_status=RunStatus.FAILED,
+            error=error,
+            event="terminalize_stale_heartbeat",
+            source=source,
+            diagnostics=diagnostics,
+            recovery_at=recovery_at,
+        )
+
+    def _terminalize_non_terminal_run(
+        self,
+        run_id: str,
+        *,
+        to_status: RunStatus,
+        error: str,
+        event: str,
+        source: str,
+        diagnostics: dict[str, str] | None = None,
+        recovery_at: datetime | None = None,
+    ) -> RunRecord | None:
+        notify_terminal = False
+        snapshot: RunRecord | None = None
+        with self._lock:
+            row = self._fetch_row(run_id)
+            if row is None:
+                return None
+
+            record = _row_to_record(row)
+            if is_terminal_status(record.status):
+                return record
+
+            now = recovery_at or _utc_now()
+            raw_heartbeat = (
+                row["heartbeat_at"] if "heartbeat_at" in row.keys() else None
+            )
+            raw_started = row["started_at"] if "started_at" in row.keys() else None
+            elapsed_seconds = None
+            if record.started_at is not None:
+                elapsed_seconds = (now - record.started_at).total_seconds()
+
+            provenance = build_terminal_provenance(
+                event=event,
+                source=source,
+                execution_owner=record.execution_owner,
+            )
+            if diagnostics:
+                for key, value in diagnostics.items():
+                    if key in _PROVENANCE_ALLOWED_KEYS and value:
+                        provenance[key] = _bound_text(
+                            _redact_progress_text(str(value)),
+                            _PROVENANCE_VALUE_MAX_LEN,
+                        )
+
+            progress_payload: dict = platform_progress(
+                step=RunPhase.FAILED.value,
+                detail=(
+                    "Run cancelled"
+                    if to_status is RunStatus.CANCELLED
+                    else "Stale heartbeat recovery"
+                ),
+            )
+            progress_payload[_PROGRESS_PROVENANCE_KEY] = provenance
+            progress = serialize_progress(progress_payload)
+            safe_error = refuse_legacy_interrupt_error(error)
+
+            cursor = self._conn.execute(
+                f"""
+                UPDATE {_RUNS_TABLE}
+                SET status = ?,
+                    completed_at = ?,
+                    elapsed_seconds = ?,
+                    error = ?,
+                    phase = ?,
+                    phase_started_at = ?,
+                    heartbeat_at = ?,
+                    progress_json = ?,
+                    execution_owner = NULL
+                WHERE run_id = ?
+                  AND status IN (?, ?)
+                  AND heartbeat_at IS ?
+                  AND started_at IS ?
+                """,
+                (
+                    to_status.value,
+                    _format_dt(now),
+                    elapsed_seconds,
+                    safe_error,
+                    RunPhase.FAILED.value,
+                    _format_dt(now),
+                    _format_dt(now),
+                    progress,
+                    run_id,
+                    RunStatus.QUEUED.value,
+                    RunStatus.RUNNING.value,
+                    raw_heartbeat,
+                    raw_started,
+                ),
+            )
+            if cursor.rowcount != 1:
+                latest = self._fetch_row(run_id)
+                return _row_to_record(latest) if latest is not None else None
+
+            self._conn.commit()
+            notify_terminal = True
+            updated_row = self._fetch_row(run_id)
+            snapshot = (
+                _row_to_record(updated_row) if updated_row is not None else None
+            )
+
+        if notify_terminal and snapshot is not None:
+            outbox = self._get_notification_outbox()
+            outbox.maybe_enqueue_terminal(snapshot)
+            outbox.suppress_stale_recovery_for_terminal_run(run_id)
+            return snapshot
+        return snapshot
 
     def store_result(
         self,

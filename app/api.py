@@ -43,6 +43,13 @@ from mission_control.run_registry import (
     is_terminal_status,
     startup_recovery_policy_diagnostics,
 )
+from mission_control.run_cancellation import (
+    CANCELLED_ALREADY_CANCELLED,
+    CANCELLED_ALREADY_TERMINAL,
+    CancelRunResult,
+    HeartbeatWatchdog,
+    cancel_run,
+)
 from mission_control.notifications import (
     NOTIFICATION_INSPECT_MAX_EVENTS,
     NotificationDeliveryWorker,
@@ -92,6 +99,10 @@ from mission_control.validator import (
 logger = logging.getLogger(__name__)
 run_registry = RunRegistry()
 run_queue = RunQueue()
+heartbeat_watchdog = HeartbeatWatchdog(
+    run_registry,
+    run_queue=run_queue,
+)
 # Phase 2C durable notifications share the run registry SQLite database.
 notification_outbox = run_registry._get_notification_outbox()
 notification_delivery_worker = NotificationDeliveryWorker(notification_outbox)
@@ -331,6 +342,11 @@ async def lifespan(_: FastAPI):
     # Phase 2C: background delivery drains due/retry work off request paths.
     notification_delivery_worker.start()
     _kick_notification_delivery()
+    heartbeat_watchdog.start()
+    logger.info(
+        "Heartbeat watchdog started stale_threshold_seconds=%s",
+        heartbeat_watchdog.stale_threshold_seconds,
+    )
     if is_notifications_configured(load_notification_config()):
         logger.info("Phase 2C notifications: webhook delivery enabled")
     else:
@@ -349,6 +365,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        heartbeat_watchdog.stop()
         workflow_reconciler.stop()
         notification_delivery_worker.stop()
 
@@ -476,6 +493,15 @@ class RunResponse(BaseModel):
 class RunAcceptedResponse(BaseModel):
     run_id: str
     status: str
+
+
+class CancelRunResponse(BaseModel):
+    ok: bool
+    run_id: str
+    status: str
+    already_terminal: bool = False
+    diagnostics: dict[str, str] = Field(default_factory=dict)
+    code: str | None = None
 
 
 class CommandEvidenceModel(BaseModel):
@@ -1573,6 +1599,67 @@ def retry_run_endpoint(
         source.mission_yaml,
         retried_from=source.run_id,
     )
+
+
+def _cancel_run_response(result: CancelRunResult) -> CancelRunResponse:
+    return CancelRunResponse(
+        ok=result.ok,
+        run_id=result.run_id,
+        status=result.status,
+        already_terminal=result.already_terminal,
+        diagnostics=result.diagnostics,
+        code=result.code,
+    )
+
+
+@app.post(
+    "/runs/{run_id}/cancel",
+    response_model=CancelRunResponse,
+    operation_id="cancel_run",
+    summary="Cancel an asynchronous mission run",
+    description=(
+        "Authorized operator cancel for a non-terminal run. Transitions the "
+        "run to cancelled idempotently, propagates cancellation to the active "
+        "subprocess/process group when present, and returns redacted "
+        "cancellation diagnostics. Returns 404 for unknown run_id and 409 "
+        "when cancellation cannot be applied."
+    ),
+    responses={
+        200: {
+            "model": CancelRunResponse,
+            "description": "Run cancelled or already terminal/cancelled.",
+        },
+        401: {"description": "Missing or invalid bearer token."},
+        404: {"description": "Unknown run_id."},
+        409: {"description": "Cancellation could not be applied."},
+    },
+)
+def cancel_run_endpoint(
+    run_id: str,
+    _auth: None = Depends(require_api_key),
+) -> CancelRunResponse:
+    record = run_registry.get_run(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = cancel_run(
+        run_registry,
+        run_id,
+        source="http_cancel",
+        run_queue=run_queue,
+    )
+    if not result.ok and result.code not in {
+        None,
+        CANCELLED_ALREADY_TERMINAL,
+        CANCELLED_ALREADY_CANCELLED,
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": result.code or "cancel_failed",
+                "message": "Run could not be cancelled",
+            },
+        )
+    return _cancel_run_response(result)
 
 
 @app.post(

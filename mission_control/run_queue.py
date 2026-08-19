@@ -31,6 +31,7 @@ _TERMINAL_OR_ACTIVE_REGISTRY = frozenset(
         "completed",
         "failed",
         "timed_out",
+        "cancelled",
     }
 )
 
@@ -198,6 +199,25 @@ class RunQueue:
     def pending_count(self) -> int:
         with self._lock:
             return len(self._pending)
+
+    def remove_pending(self, run_id: str) -> bool:
+        """Drop a queued run from the pending deque (idempotent)."""
+        with self._cond:
+            before = len(self._pending)
+            self._pending = deque(
+                (item for item in self._pending if item[0] != run_id)
+            )
+            removed = len(self._pending) != before
+            if removed:
+                logger.info(
+                    (
+                        "lifecycle run_id=%s event=removed_from_pending "
+                        "api_pid=%s"
+                    ),
+                    run_id,
+                    os.getpid(),
+                )
+            return removed
 
     def is_active(self) -> bool:
         with self._lock:
