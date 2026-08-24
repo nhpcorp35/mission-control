@@ -944,7 +944,8 @@ async def _dispatch_case00_generation(
 
     When ``benchmark_id`` / ``question_id`` are provided (generic submit_case00),
     they are forwarded unchanged as workflow_dispatch inputs. The Q1-specific
-    submit path omits them so legacy workflow defaults remain intact.
+    submit path supplies the canonical Case-00/Q1 values because the production
+    workflow requires both inputs.
     """
     dispatch_path = (
         f"/repos/{REPOSITORY}/actions/workflows/{CASE00_WORKFLOW}/dispatches"
@@ -1065,6 +1066,8 @@ async def submit_case00_q1(
         mission_id=mission_id,
         requested_ref=requested_ref,
         resolved_ref=resolved_ref,
+        benchmark_id=CASE00_BENCHMARK_ID,
+        question_id="Q1",
     )
 
 
