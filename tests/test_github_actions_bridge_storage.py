@@ -717,6 +717,8 @@ class Case00RefResolutionTests(unittest.TestCase):
         payload = self.dispatches[0]["json"]
         self.assertEqual(payload["ref"], "main")
         self.assertEqual(payload["inputs"]["legalai_ref"], self.LEGALAI_SHA)
+        self.assertEqual(payload["inputs"]["benchmark_id"], "Case-00-Triborough")
+        self.assertEqual(payload["inputs"]["question_id"], "Q1")
         self.assertNotIn("GITHUB_TOKEN", json.dumps(result))
         self.assertNotIn("bearer", json.dumps(result).lower())
 
@@ -741,6 +743,11 @@ class Case00RefResolutionTests(unittest.TestCase):
         self.assertEqual(
             self.dispatches[0]["json"]["inputs"]["legalai_ref"], self.LEGALAI_SHA
         )
+        self.assertEqual(
+            self.dispatches[0]["json"]["inputs"]["benchmark_id"],
+            "Case-00-Triborough",
+        )
+        self.assertEqual(self.dispatches[0]["json"]["inputs"]["question_id"], "Q1")
 
     def test_wrong_repository_sha_fails_before_dispatch(self) -> None:
         """Absent explicit SHA: GitHub 404 → ref_not_in_repository, no dispatch."""
@@ -1214,9 +1221,9 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(inputs["mission_id"], "mission-q1-compat")
         self.assertEqual(inputs["legalai_ref"], self.LEGALAI_SHA)
         self.assertEqual(inputs["authorization_confirmed"], "true")
-        # Legacy Q1 path omits identity inputs so workflow defaults stay intact.
-        self.assertNotIn("benchmark_id", inputs)
-        self.assertNotIn("question_id", inputs)
+        # Q1 must supply the workflow-required canonical identity inputs.
+        self.assertEqual(inputs["benchmark_id"], "Case-00-Triborough")
+        self.assertEqual(inputs["question_id"], "Q1")
 
     def test_malformed_question_and_wrong_benchmark_fail_closed(self) -> None:
         from fastmcp.exceptions import ToolError
