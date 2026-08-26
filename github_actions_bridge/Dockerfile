@@ -4,6 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
+COPY case_intake.py .
 COPY storage_policy.py .
 COPY service_auth.py .
 
