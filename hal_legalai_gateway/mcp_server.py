@@ -164,6 +164,16 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="List allowlisted Case-00 B2 object metadata under a canonical prefix.",
     ),
     ToolBinding(
+        gateway_tool="storage.verify_case_intake",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="verify_case_intake",
+        description=(
+            "HEAD- and SHA-256-verify a pre-uploaded active-case source bundle "
+            "and manifest under its canonical B2 intake prefix."
+        ),
+    ),
+    ToolBinding(
         gateway_tool=_CASE00_QUESTION_CONTRACT.gateway_tool,
         namespace=_CASE00_QUESTION_CONTRACT.namespace,
         downstream_service=_CASE00_QUESTION_CONTRACT.downstream_service,
@@ -822,6 +832,32 @@ def register_forwarding_tools(
         return await _forward(
             "storage.list_inventory",
             {"category": category, "max_keys": max_keys},
+        )
+
+    @mcp.tool(
+        name="storage.verify_case_intake",
+        description=by_name["storage.verify_case_intake"].description,
+    )
+    async def storage_verify_case_intake(
+        case_id: str,
+        source_filename: str,
+        source_bundle_size: int,
+        source_bundle_sha256: str,
+        manifest_filename: str,
+        manifest_size: int,
+        manifest_sha256: str,
+    ) -> dict[str, Any]:
+        return await _forward(
+            "storage.verify_case_intake",
+            {
+                "case_id": case_id,
+                "source_filename": source_filename,
+                "source_bundle_size": source_bundle_size,
+                "source_bundle_sha256": source_bundle_sha256,
+                "manifest_filename": manifest_filename,
+                "manifest_size": manifest_size,
+                "manifest_sha256": manifest_sha256,
+            },
         )
 
     @mcp.tool(
