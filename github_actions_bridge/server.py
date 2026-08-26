@@ -1314,6 +1314,16 @@ async def verify_case_intake(
 RENNICK_CASE_ID = "NY-Nassau-613561-2026-Desousa-v-Rennick"
 RENNICK_SOURCE_FILENAME = "Rennick_Case_Source_2026-08-26.zip"
 RENNICK_MANIFEST_FILENAME = "Rennick_Case_Intake_Manifest_2026-08-26.json"
+RENNICK_SUPPLEMENT_ID = "docket-entries-5-18-19-2026-08-26"
+RENNICK_SUPPLEMENT_ARCHIVE_FILENAME = "Rennick_Docket_Supplement_2026-08-26_5_18_19.zip"
+RENNICK_SUPPLEMENT_MANIFEST_FILENAME = "Rennick_Docket_Supplement_2026-08-26_5_18_19.manifest.json"
+RENNICK_SUPPLEMENT_FILENAMES = frozenset(
+    {
+        "613561_2026_MICHAEL_DESOUSA_et_al_v_GEORGE_RENNICK_et_al_EXHIBIT_S__5 (1).pdf",
+        "613561_2026_MICHAEL_DESOUSA_et_al_v_GEORGE_RENNICK_et_al_RJI__RE__ORDER_TO_S_18.pdf",
+        "613561_2026_MICHAEL_DESOUSA_et_al_v_GEORGE_RENNICK_et_al_LETTER___CORRESPOND_19.pdf",
+    }
+)
 
 
 def _require_absent_intake_object(client: Any, object_key: str) -> None:
@@ -1382,6 +1392,54 @@ def _upload_rennick_intake_pair(source: bytes, manifest: bytes) -> dict[str, Any
     }
 
 
+def _upload_rennick_docket_supplement(archive: bytes, manifest: bytes) -> dict[str, Any]:
+    """Store the fixed three-document public-docket supplement without overwrites."""
+    try:
+        manifest_payload = json.loads(manifest)
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            names = [name for name in bundle.namelist() if not name.endswith("/")]
+            if set(names) != RENNICK_SUPPLEMENT_FILENAMES or len(names) != 3:
+                raise ValueError("supplement archive must contain exactly docket documents 5, 18, and 19")
+            documents = manifest_payload.get("documents") if isinstance(manifest_payload, dict) else None
+            if (
+                manifest_payload.get("case_id") != RENNICK_CASE_ID
+                or manifest_payload.get("supplement_id") != RENNICK_SUPPLEMENT_ID
+                or not isinstance(documents, list)
+            ):
+                raise ValueError("invalid supplement manifest identity")
+            expected = {item.get("filename"): item for item in documents if isinstance(item, dict)}
+            if set(expected) != RENNICK_SUPPLEMENT_FILENAMES or len(expected) != 3:
+                raise ValueError("supplement manifest must identify exactly docket documents 5, 18, and 19")
+            for name in names:
+                payload = bundle.read(name)
+                item = expected[name]
+                if item.get("size") != len(payload) or item.get("sha256") != hashlib.sha256(payload).hexdigest():
+                    raise ValueError("supplement manifest document hash mismatch")
+    except (json.JSONDecodeError, zipfile.BadZipFile, KeyError, TypeError) as exc:
+        raise ValueError("invalid docket supplement archive or manifest") from exc
+
+    prefix = f"cases/{RENNICK_CASE_ID}/intake/supplements/{RENNICK_SUPPLEMENT_ID}/"
+    archive_key = prefix + RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
+    manifest_key = prefix + RENNICK_SUPPLEMENT_MANIFEST_FILENAME
+    client = _b2_client()
+    _require_absent_intake_object(client, archive_key)
+    _require_absent_intake_object(client, manifest_key)
+    archive_sha256 = hashlib.sha256(archive).hexdigest()
+    manifest_sha256 = hashlib.sha256(manifest).hexdigest()
+    client.put_object(Bucket=B2_BUCKET, Key=archive_key, Body=archive, ContentType="application/zip", Metadata={"sha256": archive_sha256})
+    try:
+        client.put_object(Bucket=B2_BUCKET, Key=manifest_key, Body=manifest, ContentType="application/json", Metadata={"sha256": manifest_sha256})
+    except Exception:
+        raise RuntimeError("supplement manifest upload failed after archive upload; retry is blocked to prevent overwrite")
+    objects = []
+    for key, expected_size, expected_sha256 in ((archive_key, len(archive), archive_sha256), (manifest_key, len(manifest), manifest_sha256)):
+        head = client.head_object(Bucket=B2_BUCKET, Key=key)
+        if head.get("ContentLength") != expected_size or (head.get("Metadata") or {}).get("sha256") != expected_sha256:
+            raise ValueError("B2 supplement upload verification mismatch")
+        objects.append({"object_key": key, "size": expected_size, "sha256": expected_sha256, "etag": (head.get("ETag") or "").strip('"')})
+    return {"ok": True, "uploaded": True, "case_id": RENNICK_CASE_ID, "supplement_id": RENNICK_SUPPLEMENT_ID, "objects": objects}
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -1417,6 +1475,29 @@ async def upload_rennick_intake_binary(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "invalid_manifest_size"}, status_code=400)
     try:
         return JSONResponse(_upload_rennick_intake_pair(source, manifest))
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/rennick/supplement", methods=["POST"])
+async def upload_rennick_docket_supplement_binary(request: Request) -> JSONResponse:
+    """Private Gateway-to-Bridge route for the fixed three-document supplement."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        archive_size = int(request.headers.get("X-Rennick-Supplement-Archive-Size", "0"))
+    except ValueError:
+        archive_size = 0
+    body = await request.body()
+    if not 0 < archive_size <= MAX_BUNDLE_BYTES or archive_size >= len(body):
+        return JSONResponse({"ok": False, "error": "invalid_supplement_archive_size"}, status_code=400)
+    archive, manifest = body[:archive_size], body[archive_size:]
+    if len(manifest) > MAX_MANIFEST_BYTES:
+        return JSONResponse({"ok": False, "error": "invalid_supplement_manifest_size"}, status_code=400)
+    try:
+        return JSONResponse(_upload_rennick_docket_supplement(archive, manifest))
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 

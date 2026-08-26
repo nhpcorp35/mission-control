@@ -180,6 +180,28 @@ async def _forward_rennick_pair(source: bytes, manifest: bytes) -> dict[str, Any
         return result
     return {"ok": False, "error": result.get("error", "bridge_upload_failed")}
 
+
+async def _forward_rennick_supplement_pair(archive: bytes, manifest: bytes) -> dict[str, Any]:
+    """Forward the fixed docket supplement through the private binary Bridge route."""
+    settings = get_settings()
+    downstream = settings.downstream_by_key("storage")
+    headers = {"X-Rennick-Supplement-Archive-Size": str(len(archive))}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    timeout = httpx.Timeout(300.0, connect=settings.connect_timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{downstream.base_url.rstrip('/')}/intake/rennick/supplement",
+            content=archive + manifest,
+            headers=headers,
+        )
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"ok": False, "error": "bridge_supplement_response_invalid"}
+    return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_supplement_failed")}
+
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
     application.router.routes = [
@@ -319,11 +341,15 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         return HTMLResponse(f'''<!doctype html><title>Rennick intake upload</title>
 <main><h2>Rennick intake upload</h2><p>Select the exact ZIP and manifest.</p>
 <input id="source" type="file" accept=".zip"><br><input id="manifest" type="file" accept=".json"><br>
-<button id="upload">Upload and verify</button><pre id="status"></pre></main>
+<button id="upload">Upload and verify</button><hr><h3>Docket supplement: Docs. 5, 18, and 19</h3>
+<input id="supplement-archive" type="file" accept=".zip"><br><input id="supplement-manifest" type="file" accept=".json"><br>
+<button id="upload-supplement">Upload supplement and verify</button><pre id="status"></pre></main>
 <script>
 const out=document.getElementById('status');
 async function upload(source,manifest) {{ const r=await fetch('/intake/rennick/upload',{{method:'POST',headers:{{'X-Rennick-Source-Size':String(source.size)}},body:new Blob([source,manifest])}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
+async function uploadSupplement(archive,manifest) {{ const r=await fetch('/intake/rennick/supplement',{{method:'POST',headers:{{'X-Rennick-Supplement-Archive-Size':String(archive.size)}},body:new Blob([archive,manifest])}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
 document.getElementById('upload').onclick=async()=>{{try{{const s=document.getElementById('source').files[0],m=document.getElementById('manifest').files[0];if(!s||!m)throw new Error('Select both files.');out.textContent='Uploading and verifying…';out.textContent=JSON.stringify(await upload(s,m),null,2)}}catch(e){{out.textContent='Upload failed: '+e.message}}}};
+document.getElementById('upload-supplement').onclick=async()=>{{try{{const a=document.getElementById('supplement-archive').files[0],m=document.getElementById('supplement-manifest').files[0];if(!a||!m)throw new Error('Select both supplement files.');out.textContent='Uploading supplement and verifying…';out.textContent=JSON.stringify(await uploadSupplement(a,m),null,2)}}catch(e){{out.textContent='Supplement upload failed: '+e.message}}}};
 </script>''')
 
     async def rennick_oauth_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
@@ -380,6 +406,23 @@ document.getElementById('upload').onclick=async()=>{{try{{const s=document.getEl
         if len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
             return JSONResponse({"ok": False, "error": "invalid_manifest_size"}, status_code=400)
         result = await _forward_rennick_pair(source, manifest)
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.post("/intake/rennick/supplement", include_in_schema=False)
+    async def rennick_docket_supplement_upload(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            archive_size = int(request.headers.get("X-Rennick-Supplement-Archive-Size", "0"))
+        except ValueError:
+            archive_size = 0
+        body = await request.body()
+        if not 0 < archive_size <= RENNICK_SOURCE_BYTES_MAX or archive_size >= len(body):
+            return JSONResponse({"ok": False, "error": "invalid_supplement_archive_size"}, status_code=400)
+        archive, manifest = body[:archive_size], body[archive_size:]
+        if len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
+            return JSONResponse({"ok": False, "error": "invalid_supplement_manifest_size"}, status_code=400)
+        result = await _forward_rennick_supplement_pair(archive, manifest)
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.get("/registry")
