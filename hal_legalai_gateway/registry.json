@@ -195,6 +195,14 @@
       "description": "HEAD- and SHA-256-verify a pre-uploaded active-case source bundle and manifest under its canonical B2 intake prefix."
     },
     {
+      "tool": "storage.upload_rennick_case_intake",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "upload_rennick_case_intake",
+      "description": "Upload the exact Rennick source ZIP and manifest to their canonical B2 intake keys, compute SHA-256 server-side, and refuse overwrites.",
+      "notes": "Bounded to the exact Rennick intake filenames and canonical case prefix; no arbitrary paths or overwrite."
+    },
+    {
       "tool": "storage.get_case00_question",
       "namespace": "storage",
       "downstream_service": "storage",
