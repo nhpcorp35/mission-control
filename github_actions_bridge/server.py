@@ -1310,7 +1310,7 @@ async def verify_case_intake(
     }
 
 
-RENICK_CASE_ID = "NY-Nassau-613561-2026-Desousa-v-Rennick"
+RENNICK_CASE_ID = "NY-Nassau-613561-2026-Desousa-v-Rennick"
 RENNICK_SOURCE_FILENAME = "Rennick_Case_Source_2026-08-26.zip"
 RENNICK_MANIFEST_FILENAME = "Rennick_Case_Intake_Manifest_2026-08-26.json"
 
@@ -1340,7 +1340,7 @@ async def upload_rennick_case_intake(
         manifest_base64, label="manifest_base64", max_size=MAX_MANIFEST_BYTES
     )
     source_key, manifest_key = intake_keys(
-        RENICK_CASE_ID, RENNICK_SOURCE_FILENAME, RENNICK_MANIFEST_FILENAME
+        RENNICK_CASE_ID, RENNICK_SOURCE_FILENAME, RENNICK_MANIFEST_FILENAME
     )
     client = _b2_client()
     _require_absent_intake_object(client, source_key)
@@ -1387,7 +1387,7 @@ async def upload_rennick_case_intake(
     return {
         "ok": True,
         "uploaded": True,
-        "case_id": RENICK_CASE_ID,
+        "case_id": RENNICK_CASE_ID,
         "objects": objects,
     }
 
