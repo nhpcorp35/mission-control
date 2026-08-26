@@ -1326,6 +1326,7 @@ RENNICK_SUPPLEMENT_FILENAMES = frozenset(
 )
 RENNICK_DIRECT_UPLOAD_TTL_SECONDS = 300
 RENNICK_DIRECT_UPLOAD_PREFIX = f"cases/{RENNICK_CASE_ID}/intake/.pending/"
+RENNICK_DIRECT_UPLOAD_ORIGIN_ENV = "HAL_LEGALAI_GATEWAY_URL"
 
 
 def _require_absent_intake_object(client: Any, object_key: str) -> None:
@@ -1442,6 +1443,42 @@ def _upload_rennick_docket_supplement(archive: bytes, manifest: bytes) -> dict[s
     return {"ok": True, "uploaded": True, "case_id": RENNICK_CASE_ID, "supplement_id": RENNICK_SUPPLEMENT_ID, "objects": objects}
 
 
+def _ensure_rennick_direct_upload_cors(client: Any) -> None:
+    """Allow this Gateway origin to PUT only the presigned pending objects.
+
+    B2 evaluates CORS before validating the presigned URL. Preserve all existing
+    bucket rules and add one narrowly-scoped rule only when no existing rule
+    already permits this origin's ``PUT`` with ``Content-Type``.
+    """
+    raw_origin = (os.environ.get(RENNICK_DIRECT_UPLOAD_ORIGIN_ENV) or "").strip().rstrip("/")
+    parsed = urlparse(raw_origin)
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc or parsed.path not in {"", "/"}:
+        raise RuntimeError(f"{RENNICK_DIRECT_UPLOAD_ORIGIN_ENV} must be an absolute origin")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        rules = list((client.get_bucket_cors(Bucket=B2_BUCKET).get("CORSRules") or []))
+    except ClientError as exc:
+        code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
+        if code not in {"NoSuchCORSConfiguration", "404", "NotFound"}:
+            raise
+        rules = []
+    for rule in rules:
+        origins = set(rule.get("AllowedOrigins") or [])
+        methods = {str(method).upper() for method in (rule.get("AllowedMethods") or [])}
+        headers = {str(header).lower() for header in (rule.get("AllowedHeaders") or [])}
+        if origin in origins and "PUT" in methods and ("*" in headers or "content-type" in headers):
+            return
+    rules.append(
+        {
+            "AllowedOrigins": [origin],
+            "AllowedMethods": ["PUT"],
+            "AllowedHeaders": ["content-type"],
+            "MaxAgeSeconds": RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
+        }
+    )
+    client.put_bucket_cors(Bucket=B2_BUCKET, CORSConfiguration={"CORSRules": rules})
+
+
 def _prepare_rennick_direct_supplement_upload() -> dict[str, Any]:
     """Create two short-lived, direct-to-B2 upload URLs for one supplement attempt.
 
@@ -1450,6 +1487,7 @@ def _prepare_rennick_direct_supplement_upload() -> dict[str, Any]:
     promotes their exact bytes to the immutable canonical supplement keys.
     """
     client = _b2_client()
+    _ensure_rennick_direct_upload_cors(client)
     upload_id = uuid.uuid4().hex
     prefix = f"{RENNICK_DIRECT_UPLOAD_PREFIX}{RENNICK_SUPPLEMENT_ID}/{upload_id}/"
     archive_key = prefix + RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
