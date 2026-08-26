@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -1326,19 +1327,8 @@ def _require_absent_intake_object(client: Any, object_key: str) -> None:
     raise ValueError("intake object already exists; refusing to overwrite")
 
 
-@mcp.tool()
-async def upload_rennick_case_intake(
-    source_bundle_base64: str,
-    manifest_base64: str,
-) -> dict[str, Any]:
-    """Upload the exact Rennick B2 intake pair, hash it server-side, and refuse overwrites."""
-    _require_allowed_user()
-    source = decode_base64_upload(
-        source_bundle_base64, label="source_bundle_base64", max_size=MAX_BUNDLE_BYTES
-    )
-    manifest = decode_base64_upload(
-        manifest_base64, label="manifest_base64", max_size=MAX_MANIFEST_BYTES
-    )
+def _upload_rennick_intake_pair(source: bytes, manifest: bytes) -> dict[str, Any]:
+    """Store and HEAD-verify the exact Rennick pair with no overwrites."""
     source_key, manifest_key = intake_keys(
         RENNICK_CASE_ID, RENNICK_SOURCE_FILENAME, RENNICK_MANIFEST_FILENAME
     )
@@ -1390,6 +1380,45 @@ async def upload_rennick_case_intake(
         "case_id": RENNICK_CASE_ID,
         "objects": objects,
     }
+
+
+@mcp.tool()
+async def upload_rennick_case_intake(
+    source_bundle_base64: str,
+    manifest_base64: str,
+) -> dict[str, Any]:
+    """Upload the exact Rennick B2 intake pair, hash it server-side, and refuse overwrites."""
+    _require_allowed_user()
+    source = decode_base64_upload(
+        source_bundle_base64, label="source_bundle_base64", max_size=MAX_BUNDLE_BYTES
+    )
+    manifest = decode_base64_upload(
+        manifest_base64, label="manifest_base64", max_size=MAX_MANIFEST_BYTES
+    )
+    return _upload_rennick_intake_pair(source, manifest)
+
+
+@mcp.custom_route("/intake/rennick/upload", methods=["POST"])
+async def upload_rennick_intake_binary(request: Request) -> JSONResponse:
+    """Private Gateway-to-Bridge binary intake route (never browser-public)."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        source_size = int(request.headers.get("X-Rennick-Source-Size", "0"))
+    except ValueError:
+        source_size = 0
+    body = await request.body()
+    if not 0 < source_size <= MAX_BUNDLE_BYTES or source_size >= len(body):
+        return JSONResponse({"ok": False, "error": "invalid_source_size"}, status_code=400)
+    source, manifest = body[:source_size], body[source_size:]
+    if len(manifest) > MAX_MANIFEST_BYTES:
+        return JSONResponse({"ok": False, "error": "invalid_manifest_size"}, status_code=400)
+    try:
+        return JSONResponse(_upload_rennick_intake_pair(source, manifest))
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
 
 @mcp.tool()
