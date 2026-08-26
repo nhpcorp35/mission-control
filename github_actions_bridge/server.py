@@ -45,6 +45,12 @@ from storage_policy import (
     validate_sha256_hex,
     verify_retrieved_acceptance_contract,
 )
+from case_intake import (
+    MAX_BUNDLE_BYTES,
+    MAX_MANIFEST_BYTES,
+    intake_keys,
+    verify_object as verify_case_intake_object,
+)
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -119,6 +125,7 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "get_acceptance_contract_template",
         "get_acceptance_contract",
         "get_case00_question",
+        "verify_case_intake",
     }
 )
 
@@ -1261,6 +1268,39 @@ async def list_case00_storage(
         "count": len(objects),
         "truncated": bool(response.get("IsTruncated")),
     }
+
+
+@mcp.tool()
+async def verify_case_intake(
+    case_id: str,
+    source_filename: str,
+    source_bundle_size: int,
+    source_bundle_sha256: str,
+    manifest_filename: str,
+    manifest_size: int,
+    manifest_sha256: str,
+) -> dict[str, Any]:
+    """Verify a pre-uploaded active-case bundle and manifest without reading it out."""
+    _require_allowed_user()
+    source_key, manifest_key = intake_keys(case_id, source_filename, manifest_filename)
+    client = _b2_client()
+    source = verify_case_intake_object(
+        client,
+        bucket=B2_BUCKET,
+        object_key=source_key,
+        expected_size=source_bundle_size,
+        expected_sha256=source_bundle_sha256,
+        max_size=MAX_BUNDLE_BYTES,
+    )
+    manifest = verify_case_intake_object(
+        client,
+        bucket=B2_BUCKET,
+        object_key=manifest_key,
+        expected_size=manifest_size,
+        expected_sha256=manifest_sha256,
+        max_size=MAX_MANIFEST_BYTES,
+    )
+    return {"ok": True, "verified": True, "case_id": case_id, "objects": [source, manifest]}
 
 
 @mcp.tool()

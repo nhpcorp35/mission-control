@@ -58,6 +58,7 @@
       "downstream_service": "storage",
       "tools": [
         "storage.list_inventory",
+        "storage.verify_case_intake",
         "storage.get_case00_question",
         "storage.archive_feedback",
         "storage.archive_review_packet",
@@ -184,6 +185,13 @@
       "namespace": "storage",
       "downstream_service": "storage",
       "downstream_tool": "list_case00_storage"
+    },
+    {
+      "tool": "storage.verify_case_intake",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "verify_case_intake",
+      "description": "HEAD- and SHA-256-verify a pre-uploaded active-case source bundle and manifest under its canonical B2 intake prefix."
     },
     {
       "tool": "storage.get_case00_question",
