@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import re
 from typing import Any
@@ -29,6 +31,18 @@ def validate_digest(value: str, label: str) -> str:
     if not SHA256_RE.fullmatch(value):
         raise ValueError(f"{label} must be a lowercase SHA-256 hex digest")
     return value
+
+
+def decode_base64_upload(value: str, *, label: str, max_size: int) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} is required")
+    try:
+        payload = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{label} must be valid base64") from exc
+    if not 1 <= len(payload) <= max_size:
+        raise ValueError(f"{label} size is outside the allowed range")
+    return payload
 
 
 def verify_object(

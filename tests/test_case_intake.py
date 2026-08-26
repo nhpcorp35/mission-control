@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import unittest
 
-from github_actions_bridge.case_intake import intake_keys, verify_object
+from github_actions_bridge.case_intake import decode_base64_upload, intake_keys, verify_object
 
 
 class _FakeB2Client:
@@ -34,6 +35,18 @@ class _MissingB2Client:
 
 
 class CaseIntakeTests(unittest.TestCase):
+    def test_decode_base64_upload_is_bounded_and_strict(self) -> None:
+        self.assertEqual(
+            decode_base64_upload(
+                base64.b64encode(b"payload").decode("ascii"),
+                label="payload",
+                max_size=7,
+            ),
+            b"payload",
+        )
+        with self.assertRaises(ValueError):
+            decode_base64_upload("not-base64", label="payload", max_size=7)
+
     def test_intake_keys_are_confined_to_the_case_intake_prefix(self) -> None:
         source, manifest = intake_keys(
             "NY-Nassau-613561-2026-Rennick",

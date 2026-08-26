@@ -48,6 +48,7 @@ from storage_policy import (
 from case_intake import (
     MAX_BUNDLE_BYTES,
     MAX_MANIFEST_BYTES,
+    decode_base64_upload,
     intake_keys,
     verify_object as verify_case_intake_object,
 )
@@ -1306,6 +1307,88 @@ async def verify_case_intake(
         "verified": verified,
         "case_id": case_id,
         "objects": [source, manifest],
+    }
+
+
+RENNICK_CASE_ID = "NY-Nassau-613561-2026-Desousa-v-Rennick"
+RENNICK_SOURCE_FILENAME = "Rennick_Case_Source_2026-08-26.zip"
+RENNICK_MANIFEST_FILENAME = "Rennick_Case_Intake_Manifest_2026-08-26.json"
+
+
+def _require_absent_intake_object(client: Any, object_key: str) -> None:
+    try:
+        client.head_object(Bucket=B2_BUCKET, Key=object_key)
+    except ClientError as exc:
+        code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return
+        raise
+    raise ValueError("intake object already exists; refusing to overwrite")
+
+
+@mcp.tool()
+async def upload_rennick_case_intake(
+    source_bundle_base64: str,
+    manifest_base64: str,
+) -> dict[str, Any]:
+    """Upload the exact Rennick B2 intake pair, hash it server-side, and refuse overwrites."""
+    _require_allowed_user()
+    source = decode_base64_upload(
+        source_bundle_base64, label="source_bundle_base64", max_size=MAX_BUNDLE_BYTES
+    )
+    manifest = decode_base64_upload(
+        manifest_base64, label="manifest_base64", max_size=MAX_MANIFEST_BYTES
+    )
+    source_key, manifest_key = intake_keys(
+        RENNICK_CASE_ID, RENNICK_SOURCE_FILENAME, RENNICK_MANIFEST_FILENAME
+    )
+    client = _b2_client()
+    _require_absent_intake_object(client, source_key)
+    _require_absent_intake_object(client, manifest_key)
+    source_sha256 = hashlib.sha256(source).hexdigest()
+    manifest_sha256 = hashlib.sha256(manifest).hexdigest()
+    client.put_object(
+        Bucket=B2_BUCKET,
+        Key=source_key,
+        Body=source,
+        ContentType="application/zip",
+        Metadata={"sha256": source_sha256},
+    )
+    try:
+        client.put_object(
+            Bucket=B2_BUCKET,
+            Key=manifest_key,
+            Body=manifest,
+            ContentType="application/json",
+            Metadata={"sha256": manifest_sha256},
+        )
+    except Exception:
+        raise RuntimeError(
+            "manifest upload failed after source upload; retry is blocked to prevent overwrite"
+        )
+    objects = []
+    for key, expected_size, expected_sha256 in (
+        (source_key, len(source), source_sha256),
+        (manifest_key, len(manifest), manifest_sha256),
+    ):
+        head = client.head_object(Bucket=B2_BUCKET, Key=key)
+        if head.get("ContentLength") != expected_size:
+            raise ValueError("B2 intake upload size mismatch")
+        if (head.get("Metadata") or {}).get("sha256") != expected_sha256:
+            raise ValueError("B2 intake upload SHA-256 metadata mismatch")
+        objects.append(
+            {
+                "object_key": key,
+                "size": expected_size,
+                "sha256": expected_sha256,
+                "etag": (head.get("ETag") or "").strip('"'),
+            }
+        )
+    return {
+        "ok": True,
+        "uploaded": True,
+        "case_id": RENNICK_CASE_ID,
+        "objects": objects,
     }
 
 
