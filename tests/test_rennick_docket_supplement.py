@@ -112,13 +112,12 @@ class RennickDocketSupplementTests(unittest.TestCase):
         client.get_bucket_cors.return_value = {"CORSRules": []}
         with mock.patch.object(server, "_b2_client", return_value=client), mock.patch.object(server.uuid, "uuid4", return_value=mock.Mock(hex="a" * 32)):
             plan = server._prepare_rennick_direct_supplement_upload()
-            self.assertEqual(len(plan["uploads"]), 2)
+            self.assertEqual(len(plan["uploads"]), 3)
             self.assertEqual(client.put_object.call_count, 0)
             self.assertTrue(all("/.pending/" in item["object_key"] for item in plan["uploads"]))
-            archive_key = next(item["object_key"] for item in plan["uploads"] if item["name"] == "archive")
-            manifest_key = next(item["object_key"] for item in plan["uploads"] if item["name"] == "manifest")
-            stored[archive_key] = {"payload": archive_payload}
-            stored[manifest_key] = {"payload": manifest_payload}
+            with zipfile.ZipFile(io.BytesIO(archive_payload)) as archive:
+                for item in plan["uploads"]:
+                    stored[item["object_key"]] = {"payload": archive.read(item["name"])}
             result = server._complete_rennick_direct_supplement_upload(plan["upload_id"])
 
         self.assertTrue(result["ok"])
@@ -131,8 +130,7 @@ class RennickDocketSupplementTests(unittest.TestCase):
                 "MaxAgeSeconds": server.RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
             }]},
         )
-        self.assertNotIn(archive_key, stored)
-        self.assertNotIn(manifest_key, stored)
+        self.assertTrue(all(item["object_key"] not in stored for item in plan["uploads"]))
         self.assertTrue(all("/.pending/" not in key for key in stored))
         self.assertEqual(len(result["objects"]), 2)
 
@@ -141,14 +139,13 @@ class RennickDocketSupplementTests(unittest.TestCase):
         upload_id = "b" * 32
         prefix = f"{server.RENNICK_DIRECT_UPLOAD_PREFIX}{server.RENNICK_SUPPLEMENT_ID}/{upload_id}/"
         archive_payload, manifest_payload = self._supplement_pair(server)
-        pending_archive = prefix + server.RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
-        pending_manifest = prefix + server.RENNICK_SUPPLEMENT_MANIFEST_FILENAME
         canonical_archive = f"cases/{server.RENNICK_CASE_ID}/intake/supplements/{server.RENNICK_SUPPLEMENT_ID}/{server.RENNICK_SUPPLEMENT_ARCHIVE_FILENAME}"
         stored = {
-            pending_archive: {"payload": archive_payload, "metadata": {}},
-            pending_manifest: {"payload": manifest_payload, "metadata": {}},
             canonical_archive: {"payload": b"already canonical", "metadata": {}},
         }
+        with zipfile.ZipFile(io.BytesIO(archive_payload)) as archive:
+            for name in server.RENNICK_SUPPLEMENT_FILENAMES:
+                stored[prefix + "documents/" + name] = {"payload": archive.read(name), "metadata": {}}
 
         def head_object(*, Bucket: str, Key: str) -> dict[str, object]:
             del Bucket
@@ -165,6 +162,5 @@ class RennickDocketSupplementTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
                 server._complete_rennick_direct_supplement_upload(upload_id)
 
-        self.assertNotIn(pending_archive, stored)
-        self.assertNotIn(pending_manifest, stored)
+        self.assertTrue(all(prefix + "documents/" + name not in stored for name in server.RENNICK_SUPPLEMENT_FILENAMES))
         self.assertIn(canonical_archive, stored)
