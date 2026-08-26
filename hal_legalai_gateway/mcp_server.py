@@ -174,6 +174,16 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         ),
     ),
     ToolBinding(
+        gateway_tool="storage.upload_rennick_case_intake",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="upload_rennick_case_intake",
+        description=(
+            "Upload the exact Rennick source ZIP and manifest to their canonical "
+            "B2 intake keys, compute SHA-256 server-side, and refuse overwrites."
+        ),
+    ),
+    ToolBinding(
         gateway_tool=_CASE00_QUESTION_CONTRACT.gateway_tool,
         namespace=_CASE00_QUESTION_CONTRACT.namespace,
         downstream_service=_CASE00_QUESTION_CONTRACT.downstream_service,
