@@ -34,6 +34,7 @@ from hal_legalai_gateway.mcp_server import (
     list_registered_tool_names,
 )
 from hal_legalai_gateway.forwarding import ToolBinding, forward_mcp_tool
+from hal_legalai_gateway.auth import service_authorization_header
 from hal_legalai_gateway.request_context import (
     RequestIdMiddleware,
     configure_logging,
@@ -157,28 +158,27 @@ def _browser_login(request: Request) -> str | None:
 
 
 async def _forward_rennick_pair(source: bytes, manifest: bytes) -> dict[str, Any]:
-    """Forward browser-uploaded bytes only on the private Gateway → Bridge hop."""
+    """Forward browser-uploaded bytes through the private binary Bridge route."""
     settings = get_settings()
-    binding = ToolBinding(
-        gateway_tool="storage.upload_rennick_case_intake",
-        namespace="storage",
-        downstream_service="storage",
-        downstream_tool="upload_rennick_case_intake",
-    )
     downstream = settings.downstream_by_key("storage")
-    return await forward_mcp_tool(
-        binding=binding,
-        arguments={
-            "source_bundle_base64": base64.b64encode(source).decode("ascii"),
-            "manifest_base64": base64.b64encode(manifest).decode("ascii"),
-        },
-        base_url=downstream.base_url,
-        authorization=settings.bridge_authorization,
-        connect_timeout_seconds=settings.connect_timeout_seconds,
-        read_timeout_seconds=max(settings.read_timeout_seconds, 300.0),
-        mcp_path=settings.mcp_path_for_service("storage"),
-        extra_secrets=settings.secret_values_for_redaction(),
-    )
+    headers = {"X-Rennick-Source-Size": str(len(source))}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    timeout = httpx.Timeout(300.0, connect=settings.connect_timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{downstream.base_url.rstrip('/')}/intake/rennick/upload",
+            content=source + manifest,
+            headers=headers,
+        )
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"ok": False, "error": "bridge_upload_response_invalid"}
+    if response.is_success:
+        return result
+    return {"ok": False, "error": result.get("error", "bridge_upload_failed")}
 
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
