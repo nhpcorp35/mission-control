@@ -18,6 +18,21 @@ class _FakeB2Client:
         return {"Body": io.BytesIO(self.payload)}
 
 
+class _NotFoundError(Exception):
+    response = {"Error": {"Code": "404"}}
+
+
+class _MissingB2Client:
+    def head_object(self, **_: object) -> dict[str, object]:
+        raise _NotFoundError()
+
+    def list_objects_v2(self, **_: object) -> dict[str, object]:
+        return {
+            "Contents": [{"Key": "cases/NY-Nassau-613561-2026-Rennick/intake/other.zip", "Size": 7}],
+            "IsTruncated": False,
+        }
+
+
 class CaseIntakeTests(unittest.TestCase):
     def test_intake_keys_are_confined_to_the_case_intake_prefix(self) -> None:
         source, manifest = intake_keys(
@@ -52,6 +67,23 @@ class CaseIntakeTests(unittest.TestCase):
         )
         self.assertEqual(result["size"], len(payload))
         self.assertEqual(result["etag"], "test-etag")
+
+    def test_verify_object_reports_only_the_constrained_prefix_on_not_found(self) -> None:
+        result = verify_object(
+            _MissingB2Client(),
+            bucket="legalai-corpus",
+            object_key="cases/NY-Nassau-613561-2026-Rennick/intake/source.zip",
+            expected_size=7,
+            expected_sha256=hashlib.sha256(b"payload").hexdigest(),
+            max_size=1024,
+        )
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["error"], "object_not_found")
+        self.assertEqual(
+            result["observed_prefix"],
+            "cases/NY-Nassau-613561-2026-Rennick/intake/",
+        )
+        self.assertEqual(result["observed_objects"][0]["object_key"], result["observed_prefix"] + "other.zip")
 
     def test_verify_object_rejects_bad_digest(self) -> None:
         payload = b"verified intake payload"
