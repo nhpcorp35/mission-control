@@ -322,8 +322,8 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
 <button id="upload">Upload and verify</button><pre id="status"></pre></main>
 <script>
 const out=document.getElementById('status');
-async function put(path,file) {{ const r=await fetch(path,{{method:'POST',body:file}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
-document.getElementById('upload').onclick=async()=>{{try{{const s=document.getElementById('source').files[0],m=document.getElementById('manifest').files[0];if(!s||!m)throw new Error('Select both files.');out.textContent='Uploading ZIP…';await put('/intake/rennick/source',s);out.textContent='Uploading manifest and verifying…';out.textContent=JSON.stringify(await put('/intake/rennick/manifest',m),null,2)}}catch(e){{out.textContent='Upload failed: '+e.message}}}};
+async function upload(source,manifest) {{ const r=await fetch('/intake/rennick/upload',{{method:'POST',headers:{{'X-Rennick-Source-Size':String(source.size)}},body:new Blob([source,manifest])}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
+document.getElementById('upload').onclick=async()=>{{try{{const s=document.getElementById('source').files[0],m=document.getElementById('manifest').files[0];if(!s||!m)throw new Error('Select both files.');out.textContent='Uploading and verifying…';out.textContent=JSON.stringify(await upload(s,m),null,2)}}catch(e){{out.textContent='Upload failed: '+e.message}}}};
 </script>''')
 
     async def rennick_oauth_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
@@ -364,27 +364,21 @@ document.getElementById('upload').onclick=async()=>{{try{{const s=document.getEl
             )
         return await call_next(request)
 
-    @application.post("/intake/rennick/source", include_in_schema=False)
-    async def rennick_source(request: Request) -> JSONResponse:
+    @application.post("/intake/rennick/upload", include_in_schema=False)
+    async def rennick_upload(request: Request) -> JSONResponse:
         if _browser_login(request) is None:
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        source = await request.body()
-        if not source or len(source) > RENNICK_SOURCE_BYTES_MAX:
+        try:
+            source_size = int(request.headers.get("X-Rennick-Source-Size", "0"))
+        except ValueError:
+            source_size = 0
+        body = await request.body()
+        if not 0 < source_size <= RENNICK_SOURCE_BYTES_MAX or source_size >= len(body):
             return JSONResponse({"ok": False, "error": "invalid_source_size"}, status_code=400)
-        application.state.rennick_source = source
-        return JSONResponse({"ok": True, "source_received": True})
-
-    @application.post("/intake/rennick/manifest", include_in_schema=False)
-    async def rennick_manifest(request: Request) -> JSONResponse:
-        if _browser_login(request) is None:
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        manifest = await request.body()
-        if not manifest or len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
+        source = body[:source_size]
+        manifest = body[source_size:]
+        if len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
             return JSONResponse({"ok": False, "error": "invalid_manifest_size"}, status_code=400)
-        source = getattr(application.state, "rennick_source", None)
-        application.state.rennick_source = None
-        if source is None:
-            return JSONResponse({"ok": False, "error": "source_missing"}, status_code=400)
         result = await _forward_rennick_pair(source, manifest)
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
