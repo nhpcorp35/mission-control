@@ -59,6 +59,7 @@
       "tools": [
         "storage.list_inventory",
         "storage.verify_case_intake",
+        "storage.upload_rennick_case_intake",
         "storage.get_case00_question",
         "storage.archive_feedback",
         "storage.archive_review_packet",
