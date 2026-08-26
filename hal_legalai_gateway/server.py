@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
-import base64
+import secrets
+import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+import httpx
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
@@ -27,7 +34,6 @@ from hal_legalai_gateway.mcp_server import (
     list_registered_tool_names,
 )
 from hal_legalai_gateway.forwarding import ToolBinding, forward_mcp_tool
-from hal_legalai_gateway.intake_upload import IntakeUploadSessions
 from hal_legalai_gateway.request_context import (
     RequestIdMiddleware,
     configure_logging,
@@ -64,10 +70,11 @@ _mcp: FastMCP | None = None
 _registered_tools: list[str] = []
 _mcp_http_app: Any = None
 _auth_override: AuthProvider | None = None
-_intake_upload_sessions: IntakeUploadSessions | None = None
-
 RENNICK_SOURCE_BYTES_MAX = 50 * 1024 * 1024
 RENNICK_MANIFEST_BYTES_MAX = 128 * 1024
+RENNICK_BROWSER_SESSION_SECONDS = 15 * 60
+_RENNICK_STATE_COOKIE = "rennick_oauth_state"
+_RENNICK_SESSION_COOKIE = "rennick_upload_session"
 
 
 class _GatewayAuthBackend(AuthenticationBackend):
@@ -101,20 +108,52 @@ def get_mcp() -> FastMCP | None:
 
 def reset_settings_for_tests() -> None:
     """Clear cached settings / MCP state (test helper)."""
-    global _settings, _mcp, _registered_tools, _mcp_http_app, _auth_override, _intake_upload_sessions
+    global _settings, _mcp, _registered_tools, _mcp_http_app, _auth_override
     _settings = None
     _mcp = None
     _registered_tools = []
     _mcp_http_app = None
     _auth_override = None
-    _intake_upload_sessions = None
 
 
-def _upload_sessions() -> IntakeUploadSessions:
-    global _intake_upload_sessions
-    if _intake_upload_sessions is None:
-        _intake_upload_sessions = IntakeUploadSessions(get_settings().jwt_signing_key)
-    return _intake_upload_sessions
+def _sign_browser_value(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        get_settings().jwt_signing_key.encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _verified_browser_value(value: str | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    try:
+        encoded, signature = value.split(".", 1)
+        expected = hmac.new(
+            get_settings().jwt_signing_key.encode("utf-8"),
+            encoded.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        if not isinstance(payload, dict) or int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _browser_login(request: Request) -> str | None:
+    payload = _verified_browser_value(request.cookies.get(_RENNICK_SESSION_COOKIE))
+    login = payload.get("login") if payload else None
+    if login != get_settings().allowed_github_login:
+        return None
+    return str(login)
 
 
 async def _forward_rennick_pair(source: bytes, manifest: bytes) -> dict[str, Any]:
@@ -260,37 +299,70 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             status_code=307,
         )
 
-    @application.get("/intake/rennick/upload", include_in_schema=False)
-    async def rennick_upload_page(ticket: str) -> HTMLResponse:
-        # The ticket is validated by both binary POST routes; never expose any
-        # source content in this page or in error responses.
+    @application.get("/intake/rennick", include_in_schema=False)
+    async def rennick_upload_page(request: Request) -> HTMLResponse | RedirectResponse:
+        if _browser_login(request) is None:
+            nonce = secrets.token_urlsafe(24)
+            expires_at = int(time.time()) + 600
+            state = _sign_browser_value({"nonce": nonce, "exp": expires_at})
+            settings = get_settings()
+            callback = f"{settings.gateway_public_url.rstrip('/')}/intake/rennick/callback"
+            url = "https://github.com/login/oauth/authorize?" + urlencode(
+                {"client_id": settings.github_oauth_client_id, "redirect_uri": callback, "state": state, "scope": "read:user"}
+            )
+            response = RedirectResponse(url=url, status_code=303)
+            response.set_cookie(_RENNICK_STATE_COOKIE, nonce, max_age=600, httponly=True, secure=True, samesite="lax")
+            return response
         return HTMLResponse(f'''<!doctype html><title>Rennick intake upload</title>
 <main><h2>Rennick intake upload</h2><p>Select the exact ZIP and manifest.</p>
 <input id="source" type="file" accept=".zip"><br><input id="manifest" type="file" accept=".json"><br>
 <button id="upload">Upload and verify</button><pre id="status"></pre></main>
 <script>
-const t={ticket!r}, out=document.getElementById('status');
-async function put(path,file) {{ const r=await fetch(path+'?ticket='+encodeURIComponent(t),{{method:'POST',body:file}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
+const out=document.getElementById('status');
+async function put(path,file) {{ const r=await fetch(path,{{method:'POST',body:file}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
 document.getElementById('upload').onclick=async()=>{{try{{const s=document.getElementById('source').files[0],m=document.getElementById('manifest').files[0];if(!s||!m)throw new Error('Select both files.');out.textContent='Uploading ZIP…';await put('/intake/rennick/source',s);out.textContent='Uploading manifest and verifying…';out.textContent=JSON.stringify(await put('/intake/rennick/manifest',m),null,2)}}catch(e){{out.textContent='Upload failed: '+e.message}}}};
 </script>''')
 
+    @application.get("/intake/rennick/callback", include_in_schema=False)
+    async def rennick_oauth_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
+        state_payload = _verified_browser_value(state)
+        if not code or state_payload is None or not hmac.compare_digest(str(state_payload.get("nonce", "")), request.cookies.get(_RENNICK_STATE_COOKIE, "")):
+            return RedirectResponse(url="/intake/rennick", status_code=303)
+        settings = get_settings()
+        callback = f"{settings.gateway_public_url.rstrip('/')}/intake/rennick/callback"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token_response = await client.post("https://github.com/login/oauth/access_token", headers={"Accept": "application/json"}, data={"client_id": settings.github_oauth_client_id, "client_secret": settings.github_oauth_client_secret, "code": code, "redirect_uri": callback})
+            token = (token_response.json() if token_response.is_success else {}).get("access_token")
+            user_response = await client.get("https://api.github.com/user", headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"}) if token else None
+        login = (user_response.json() if user_response is not None and user_response.is_success else {}).get("login")
+        if login != settings.allowed_github_login:
+            return RedirectResponse(url="/intake/rennick", status_code=303)
+        response = RedirectResponse(url="/intake/rennick", status_code=303)
+        response.set_cookie(_RENNICK_SESSION_COOKIE, _sign_browser_value({"login": login, "exp": int(time.time()) + RENNICK_BROWSER_SESSION_SECONDS}), max_age=RENNICK_BROWSER_SESSION_SECONDS, httponly=True, secure=True, samesite="lax")
+        response.delete_cookie(_RENNICK_STATE_COOKIE)
+        return response
+
     @application.post("/intake/rennick/source", include_in_schema=False)
-    async def rennick_source(ticket: str, request: Request) -> JSONResponse:
+    async def rennick_source(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         source = await request.body()
         if not source or len(source) > RENNICK_SOURCE_BYTES_MAX:
             return JSONResponse({"ok": False, "error": "invalid_source_size"}, status_code=400)
-        if not _upload_sessions().store_source(ticket, source):
-            return JSONResponse({"ok": False, "error": "invalid_or_expired_ticket"}, status_code=403)
+        application.state.rennick_source = source
         return JSONResponse({"ok": True, "source_received": True})
 
     @application.post("/intake/rennick/manifest", include_in_schema=False)
-    async def rennick_manifest(ticket: str, request: Request) -> JSONResponse:
+    async def rennick_manifest(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         manifest = await request.body()
         if not manifest or len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
             return JSONResponse({"ok": False, "error": "invalid_manifest_size"}, status_code=400)
-        source = _upload_sessions().take_source(ticket)
+        source = getattr(application.state, "rennick_source", None)
+        application.state.rennick_source = None
         if source is None:
-            return JSONResponse({"ok": False, "error": "source_missing_or_ticket_expired"}, status_code=400)
+            return JSONResponse({"ok": False, "error": "source_missing"}, status_code=400)
         result = await _forward_rennick_pair(source, manifest)
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
