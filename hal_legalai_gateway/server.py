@@ -306,7 +306,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             expires_at = int(time.time()) + 600
             state = _sign_browser_value({"nonce": nonce, "exp": expires_at})
             settings = get_settings()
-            callback = f"{settings.gateway_public_url.rstrip('/')}/intake/rennick/callback"
+            # Reuse the callback already registered with GitHub for FastMCP.
+            # A middleware below handles only browser-upload sessions; all MCP
+            # OAuth callbacks continue to the FastMCP route unchanged.
+            callback = f"{settings.gateway_public_url.rstrip('/')}/auth/callback"
             url = "https://github.com/login/oauth/authorize?" + urlencode(
                 {"client_id": settings.github_oauth_client_id, "redirect_uri": callback, "state": state, "scope": "read:user"}
             )
@@ -323,13 +326,12 @@ async function put(path,file) {{ const r=await fetch(path,{{method:'POST',body:f
 document.getElementById('upload').onclick=async()=>{{try{{const s=document.getElementById('source').files[0],m=document.getElementById('manifest').files[0];if(!s||!m)throw new Error('Select both files.');out.textContent='Uploading ZIP…';await put('/intake/rennick/source',s);out.textContent='Uploading manifest and verifying…';out.textContent=JSON.stringify(await put('/intake/rennick/manifest',m),null,2)}}catch(e){{out.textContent='Upload failed: '+e.message}}}};
 </script>''')
 
-    @application.get("/intake/rennick/callback", include_in_schema=False)
     async def rennick_oauth_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
         state_payload = _verified_browser_value(state)
         if not code or state_payload is None or not hmac.compare_digest(str(state_payload.get("nonce", "")), request.cookies.get(_RENNICK_STATE_COOKIE, "")):
             return RedirectResponse(url="/intake/rennick", status_code=303)
         settings = get_settings()
-        callback = f"{settings.gateway_public_url.rstrip('/')}/intake/rennick/callback"
+        callback = f"{settings.gateway_public_url.rstrip('/')}/auth/callback"
         async with httpx.AsyncClient(timeout=15.0) as client:
             token_response = await client.post("https://github.com/login/oauth/access_token", headers={"Accept": "application/json"}, data={"client_id": settings.github_oauth_client_id, "client_secret": settings.github_oauth_client_secret, "code": code, "redirect_uri": callback})
             token = (token_response.json() if token_response.is_success else {}).get("access_token")
@@ -341,6 +343,26 @@ document.getElementById('upload').onclick=async()=>{{try{{const s=document.getEl
         response.set_cookie(_RENNICK_SESSION_COOKIE, _sign_browser_value({"login": login, "exp": int(time.time()) + RENNICK_BROWSER_SESSION_SECONDS}), max_age=RENNICK_BROWSER_SESSION_SECONDS, httponly=True, secure=True, samesite="lax")
         response.delete_cookie(_RENNICK_STATE_COOKIE)
         return response
+
+    @application.middleware("http")
+    async def rennick_browser_callback(request: Request, call_next: Any) -> Any:
+        """Handle only the browser uploader's OAuth callback.
+
+        The existing GitHub OAuth App has ``/auth/callback`` registered for
+        FastMCP. Requests without our short-lived browser state cookie pass
+        straight through to FastMCP, preserving ChatGPT's OAuth flow.
+        """
+        if (
+            request.method == "GET"
+            and request.url.path == "/auth/callback"
+            and request.cookies.get(_RENNICK_STATE_COOKIE)
+        ):
+            return await rennick_oauth_callback(
+                request,
+                code=request.query_params.get("code", ""),
+                state=request.query_params.get("state", ""),
+            )
+        return await call_next(request)
 
     @application.post("/intake/rennick/source", include_in_schema=False)
     async def rennick_source(request: Request) -> JSONResponse:
