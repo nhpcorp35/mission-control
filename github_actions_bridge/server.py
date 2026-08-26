@@ -1487,7 +1487,7 @@ async def upload_rennick_docket_supplement_binary(request: Request) -> JSONRespo
     if not expected or not provided or not hmac.compare_digest(provided, expected):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     try:
-        archive_size = int(request.headers.get("X-Rennick-Supplement-Archive-Size", "0"))
+        archive_size = int(request.query_params.get("archive_size") or request.headers.get("X-Rennick-Supplement-Archive-Size", "0"))
     except ValueError:
         archive_size = 0
     body = await request.body()
