@@ -871,6 +871,24 @@ def register_forwarding_tools(
         )
 
     @mcp.tool(
+        name="storage.upload_rennick_case_intake",
+        description=by_name["storage.upload_rennick_case_intake"].description,
+    )
+    async def storage_upload_rennick_case_intake(
+        source_bundle_base64: str,
+        manifest_base64: str,
+    ) -> dict[str, Any]:
+        """Forward the bounded Rennick B2 intake upload without altering payloads."""
+        return await _forward(
+            "storage.upload_rennick_case_intake",
+            {
+                "source_bundle_base64": source_bundle_base64,
+                "manifest_base64": manifest_base64,
+            },
+            read_timeout_seconds=300.0,
+        )
+
+    @mcp.tool(
         name="storage.get_case00_question",
         description=by_name["storage.get_case00_question"].description,
     )
