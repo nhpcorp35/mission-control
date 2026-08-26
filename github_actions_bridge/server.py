@@ -1300,7 +1300,13 @@ async def verify_case_intake(
         expected_sha256=manifest_sha256,
         max_size=MAX_MANIFEST_BYTES,
     )
-    return {"ok": True, "verified": True, "case_id": case_id, "objects": [source, manifest]}
+    verified = bool(source.get("verified")) and bool(manifest.get("verified"))
+    return {
+        "ok": verified,
+        "verified": verified,
+        "case_id": case_id,
+        "objects": [source, manifest],
+    }
 
 
 @mcp.tool()
