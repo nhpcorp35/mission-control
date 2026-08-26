@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import base64
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
@@ -25,6 +26,8 @@ from hal_legalai_gateway.mcp_server import (
     create_mcp_server,
     list_registered_tool_names,
 )
+from hal_legalai_gateway.forwarding import ToolBinding, forward_mcp_tool
+from hal_legalai_gateway.intake_upload import IntakeUploadSessions
 from hal_legalai_gateway.request_context import (
     RequestIdMiddleware,
     configure_logging,
@@ -61,6 +64,10 @@ _mcp: FastMCP | None = None
 _registered_tools: list[str] = []
 _mcp_http_app: Any = None
 _auth_override: AuthProvider | None = None
+_intake_upload_sessions: IntakeUploadSessions | None = None
+
+RENNICK_SOURCE_BYTES_MAX = 50 * 1024 * 1024
+RENNICK_MANIFEST_BYTES_MAX = 128 * 1024
 
 
 class _GatewayAuthBackend(AuthenticationBackend):
@@ -94,12 +101,45 @@ def get_mcp() -> FastMCP | None:
 
 def reset_settings_for_tests() -> None:
     """Clear cached settings / MCP state (test helper)."""
-    global _settings, _mcp, _registered_tools, _mcp_http_app, _auth_override
+    global _settings, _mcp, _registered_tools, _mcp_http_app, _auth_override, _intake_upload_sessions
     _settings = None
     _mcp = None
     _registered_tools = []
     _mcp_http_app = None
     _auth_override = None
+    _intake_upload_sessions = None
+
+
+def _upload_sessions() -> IntakeUploadSessions:
+    global _intake_upload_sessions
+    if _intake_upload_sessions is None:
+        _intake_upload_sessions = IntakeUploadSessions(get_settings().jwt_signing_key)
+    return _intake_upload_sessions
+
+
+async def _forward_rennick_pair(source: bytes, manifest: bytes) -> dict[str, Any]:
+    """Forward browser-uploaded bytes only on the private Gateway → Bridge hop."""
+    settings = get_settings()
+    binding = ToolBinding(
+        gateway_tool="storage.upload_rennick_case_intake",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="upload_rennick_case_intake",
+    )
+    downstream = settings.downstream_by_key("storage")
+    return await forward_mcp_tool(
+        binding=binding,
+        arguments={
+            "source_bundle_base64": base64.b64encode(source).decode("ascii"),
+            "manifest_base64": base64.b64encode(manifest).decode("ascii"),
+        },
+        base_url=downstream.base_url,
+        authorization=settings.bridge_authorization,
+        connect_timeout_seconds=settings.connect_timeout_seconds,
+        read_timeout_seconds=max(settings.read_timeout_seconds, 300.0),
+        mcp_path=settings.mcp_path_for_service("storage"),
+        extra_secrets=settings.secret_values_for_redaction(),
+    )
 
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
@@ -219,6 +259,40 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             url=f"{base}/.well-known/oauth-authorization-server",
             status_code=307,
         )
+
+    @application.get("/intake/rennick/upload", include_in_schema=False)
+    async def rennick_upload_page(ticket: str) -> HTMLResponse:
+        # The ticket is validated by both binary POST routes; never expose any
+        # source content in this page or in error responses.
+        return HTMLResponse(f'''<!doctype html><title>Rennick intake upload</title>
+<main><h2>Rennick intake upload</h2><p>Select the exact ZIP and manifest.</p>
+<input id="source" type="file" accept=".zip"><br><input id="manifest" type="file" accept=".json"><br>
+<button id="upload">Upload and verify</button><pre id="status"></pre></main>
+<script>
+const t={ticket!r}, out=document.getElementById('status');
+async function put(path,file) {{ const r=await fetch(path+'?ticket='+encodeURIComponent(t),{{method:'POST',body:file}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
+document.getElementById('upload').onclick=async()=>{{try{{const s=document.getElementById('source').files[0],m=document.getElementById('manifest').files[0];if(!s||!m)throw new Error('Select both files.');out.textContent='Uploading ZIP…';await put('/intake/rennick/source',s);out.textContent='Uploading manifest and verifying…';out.textContent=JSON.stringify(await put('/intake/rennick/manifest',m),null,2)}}catch(e){{out.textContent='Upload failed: '+e.message}}}};
+</script>''')
+
+    @application.post("/intake/rennick/source", include_in_schema=False)
+    async def rennick_source(ticket: str, request: Request) -> JSONResponse:
+        source = await request.body()
+        if not source or len(source) > RENNICK_SOURCE_BYTES_MAX:
+            return JSONResponse({"ok": False, "error": "invalid_source_size"}, status_code=400)
+        if not _upload_sessions().store_source(ticket, source):
+            return JSONResponse({"ok": False, "error": "invalid_or_expired_ticket"}, status_code=403)
+        return JSONResponse({"ok": True, "source_received": True})
+
+    @application.post("/intake/rennick/manifest", include_in_schema=False)
+    async def rennick_manifest(ticket: str, request: Request) -> JSONResponse:
+        manifest = await request.body()
+        if not manifest or len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
+            return JSONResponse({"ok": False, "error": "invalid_manifest_size"}, status_code=400)
+        source = _upload_sessions().take_source(ticket)
+        if source is None:
+            return JSONResponse({"ok": False, "error": "source_missing_or_ticket_expired"}, status_code=400)
+        result = await _forward_rennick_pair(source, manifest)
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.get("/registry")
     async def registry_endpoint() -> dict[str, Any]:

@@ -53,6 +53,7 @@ from hal_legalai_gateway.health import (
     aggregate_health,
     probe_downstream,
 )
+from hal_legalai_gateway.intake_upload import IntakeUploadSessions
 from hal_legalai_gateway.mcp_server import (
     CANONICAL_GATEWAY_DISPLAY_NAME,
     CANONICAL_GATEWAY_IDENTITY_VERSION,
@@ -108,6 +109,25 @@ FORBIDDEN_WORKFLOW_TOOLS = (
     "workflow.wait",
     "workflow.history",
 )
+
+
+class RennickIntakeUploadSessionTests(unittest.TestCase):
+    def test_ticket_is_bounded_and_source_is_single_use(self) -> None:
+        clock = [1_000.0]
+        sessions = IntakeUploadSessions("test-signing-key", now=lambda: clock[0])
+        ticket = sessions.issue()
+
+        self.assertTrue(sessions.store_source(ticket, b"zip-bytes"))
+        self.assertEqual(sessions.take_source(ticket), b"zip-bytes")
+        self.assertIsNone(sessions.take_source(ticket))
+
+    def test_expired_or_tampered_ticket_is_rejected(self) -> None:
+        clock = [1_000.0]
+        sessions = IntakeUploadSessions("test-signing-key", now=lambda: clock[0])
+        ticket = sessions.issue()
+        self.assertFalse(sessions.store_source(ticket + "x", b"zip"))
+        clock[0] += 901
+        self.assertFalse(sessions.store_source(ticket, b"zip"))
 
 REQUIRED_SECRETS = {
     "GITHUB_OAUTH_CLIENT_ID": "test-gateway-client-id",
