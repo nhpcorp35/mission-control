@@ -1451,6 +1451,8 @@ def _ensure_rennick_direct_upload_cors(client: Any) -> None:
     already permits this origin's ``PUT`` with ``Content-Type``.
     """
     raw_origin = (os.environ.get(RENNICK_DIRECT_UPLOAD_ORIGIN_ENV) or "").strip().rstrip("/")
+    if raw_origin and "://" not in raw_origin:
+        raw_origin = f"https://{raw_origin}"
     parsed = urlparse(raw_origin)
     if parsed.scheme not in {"https", "http"} or not parsed.netloc or parsed.path not in {"", "/"}:
         raise RuntimeError(f"{RENNICK_DIRECT_UPLOAD_ORIGIN_ENV} must be an absolute origin")
