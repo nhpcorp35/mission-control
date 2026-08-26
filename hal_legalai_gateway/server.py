@@ -202,6 +202,26 @@ async def _forward_rennick_supplement_pair(archive: bytes, manifest: bytes) -> d
         result = {"ok": False, "error": "bridge_supplement_response_invalid"}
     return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_supplement_failed")}
 
+
+async def _forward_rennick_direct_supplement(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    downstream = settings.downstream_by_key("storage")
+    headers: dict[str, str] = {}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=settings.connect_timeout_seconds)) as client:
+        response = await client.post(
+            f"{downstream.base_url.rstrip('/')}/intake/rennick/supplement/direct/{action}",
+            headers=headers,
+            json=payload,
+        )
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"ok": False, "error": "bridge_direct_upload_response_invalid"}
+    return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_direct_upload_failed")}
+
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
     application.router.routes = [
@@ -347,7 +367,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
 <script>
 const out=document.getElementById('status');
 async function upload(source,manifest) {{ const r=await fetch('/intake/rennick/upload',{{method:'POST',headers:{{'X-Rennick-Source-Size':String(source.size)}},body:new Blob([source,manifest])}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
-async function uploadSupplement(archive,manifest) {{ const r=await fetch('/intake/rennick/supplement?archive_size='+encodeURIComponent(archive.size),{{method:'POST',headers:{{'X-Rennick-Supplement-Archive-Size':String(archive.size)}},body:new Blob([archive,manifest])}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
+async function uploadSupplement(archive,manifest) {{ const plan=await (await fetch('/intake/rennick/supplement/direct/prepare',{{method:'POST'}})).json(); if(!plan.ok)throw new Error(plan.error); for(const item of plan.uploads){{const file=item.name==='archive'?archive:manifest; const r=await fetch(item.url,{{method:'PUT',headers:{{'Content-Type':item.content_type}},body:file}});if(!r.ok)throw new Error('B2 upload failed')}} const r=await fetch('/intake/rennick/supplement/direct/complete',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{upload_id:plan.upload_id}})}});if(!r.ok)throw new Error(await r.text());return r.json(); }}
 document.getElementById('upload').onclick=async()=>{{try{{const s=document.getElementById('source').files[0],m=document.getElementById('manifest').files[0];if(!s||!m)throw new Error('Select both files.');out.textContent='Uploading and verifying…';out.textContent=JSON.stringify(await upload(s,m),null,2)}}catch(e){{out.textContent='Upload failed: '+e.message}}}};
 document.getElementById('upload-supplement').onclick=async()=>{{try{{const a=document.getElementById('supplement-archive').files[0],m=document.getElementById('supplement-manifest').files[0];if(!a||!m)throw new Error('Select both supplement files.');out.textContent='Uploading supplement and verifying…';out.textContent=JSON.stringify(await uploadSupplement(a,m),null,2)}}catch(e){{out.textContent='Supplement upload failed: '+e.message}}}};
 </script>''')
@@ -423,6 +443,24 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const a=doc
         if len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
             return JSONResponse({"ok": False, "error": "invalid_supplement_manifest_size"}, status_code=400)
         result = await _forward_rennick_supplement_pair(archive, manifest)
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.post("/intake/rennick/supplement/direct/prepare", include_in_schema=False)
+    async def rennick_direct_supplement_prepare(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        result = await _forward_rennick_direct_supplement("prepare")
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.post("/intake/rennick/supplement/direct/complete", include_in_schema=False)
+    async def rennick_direct_supplement_complete(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except ValueError:
+            return JSONResponse({"ok": False, "error": "invalid_completion_payload"}, status_code=400)
+        result = await _forward_rennick_direct_supplement("complete", payload)
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.get("/registry")

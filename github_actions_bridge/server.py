@@ -1324,6 +1324,9 @@ RENNICK_SUPPLEMENT_FILENAMES = frozenset(
         "613561_2026_MICHAEL_DESOUSA_et_al_v_GEORGE_RENNICK_et_al_LETTER___CORRESPOND_19.pdf",
     }
 )
+RENNICK_DIRECT_UPLOAD_TTL_SECONDS = 300
+RENNICK_DIRECT_UPLOAD_PREFIX = f"cases/{RENNICK_CASE_ID}/intake/.pending/"
+RENNICK_DIRECT_UPLOAD_ORIGIN_ENV = "HAL_LEGALAI_GATEWAY_URL"
 
 
 def _require_absent_intake_object(client: Any, object_key: str) -> None:
@@ -1440,6 +1443,116 @@ def _upload_rennick_docket_supplement(archive: bytes, manifest: bytes) -> dict[s
     return {"ok": True, "uploaded": True, "case_id": RENNICK_CASE_ID, "supplement_id": RENNICK_SUPPLEMENT_ID, "objects": objects}
 
 
+def _ensure_rennick_direct_upload_cors(client: Any) -> None:
+    """Allow this Gateway origin to PUT only the presigned pending objects.
+
+    B2 evaluates CORS before validating the presigned URL. Preserve all existing
+    bucket rules and add one narrowly-scoped rule only when no existing rule
+    already permits this origin's ``PUT`` with ``Content-Type``.
+    """
+    raw_origin = (os.environ.get(RENNICK_DIRECT_UPLOAD_ORIGIN_ENV) or "").strip().rstrip("/")
+    parsed = urlparse(raw_origin)
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc or parsed.path not in {"", "/"}:
+        raise RuntimeError(f"{RENNICK_DIRECT_UPLOAD_ORIGIN_ENV} must be an absolute origin")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        rules = list((client.get_bucket_cors(Bucket=B2_BUCKET).get("CORSRules") or []))
+    except ClientError as exc:
+        code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
+        if code not in {"NoSuchCORSConfiguration", "404", "NotFound"}:
+            raise
+        rules = []
+    for rule in rules:
+        origins = set(rule.get("AllowedOrigins") or [])
+        methods = {str(method).upper() for method in (rule.get("AllowedMethods") or [])}
+        headers = {str(header).lower() for header in (rule.get("AllowedHeaders") or [])}
+        if origin in origins and "PUT" in methods and ("*" in headers or "content-type" in headers):
+            return
+    rules.append(
+        {
+            "AllowedOrigins": [origin],
+            "AllowedMethods": ["PUT"],
+            "AllowedHeaders": ["content-type"],
+            "MaxAgeSeconds": RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
+        }
+    )
+    client.put_bucket_cors(Bucket=B2_BUCKET, CORSConfiguration={"CORSRules": rules})
+
+
+def _prepare_rennick_direct_supplement_upload() -> dict[str, Any]:
+    """Create two short-lived, direct-to-B2 upload URLs for one supplement attempt.
+
+    Browser clients receive no B2 credentials and upload only to a unique pending
+    prefix. A later server-side completion step validates the two B2 objects and
+    promotes their exact bytes to the immutable canonical supplement keys.
+    """
+    client = _b2_client()
+    _ensure_rennick_direct_upload_cors(client)
+    upload_id = uuid.uuid4().hex
+    prefix = f"{RENNICK_DIRECT_UPLOAD_PREFIX}{RENNICK_SUPPLEMENT_ID}/{upload_id}/"
+    archive_key = prefix + RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
+    manifest_key = prefix + RENNICK_SUPPLEMENT_MANIFEST_FILENAME
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "expires_in_seconds": RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
+        "uploads": [
+            {
+                "name": "archive",
+                "object_key": archive_key,
+                "content_type": "application/zip",
+                "url": client.generate_presigned_url(
+                    "put_object",
+                    Params={"Bucket": B2_BUCKET, "Key": archive_key, "ContentType": "application/zip"},
+                    ExpiresIn=RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
+                    HttpMethod="PUT",
+                ),
+            },
+            {
+                "name": "manifest",
+                "object_key": manifest_key,
+                "content_type": "application/json",
+                "url": client.generate_presigned_url(
+                    "put_object",
+                    Params={"Bucket": B2_BUCKET, "Key": manifest_key, "ContentType": "application/json"},
+                    ExpiresIn=RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
+                    HttpMethod="PUT",
+                ),
+            },
+        ],
+    }
+
+
+def _complete_rennick_direct_supplement_upload(upload_id: str) -> dict[str, Any]:
+    """Validate pending direct uploads, then promote exact bytes immutably."""
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        raise ValueError("invalid direct upload id")
+    prefix = f"{RENNICK_DIRECT_UPLOAD_PREFIX}{RENNICK_SUPPLEMENT_ID}/{upload_id}/"
+    archive_key = prefix + RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
+    manifest_key = prefix + RENNICK_SUPPLEMENT_MANIFEST_FILENAME
+    client = _b2_client()
+    archive_head = client.head_object(Bucket=B2_BUCKET, Key=archive_key)
+    manifest_head = client.head_object(Bucket=B2_BUCKET, Key=manifest_key)
+    if not 0 < archive_head.get("ContentLength", 0) <= MAX_BUNDLE_BYTES:
+        raise ValueError("invalid pending supplement archive size")
+    if not 0 < manifest_head.get("ContentLength", 0) <= MAX_MANIFEST_BYTES:
+        raise ValueError("invalid pending supplement manifest size")
+    archive = client.get_object(Bucket=B2_BUCKET, Key=archive_key)["Body"].read()
+    manifest = client.get_object(Bucket=B2_BUCKET, Key=manifest_key)["Body"].read()
+    if len(archive) != archive_head["ContentLength"] or len(manifest) != manifest_head["ContentLength"]:
+        raise ValueError("pending supplement object read size mismatch")
+    result = _upload_rennick_docket_supplement(archive, manifest)
+    cleanup_error = None
+    for key in (archive_key, manifest_key):
+        try:
+            client.delete_object(Bucket=B2_BUCKET, Key=key)
+        except Exception as exc:  # A completed immutable upload must not be reported as failed because staging cleanup missed.
+            cleanup_error = str(exc)
+    if cleanup_error:
+        result["staging_cleanup_warning"] = cleanup_error
+    return result
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -1499,6 +1612,28 @@ async def upload_rennick_docket_supplement_binary(request: Request) -> JSONRespo
     try:
         return JSONResponse(_upload_rennick_docket_supplement(archive, manifest))
     except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/rennick/supplement/direct/prepare", methods=["POST"])
+async def prepare_rennick_direct_supplement_upload(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    return JSONResponse(_prepare_rennick_direct_supplement_upload())
+
+
+@mcp.custom_route("/intake/rennick/supplement/direct/complete", methods=["POST"])
+async def complete_rennick_direct_supplement_upload(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(_complete_rennick_direct_supplement_upload(str(payload.get("upload_id", ""))))
+    except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
 
