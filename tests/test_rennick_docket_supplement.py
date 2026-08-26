@@ -135,3 +135,36 @@ class RennickDocketSupplementTests(unittest.TestCase):
         self.assertNotIn(manifest_key, stored)
         self.assertTrue(all("/.pending/" not in key for key in stored))
         self.assertEqual(len(result["objects"]), 2)
+
+    def test_direct_completion_cleans_pending_objects_when_canonical_keys_already_exist(self) -> None:
+        server = _bridge_server()
+        upload_id = "b" * 32
+        prefix = f"{server.RENNICK_DIRECT_UPLOAD_PREFIX}{server.RENNICK_SUPPLEMENT_ID}/{upload_id}/"
+        archive_payload, manifest_payload = self._supplement_pair(server)
+        pending_archive = prefix + server.RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
+        pending_manifest = prefix + server.RENNICK_SUPPLEMENT_MANIFEST_FILENAME
+        canonical_archive = f"cases/{server.RENNICK_CASE_ID}/intake/supplements/{server.RENNICK_SUPPLEMENT_ID}/{server.RENNICK_SUPPLEMENT_ARCHIVE_FILENAME}"
+        stored = {
+            pending_archive: {"payload": archive_payload, "metadata": {}},
+            pending_manifest: {"payload": manifest_payload, "metadata": {}},
+            canonical_archive: {"payload": b"already canonical", "metadata": {}},
+        }
+
+        def head_object(*, Bucket: str, Key: str) -> dict[str, object]:
+            del Bucket
+            record = stored.get(Key)
+            if record is None:
+                raise server.ClientError({"Error": {"Code": "404"}}, "HeadObject")
+            return {"ContentLength": len(record["payload"]), "ETag": '"test-etag"', "Metadata": record["metadata"]}
+
+        client = mock.Mock()
+        client.head_object.side_effect = head_object
+        client.get_object.side_effect = lambda *, Bucket, Key: {"Body": io.BytesIO(stored[Key]["payload"])}
+        client.delete_object.side_effect = lambda *, Bucket, Key: stored.pop(Key, None)
+        with mock.patch.object(server, "_b2_client", return_value=client):
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
+                server._complete_rennick_direct_supplement_upload(upload_id)
+
+        self.assertNotIn(pending_archive, stored)
+        self.assertNotIn(pending_manifest, stored)
+        self.assertIn(canonical_archive, stored)
