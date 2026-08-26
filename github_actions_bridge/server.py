@@ -1461,7 +1461,7 @@ def _ensure_rennick_direct_upload_cors(client: Any) -> None:
         rules = list((client.get_bucket_cors(Bucket=B2_BUCKET).get("CORSRules") or []))
     except ClientError as exc:
         code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
-        if code not in {"NoSuchCORSConfiguration", "404", "NotFound"}:
+        if code not in {"NoSuchCORSConfiguration", "NoSuchCorsConfiguration", "404", "NotFound"}:
             raise
         rules = []
     for rule in rules:
