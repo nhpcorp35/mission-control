@@ -1537,19 +1537,26 @@ def _complete_rennick_direct_supplement_upload(upload_id: str) -> dict[str, Any]
         raise ValueError("invalid pending supplement archive size")
     if not 0 < manifest_head.get("ContentLength", 0) <= MAX_MANIFEST_BYTES:
         raise ValueError("invalid pending supplement manifest size")
-    archive = client.get_object(Bucket=B2_BUCKET, Key=archive_key)["Body"].read()
-    manifest = client.get_object(Bucket=B2_BUCKET, Key=manifest_key)["Body"].read()
-    if len(archive) != archive_head["ContentLength"] or len(manifest) != manifest_head["ContentLength"]:
-        raise ValueError("pending supplement object read size mismatch")
-    result = _upload_rennick_docket_supplement(archive, manifest)
+    result: dict[str, Any] | None = None
     cleanup_error = None
-    for key in (archive_key, manifest_key):
-        try:
-            client.delete_object(Bucket=B2_BUCKET, Key=key)
-        except Exception as exc:  # A completed immutable upload must not be reported as failed because staging cleanup missed.
-            cleanup_error = str(exc)
-    if cleanup_error:
+    try:
+        archive = client.get_object(Bucket=B2_BUCKET, Key=archive_key)["Body"].read()
+        manifest = client.get_object(Bucket=B2_BUCKET, Key=manifest_key)["Body"].read()
+        if len(archive) != archive_head["ContentLength"] or len(manifest) != manifest_head["ContentLength"]:
+            raise ValueError("pending supplement object read size mismatch")
+        result = _upload_rennick_docket_supplement(archive, manifest)
+    finally:
+        # Failed validation or an immutable-key conflict must not strand legal
+        # document bytes in the pending prefix.
+        for key in (archive_key, manifest_key):
+            try:
+                client.delete_object(Bucket=B2_BUCKET, Key=key)
+            except Exception as exc:
+                cleanup_error = str(exc)
+    if cleanup_error and result is not None:
         result["staging_cleanup_warning"] = cleanup_error
+    if result is None:
+        raise RuntimeError("direct supplement completion did not produce a result")
     return result
 
 
