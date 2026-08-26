@@ -43,7 +43,27 @@ def verify_object(
     if not isinstance(expected_size, int) or expected_size < 1 or expected_size > max_size:
         raise ValueError("expected object size is outside the allowed range")
     validate_digest(expected_sha256, "expected_sha256")
-    head = client.head_object(Bucket=bucket, Key=object_key)
+    try:
+        head = client.head_object(Bucket=bucket, Key=object_key)
+    except Exception as exc:
+        error = getattr(exc, "response", {}) or {}
+        code = str((error.get("Error") or {}).get("Code", ""))
+        if code not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+        prefix = object_key.rsplit("/", 1)[0] + "/"
+        listing = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=20)
+        observed = [
+            {"object_key": item.get("Key"), "size": item.get("Size")}
+            for item in listing.get("Contents", [])
+        ]
+        return {
+            "object_key": object_key,
+            "verified": False,
+            "error": "object_not_found",
+            "observed_prefix": prefix,
+            "observed_objects": observed,
+            "truncated": bool(listing.get("IsTruncated")),
+        }
     if head.get("ContentLength") != expected_size:
         raise ValueError("B2 object size mismatch")
     response = client.get_object(Bucket=bucket, Key=object_key)
@@ -65,6 +85,7 @@ def verify_object(
         raise ValueError("B2 object SHA-256 mismatch")
     return {
         "object_key": object_key,
+        "verified": True,
         "size": read_size,
         "sha256": expected_sha256,
         "etag": (head.get("ETag") or "").strip('"'),
