@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
@@ -203,6 +203,22 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             },
             "registered_tools": list(_registered_tools),
         }
+
+    @application.get("/.well-known/openid-configuration", include_in_schema=False)
+    async def openid_configuration() -> RedirectResponse:
+        """Alias OIDC discovery to the OAuth authorization-server metadata.
+
+        ChatGPT's custom-app scanner probes the OIDC well-known path before
+        starting OAuth. The Gateway is an OAuth authorization server rather
+        than an OpenID Connect identity provider, but its existing OAuth
+        metadata has the required authorization, token, and registration
+        endpoints.
+        """
+        base = get_settings().gateway_public_url.rstrip("/")
+        return RedirectResponse(
+            url=f"{base}/.well-known/oauth-authorization-server",
+            status_code=307,
+        )
 
     @application.get("/registry")
     async def registry_endpoint() -> dict[str, Any]:
