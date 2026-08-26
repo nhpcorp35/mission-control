@@ -889,28 +889,6 @@ def register_forwarding_tools(
         )
 
     @mcp.tool(
-        name="storage.open_rennick_intake_upload",
-        description=(
-            "Create one short-lived browser upload link for the exact Rennick ZIP "
-            "and manifest. Use this instead of passing attachment bytes or Base64."
-        ),
-    )
-    async def storage_open_rennick_intake_upload() -> dict[str, Any]:
-        """Return a signed browser-upload link without handling evidence bytes."""
-        # Import lazily to avoid a module cycle during FastMCP application setup.
-        from hal_legalai_gateway.server import _upload_sessions
-
-        ticket = _upload_sessions().issue()
-        return {
-            "ok": True,
-            "upload_url": (
-                f"{settings.gateway_public_url.rstrip('/')}/intake/rennick/upload?ticket={ticket}"
-            ),
-            "expires_in_seconds": 900,
-            "instructions": "Open the link, select the exact ZIP and JSON manifest, then upload.",
-        }
-
-    @mcp.tool(
         name="storage.get_case00_question",
         description=by_name["storage.get_case00_question"].description,
     )
