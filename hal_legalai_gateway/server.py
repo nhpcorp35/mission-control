@@ -299,7 +299,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             status_code=307,
         )
 
-    @application.get("/intake/rennick", include_in_schema=False)
+    @application.get("/intake/rennick", include_in_schema=False, response_model=None)
     async def rennick_upload_page(request: Request) -> HTMLResponse | RedirectResponse:
         if _browser_login(request) is None:
             nonce = secrets.token_urlsafe(24)
