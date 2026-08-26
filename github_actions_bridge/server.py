@@ -1480,7 +1480,7 @@ def _ensure_rennick_direct_upload_cors(client: Any) -> None:
 
 
 def _prepare_rennick_direct_supplement_upload() -> dict[str, Any]:
-    """Create two short-lived, direct-to-B2 upload URLs for one supplement attempt.
+    """Create direct-to-B2 PDF upload URLs for the fixed supplement.
 
     Browser clients receive no B2 credentials and upload only to a unique pending
     prefix. A later server-side completion step validates the two B2 objects and
@@ -1490,36 +1490,27 @@ def _prepare_rennick_direct_supplement_upload() -> dict[str, Any]:
     _ensure_rennick_direct_upload_cors(client)
     upload_id = uuid.uuid4().hex
     prefix = f"{RENNICK_DIRECT_UPLOAD_PREFIX}{RENNICK_SUPPLEMENT_ID}/{upload_id}/"
-    archive_key = prefix + RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
-    manifest_key = prefix + RENNICK_SUPPLEMENT_MANIFEST_FILENAME
+    uploads = []
+    for filename in sorted(RENNICK_SUPPLEMENT_FILENAMES):
+        object_key = prefix + "documents/" + filename
+        uploads.append(
+            {
+                "name": filename,
+                "object_key": object_key,
+                "content_type": "application/pdf",
+                "url": client.generate_presigned_url(
+                    "put_object",
+                    Params={"Bucket": B2_BUCKET, "Key": object_key, "ContentType": "application/pdf"},
+                    ExpiresIn=RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
+                    HttpMethod="PUT",
+                ),
+            }
+        )
     return {
         "ok": True,
         "upload_id": upload_id,
         "expires_in_seconds": RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
-        "uploads": [
-            {
-                "name": "archive",
-                "object_key": archive_key,
-                "content_type": "application/zip",
-                "url": client.generate_presigned_url(
-                    "put_object",
-                    Params={"Bucket": B2_BUCKET, "Key": archive_key, "ContentType": "application/zip"},
-                    ExpiresIn=RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
-                    HttpMethod="PUT",
-                ),
-            },
-            {
-                "name": "manifest",
-                "object_key": manifest_key,
-                "content_type": "application/json",
-                "url": client.generate_presigned_url(
-                    "put_object",
-                    Params={"Bucket": B2_BUCKET, "Key": manifest_key, "ContentType": "application/json"},
-                    ExpiresIn=RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
-                    HttpMethod="PUT",
-                ),
-            },
-        ],
+        "uploads": uploads,
     }
 
 
@@ -1528,27 +1519,28 @@ def _complete_rennick_direct_supplement_upload(upload_id: str) -> dict[str, Any]
     if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
         raise ValueError("invalid direct upload id")
     prefix = f"{RENNICK_DIRECT_UPLOAD_PREFIX}{RENNICK_SUPPLEMENT_ID}/{upload_id}/"
-    archive_key = prefix + RENNICK_SUPPLEMENT_ARCHIVE_FILENAME
-    manifest_key = prefix + RENNICK_SUPPLEMENT_MANIFEST_FILENAME
+    pending_keys = {name: prefix + "documents/" + name for name in RENNICK_SUPPLEMENT_FILENAMES}
     client = _b2_client()
-    archive_head = client.head_object(Bucket=B2_BUCKET, Key=archive_key)
-    manifest_head = client.head_object(Bucket=B2_BUCKET, Key=manifest_key)
-    if not 0 < archive_head.get("ContentLength", 0) <= MAX_BUNDLE_BYTES:
-        raise ValueError("invalid pending supplement archive size")
-    if not 0 < manifest_head.get("ContentLength", 0) <= MAX_MANIFEST_BYTES:
-        raise ValueError("invalid pending supplement manifest size")
+    heads = {name: client.head_object(Bucket=B2_BUCKET, Key=key) for name, key in pending_keys.items()}
+    if any(not 0 < head.get("ContentLength", 0) <= MAX_BUNDLE_BYTES for head in heads.values()):
+        raise ValueError("invalid pending supplement document size")
     result: dict[str, Any] | None = None
     cleanup_error = None
     try:
-        archive = client.get_object(Bucket=B2_BUCKET, Key=archive_key)["Body"].read()
-        manifest = client.get_object(Bucket=B2_BUCKET, Key=manifest_key)["Body"].read()
-        if len(archive) != archive_head["ContentLength"] or len(manifest) != manifest_head["ContentLength"]:
-            raise ValueError("pending supplement object read size mismatch")
+        documents = {name: client.get_object(Bucket=B2_BUCKET, Key=key)["Body"].read() for name, key in pending_keys.items()}
+        if any(len(documents[name]) != heads[name]["ContentLength"] for name in documents):
+            raise ValueError("pending supplement document read size mismatch")
+        archive_stream = io.BytesIO()
+        with zipfile.ZipFile(archive_stream, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
+            for name in sorted(documents):
+                archive_file.writestr(name, documents[name])
+        archive = archive_stream.getvalue()
+        manifest = json.dumps({"case_id": RENNICK_CASE_ID, "supplement_id": RENNICK_SUPPLEMENT_ID, "documents": [{"filename": name, "size": len(documents[name]), "sha256": hashlib.sha256(documents[name]).hexdigest()} for name in sorted(documents)]}, sort_keys=True).encode()
         result = _upload_rennick_docket_supplement(archive, manifest)
     finally:
         # Failed validation or an immutable-key conflict must not strand legal
         # document bytes in the pending prefix.
-        for key in (archive_key, manifest_key):
+        for key in pending_keys.values():
             try:
                 client.delete_object(Bucket=B2_BUCKET, Key=key)
             except Exception as exc:
