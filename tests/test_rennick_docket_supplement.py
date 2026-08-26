@@ -81,6 +81,7 @@ class RennickDocketSupplementTests(unittest.TestCase):
         server = _bridge_server()
         archive_payload, manifest_payload = self._supplement_pair(server)
         stored: dict[str, dict[str, object]] = {}
+        os.environ[server.RENNICK_DIRECT_UPLOAD_ORIGIN_ENV] = "https://hal-legalai-gateway-production.up.railway.app"
 
         def head_object(*, Bucket: str, Key: str) -> dict[str, object]:
             del Bucket
@@ -108,6 +109,7 @@ class RennickDocketSupplementTests(unittest.TestCase):
         client.put_object.side_effect = put_object
         client.get_object.side_effect = get_object
         client.delete_object.side_effect = delete_object
+        client.get_bucket_cors.return_value = {"CORSRules": []}
         with mock.patch.object(server, "_b2_client", return_value=client), mock.patch.object(server.uuid, "uuid4", return_value=mock.Mock(hex="a" * 32)):
             plan = server._prepare_rennick_direct_supplement_upload()
             self.assertEqual(len(plan["uploads"]), 2)
@@ -120,6 +122,15 @@ class RennickDocketSupplementTests(unittest.TestCase):
             result = server._complete_rennick_direct_supplement_upload(plan["upload_id"])
 
         self.assertTrue(result["ok"])
+        client.put_bucket_cors.assert_called_once_with(
+            Bucket=server.B2_BUCKET,
+            CORSConfiguration={"CORSRules": [{
+                "AllowedOrigins": ["https://hal-legalai-gateway-production.up.railway.app"],
+                "AllowedMethods": ["PUT"],
+                "AllowedHeaders": ["content-type"],
+                "MaxAgeSeconds": server.RENNICK_DIRECT_UPLOAD_TTL_SECONDS,
+            }]},
+        )
         self.assertNotIn(archive_key, stored)
         self.assertNotIn(manifest_key, stored)
         self.assertTrue(all("/.pending/" not in key for key in stored))
