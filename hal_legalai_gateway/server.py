@@ -8,6 +8,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -447,7 +448,7 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         if login != settings.allowed_github_login:
             return RedirectResponse(url="/intake/rennick", status_code=303)
         destination = str(state_payload.get("return_to") or "/intake/rennick")
-        if destination not in {"/intake/rennick", "/intake/szymczyk"}:
+        if destination not in {"/intake/rennick", "/intake/szymczyk"} and not re.fullmatch(r"/intake/szymczyk/identify\?sha256=[0-9a-f]{64}", destination):
             destination = "/intake/rennick"
         response = RedirectResponse(url=destination, status_code=303)
         response.set_cookie(_RENNICK_SESSION_COOKIE, _sign_browser_value({"login": login, "exp": int(time.time()) + RENNICK_BROWSER_SESSION_SECONDS}), max_age=RENNICK_BROWSER_SESSION_SECONDS, httponly=True, secure=True, samesite="lax")
@@ -553,9 +554,17 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.get("/intake/szymczyk/identify", include_in_schema=False)
-    async def szymczyk_identify(request: Request, sha256: str) -> JSONResponse:
+    async def szymczyk_identify(request: Request, sha256: str) -> JSONResponse | RedirectResponse:
         if _browser_login(request) is None:
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+            nonce = secrets.token_urlsafe(24)
+            return_to = f"/intake/szymczyk/identify?sha256={sha256}"
+            state = _sign_browser_value({"nonce": nonce, "exp": int(time.time()) + 600, "return_to": return_to})
+            settings = get_settings()
+            callback = f"{settings.gateway_public_url.rstrip('/')}/auth/callback"
+            url = "https://github.com/login/oauth/authorize?" + urlencode({"client_id": settings.github_oauth_client_id, "redirect_uri": callback, "state": state, "scope": "read:user"})
+            response = RedirectResponse(url=url, status_code=303)
+            response.set_cookie(_RENNICK_STATE_COOKIE, nonce, max_age=600, httponly=True, secure=True, samesite="lax")
+            return response
         result = await _forward_szymczyk_identification({"sha256": sha256})
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
