@@ -29,6 +29,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from botocore.exceptions import ClientError
+from pypdf import PdfReader
 
 from storage_policy import (
     ACCEPTANCE_CONTRACT_PREFIX,
@@ -1669,6 +1670,57 @@ def _inspect_szymczyk_intake(sha256: str) -> dict[str, Any]:
     return {"ok": True, "verified": True, "intake_id": PENDING_INTAKE_ID, "file_count": len(files), "pdf_count": sum(item["filename"].lower().endswith(".pdf") for item in files), "manifest_object_key": manifest_key, "manifest_sha256": manifest_sha256}
 
 
+_INDEX_RE = re.compile(r"(?i)\bindex\s*(?:no\.?|number)?\s*[:#]?\s*(\d{6,}/\d{4})")
+_COURT_RE = re.compile(r"(?is)SUPREME\s+COURT\s+OF\s+THE\s+STATE\s+OF\s+NEW\s+YORK\s+COUNTY\s+OF\s+([A-Z ]{3,40})")
+_CAPTION_RE = re.compile(r"(?is)(.{3,220}?)\s*,?\s*(?:Plaintiff|Petitioner)s?\s*,?\s*(?:-against-|v\.?|vs\.?)\s*(.{3,220}?)\s*,?\s*(?:Defendant|Respondent)s?")
+
+
+def _identify_szymczyk_intake(sha256: str) -> dict[str, Any]:
+    """Extract factual case identity only from first pages of verified PDFs."""
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError("invalid provisional intake SHA-256")
+    prefix = f"pending-intakes/{PENDING_INTAKE_ID}/verified/{sha256}/"
+    source_key = prefix + PENDING_INTAKE_FILENAME
+    manifest_key = prefix + "identification_manifest.json"
+    client = _b2_client()
+    try:
+        existing = client.get_object(Bucket=B2_BUCKET, Key=manifest_key)["Body"].read()
+        return json.loads(existing)
+    except ClientError as exc:
+        if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    with tempfile.NamedTemporaryFile(prefix="legalai-szymczyk-id-", suffix=".zip") as local:
+        body = client.get_object(Bucket=B2_BUCKET, Key=source_key)["Body"]
+        for chunk in iter(lambda: body.read(1024 * 1024), b""):
+            local.write(chunk)
+        local.flush()
+        try:
+            archive = zipfile.ZipFile(local.name)
+        except zipfile.BadZipFile as exc:
+            raise ValueError("provisional intake is not a valid ZIP archive") from exc
+        candidates: list[dict[str, str]] = []
+        with archive:
+            for info in sorted((item for item in archive.infolist() if not item.is_dir() and item.filename.lower().endswith(".pdf")), key=lambda item: item.filename.lower()):
+                try:
+                    reader = PdfReader(io.BytesIO(archive.read(info)))
+                    text = (reader.pages[0].extract_text() if reader.pages else "") or ""
+                except Exception:
+                    continue
+                index = _INDEX_RE.search(text)
+                court = _COURT_RE.search(text)
+                caption = _CAPTION_RE.search(" ".join(text.split()))
+                if index or court or caption:
+                    candidates.append({"filename": info.filename, "index_number": index.group(1) if index else "", "court": ("Supreme Court of the State of New York, County of " + " ".join(court.group(1).split()).title()) if court else "", "caption": (" ".join(caption.group(1).split()) + " v. " + " ".join(caption.group(2).split())) if caption else ""})
+    if not candidates:
+        raise ValueError("no case identity text found on first PDF pages")
+    best = next((item for item in candidates if item["index_number"] and item["court"] and item["caption"]), candidates[0])
+    payload = {"ok": True, "identified": bool(best["index_number"] and best["court"] and best["caption"]), "intake_id": PENDING_INTAKE_ID, "case_caption": best["caption"], "court": best["court"], "index_number": best["index_number"], "evidence_filename": best["filename"], "candidates": candidates[:20]}
+    raw = json.dumps(payload, sort_keys=True).encode()
+    _require_absent_intake_object(client, manifest_key)
+    client.put_object(Bucket=B2_BUCKET, Key=manifest_key, Body=raw, ContentType="application/json", Metadata={"sha256": hashlib.sha256(raw).hexdigest()})
+    return payload
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -1784,6 +1836,19 @@ async def inspect_szymczyk_intake(request: Request) -> JSONResponse:
     try:
         payload = await request.json()
         return JSONResponse(_inspect_szymczyk_intake(str(payload.get("sha256", ""))))
+    except (ValueError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/szymczyk/identify", methods=["POST"])
+async def identify_szymczyk_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(_identify_szymczyk_intake(str(payload.get("sha256", ""))))
     except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
