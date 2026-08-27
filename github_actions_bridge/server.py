@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 import uuid
 import zipfile
@@ -1620,6 +1621,54 @@ def _complete_szymczyk_direct_intake(upload_id: str) -> dict[str, Any]:
         client.delete_object(Bucket=B2_BUCKET, Key=pending_key)
 
 
+def _inspect_szymczyk_intake(sha256: str) -> dict[str, Any]:
+    """Read-only ZIP integrity and hash inventory for one verified provisional intake."""
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError("invalid provisional intake SHA-256")
+    prefix = f"pending-intakes/{PENDING_INTAKE_ID}/verified/{sha256}/"
+    source_key = prefix + PENDING_INTAKE_FILENAME
+    manifest_key = prefix + "contents_manifest.json"
+    client = _b2_client()
+    source_head = client.head_object(Bucket=B2_BUCKET, Key=source_key)
+    if (source_head.get("Metadata") or {}).get("sha256") != sha256:
+        raise ValueError("provisional intake source hash metadata mismatch")
+    try:
+        existing = client.head_object(Bucket=B2_BUCKET, Key=manifest_key)
+        return {"ok": True, "verified": True, "already_inspected": True, "intake_id": PENDING_INTAKE_ID, "manifest_object_key": manifest_key, "manifest_size": existing.get("ContentLength")}
+    except ClientError as exc:
+        if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    with tempfile.NamedTemporaryFile(prefix="legalai-szymczyk-", suffix=".zip") as local:
+        body = client.get_object(Bucket=B2_BUCKET, Key=source_key)["Body"]
+        for chunk in iter(lambda: body.read(1024 * 1024), b""):
+            local.write(chunk)
+        local.flush()
+        try:
+            archive = zipfile.ZipFile(local.name)
+        except zipfile.BadZipFile as exc:
+            raise ValueError("provisional intake is not a valid ZIP archive") from exc
+        with archive:
+            files = []
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                digest = hashlib.sha256()
+                with archive.open(info) as member:
+                    for chunk in iter(lambda: member.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                files.append({"filename": info.filename, "size_bytes": info.file_size, "compressed_size_bytes": info.compress_size, "sha256": digest.hexdigest()})
+    if not files:
+        raise ValueError("provisional intake ZIP contains no files")
+    payload = json.dumps({"schema_version": "provisional-intake-contents.v1", "intake_id": PENDING_INTAKE_ID, "source_sha256": sha256, "source_size_bytes": source_head.get("ContentLength"), "file_count": len(files), "pdf_count": sum(item["filename"].lower().endswith(".pdf") for item in files), "files": files}, sort_keys=True).encode()
+    manifest_sha256 = hashlib.sha256(payload).hexdigest()
+    _require_absent_intake_object(client, manifest_key)
+    client.put_object(Bucket=B2_BUCKET, Key=manifest_key, Body=payload, ContentType="application/json", Metadata={"sha256": manifest_sha256})
+    head = client.head_object(Bucket=B2_BUCKET, Key=manifest_key)
+    if head.get("ContentLength") != len(payload) or (head.get("Metadata") or {}).get("sha256") != manifest_sha256:
+        raise ValueError("contents manifest verification mismatch")
+    return {"ok": True, "verified": True, "intake_id": PENDING_INTAKE_ID, "file_count": len(files), "pdf_count": sum(item["filename"].lower().endswith(".pdf") for item in files), "manifest_object_key": manifest_key, "manifest_sha256": manifest_sha256}
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -1722,6 +1771,19 @@ async def complete_szymczyk_direct_intake(request: Request) -> JSONResponse:
     try:
         payload = await request.json()
         return JSONResponse(_complete_szymczyk_direct_intake(str(payload.get("upload_id", ""))))
+    except (ValueError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/szymczyk/inspect", methods=["POST"])
+async def inspect_szymczyk_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(_inspect_szymczyk_intake(str(payload.get("sha256", ""))))
     except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
