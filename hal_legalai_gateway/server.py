@@ -553,7 +553,7 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         result = await _forward_szymczyk_inspection({"sha256": sha256})
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
-    @application.get("/intake/szymczyk/identify", include_in_schema=False)
+    @application.get("/intake/szymczyk/identify", include_in_schema=False, response_model=None)
     async def szymczyk_identify(request: Request, sha256: str) -> JSONResponse | RedirectResponse:
         if _browser_login(request) is None:
             nonce = secrets.token_urlsafe(24)
