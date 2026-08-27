@@ -222,6 +222,22 @@ async def _forward_rennick_direct_supplement(action: str, payload: dict[str, Any
         result = {"ok": False, "error": "bridge_direct_upload_response_invalid"}
     return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_direct_upload_failed")}
 
+
+async def _forward_szymczyk_direct(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    downstream = settings.downstream_by_key("storage")
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+        response = await client.post(f"{downstream.base_url.rstrip('/')}/intake/szymczyk/direct/{action}", headers=headers, json=payload or {})
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"ok": False, "error": "bridge_szymczyk_upload_response_invalid"}
+    return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_szymczyk_upload_failed")}
+
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
     application.router.routes = [
@@ -372,6 +388,19 @@ document.getElementById('upload').onclick=async()=>{{try{{const s=document.getEl
 document.getElementById('upload-supplement').onclick=async()=>{{try{{const files=document.getElementById('supplement-documents').files;if(files.length!==3)throw new Error('Select exactly three PDFs.');out.textContent='Uploading supplement and verifying…';out.textContent=JSON.stringify(await uploadSupplement(files),null,2)}}catch(e){{out.textContent='Supplement upload failed: '+e.message}}}};
 </script>''')
 
+    @application.get("/intake/szymczyk", include_in_schema=False, response_model=None)
+    async def szymczyk_upload_page(request: Request) -> HTMLResponse | RedirectResponse:
+        if _browser_login(request) is None:
+            nonce = secrets.token_urlsafe(24)
+            state = _sign_browser_value({"nonce": nonce, "exp": int(time.time()) + 600, "return_to": "/intake/szymczyk"})
+            settings = get_settings()
+            callback = f"{settings.gateway_public_url.rstrip('/')}/auth/callback"
+            url = "https://github.com/login/oauth/authorize?" + urlencode({"client_id": settings.github_oauth_client_id, "redirect_uri": callback, "state": state, "scope": "read:user"})
+            response = RedirectResponse(url=url, status_code=303)
+            response.set_cookie(_RENNICK_STATE_COOKIE, nonce, max_age=600, httponly=True, secure=True, samesite="lax")
+            return response
+        return HTMLResponse('''<!doctype html><title>Szymczyk provisional intake</title><main><h2>Szymczyk provisional intake</h2><p>Select <code>wetransfer_szymczyk-case_2026-08-27_1952</code>. It uploads directly to private storage and is then hash-verified.</p><input id="source" type="file"><br><button id="upload">Upload and verify</button><pre id="status"></pre></main><script>const out=document.getElementById('status');document.getElementById('upload').onclick=async()=>{try{const file=document.getElementById('source').files[0];if(!file)throw new Error('Select the case file.');out.textContent='Preparing direct upload…';const plan=await (await fetch('/intake/szymczyk/direct/prepare',{method:'POST'})).json();if(!plan.ok)throw new Error(plan.error);if(file.size>plan.max_bytes)throw new Error('File exceeds 1 GB limit.');out.textContent='Uploading directly to private storage…';const put=await fetch(plan.url,{method:'PUT',headers:{'Content-Type':plan.content_type},body:file});if(!put.ok)throw new Error('Storage upload failed.');out.textContent='Verifying stored bytes…';const result=await (await fetch('/intake/szymczyk/direct/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({upload_id:plan.upload_id})})).json();if(!result.ok)throw new Error(result.error||'verification failed');out.textContent=JSON.stringify(result,null,2)}catch(e){out.textContent='Upload failed: '+e.message}};</script>''')
+
     async def rennick_oauth_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
         state_payload = _verified_browser_value(state)
         if not code or state_payload is None or not hmac.compare_digest(str(state_payload.get("nonce", "")), request.cookies.get(_RENNICK_STATE_COOKIE, "")):
@@ -385,7 +414,10 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         login = (user_response.json() if user_response is not None and user_response.is_success else {}).get("login")
         if login != settings.allowed_github_login:
             return RedirectResponse(url="/intake/rennick", status_code=303)
-        response = RedirectResponse(url="/intake/rennick", status_code=303)
+        destination = str(state_payload.get("return_to") or "/intake/rennick")
+        if destination not in {"/intake/rennick", "/intake/szymczyk"}:
+            destination = "/intake/rennick"
+        response = RedirectResponse(url=destination, status_code=303)
         response.set_cookie(_RENNICK_SESSION_COOKIE, _sign_browser_value({"login": login, "exp": int(time.time()) + RENNICK_BROWSER_SESSION_SECONDS}), max_age=RENNICK_BROWSER_SESSION_SECONDS, httponly=True, secure=True, samesite="lax")
         response.delete_cookie(_RENNICK_STATE_COOKIE)
         return response
@@ -461,6 +493,24 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         except ValueError:
             return JSONResponse({"ok": False, "error": "invalid_completion_payload"}, status_code=400)
         result = await _forward_rennick_direct_supplement("complete", payload)
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.post("/intake/szymczyk/direct/prepare", include_in_schema=False)
+    async def szymczyk_direct_prepare(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        result = await _forward_szymczyk_direct("prepare")
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.post("/intake/szymczyk/direct/complete", include_in_schema=False)
+    async def szymczyk_direct_complete(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except ValueError:
+            return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+        result = await _forward_szymczyk_direct("complete", payload)
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.get("/registry")
