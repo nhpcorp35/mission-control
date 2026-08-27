@@ -1327,6 +1327,11 @@ RENNICK_SUPPLEMENT_FILENAMES = frozenset(
 RENNICK_DIRECT_UPLOAD_TTL_SECONDS = 300
 RENNICK_DIRECT_UPLOAD_PREFIX = f"cases/{RENNICK_CASE_ID}/intake/.pending/"
 RENNICK_DIRECT_UPLOAD_ORIGIN_ENV = "HAL_LEGALAI_GATEWAY_URL"
+PENDING_INTAKE_ID = "szymczyk-case-2026-08-27"
+PENDING_INTAKE_FILENAME = "wetransfer_szymczyk-case_2026-08-27_1952"
+PENDING_INTAKE_MAX_BYTES = 1024 * 1024 * 1024
+PENDING_INTAKE_TTL_SECONDS = 60 * 60
+PENDING_INTAKE_PREFIX = f"pending-intakes/{PENDING_INTAKE_ID}/.pending/"
 
 
 def _require_absent_intake_object(client: Any, object_key: str) -> None:
@@ -1554,6 +1559,67 @@ def _complete_rennick_direct_supplement_upload(upload_id: str) -> dict[str, Any]
     return result
 
 
+def _prepare_szymczyk_direct_intake() -> dict[str, Any]:
+    """Issue one short-lived direct B2 URL for the 733 MB provisional intake."""
+    client = _b2_client()
+    _ensure_rennick_direct_upload_cors(client)
+    upload_id = uuid.uuid4().hex
+    object_key = f"{PENDING_INTAKE_PREFIX}{upload_id}/{PENDING_INTAKE_FILENAME}"
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "filename": PENDING_INTAKE_FILENAME,
+        "max_bytes": PENDING_INTAKE_MAX_BYTES,
+        "expires_in_seconds": PENDING_INTAKE_TTL_SECONDS,
+        "content_type": "application/octet-stream",
+        "url": client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": B2_BUCKET, "Key": object_key, "ContentType": "application/octet-stream"},
+            ExpiresIn=PENDING_INTAKE_TTL_SECONDS,
+            HttpMethod="PUT",
+        ),
+    }
+
+
+def _complete_szymczyk_direct_intake(upload_id: str) -> dict[str, Any]:
+    """Stream-hash the pending object, then copy it to an immutable provisional key."""
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        raise ValueError("invalid direct upload id")
+    pending_key = f"{PENDING_INTAKE_PREFIX}{upload_id}/{PENDING_INTAKE_FILENAME}"
+    client = _b2_client()
+    head = client.head_object(Bucket=B2_BUCKET, Key=pending_key)
+    size = int(head.get("ContentLength") or 0)
+    if not 0 < size <= PENDING_INTAKE_MAX_BYTES:
+        raise ValueError("invalid pending intake size")
+    digest = hashlib.sha256()
+    try:
+        body = client.get_object(Bucket=B2_BUCKET, Key=pending_key)["Body"]
+        for chunk in iter(lambda: body.read(1024 * 1024), b""):
+            digest.update(chunk)
+        sha256 = digest.hexdigest()
+        verified_prefix = f"pending-intakes/{PENDING_INTAKE_ID}/verified/{sha256}/"
+        source_key = verified_prefix + PENDING_INTAKE_FILENAME
+        manifest_key = verified_prefix + "intake_manifest.json"
+        _require_absent_intake_object(client, source_key)
+        _require_absent_intake_object(client, manifest_key)
+        client.copy_object(
+            Bucket=B2_BUCKET,
+            Key=source_key,
+            CopySource={"Bucket": B2_BUCKET, "Key": pending_key},
+            MetadataDirective="REPLACE",
+            Metadata={"sha256": sha256},
+            ContentType="application/octet-stream",
+        )
+        manifest = json.dumps({"schema_version": "provisional-intake.v1", "intake_id": PENDING_INTAKE_ID, "filename": PENDING_INTAKE_FILENAME, "size_bytes": size, "sha256": sha256}, sort_keys=True).encode()
+        client.put_object(Bucket=B2_BUCKET, Key=manifest_key, Body=manifest, ContentType="application/json", Metadata={"sha256": hashlib.sha256(manifest).hexdigest()})
+        verified = client.head_object(Bucket=B2_BUCKET, Key=source_key)
+        if verified.get("ContentLength") != size or (verified.get("Metadata") or {}).get("sha256") != sha256:
+            raise ValueError("B2 provisional intake verification mismatch")
+        return {"ok": True, "uploaded": True, "intake_id": PENDING_INTAKE_ID, "objects": [{"object_key": source_key, "size": size, "sha256": sha256}, {"object_key": manifest_key, "size": len(manifest), "sha256": hashlib.sha256(manifest).hexdigest()}]}
+    finally:
+        client.delete_object(Bucket=B2_BUCKET, Key=pending_key)
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -1634,6 +1700,28 @@ async def complete_rennick_direct_supplement_upload(request: Request) -> JSONRes
     try:
         payload = await request.json()
         return JSONResponse(_complete_rennick_direct_supplement_upload(str(payload.get("upload_id", ""))))
+    except (ValueError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/szymczyk/direct/prepare", methods=["POST"])
+async def prepare_szymczyk_direct_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    return JSONResponse(_prepare_szymczyk_direct_intake())
+
+
+@mcp.custom_route("/intake/szymczyk/direct/complete", methods=["POST"])
+async def complete_szymczyk_direct_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(_complete_szymczyk_direct_intake(str(payload.get("upload_id", ""))))
     except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
