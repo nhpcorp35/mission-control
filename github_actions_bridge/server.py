@@ -2117,22 +2117,21 @@ async def build_verified_case_index(request: Request) -> JSONResponse:
     try:
         payload = await request.json()
         case_id, source_sha256 = str(payload.get("case_id", "")), str(payload.get("source_sha256", ""))
-        client = _b2_client()
-        prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
-        index_key = prefix + "page_records.jsonl"
-        try:
-            client.head_object(Bucket=B2_BUCKET, Key=index_key)
-            return JSONResponse({"ok": True, "already_present": True, "index_key": index_key})
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}: raise
-        descriptor = json.loads(client.get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read())
-        source_key = str(descriptor.get("source_object_key", ""))
-        if not source_key.startswith(prefix): raise ValueError("verified source descriptor is invalid")
-        body = build_page_records(client, B2_BUCKET, source_key, manifest)
-        client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson", IfNoneMatch="*")
-        return JSONResponse({"ok": True, "created": True, "index_key": index_key, "bytes": len(body)})
+        return JSONResponse(_build_verified_case_index(case_id, source_sha256))
     except (TypeError, ValueError, KeyError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+def _build_verified_case_index(case_id: str, source_sha256: str) -> dict[str, Any]:
+    client = _b2_client(); prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256); index_key = prefix + "page_records.jsonl"
+    try:
+        client.head_object(Bucket=B2_BUCKET, Key=index_key); return {"ok": True, "already_present": True, "index_key": index_key}
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}: raise
+    descriptor = json.loads(client.get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read()); source_key = str(descriptor.get("source_object_key", ""))
+    if not source_key.startswith(prefix): raise ValueError("verified source descriptor is invalid")
+    body = build_page_records(client, B2_BUCKET, source_key, manifest); client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson", IfNoneMatch="*")
+    return {"ok": True, "created": True, "index_key": index_key, "bytes": len(body)}
 
 
 @mcp.custom_route("/intake/szymczyk/direct/prepare", methods=["POST"])
@@ -3333,6 +3332,14 @@ def main() -> None:
         logger.warning("Rennick verified intake promotion result: %s", result)
     except Exception:  # noqa: BLE001 - preserve service availability and log evidence
         logger.exception("Rennick verified intake promotion failed")
+    for case_id, source_sha256 in (
+        (RENNICK_CASE_ID, "6394faf9d9ccdf258a061e231bf2ce9a7e27599c27e5187c4234613e876caf77"),
+        (SZYMCZYK_CASE_ID, "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc"),
+    ):
+        try:
+            logger.warning("Verified case index result: %s", _build_verified_case_index(case_id, source_sha256))
+        except Exception:  # noqa: BLE001 - preserve service availability and log evidence
+            logger.exception("Verified case index failed for %s", case_id)
     app = create_http_app()
     uvicorn.run(
         app,
