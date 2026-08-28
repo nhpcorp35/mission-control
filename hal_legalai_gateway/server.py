@@ -319,6 +319,23 @@ async def _forward_szymczyk_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
         result = {"ok": False, "error": "bridge_szymczyk_pipeline_response_invalid"}
     return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_szymczyk_pipeline_failed")}
 
+
+async def _forward_verified_case_pages(payload: dict[str, Any]) -> dict[str, Any]:
+    """Forward a bounded, authenticated page request to the private Bridge."""
+    settings = get_settings()
+    downstream = settings.downstream_by_key("storage")
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
+        response = await client.post(f"{downstream.base_url.rstrip('/')}/cases/verified/read-pages", headers=headers, json=payload)
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"ok": False, "error": "bridge_verified_case_reader_response_invalid"}
+    return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_verified_case_reader_failed")}
+
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
     application.router.routes = [
@@ -659,6 +676,17 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
             response.set_cookie(_RENNICK_STATE_COOKIE, nonce, max_age=600, httponly=True, secure=True, samesite="lax")
             return response
         result = await _forward_szymczyk_pipeline({"sha256": sha256})
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.post("/cases/verified/read-pages", include_in_schema=False)
+    async def verified_case_pages(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except ValueError:
+            return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+        result = await _forward_verified_case_pages(payload)
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.get("/registry")
