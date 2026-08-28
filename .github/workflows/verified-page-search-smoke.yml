@@ -1,0 +1,28 @@
+name: Verified-page search smoke test
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: Read-only search query
+        required: true
+        default: riparian law
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run authenticated read-only Bridge search
+        env:
+          BRIDGE_SERVICE_TOKEN: ${{ secrets.BRIDGE_SERVICE_TOKEN }}
+          SEARCH_QUERY: ${{ inputs.query }}
+        run: python tools/verified_page_search_smoke.py
