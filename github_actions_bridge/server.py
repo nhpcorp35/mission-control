@@ -1408,6 +1408,62 @@ def _upload_rennick_intake_pair(source: bytes, manifest: bytes) -> dict[str, Any
     }
 
 
+def _normalize_rennick_contents_manifest(raw: bytes) -> bytes:
+    """Normalize the existing intake manifest without opening the ZIP or PDFs."""
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("Rennick intake manifest is invalid")
+    candidates = payload.get("files") or payload.get("documents") or payload.get("entries")
+    if not isinstance(candidates, list):
+        raise ValueError("Rennick intake manifest has no document list")
+    files = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            raise ValueError("Rennick intake manifest document entry is invalid")
+        filename = item.get("filename") or item.get("name") or item.get("path")
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("Rennick intake manifest document filename is invalid")
+        files.append(dict(item, filename=filename))
+    if not files:
+        raise ValueError("Rennick intake manifest contains no documents")
+    return json.dumps({"schema_version": "case-contents.v1", "files": files}, sort_keys=True).encode()
+
+
+def _promote_rennick_intake() -> dict[str, Any]:
+    """Copy already-verified Rennick bytes to canonical reader keys, immutably."""
+    client = _b2_client()
+    source_key, manifest_key = intake_keys(RENNICK_CASE_ID, RENNICK_SOURCE_FILENAME, RENNICK_MANIFEST_FILENAME)
+    source_head = client.head_object(Bucket=B2_BUCKET, Key=source_key)
+    source_sha256 = str((source_head.get("Metadata") or {}).get("sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise ValueError("Rennick source is not hash-verified")
+    raw_manifest = client.get_object(Bucket=B2_BUCKET, Key=manifest_key)["Body"].read()
+    contents = _normalize_rennick_contents_manifest(raw_manifest)
+    prefix = f"cases/{RENNICK_CASE_ID}/intake/source/{source_sha256}/"
+    identity_key = f"cases/{RENNICK_CASE_ID}/intake/case_identity.json"
+    identity = json.dumps({"schema_version": "case-identity.v1", "case_id": RENNICK_CASE_ID, "source_sha256": source_sha256, "source_filename": RENNICK_SOURCE_FILENAME}, sort_keys=True).encode()
+    descriptor_key = prefix + "source_descriptor.json"
+    descriptor = json.dumps({"schema_version": "verified-case-source-descriptor.v1", "case_id": RENNICK_CASE_ID, "source_sha256": source_sha256, "source_object_key": prefix + RENNICK_SOURCE_FILENAME, "contents_manifest_key": prefix + "contents_manifest.json"}, sort_keys=True).encode()
+    copies = ((prefix + RENNICK_SOURCE_FILENAME, source_key), (prefix + "intake_manifest.json", manifest_key))
+    for target, original in copies:
+        try:
+            client.head_object(Bucket=B2_BUCKET, Key=target)
+        except ClientError as exc:
+            if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+            client.copy_object(Bucket=B2_BUCKET, Key=target, CopySource={"Bucket": B2_BUCKET, "Key": original}, MetadataDirective="COPY")
+    for key, body in ((prefix + "contents_manifest.json", contents), (identity_key, identity), (descriptor_key, descriptor)):
+        try:
+            existing = client.get_object(Bucket=B2_BUCKET, Key=key)["Body"].read()
+            if existing != body:
+                raise ValueError("canonical Rennick intake object already exists with different contents")
+        except ClientError as exc:
+            if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+            client.put_object(Bucket=B2_BUCKET, Key=key, Body=body, ContentType="application/json", Metadata={"sha256": hashlib.sha256(body).hexdigest()})
+    return {"ok": True, "promoted": True, "case_id": RENNICK_CASE_ID, "source_sha256": source_sha256, "canonical_prefix": prefix, "identity_object_key": identity_key}
+
+
 def _upload_rennick_docket_supplement(archive: bytes, manifest: bytes) -> dict[str, Any]:
     """Store the fixed three-document public-docket supplement without overwrites."""
     try:
@@ -1924,6 +1980,18 @@ async def upload_rennick_case_intake(
         manifest_base64, label="manifest_base64", max_size=MAX_MANIFEST_BYTES
     )
     return _upload_rennick_intake_pair(source, manifest)
+
+
+@mcp.custom_route("/intake/rennick/promote", methods=["POST"])
+async def promote_rennick_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        return JSONResponse(_promote_rennick_intake())
+    except (ValueError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
 
 @mcp.custom_route("/intake/rennick/upload", methods=["POST"])
