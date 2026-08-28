@@ -2130,7 +2130,10 @@ def _build_verified_case_index(case_id: str, source_sha256: str) -> dict[str, An
         if exc.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}: raise
     descriptor = json.loads(client.get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read()); source_key = str(descriptor.get("source_object_key", ""))
     if not source_key.startswith(prefix): raise ValueError("verified source descriptor is invalid")
-    body = build_page_records(client, B2_BUCKET, source_key, manifest); client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson", IfNoneMatch="*")
+    body = build_page_records(client, B2_BUCKET, source_key, manifest)
+    # B2's S3-compatible endpoint does not accept the conditional PUT header;
+    # the HEAD check above preserves the no-overwrite rule for this startup job.
+    client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson")
     return {"ok": True, "created": True, "index_key": index_key, "bytes": len(body)}
 
 
@@ -3337,6 +3340,8 @@ def main() -> None:
         (SZYMCZYK_CASE_ID, "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc"),
     ):
         try:
+            if case_id == SZYMCZYK_CASE_ID:
+                _promote_szymczyk_intake(source_sha256)
             logger.warning("Verified case index result: %s", _build_verified_case_index(case_id, source_sha256))
         except Exception:  # noqa: BLE001 - preserve service availability and log evidence
             logger.exception("Verified case index failed for %s", case_id)
