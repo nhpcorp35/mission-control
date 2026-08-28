@@ -224,6 +224,23 @@ async def _forward_rennick_direct_supplement(action: str, payload: dict[str, Any
     return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_direct_upload_failed")}
 
 
+async def _forward_rennick_promotion() -> dict[str, Any]:
+    """Promote existing verified Rennick bytes without accepting an upload."""
+    settings = get_settings()
+    downstream = settings.downstream_by_key("storage")
+    headers: dict[str, str] = {}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
+        response = await client.post(f"{downstream.base_url.rstrip('/')}/intake/rennick/promote", headers=headers)
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"ok": False, "error": "bridge_rennick_promotion_response_invalid"}
+    return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_rennick_promotion_failed")}
+
+
 async def _forward_szymczyk_direct(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = get_settings()
     downstream = settings.downstream_by_key("storage")
@@ -556,6 +573,13 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         if len(manifest) > RENNICK_MANIFEST_BYTES_MAX:
             return JSONResponse({"ok": False, "error": "invalid_manifest_size"}, status_code=400)
         result = await _forward_rennick_pair(source, manifest)
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.post("/intake/rennick/promote", include_in_schema=False)
+    async def rennick_promote(request: Request) -> JSONResponse:
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        result = await _forward_rennick_promotion()
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.post("/intake/rennick/supplement", include_in_schema=False)
