@@ -22,11 +22,12 @@ def build_page_records(client: Any, bucket: str, source_key: str, manifest: dict
         members = {item.filename.rsplit("/", 1)[-1]: item for item in archive.infolist()}
         for item in manifest.get("files", []):
             filename = str(item.get("filename", "")) if isinstance(item, dict) else ""
-            if not filename.lower().endswith(".pdf") or filename not in members:
+            document_name = filename.rsplit("/", 1)[-1]
+            if not filename.lower().endswith(".pdf") or document_name not in members:
                 continue
-            data = archive.read(members[filename])
+            data = archive.read(members[document_name])
             for number, page in enumerate(PdfReader(io.BytesIO(data)).pages, start=1):
                 text = (page.extract_text() or "").strip()
                 if text:
-                    lines.append(json.dumps({"filename": filename, "page_number": number, "text": text}, separators=(",", ":")))
+                    lines.append(json.dumps({"filename": document_name, "page_number": number, "text": text}, separators=(",", ":")))
     return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")

@@ -23,3 +23,11 @@ class IndexTests(unittest.TestCase):
         with zipfile.ZipFile(blob,"w") as z: z.writestr("Doc.pdf",b"x")
         rows=build_page_records(_Client(blob.getvalue()),"b","k",{"files":[{"filename":"Doc.pdf"},{"filename":"x.txt"}]})
         self.assertEqual(json.loads(rows)["filename"],"Doc.pdf")
+
+    @patch("github_actions_bridge.verified_case_index.PdfReader")
+    def test_indexes_pdf_when_manifest_uses_archive_directory(self, reader):
+        reader.return_value.pages=[type("P",(),{"extract_text":lambda _: "hello"})()]
+        blob=io.BytesIO()
+        with zipfile.ZipFile(blob,"w") as z: z.writestr("SZYMCZYK case/Doc.pdf",b"x")
+        rows=build_page_records(_Client(blob.getvalue()),"b","k",{"files":[{"filename":"SZYMCZYK case/Doc.pdf"}]})
+        self.assertEqual(json.loads(rows)["filename"],"Doc.pdf")
