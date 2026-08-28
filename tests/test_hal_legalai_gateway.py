@@ -1557,6 +1557,7 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
             list(registry.namespaces["case"].tools),
             [
                 "case.resolve_commit",
+                "case.search_verified_pages",
                 "case.submit",
                 "case.status",
                 "case.cancel",
@@ -1640,6 +1641,49 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
         )
         self.assertNotIn(
             "idempotency_key", omit_mock.await_args.kwargs["arguments"]
+        )
+
+    def test_search_verified_pages_uses_bridge_service_authorization(self) -> None:
+        collector = self._collect_tools("case.search_verified_pages")
+
+        class Response:
+            is_success = True
+
+            def json(self):
+                return {"ok": True, "results": [{"document_name": "record.pdf", "page": 7}]}
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, *, headers, json):
+                self.url = url
+                self.headers = headers
+                self.payload = json
+                Client.last = self
+                return Response()
+
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch("hal_legalai_gateway.mcp_server.httpx.AsyncClient", Client):
+            result = asyncio.run(
+                collector["case.search_verified_pages"](
+                    "szymczyk-case-2026-08-27", "a" * 64, "riparian law"
+                )
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(Client.last.url, "https://bridge.example/cases/verified/search")
+        self.assertEqual(Client.last.headers, {"Authorization": f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}"})
+        self.assertEqual(
+            Client.last.payload,
+            {"case_id": "szymczyk-case-2026-08-27", "source_sha256": "a" * 64, "query": "riparian law", "limit": 20},
         )
 
     def test_status_forwards_canonical_workflow_id(self) -> None:

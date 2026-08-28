@@ -7,6 +7,7 @@ import re
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+import httpx
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
 from fastmcp.server.dependencies import get_access_token
@@ -67,6 +68,21 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
             "path, and owner input."
         ),
         notes="Gateway-native read-only resolver; does not forward downstream.",
+    ),
+    ToolBinding(
+        gateway_tool="case.search_verified_pages",
+        namespace="case",
+        downstream_service="bridge",
+        downstream_tool="/cases/verified/search",
+        description=(
+            "Search the immutable verified-page index for one promoted case. "
+            "Requires case_id, source_sha256, and a query; returns the Bridge's "
+            "exact page citations only."
+        ),
+        notes=(
+            "Gateway-native authenticated HTTP call to the Bridge verified-page "
+            "search route; it never forwards the inbound OAuth bearer."
+        ),
     ),
     ToolBinding(
         gateway_tool="case.submit",
@@ -735,6 +751,52 @@ def register_forwarding_tools(
         except CaseResolveCommitContractError:
             return failure_response(error="invalid_ref", ref=ref)
         return await resolve_legalai_commit(validated["ref"])
+
+    @mcp.tool(
+        name="case.search_verified_pages",
+        description=by_name["case.search_verified_pages"].description,
+    )
+    async def case_search_verified_pages(
+        case_id: str,
+        source_sha256: str,
+        query: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Search a Bridge-built immutable page index using the service credential."""
+        if _require_gateway_principal(settings) is None:
+            return {"ok": False, "error": "unauthorized"}
+        if not all(isinstance(value, str) and value.strip() for value in (case_id, source_sha256, query)):
+            return {"ok": False, "error": "case_id, source_sha256, and query are required"}
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            return {"ok": False, "error": "limit must be an integer from 1 to 100"}
+        downstream = settings.downstream_by_key("bridge")
+        authorization = resolve_authorization_for_service(
+            downstream_service="bridge",
+            bridge_authorization=settings.bridge_authorization,
+        )
+        if not authorization:
+            return {"ok": False, "error": "bridge service authorization is unavailable"}
+        payload = {
+            "case_id": case_id.strip(),
+            "source_sha256": source_sha256.strip(),
+            "query": query.strip(),
+            "limit": limit,
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)
+            ) as client:
+                response = await client.post(
+                    f"{downstream.base_url.rstrip('/')}/cases/verified/search",
+                    headers={"Authorization": authorization},
+                    json=payload,
+                )
+            body = response.json()
+        except (httpx.HTTPError, ValueError):
+            return {"ok": False, "error": "verified-page search unavailable"}
+        if not response.is_success:
+            return {"ok": False, "error": str(body.get("error", "verified-page search failed")) if isinstance(body, dict) else "verified-page search failed"}
+        return body if isinstance(body, dict) else {"ok": False, "error": "invalid verified-page search response"}
 
     @mcp.tool(name="case.submit", description=by_name["case.submit"].description)
     async def case_submit(

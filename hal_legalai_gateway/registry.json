@@ -41,6 +41,7 @@
       "downstream_service": "bridge",
       "tools": [
         "case.resolve_commit",
+        "case.search_verified_pages",
         "case.submit",
         "case.status",
         "case.cancel",
@@ -116,6 +117,14 @@
       "downstream_tool": "resolve_commit",
       "description": "Read-only resolver for nhpcorp35/legal-ai commits. Accepts ref exactly main or a lowercase 40-character SHA. Returns immutable commit_sha; rejects repository, URL, path, and owner input.",
       "notes": "Gateway-native read-only resolver; does not forward downstream."
+    },
+    {
+      "tool": "case.search_verified_pages",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "/cases/verified/search",
+      "description": "Search the immutable verified-page index for one promoted case. Requires case_id, source_sha256, and a query; returns the Bridge's exact page citations only.",
+      "notes": "Gateway-native authenticated HTTP call to the Bridge verified-page search route; it never forwards the inbound OAuth bearer."
     },
     {
       "tool": "case.submit",
