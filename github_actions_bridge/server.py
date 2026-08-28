@@ -56,6 +56,7 @@ from case_intake import (
     intake_keys,
     verify_object as verify_case_intake_object,
 )
+from verified_case_reader import canonical_source_prefix, extract_pdf_pages, read_verified_manifest, validate_page_request
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -1756,6 +1757,15 @@ def _promote_szymczyk_intake(sha256: str) -> dict[str, Any]:
     }
     identity_bytes = json.dumps(identity, sort_keys=True).encode()
     identity_key = f"cases/{SZYMCZYK_CASE_ID}/intake/case_identity.json"
+    descriptor = {
+        "schema_version": "verified-case-source-descriptor.v1",
+        "case_id": SZYMCZYK_CASE_ID,
+        "source_sha256": sha256,
+        "source_object_key": canonical_prefix + PENDING_INTAKE_FILENAME,
+        "contents_manifest_key": canonical_prefix + "contents_manifest.json",
+    }
+    descriptor_bytes = json.dumps(descriptor, sort_keys=True).encode()
+    descriptor_key = canonical_prefix + "source_descriptor.json"
     expected = [(canonical_prefix + name, provisional_prefix + name) for name in source_keys]
     existing = []
     for target, original in expected:
@@ -1779,6 +1789,14 @@ def _promote_szymczyk_intake(sha256: str) -> dict[str, Any]:
             raise
         client.put_object(Bucket=B2_BUCKET, Key=identity_key, Body=identity_bytes, ContentType="application/json", Metadata={"sha256": hashlib.sha256(identity_bytes).hexdigest()})
         identity_already_present = False
+    try:
+        existing_descriptor = client.get_object(Bucket=B2_BUCKET, Key=descriptor_key)["Body"].read()
+        if existing_descriptor != descriptor_bytes:
+            raise ValueError("canonical source descriptor already exists with different contents")
+    except ClientError as exc:
+        if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+        client.put_object(Bucket=B2_BUCKET, Key=descriptor_key, Body=descriptor_bytes, ContentType="application/json", Metadata={"sha256": hashlib.sha256(descriptor_bytes).hexdigest()})
     return {
         "ok": True,
         "promoted": True,
@@ -1790,6 +1808,7 @@ def _promote_szymczyk_intake(sha256: str) -> dict[str, Any]:
         "source_sha256": sha256,
         "canonical_prefix": canonical_prefix,
         "identity_object_key": identity_key,
+        "source_descriptor_key": descriptor_key,
     }
 
 
@@ -1973,6 +1992,36 @@ async def complete_rennick_direct_supplement_upload(request: Request) -> JSONRes
         return JSONResponse(_complete_rennick_direct_supplement_upload(str(payload.get("upload_id", ""))))
     except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/cases/verified/read-pages", methods=["POST"])
+async def read_verified_case_pages(request: Request) -> JSONResponse:
+    """Authenticate and validate a bounded generic case-page request."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id = str(payload.get("case_id", ""))
+        source_sha256 = str(payload.get("source_sha256", ""))
+        document_name, pages = validate_page_request(str(payload.get("document_name", "")), payload.get("pages"))
+        prefix, manifest = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
+        filenames = {str(item.get("filename", "")) for item in manifest["files"] if isinstance(item, dict)}
+        if document_name not in filenames:
+            raise ValueError("document is not in the verified source manifest")
+        descriptor = json.loads(_b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read())
+        source_key = str(descriptor.get("source_object_key", ""))
+        if not source_key.startswith(prefix):
+            raise ValueError("verified source descriptor is invalid")
+        stream = _b2_client().get_object(Bucket=B2_BUCKET, Key=source_key)["Body"]
+        try:
+            archive = stream.read()
+        finally:
+            stream.close()
+        return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "document_name": document_name, "pages": extract_pdf_pages(archive, document_name, pages)})
+    except (TypeError, ValueError, KeyError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
 @mcp.custom_route("/intake/szymczyk/direct/prepare", methods=["POST"])
