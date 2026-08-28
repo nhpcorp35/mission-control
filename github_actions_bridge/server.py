@@ -3275,6 +3275,14 @@ def main() -> None:
     import uvicorn
 
     asyncio.run(validate_required_production_tools())
+    # One-time migration for the already verified Rennick intake. The operation
+    # is create-only and idempotent, so later restarts only compare immutable
+    # records; it never accepts a browser upload or overwrites B2 objects.
+    try:
+        result = _promote_rennick_intake()
+        logger.info("Rennick verified intake promotion result: %s", result)
+    except Exception:  # noqa: BLE001 - preserve service availability and log evidence
+        logger.exception("Rennick verified intake promotion failed")
     app = create_http_app()
     uvicorn.run(
         app,
