@@ -56,7 +56,7 @@ from case_intake import (
     intake_keys,
     verify_object as verify_case_intake_object,
 )
-from verified_case_reader import canonical_source_prefix, extract_pdf_pages, read_verified_manifest, validate_page_request
+from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_verified_manifest, validate_page_request
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -2014,12 +2014,7 @@ async def read_verified_case_pages(request: Request) -> JSONResponse:
         source_key = str(descriptor.get("source_object_key", ""))
         if not source_key.startswith(prefix):
             raise ValueError("verified source descriptor is invalid")
-        stream = _b2_client().get_object(Bucket=B2_BUCKET, Key=source_key)["Body"]
-        try:
-            archive = stream.read()
-        finally:
-            stream.close()
-        return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "document_name": document_name, "pages": extract_pdf_pages(archive, document_name, pages)})
+        return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "document_name": document_name, "pages": extract_pdf_pages_from_object(_b2_client(), B2_BUCKET, source_key, document_name, pages)})
     except (TypeError, ValueError, KeyError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
