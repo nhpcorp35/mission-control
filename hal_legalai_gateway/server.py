@@ -287,6 +287,22 @@ async def _forward_szymczyk_promotion(payload: dict[str, Any]) -> dict[str, Any]
         result = {"ok": False, "error": "bridge_szymczyk_promotion_response_invalid"}
     return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_szymczyk_promotion_failed")}
 
+
+async def _forward_szymczyk_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+    settings = get_settings()
+    downstream = settings.downstream_by_key("storage")
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=settings.connect_timeout_seconds)) as client:
+        response = await client.post(f"{downstream.base_url.rstrip('/')}/intake/szymczyk/inventory", headers=headers, json=payload)
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"ok": False, "error": "bridge_szymczyk_inventory_response_invalid"}
+    return result if response.is_success else {"ok": False, "error": result.get("error", "bridge_szymczyk_inventory_failed")}
+
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
     application.router.routes = [
@@ -464,7 +480,7 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         if login != settings.allowed_github_login:
             return RedirectResponse(url="/intake/rennick", status_code=303)
         destination = str(state_payload.get("return_to") or "/intake/rennick")
-        if destination not in {"/intake/rennick", "/intake/szymczyk"} and not re.fullmatch(r"/intake/szymczyk/(?:identify|promote)\?sha256=[0-9a-f]{64}", destination):
+        if destination not in {"/intake/rennick", "/intake/szymczyk"} and not re.fullmatch(r"/intake/szymczyk/(?:identify|promote|inventory)\?sha256=[0-9a-f]{64}", destination):
             destination = "/intake/rennick"
         response = RedirectResponse(url=destination, status_code=303)
         response.set_cookie(_RENNICK_SESSION_COOKIE, _sign_browser_value({"login": login, "exp": int(time.time()) + RENNICK_BROWSER_SESSION_SECONDS}), max_age=RENNICK_BROWSER_SESSION_SECONDS, httponly=True, secure=True, samesite="lax")
@@ -597,6 +613,21 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
             response.set_cookie(_RENNICK_STATE_COOKIE, nonce, max_age=600, httponly=True, secure=True, samesite="lax")
             return response
         result = await _forward_szymczyk_promotion({"sha256": sha256})
+        return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+    @application.get("/intake/szymczyk/inventory", include_in_schema=False, response_model=None)
+    async def szymczyk_inventory(request: Request, sha256: str) -> JSONResponse | RedirectResponse:
+        if _browser_login(request) is None:
+            nonce = secrets.token_urlsafe(24)
+            return_to = f"/intake/szymczyk/inventory?sha256={sha256}"
+            state = _sign_browser_value({"nonce": nonce, "exp": int(time.time()) + 600, "return_to": return_to})
+            settings = get_settings()
+            callback = f"{settings.gateway_public_url.rstrip('/')}/auth/callback"
+            url = "https://github.com/login/oauth/authorize?" + urlencode({"client_id": settings.github_oauth_client_id, "redirect_uri": callback, "state": state, "scope": "read:user"})
+            response = RedirectResponse(url=url, status_code=303)
+            response.set_cookie(_RENNICK_STATE_COOKIE, nonce, max_age=600, httponly=True, secure=True, samesite="lax")
+            return response
+        result = await _forward_szymczyk_inventory({"sha256": sha256})
         return JSONResponse(result, status_code=200 if result.get("ok") else 502)
 
     @application.get("/registry")
