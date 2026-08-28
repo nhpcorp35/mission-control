@@ -483,6 +483,41 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             status_code=307,
         )
 
+    @application.post("/portal/case-00/q4/feedback", include_in_schema=False)
+    async def archive_portal_case00_q4_feedback(request: Request) -> JSONResponse:
+        """Accept the portal's fixed Q4 feedback shape and archive it via Storage."""
+        secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+        supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+        if not secret or not hmac.compare_digest(supplied, secret):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid payload"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "invalid payload"}, status_code=400)
+        reviewer, decision, notes, packet = (payload.get(k) for k in ("reviewer", "decision", "notes", "original_packet_md"))
+        if (not isinstance(reviewer, str) or not isinstance(notes, str) or not isinstance(packet, str)
+                or decision not in {"accept", "revise", "reject", "investigate_further"}
+                or not packet or len(packet) > 2_000_000 or len(notes) > 20_000):
+            return JSONResponse({"ok": False, "error": "invalid feedback"}, status_code=400)
+        settings = get_settings()
+        binding = ToolBinding("storage.archive_feedback", "storage", "storage", "archive_case00_attorney_feedback")
+        evaluation = {"question_id": "Q4", "reviewer": reviewer, "decision": decision, "notes": notes}
+        email = f"# Case-00 Q4 attorney feedback\n\nReviewer: {reviewer}\nDecision: {decision}\n\n{notes}\n"
+        result = await forward_mcp_tool(
+            binding=binding,
+            arguments={"evaluation_date": time.strftime("%Y-%m-%d"), "original_packet_md": packet,
+                       "feedback_email_md": email, "structured_evaluation_json": json.dumps(evaluation, separators=(",", ":"))},
+            base_url=settings.downstream_by_key("storage").base_url,
+            authorization=settings.bridge_authorization,
+            connect_timeout_seconds=settings.connect_timeout_seconds,
+            read_timeout_seconds=settings.read_timeout_seconds,
+            mcp_path=settings.mcp_path_for_service("storage"),
+            extra_secrets=settings.secret_values_for_redaction(),
+        )
+        return JSONResponse({"ok": bool(result.get("ok"))}, status_code=200 if result.get("ok") else 502)
+
     @application.get("/intake/rennick", include_in_schema=False, response_model=None)
     async def rennick_upload_page(request: Request) -> HTMLResponse | RedirectResponse:
         if _browser_login(request) is None:
