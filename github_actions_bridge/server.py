@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -3337,10 +3338,7 @@ def main() -> None:
         logger.warning("Rennick verified intake promotion result: %s", result)
     except Exception:  # noqa: BLE001 - preserve service availability and log evidence
         logger.exception("Rennick verified intake promotion failed")
-    for case_id, source_sha256 in (
-        (RENNICK_CASE_ID, "6394faf9d9ccdf258a061e231bf2ce9a7e27599c27e5187c4234613e876caf77"),
-        (SZYMCZYK_CASE_ID, "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc"),
-    ):
+    for case_id, source_sha256 in ((RENNICK_CASE_ID, "6394faf9d9ccdf258a061e231bf2ce9a7e27599c27e5187c4234613e876caf77"),):
         try:
             if case_id == SZYMCZYK_CASE_ID:
                 _promote_szymczyk_intake(source_sha256)
@@ -3348,6 +3346,15 @@ def main() -> None:
         except Exception:  # noqa: BLE001 - preserve service availability and log evidence
             logger.exception("Verified case index failed for %s", case_id)
     app = create_http_app()
+    def build_szymczyk_index_after_startup() -> None:
+        try:
+            _promote_szymczyk_intake("ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc")
+            logger.warning("Szymczyk verified case index result: %s", _build_verified_case_index(SZYMCZYK_CASE_ID, "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc"))
+        except Exception:
+            logger.exception("Szymczyk verified case index failed")
+    timer = threading.Timer(15.0, build_szymczyk_index_after_startup)
+    timer.daemon = True
+    timer.start()
     uvicorn.run(
         app,
         host="0.0.0.0",
