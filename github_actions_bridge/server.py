@@ -2125,7 +2125,9 @@ async def build_verified_case_index(request: Request) -> JSONResponse:
 def _build_verified_case_index(case_id: str, source_sha256: str) -> dict[str, Any]:
     client = _b2_client(); prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256); index_key = prefix + "page_records.jsonl"
     try:
-        client.head_object(Bucket=B2_BUCKET, Key=index_key); return {"ok": True, "already_present": True, "index_key": index_key}
+        existing = client.head_object(Bucket=B2_BUCKET, Key=index_key)
+        if int(existing.get("ContentLength", 0)) > 0:
+            return {"ok": True, "already_present": True, "index_key": index_key}
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}: raise
     descriptor = json.loads(client.get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read()); source_key = str(descriptor.get("source_object_key", ""))
