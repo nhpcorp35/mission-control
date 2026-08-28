@@ -3280,7 +3280,9 @@ def main() -> None:
     # records; it never accepts a browser upload or overwrites B2 objects.
     try:
         result = _promote_rennick_intake()
-        logger.info("Rennick verified intake promotion result: %s", result)
+        # Railway retains warning-level application output by default; this is
+        # operational evidence for the one-time, idempotent migration.
+        logger.warning("Rennick verified intake promotion result: %s", result)
     except Exception:  # noqa: BLE001 - preserve service availability and log evidence
         logger.exception("Rennick verified intake promotion failed")
     app = create_http_app()
