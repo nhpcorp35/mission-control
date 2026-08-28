@@ -1868,6 +1868,29 @@ def _inventory_szymczyk_intake(sha256: str) -> dict[str, Any]:
     }
 
 
+def _process_szymczyk_intake(sha256: str) -> dict[str, Any]:
+    """Run the complete factual intake pipeline with one idempotent request."""
+    inspection = _inspect_szymczyk_intake(sha256)
+    identification = _identify_szymczyk_intake(sha256)
+    promotion = _promote_szymczyk_intake(sha256)
+    inventory = _inventory_szymczyk_intake(sha256)
+    return {
+        "ok": True,
+        "pipeline": "szymczyk-intake.v1",
+        "case_id": promotion["case_id"],
+        "case_caption": promotion["case_caption"],
+        "court": promotion["court"],
+        "index_number": promotion["index_number"],
+        "source_sha256": sha256,
+        "stages": {
+            "inspection": {"ok": inspection.get("ok"), "file_count": inspection.get("file_count"), "pdf_count": inspection.get("pdf_count"), "contents_manifest_key": inspection.get("manifest_object_key")},
+            "identification": {"ok": identification.get("ok"), "evidence_filename": identification.get("evidence_filename")},
+            "promotion": {"ok": promotion.get("ok"), "canonical_prefix": promotion.get("canonical_prefix")},
+            "inventory": {"ok": inventory.get("ok"), "inventory_object_key": inventory.get("inventory_object_key")},
+        },
+    }
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -2022,6 +2045,19 @@ async def inventory_szymczyk_intake(request: Request) -> JSONResponse:
     try:
         payload = await request.json()
         return JSONResponse(_inventory_szymczyk_intake(str(payload.get("sha256", ""))))
+    except (ValueError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/szymczyk/process", methods=["POST"])
+async def process_szymczyk_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(_process_szymczyk_intake(str(payload.get("sha256", ""))))
     except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
