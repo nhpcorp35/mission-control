@@ -31,6 +31,8 @@ from starlette.responses import JSONResponse
 
 from botocore.exceptions import ClientError
 from pypdf import PdfReader
+from verified_case_search import search_index_jsonl
+from verified_case_index import build_page_records
 
 from storage_policy import (
     ACCEPTANCE_CONTRACT_PREFIX,
@@ -2083,6 +2085,52 @@ async def read_verified_case_pages(request: Request) -> JSONResponse:
         if not source_key.startswith(prefix):
             raise ValueError("verified source descriptor is invalid")
         return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "document_name": document_name, "pages": extract_pdf_pages_from_object(_b2_client(), B2_BUCKET, source_key, document_name, pages)})
+    except (TypeError, ValueError, KeyError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@mcp.custom_route("/cases/verified/search", methods=["POST"])
+async def search_verified_case(request: Request) -> JSONResponse:
+    """Search a prebuilt immutable page index and return exact citations only."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id, source_sha256 = str(payload.get("case_id", "")), str(payload.get("source_sha256", ""))
+        query, limit = str(payload.get("query", "")), int(payload.get("limit", 20))
+        prefix, _ = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
+        raw = _b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()
+        return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "results": search_index_jsonl(raw, query, limit)})
+    except (TypeError, ValueError, KeyError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@mcp.custom_route("/cases/verified/build-index", methods=["POST"])
+async def build_verified_case_index(request: Request) -> JSONResponse:
+    """Create the immutable page-text index once for a promoted source."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id, source_sha256 = str(payload.get("case_id", "")), str(payload.get("source_sha256", ""))
+        client = _b2_client()
+        prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
+        index_key = prefix + "page_records.jsonl"
+        try:
+            client.head_object(Bucket=B2_BUCKET, Key=index_key)
+            return JSONResponse({"ok": True, "already_present": True, "index_key": index_key})
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}: raise
+        descriptor = json.loads(client.get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read())
+        source_key = str(descriptor.get("source_object_key", ""))
+        if not source_key.startswith(prefix): raise ValueError("verified source descriptor is invalid")
+        body = build_page_records(client, B2_BUCKET, source_key, manifest)
+        client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson", IfNoneMatch="*")
+        return JSONResponse({"ok": True, "created": True, "index_key": index_key, "bytes": len(body)})
     except (TypeError, ValueError, KeyError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
