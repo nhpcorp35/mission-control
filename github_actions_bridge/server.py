@@ -1334,6 +1334,10 @@ PENDING_INTAKE_FILENAME = "wetransfer_szymczyk-case_2026-08-27_1952"
 PENDING_INTAKE_MAX_BYTES = 1024 * 1024 * 1024
 PENDING_INTAKE_TTL_SECONDS = 60 * 60
 PENDING_INTAKE_PREFIX = f"pending-intakes/{PENDING_INTAKE_ID}/.pending/"
+SZYMCZYK_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
+SZYMCZYK_CASE_CAPTION = "Andrzej Szymczyk v. Hudson 36 LLC and Hudson 37 LLC"
+SZYMCZYK_CASE_COURT = "Supreme Court of the State of New York, County of New York"
+SZYMCZYK_CASE_INDEX_NUMBER = "158068/2018"
 
 
 def _require_absent_intake_object(client: Any, object_key: str) -> None:
@@ -1721,6 +1725,73 @@ def _identify_szymczyk_intake(sha256: str) -> dict[str, Any]:
     return payload
 
 
+def _promote_szymczyk_intake(sha256: str) -> dict[str, Any]:
+    """Copy the verified Szymczyk source and factual manifests to canonical B2 keys."""
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError("invalid provisional intake SHA-256")
+    client = _b2_client()
+    provisional_prefix = f"pending-intakes/{PENDING_INTAKE_ID}/verified/{sha256}/"
+    canonical_prefix = f"cases/{SZYMCZYK_CASE_ID}/intake/source/{sha256}/"
+    source_keys = [
+        PENDING_INTAKE_FILENAME,
+        "intake_manifest.json",
+        "contents_manifest.json",
+        "identification_manifest.json",
+    ]
+    source_head = client.head_object(Bucket=B2_BUCKET, Key=provisional_prefix + PENDING_INTAKE_FILENAME)
+    if (source_head.get("Metadata") or {}).get("sha256") != sha256:
+        raise ValueError("provisional intake source hash metadata mismatch")
+    for name in source_keys[1:]:
+        client.head_object(Bucket=B2_BUCKET, Key=provisional_prefix + name)
+    identity = {
+        "schema_version": "case-identity.v1",
+        "case_id": SZYMCZYK_CASE_ID,
+        "case_caption": SZYMCZYK_CASE_CAPTION,
+        "court": SZYMCZYK_CASE_COURT,
+        "index_number": SZYMCZYK_CASE_INDEX_NUMBER,
+        "source_intake_id": PENDING_INTAKE_ID,
+        "source_sha256": sha256,
+        "source_filename": PENDING_INTAKE_FILENAME,
+    }
+    identity_bytes = json.dumps(identity, sort_keys=True).encode()
+    identity_key = f"cases/{SZYMCZYK_CASE_ID}/intake/case_identity.json"
+    expected = [(canonical_prefix + name, provisional_prefix + name) for name in source_keys]
+    existing = []
+    for target, original in expected:
+        try:
+            target_head = client.head_object(Bucket=B2_BUCKET, Key=target)
+            original_head = client.head_object(Bucket=B2_BUCKET, Key=original)
+            if target_head.get("ContentLength") != original_head.get("ContentLength"):
+                raise ValueError("canonical intake object size mismatch")
+            existing.append(target)
+        except ClientError as exc:
+            if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+            client.copy_object(Bucket=B2_BUCKET, Key=target, CopySource={"Bucket": B2_BUCKET, "Key": original}, MetadataDirective="COPY")
+    try:
+        existing_identity = client.get_object(Bucket=B2_BUCKET, Key=identity_key)["Body"].read()
+        if existing_identity != identity_bytes:
+            raise ValueError("canonical case identity already exists with different contents")
+        identity_already_present = True
+    except ClientError as exc:
+        if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+        client.put_object(Bucket=B2_BUCKET, Key=identity_key, Body=identity_bytes, ContentType="application/json", Metadata={"sha256": hashlib.sha256(identity_bytes).hexdigest()})
+        identity_already_present = False
+    return {
+        "ok": True,
+        "promoted": True,
+        "already_present": len(existing) == len(expected) and identity_already_present,
+        "case_id": SZYMCZYK_CASE_ID,
+        "case_caption": SZYMCZYK_CASE_CAPTION,
+        "court": SZYMCZYK_CASE_COURT,
+        "index_number": SZYMCZYK_CASE_INDEX_NUMBER,
+        "source_sha256": sha256,
+        "canonical_prefix": canonical_prefix,
+        "identity_object_key": identity_key,
+    }
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -1849,6 +1920,19 @@ async def identify_szymczyk_intake(request: Request) -> JSONResponse:
     try:
         payload = await request.json()
         return JSONResponse(_identify_szymczyk_intake(str(payload.get("sha256", ""))))
+    except (ValueError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/szymczyk/promote", methods=["POST"])
+async def promote_szymczyk_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(_promote_szymczyk_intake(str(payload.get("sha256", ""))))
     except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
