@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import pathlib
 import re
 import tempfile
 import time
@@ -1792,6 +1793,81 @@ def _promote_szymczyk_intake(sha256: str) -> dict[str, Any]:
     }
 
 
+def _szymczyk_filename_category(filename: str) -> str:
+    """Return a transparent, filename-only document group (not legal classification)."""
+    name = filename.casefold()
+    if not name.endswith(".pdf"):
+        return "Other files"
+    if "affidavit" in name or "affirm" in name:
+        return "Affidavits / affirmations"
+    if "exhibit" in name:
+        return "Exhibits"
+    if "notice" in name:
+        return "Notices"
+    if "order" in name:
+        return "Orders"
+    if "motion" in name or "osc" in name:
+        return "Motions / orders to show cause"
+    if "complaint" in name or "summons" in name or "answer" in name:
+        return "Pleadings"
+    if "letter" in name or "correspond" in name:
+        return "Correspondence"
+    return "Other PDFs"
+
+
+def _inventory_szymczyk_intake(sha256: str) -> dict[str, Any]:
+    """Create a factual, filename-only inventory from the canonical contents manifest."""
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError("invalid source SHA-256")
+    client = _b2_client()
+    canonical_prefix = f"cases/{SZYMCZYK_CASE_ID}/intake/source/{sha256}/"
+    contents_key = canonical_prefix + "contents_manifest.json"
+    inventory_key = f"cases/{SZYMCZYK_CASE_ID}/intake/inventory.json"
+    try:
+        existing = client.get_object(Bucket=B2_BUCKET, Key=inventory_key)["Body"].read()
+        return json.loads(existing)
+    except ClientError as exc:
+        if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    contents = json.loads(client.get_object(Bucket=B2_BUCKET, Key=contents_key)["Body"].read())
+    files = contents.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("canonical contents manifest has no files")
+    grouped: dict[str, int] = {}
+    extensions: dict[str, int] = {}
+    documents: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+            raise ValueError("canonical contents manifest has an invalid file entry")
+        filename = item["filename"]
+        category = _szymczyk_filename_category(filename)
+        grouped[category] = grouped.get(category, 0) + 1
+        suffix = pathlib.PurePosixPath(filename).suffix.casefold() or "[no extension]"
+        extensions[suffix] = extensions.get(suffix, 0) + 1
+        documents.append({"filename": filename, "size_bytes": item.get("size_bytes"), "category": category})
+    payload = {
+        "ok": True,
+        "schema_version": "case-intake-inventory.v1",
+        "classification": "filename-only; no document contents were read",
+        "case_id": SZYMCZYK_CASE_ID,
+        "source_sha256": sha256,
+        "source_contents_manifest_key": contents_key,
+        "file_count": len(files),
+        "pdf_count": sum(1 for item in files if str(item.get("filename", "")).casefold().endswith(".pdf")),
+        "groups": dict(sorted(grouped.items())),
+        "extensions": dict(sorted(extensions.items())),
+        "documents": sorted(documents, key=lambda item: str(item["filename"]).casefold()),
+    }
+    raw = json.dumps(payload, sort_keys=True).encode()
+    _require_absent_intake_object(client, inventory_key)
+    client.put_object(Bucket=B2_BUCKET, Key=inventory_key, Body=raw, ContentType="application/json", Metadata={"sha256": hashlib.sha256(raw).hexdigest()})
+    return {
+        **{key: value for key, value in payload.items() if key != "documents"},
+        "inventory_object_key": inventory_key,
+        "inventory_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 @mcp.tool()
 async def upload_rennick_case_intake(
     source_bundle_base64: str,
@@ -1933,6 +2009,19 @@ async def promote_szymczyk_intake(request: Request) -> JSONResponse:
     try:
         payload = await request.json()
         return JSONResponse(_promote_szymczyk_intake(str(payload.get("sha256", ""))))
+    except (ValueError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+
+@mcp.custom_route("/intake/szymczyk/inventory", methods=["POST"])
+async def inventory_szymczyk_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(_inventory_szymczyk_intake(str(payload.get("sha256", ""))))
     except (ValueError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
