@@ -1306,7 +1306,12 @@ async def read_case00_attorney_feedback(request: Request) -> JSONResponse:
     try:
         response = _b2_client().get_object(Bucket=B2_BUCKET, Key=object_key)
         raw = response["Body"].read(30_001)
-    except ClientError:
+    except ClientError as exc:
+        logger.warning(
+            "Case-00 attorney feedback read failed archive_id=%s b2_error=%s",
+            archive_id,
+            exc.response.get("Error", {}).get("Code", "unknown"),
+        )
         return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
     if len(raw) > 30_000:
         return JSONResponse({"ok": False, "error": "feedback_too_large"}, status_code=422)
