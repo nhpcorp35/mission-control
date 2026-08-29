@@ -518,6 +518,37 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         )
         return JSONResponse({"ok": bool(result.get("ok"))}, status_code=200 if result.get("ok") else 502)
 
+    @application.post("/portal/case-00/q4/feedback/read", include_in_schema=False)
+    async def read_portal_case00_q4_feedback(request: Request) -> JSONResponse:
+        """Read one archived portal feedback note through the private Bridge path."""
+        secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+        supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+        if not secret or not hmac.compare_digest(supplied, secret):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+            archive_id = str(payload.get("archive_id", ""))
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+        settings = get_settings()
+        headers = {"Content-Type": "application/json"}
+        authorization = service_authorization_header(settings.bridge_authorization)
+        if authorization:
+            headers["Authorization"] = authorization
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)
+        ) as client:
+            response = await client.post(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/case-00/attorney-feedback/read",
+                json={"archive_id": archive_id},
+                headers=headers,
+            )
+        try:
+            result = response.json()
+        except ValueError:
+            result = {"ok": False, "error": "bridge_read_response_invalid"}
+        return JSONResponse(result, status_code=response.status_code)
+
     @application.get("/intake/rennick", include_in_schema=False, response_model=None)
     async def rennick_upload_page(request: Request) -> HTMLResponse | RedirectResponse:
         if _browser_login(request) is None:

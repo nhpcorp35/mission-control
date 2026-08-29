@@ -75,6 +75,12 @@ from service_auth import (
 
 # Exact immutable LegalAI commit SHA (lowercase hex only — no abbreviated / mixed case).
 _FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_ATTORNEY_REVIEW_ARCHIVE_ID_RE = re.compile(r"^review-\d{8}-[0-9a-f]{12}$")
+_ATTORNEY_REVIEW_PREFIX = (
+    "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/"
+    "attorney-reviews/"
+)
+_ATTORNEY_REVIEW_FEEDBACK_FILENAME = "John-Cuomo-Case00-Attorney-Feedback-Email-2026-08-02.md"
 
 # Structured Case-00 ref / dispatch failures (safe for Gateway envelopes).
 ERROR_REF_INVALID = "ref_invalid"
@@ -1277,6 +1283,38 @@ async def list_case00_storage(
         "count": len(objects),
         "truncated": bool(response.get("IsTruncated")),
     }
+
+
+@mcp.custom_route("/case-00/attorney-feedback/read", methods=["POST"])
+async def read_case00_attorney_feedback(request: Request) -> JSONResponse:
+    """Read one fixed-format archived attorney-feedback note for the Gateway."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        archive_id = str(payload.get("archive_id", ""))
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not _ATTORNEY_REVIEW_ARCHIVE_ID_RE.fullmatch(archive_id):
+        return JSONResponse({"ok": False, "error": "invalid_archive_id"}, status_code=400)
+    object_key = (
+        f"{_ATTORNEY_REVIEW_PREFIX}{archive_id}/"
+        f"{_ATTORNEY_REVIEW_FEEDBACK_FILENAME}"
+    )
+    try:
+        response = _b2_client().get_object(Bucket=B2_BUCKET, Key=object_key)
+        raw = response["Body"].read(30_001)
+    except ClientError:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    if len(raw) > 30_000:
+        return JSONResponse({"ok": False, "error": "feedback_too_large"}, status_code=422)
+    try:
+        feedback_markdown = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return JSONResponse({"ok": False, "error": "invalid_feedback"}, status_code=422)
+    return JSONResponse({"ok": True, "archive_id": archive_id, "feedback_markdown": feedback_markdown})
 
 
 @mcp.tool()
