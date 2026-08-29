@@ -77,6 +77,11 @@ RENNICK_MANIFEST_BYTES_MAX = 128 * 1024
 RENNICK_BROWSER_SESSION_SECONDS = 15 * 60
 _RENNICK_STATE_COOKIE = "rennick_oauth_state"
 _RENNICK_SESSION_COOKIE = "rennick_upload_session"
+_PORTAL_REVIEW_DECISIONS = frozenset(
+    {"accept", "revise", "reject", "investigate_further"}
+)
+_PORTAL_REVIEW_QUESTIONS = frozenset({"Q4", "Q5"})
+_PORTAL_REVIEWER_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}$")
 
 
 class _GatewayAuthBackend(AuthenticationBackend):
@@ -116,6 +121,78 @@ def reset_settings_for_tests() -> None:
     _registered_tools = []
     _mcp_http_app = None
     _auth_override = None
+
+
+async def _archive_portal_case00_feedback(
+    request: Request, *, question_id: str
+) -> JSONResponse:
+    """Archive one authenticated, bounded Case-00 portal submission.
+
+    The portal verifies its B2 packet before calling this bounded relay.  The
+    gateway only accepts explicitly supported question IDs, rather than acting
+    as a general-purpose archive proxy.
+    """
+    if question_id not in _PORTAL_REVIEW_QUESTIONS:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "invalid_submission"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "invalid_submission"}, status_code=400)
+    reviewer = payload.get("reviewer")
+    decision = payload.get("decision")
+    notes = payload.get("notes", "")
+    packet = payload.get("original_packet_md")
+    if not all(isinstance(value, str) for value in (reviewer, decision, notes, packet)):
+        return JSONResponse({"ok": False, "error": "invalid_submission"}, status_code=400)
+    reviewer = reviewer.strip().lower()
+    decision = decision.strip().lower()
+    notes = notes.strip()
+    if (
+        decision not in _PORTAL_REVIEW_DECISIONS
+        or not _PORTAL_REVIEWER_EMAIL.fullmatch(reviewer)
+        or not packet.startswith("# Case-00 Attorney Cognition Review Packet v1")
+        or f"**Question ID:** {question_id}" not in packet
+        or len(packet) > 50_000
+        or len(notes) > 12_000
+    ):
+        return JSONResponse({"ok": False, "error": "invalid_submission"}, status_code=400)
+    settings = get_settings()
+    binding = ToolBinding(
+        "storage.archive_feedback", "storage", "storage", "archive_case00_attorney_feedback"
+    )
+    evaluation = {
+        "case_id": "case-00-triborough",
+        "question_id": question_id,
+        "reviewer": reviewer,
+        "decision": decision,
+        "notes": notes,
+    }
+    email = (
+        f"# Case-00 {question_id} attorney feedback\n\n"
+        f"Reviewer: {reviewer}\nDecision: {decision}\n\n{notes}\n"
+    )
+    result = await forward_mcp_tool(
+        binding=binding,
+        arguments={
+            "evaluation_date": time.strftime("%Y-%m-%d"),
+            "original_packet_md": packet,
+            "feedback_email_md": email,
+            "structured_evaluation_json": json.dumps(evaluation, separators=(",", ":")),
+        },
+        base_url=settings.downstream_by_key("storage").base_url,
+        authorization=settings.bridge_authorization,
+        connect_timeout_seconds=settings.connect_timeout_seconds,
+        read_timeout_seconds=settings.read_timeout_seconds,
+        mcp_path=settings.mcp_path_for_service("storage"),
+        extra_secrets=settings.secret_values_for_redaction(),
+    )
+    return JSONResponse(result, status_code=201 if result.get("ok") else 502)
 
 
 def _sign_browser_value(payload: dict[str, Any]) -> str:
@@ -485,38 +562,11 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
 
     @application.post("/portal/case-00/q4/feedback", include_in_schema=False)
     async def archive_portal_case00_q4_feedback(request: Request) -> JSONResponse:
-        """Accept the portal's fixed Q4 feedback shape and archive it via Storage."""
-        secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
-        supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
-        if not secret or not hmac.compare_digest(supplied, secret):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            payload = await request.json()
-        except Exception:
-            return JSONResponse({"ok": False, "error": "invalid payload"}, status_code=400)
-        if not isinstance(payload, dict):
-            return JSONResponse({"ok": False, "error": "invalid payload"}, status_code=400)
-        reviewer, decision, notes, packet = (payload.get(k) for k in ("reviewer", "decision", "notes", "original_packet_md"))
-        if (not isinstance(reviewer, str) or not isinstance(notes, str) or not isinstance(packet, str)
-                or decision not in {"accept", "revise", "reject", "investigate_further"}
-                or not packet or len(packet) > 2_000_000 or len(notes) > 20_000):
-            return JSONResponse({"ok": False, "error": "invalid feedback"}, status_code=400)
-        settings = get_settings()
-        binding = ToolBinding("storage.archive_feedback", "storage", "storage", "archive_case00_attorney_feedback")
-        evaluation = {"question_id": "Q4", "reviewer": reviewer, "decision": decision, "notes": notes}
-        email = f"# Case-00 Q4 attorney feedback\n\nReviewer: {reviewer}\nDecision: {decision}\n\n{notes}\n"
-        result = await forward_mcp_tool(
-            binding=binding,
-            arguments={"evaluation_date": time.strftime("%Y-%m-%d"), "original_packet_md": packet,
-                       "feedback_email_md": email, "structured_evaluation_json": json.dumps(evaluation, separators=(",", ":"))},
-            base_url=settings.downstream_by_key("storage").base_url,
-            authorization=settings.bridge_authorization,
-            connect_timeout_seconds=settings.connect_timeout_seconds,
-            read_timeout_seconds=settings.read_timeout_seconds,
-            mcp_path=settings.mcp_path_for_service("storage"),
-            extra_secrets=settings.secret_values_for_redaction(),
-        )
-        return JSONResponse({"ok": bool(result.get("ok"))}, status_code=200 if result.get("ok") else 502)
+        return await _archive_portal_case00_feedback(request, question_id="Q4")
+
+    @application.post("/portal/case-00/q5/feedback", include_in_schema=False)
+    async def archive_portal_case00_q5_feedback(request: Request) -> JSONResponse:
+        return await _archive_portal_case00_feedback(request, question_id="Q5")
 
     @application.post("/portal/case-00/q4/feedback/read", include_in_schema=False)
     async def read_portal_case00_q4_feedback(request: Request) -> JSONResponse:
