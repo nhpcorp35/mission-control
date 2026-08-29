@@ -1085,6 +1085,7 @@ class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.env = {
             **REQUIRED_SECRETS,
+            "PORTAL_REVIEW_GATEWAY_SECRET": "test-portal-review-secret",
             "RAILWAY_GIT_COMMIT_SHA": "deadbeefcafebabe0123456789abcdef01234567",
             "GATEWAY_HEALTH_TIMEOUT_SECONDS": "1",
             "GATEWAY_BRIDGE_URL": "https://bridge.example",
@@ -1273,6 +1274,48 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn(TEST_BRIDGE_SERVICE_TOKEN, blob)
         self.assertNotIn(REQUIRED_SECRETS["GITHUB_OAUTH_CLIENT_SECRET"], blob)
         self.assertNotIn(REQUIRED_SECRETS["JWT_SIGNING_KEY"], blob)
+
+    def test_portal_feedback_requires_shared_secret(self) -> None:
+        response = self.client.post("/portal/case-00/q5/feedback", json={})
+        self.assertEqual(response.status_code, 401)
+
+    def test_portal_q5_feedback_archives_only_matching_packet(self) -> None:
+        async def fake_forward(**kwargs: Any) -> dict[str, Any]:
+            self.assertEqual(kwargs["binding"].gateway_tool, "storage.archive_feedback")
+            evaluation = json.loads(kwargs["arguments"]["structured_evaluation_json"])
+            self.assertEqual(evaluation["question_id"], "Q5")
+            self.assertEqual(evaluation["reviewer"], "johncuomo@gmail.com")
+            return {"ok": True, "result": {"archive_id": "review-test-q5"}}
+
+        packet = "# Case-00 Attorney Cognition Review Packet v1\n\n**Question ID:** Q5\n"
+        with mock.patch(
+            "hal_legalai_gateway.server.forward_mcp_tool", side_effect=fake_forward
+        ):
+            response = self.client.post(
+                "/portal/case-00/q5/feedback",
+                headers={"X-LegalAI-Portal-Secret": "test-portal-review-secret"},
+                json={
+                    "reviewer": "johncuomo@gmail.com",
+                    "decision": "investigate_further",
+                    "notes": "Need one additional record check.",
+                    "original_packet_md": packet,
+                },
+            )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.json()["ok"])
+
+    def test_portal_q5_rejects_q4_packet(self) -> None:
+        response = self.client.post(
+            "/portal/case-00/q5/feedback",
+            headers={"X-LegalAI-Portal-Secret": "test-portal-review-secret"},
+            json={
+                "reviewer": "johncuomo@gmail.com",
+                "decision": "accept",
+                "notes": "",
+                "original_packet_md": "# Case-00 Attorney Cognition Review Packet v1\n\n**Question ID:** Q4\n",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
 
 
 class ServiceCredentialTests(unittest.TestCase):
