@@ -82,6 +82,7 @@ _PORTAL_REVIEW_DECISIONS = frozenset(
 )
 _PORTAL_REVIEW_QUESTIONS = frozenset({"Q4", "Q5"})
 _PORTAL_REVIEWER_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}$")
+_PORTAL_REVIEW_ARCHIVE_ID = re.compile(r"^review-\d{8}-[0-9a-f]{12}$")
 
 
 class _GatewayAuthBackend(AuthenticationBackend):
@@ -193,6 +194,51 @@ async def _archive_portal_case00_feedback(
         extra_secrets=settings.secret_values_for_redaction(),
     )
     return JSONResponse(result, status_code=201 if result.get("ok") else 502)
+
+
+async def _read_portal_case00_feedback(
+    request: Request, *, question_id: str
+) -> JSONResponse:
+    """Read one fixed-format archived portal feedback note.
+
+    This is intentionally separate from the public MCP catalog.  It accepts
+    only the portal shared secret and a bounded archive identifier, then uses
+    the existing private Bridge read route.  It never exposes B2 credentials.
+    """
+    if question_id not in _PORTAL_REVIEW_QUESTIONS:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        archive_id = str(payload.get("archive_id", ""))
+    except (ValueError, json.JSONDecodeError, AttributeError):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not _PORTAL_REVIEW_ARCHIVE_ID.fullmatch(archive_id):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+
+    settings = get_settings()
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)
+        ) as client:
+            response = await client.post(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/case-00/attorney-feedback/read",
+                json={"archive_id": archive_id},
+                headers=headers,
+            )
+        result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "feedback_read_unavailable"}, status_code=502)
+    if not isinstance(result, dict):
+        return JSONResponse({"ok": False, "error": "feedback_read_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
 
 
 def _sign_browser_value(payload: dict[str, Any]) -> str:
@@ -570,34 +616,11 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
 
     @application.post("/portal/case-00/q4/feedback/read", include_in_schema=False)
     async def read_portal_case00_q4_feedback(request: Request) -> JSONResponse:
-        """Read one archived portal feedback note through the private Bridge path."""
-        secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
-        supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
-        if not secret or not hmac.compare_digest(supplied, secret):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            payload = await request.json()
-            archive_id = str(payload.get("archive_id", ""))
-        except Exception:
-            return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
-        settings = get_settings()
-        headers = {"Content-Type": "application/json"}
-        authorization = service_authorization_header(settings.bridge_authorization)
-        if authorization:
-            headers["Authorization"] = authorization
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)
-        ) as client:
-            response = await client.post(
-                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/case-00/attorney-feedback/read",
-                json={"archive_id": archive_id},
-                headers=headers,
-            )
-        try:
-            result = response.json()
-        except ValueError:
-            result = {"ok": False, "error": "bridge_read_response_invalid"}
-        return JSONResponse(result, status_code=response.status_code)
+        return await _read_portal_case00_feedback(request, question_id="Q4")
+
+    @application.post("/portal/case-00/q5/feedback/read", include_in_schema=False)
+    async def read_portal_case00_q5_feedback(request: Request) -> JSONResponse:
+        return await _read_portal_case00_feedback(request, question_id="Q5")
 
     @application.get("/intake/rennick", include_in_schema=False, response_model=None)
     async def rennick_upload_page(request: Request) -> HTMLResponse | RedirectResponse:
