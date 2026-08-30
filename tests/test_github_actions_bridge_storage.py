@@ -503,6 +503,42 @@ class BridgeOperationalIntegrityTests(unittest.TestCase):
             self.server.REQUIRED_PRODUCTION_TOOLS,
         )
 
+    def test_get_case00_attorney_feedback_resolves_only_question_matched_archive(self) -> None:
+        archive_id = "review-20260830-deadbeefcafe"
+        evaluation_key = (
+            self.server.CASE00_PREFIXES["attorney_reviews"]
+            + archive_id
+            + "/"
+            + self.server._ATTORNEY_REVIEW_EVALUATION_FILENAME
+        )
+
+        class FakeB2:
+            def list_objects_v2(self, **kwargs):
+                self.list_kwargs = kwargs
+                return {"Contents": [{"Key": evaluation_key, "LastModified": 1}]}
+
+            def get_object(self, **kwargs):
+                self.get_kwargs = kwargs
+                return {
+                    "Body": io.BytesIO(
+                        b'{"question_id":"Q5","reviewer":"john@example.com",'
+                        b'"decision":"accept","notes":"Correct."}'
+                    )
+                }
+
+        fake_b2 = FakeB2()
+        with mock.patch.object(self.server, "_require_allowed_user"), mock.patch.object(
+            self.server, "_b2_client", return_value=fake_b2
+        ):
+            result = asyncio.run(
+                self.server.get_case00_attorney_feedback.fn("q5")
+            )
+        self.assertEqual(result["archive_id"], archive_id)
+        self.assertEqual(result["question_id"], "Q5")
+        self.assertEqual(result["notes"], "Correct.")
+        self.assertEqual(fake_b2.list_kwargs["Prefix"], self.server.CASE00_PREFIXES["attorney_reviews"])
+        self.assertEqual(fake_b2.get_kwargs["Key"], evaluation_key)
+
     def test_missing_required_tools_detection(self) -> None:
         registered = set(self.server.REQUIRED_PRODUCTION_TOOLS) - {
             "archive_case00_review_packet"

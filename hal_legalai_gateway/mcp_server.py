@@ -214,6 +214,17 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="Archive and HEAD-verify one Case-00 attorney-feedback package.",
     ),
     ToolBinding(
+        gateway_tool="storage.get_case00_attorney_feedback",
+        namespace="storage",
+        downstream_service="storage",
+        downstream_tool="get_case00_attorney_feedback",
+        description=(
+            "Read the newest archived Case-00 attorney feedback for one fixed "
+            "question ID. The server resolves the archive internally; callers "
+            "cannot provide B2 keys or archive IDs."
+        ),
+    ),
+    ToolBinding(
         gateway_tool="storage.archive_review_packet",
         namespace="storage",
         downstream_service="storage",
@@ -998,6 +1009,15 @@ def register_forwarding_tools(
                 "feedback_email_md": feedback_email_md,
                 "structured_evaluation_json": structured_evaluation_json,
             },
+        )
+
+    @mcp.tool(
+        name="storage.get_case00_attorney_feedback",
+        description=by_name["storage.get_case00_attorney_feedback"].description,
+    )
+    async def storage_get_case00_attorney_feedback(question_id: str) -> dict[str, Any]:
+        return await _forward(
+            "storage.get_case00_attorney_feedback", {"question_id": question_id}
         )
 
     @mcp.tool(

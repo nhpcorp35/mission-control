@@ -36,6 +36,9 @@ from verified_case_search import search_index_jsonl
 from verified_case_index import build_page_records
 
 from storage_policy import (
+    ALLOWED_QUESTION_IDS,
+    ATTORNEY_REVIEW_FILENAMES,
+    CASE00_PREFIXES,
     ACCEPTANCE_CONTRACT_PREFIX,
     MAX_ACCEPTANCE_CONTRACT_BYTES,
     archive_create_only_put_params,
@@ -81,6 +84,7 @@ _ATTORNEY_REVIEW_PREFIX = (
     "attorney-reviews/"
 )
 _ATTORNEY_REVIEW_FEEDBACK_FILENAME = "John-Cuomo-Case00-Attorney-Feedback-Email-2026-08-02.md"
+_ATTORNEY_REVIEW_EVALUATION_FILENAME = ATTORNEY_REVIEW_FILENAMES["structured_evaluation"]
 
 # Structured Case-00 ref / dispatch failures (safe for Gateway envelopes).
 ERROR_REF_INVALID = "ref_invalid"
@@ -133,6 +137,7 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "get_case_artifact",
         "list_case00_storage",
         "archive_case00_attorney_feedback",
+        "get_case00_attorney_feedback",
         "archive_case00_review_packet",
         "archive_acceptance_contract",
         "verify_acceptance_contract",
@@ -1320,6 +1325,58 @@ async def read_case00_attorney_feedback(request: Request) -> JSONResponse:
     except UnicodeDecodeError:
         return JSONResponse({"ok": False, "error": "invalid_feedback"}, status_code=422)
     return JSONResponse({"ok": True, "archive_id": archive_id, "feedback_markdown": feedback_markdown})
+
+
+@mcp.tool()
+async def get_case00_attorney_feedback(question_id: str) -> dict[str, Any]:
+    """Read the newest archived Case-00 feedback for one fixed question.
+
+    The question ID is the only caller input. Archive discovery and B2 access
+    remain server-side; arbitrary object keys and archive identifiers are never
+    accepted or returned as retrieval inputs.
+    """
+    _require_allowed_user()
+    normalized_question_id = question_id.strip().upper()
+    if normalized_question_id not in ALLOWED_QUESTION_IDS:
+        raise ValueError("question_id must be one of Q1, Q2, Q3, Q4, or Q5")
+
+    prefix = CASE00_PREFIXES["attorney_reviews"]
+    response = _b2_client().list_objects_v2(Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=200)
+    candidates = sorted(
+        (
+            item
+            for item in response.get("Contents", [])
+            if str(item.get("Key", "")).endswith("/" + _ATTORNEY_REVIEW_EVALUATION_FILENAME)
+        ),
+        key=lambda item: item["LastModified"],
+        reverse=True,
+    )
+    for item in candidates:
+        object_key = str(item["Key"])
+        try:
+            raw = _b2_client().get_object(Bucket=B2_BUCKET, Key=object_key)["Body"].read(30_001)
+            evaluation = json.loads(raw)
+        except (ClientError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if not isinstance(evaluation, dict) or evaluation.get("question_id") != normalized_question_id:
+            continue
+        reviewer = evaluation.get("reviewer")
+        decision = evaluation.get("decision")
+        notes = evaluation.get("notes")
+        if not all(isinstance(value, str) for value in (reviewer, decision, notes)):
+            continue
+        archive_id = object_key.removeprefix(prefix).split("/", 1)[0]
+        if not _ATTORNEY_REVIEW_ARCHIVE_ID_RE.fullmatch(archive_id):
+            continue
+        return {
+            "ok": True,
+            "question_id": normalized_question_id,
+            "archive_id": archive_id,
+            "reviewer": reviewer,
+            "decision": decision,
+            "notes": notes,
+        }
+    raise ValueError(f"no archived attorney feedback found for {normalized_question_id}")
 
 
 @mcp.tool()
@@ -3099,6 +3156,7 @@ _LOCAL_CANONICAL_ALIASES: tuple[tuple[str, str], ...] = (
     ("case.get_artifacts", "get_artifacts"),
     ("storage.list_inventory", "list_case00_storage"),
     ("storage.archive_feedback", "archive_case00_attorney_feedback"),
+    ("storage.get_case00_attorney_feedback", "get_case00_attorney_feedback"),
     ("storage.archive_review_packet", "archive_case00_review_packet"),
     ("storage.archive_acceptance_contract", "archive_acceptance_contract"),
     ("storage.verify_acceptance_contract", "verify_acceptance_contract"),
