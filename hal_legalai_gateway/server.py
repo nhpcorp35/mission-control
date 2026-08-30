@@ -1,4 +1,4 @@
-ÕştÙçëÍŸ®[kn{÷½wíî´o]vïmšo­wÍİÛVŞy·»uç{áöİİ®Ñ§½m×s¾;ßÍ["""HAL LegalAI Gateway HTTP + authenticated MCP service (Phase 2)."""
+"""HAL LegalAI Gateway HTTP + authenticated MCP service (Phase 2)."""
 
 from __future__ import annotations
 
