@@ -1,4 +1,4 @@
-"""HAL LegalAI Gateway HTTP + authenticated MCP service (Phase 2)."""
+ÕþtÙçëÍŸ®[kn{÷½wíî´o]vïmšo­žwÍÝÛVÞy·»uç{áöÝÝ®Ñ§½m×s¾;ßÍ["""HAL LegalAI Gateway HTTP + authenticated MCP service (Phase 2)."""
 
 from __future__ import annotations
 
@@ -194,6 +194,32 @@ async def _archive_portal_case00_feedback(
         extra_secrets=settings.secret_values_for_redaction(),
     )
     return JSONResponse(result, status_code=201 if result.get("ok") else 502)
+
+
+async def _archive_portal_szymczyk_feedback(request: Request) -> JSONResponse:
+    """Relay one authenticated Szymczyk portal submission to the B2 bridge."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "invalid_submission"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "invalid_submission"}, status_code=400)
+    settings = get_settings()
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.post(settings.downstream_by_key("storage").base_url.rstrip("/") + "/portal/szymczyk/feedback", headers=headers, json=payload)
+            result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "archive_unavailable"}, status_code=502)
+    return JSONResponse(result if isinstance(result, dict) else {"ok": False, "error": "archive_unavailable"}, status_code=201 if response.status_code == 201 else response.status_code)
 
 
 async def _read_portal_case00_feedback(
@@ -609,6 +635,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.post("/portal/case-00/q4/feedback", include_in_schema=False)
     async def archive_portal_case00_q4_feedback(request: Request) -> JSONResponse:
         return await _archive_portal_case00_feedback(request, question_id="Q4")
+
+    @application.post("/portal/szymczyk/feedback", include_in_schema=False)
+    async def archive_portal_szymczyk_feedback(request: Request) -> JSONResponse:
+        return await _archive_portal_szymczyk_feedback(request)
 
     @application.post("/portal/case-00/q5/feedback", include_in_schema=False)
     async def archive_portal_case00_q5_feedback(request: Request) -> JSONResponse:
