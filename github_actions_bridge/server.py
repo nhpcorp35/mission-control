@@ -2436,6 +2436,26 @@ async def szymczyk_portal_feedback_status(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "submission_count": len(feedback), "latest_submitted_at": latest.isoformat() if latest else None})
 
 
+@mcp.custom_route("/portal/szymczyk/feedback/latest", methods=["GET"])
+async def read_latest_szymczyk_portal_feedback(request: Request) -> JSONResponse:
+    """Return the newest Szymczyk feedback through service auth only."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    prefix = "cases/NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37/derived/attorney-reviews/"
+    try:
+        contents = _b2_client().list_objects_v2(Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=200).get("Contents", [])
+        feedback = [item for item in contents if item["Key"].endswith("/feedback.md")]
+        if not feedback:
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+        latest = max(feedback, key=lambda item: item["LastModified"])
+        body = _b2_client().get_object(Bucket=B2_BUCKET, Key=latest["Key"])["Body"].read().decode("utf-8")
+    except (ClientError, UnicodeDecodeError):
+        return JSONResponse({"ok": False, "error": "feedback_read_unavailable"}, status_code=502)
+    return JSONResponse({"ok": True, "archive_id": latest["Key"].rstrip("/").split("/")[-2], "submitted_at": latest["LastModified"].isoformat(), "feedback_markdown": body})
+
+
 def _b2_object_exists(client: Any, object_key: str) -> bool:
     try:
         client.head_object(Bucket=B2_BUCKET, Key=object_key)

@@ -238,6 +238,25 @@ async def _szymczyk_feedback_status(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=response.status_code)
 
 
+async def _read_latest_szymczyk_feedback(request: Request) -> JSONResponse:
+    """Relay the newest Szymczyk feedback through the portal secret boundary."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    if not secret or not hmac.compare_digest(request.headers.get("X-LegalAI-Portal-Secret", ""), secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    settings = get_settings()
+    headers = {}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.get(settings.downstream_by_key("storage").base_url.rstrip("/") + "/portal/szymczyk/feedback/latest", headers=headers)
+            result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "feedback_read_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
+
+
 async def _read_portal_case00_feedback(
     request: Request, *, question_id: str
 ) -> JSONResponse:
@@ -659,6 +678,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/szymczyk/feedback/status", include_in_schema=False)
     async def szymczyk_feedback_status(request: Request) -> JSONResponse:
         return await _szymczyk_feedback_status(request)
+
+    @application.get("/portal/szymczyk/feedback/latest", include_in_schema=False)
+    async def read_latest_szymczyk_feedback(request: Request) -> JSONResponse:
+        return await _read_latest_szymczyk_feedback(request)
 
     @application.post("/portal/case-00/q5/feedback", include_in_schema=False)
     async def archive_portal_case00_q5_feedback(request: Request) -> JSONResponse:
