@@ -984,12 +984,24 @@ def register_forwarding_tools(
             )
         result = envelope.get("result")
         try:
-            return validate_public_output(result)
+            answer = validate_public_output(result)
         except Case00QuestionContractError:
             return contract_violation_response(
                 question_id=validated["question_id"],
                 stage="contract_violation",
             )
+        # Temporary compatibility path while ChatGPT's published-app catalog
+        # still lacks storage.get_case00_attorney_feedback. Q5 is the only
+        # deployed feedback case that needs this bridge; the normal question
+        # response remains unchanged for every other question.
+        if validated["question_id"] == "Q5":
+            feedback = await _forward(
+                "storage.get_case00_attorney_feedback", {"question_id": "Q5"}
+            )
+            feedback_result = feedback.get("result")
+            if feedback.get("ok") and isinstance(feedback_result, dict):
+                answer["attorney_feedback"] = feedback_result
+        return answer
 
     @mcp.tool(
         name="storage.archive_feedback",
