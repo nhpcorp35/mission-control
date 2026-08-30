@@ -2419,6 +2419,23 @@ async def archive_szymczyk_portal_feedback(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "verified": True, "archive_id": archive_id}, status_code=201)
 
 
+@mcp.custom_route("/portal/szymczyk/feedback/status", methods=["GET"])
+async def szymczyk_portal_feedback_status(request: Request) -> JSONResponse:
+    """Return only existence metadata for archived Szymczyk attorney feedback."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    prefix = "cases/NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37/derived/attorney-reviews/"
+    try:
+        contents = _b2_client().list_objects_v2(Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=200).get("Contents", [])
+    except ClientError:
+        return JSONResponse({"ok": False, "error": "storage_unavailable"}, status_code=502)
+    feedback = [item for item in contents if item["Key"].endswith("/feedback.md")]
+    latest = max((item["LastModified"] for item in feedback), default=None)
+    return JSONResponse({"ok": True, "submission_count": len(feedback), "latest_submitted_at": latest.isoformat() if latest else None})
+
+
 def _b2_object_exists(client: Any, object_key: str) -> bool:
     try:
         client.head_object(Bucket=B2_BUCKET, Key=object_key)
