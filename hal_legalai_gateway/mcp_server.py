@@ -991,12 +991,13 @@ def register_forwarding_tools(
                 stage="contract_violation",
             )
         # Temporary compatibility path while ChatGPT's published-app catalog
-        # still lacks storage.get_case00_attorney_feedback. Q5 is the only
-        # deployed feedback case that needs this bridge; the normal question
+        # still lacks storage.get_case00_attorney_feedback. Only Q4 and Q5
+        # have deployed feedback that needs this bridge; the normal question
         # response remains unchanged for every other question.
-        if validated["question_id"] == "Q5":
+        if validated["question_id"] in {"Q4", "Q5"}:
             feedback = await _forward(
-                "storage.get_case00_attorney_feedback", {"question_id": "Q5"}
+                "storage.get_case00_attorney_feedback",
+                {"question_id": validated["question_id"]},
             )
             feedback_result = feedback.get("result")
             if feedback.get("ok") and isinstance(feedback_result, dict):
