@@ -63,6 +63,7 @@
         "storage.upload_rennick_case_intake",
         "storage.get_case00_question",
         "storage.archive_feedback",
+        "storage.get_case00_attorney_feedback",
         "storage.archive_review_packet",
         "storage.archive_acceptance_contract",
         "storage.verify_acceptance_contract",
@@ -223,6 +224,13 @@
       "namespace": "storage",
       "downstream_service": "storage",
       "downstream_tool": "archive_case00_attorney_feedback"
+    },
+    {
+      "tool": "storage.get_case00_attorney_feedback",
+      "namespace": "storage",
+      "downstream_service": "storage",
+      "downstream_tool": "get_case00_attorney_feedback",
+      "description": "Read the newest archived Case-00 attorney feedback for one fixed question ID. The server resolves the archive internally; callers cannot provide B2 keys or archive IDs."
     },
     {
       "tool": "storage.archive_review_packet",
