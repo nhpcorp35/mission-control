@@ -1279,6 +1279,48 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/portal/case-00/q5/feedback", json={})
         self.assertEqual(response.status_code, 401)
 
+    def test_szymczyk_current_packet_requires_shared_secret(self) -> None:
+        response = self.client.get("/portal/szymczyk/review-packet/current")
+        self.assertEqual(response.status_code, 401)
+
+    def test_szymczyk_current_packet_relays_service_authenticated_read(self) -> None:
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "ok": True,
+                    "run_id": "candidate-01",
+                    "packet_sha256": "a" * 64,
+                    "review_packet_markdown": "# Verified-Case Attorney Review Packet\\n",
+                }
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *, headers):
+                Client.url = url
+                Client.headers = headers
+                return Response()
+
+        with mock.patch("hal_legalai_gateway.server.httpx.AsyncClient", lambda **kwargs: Client()):
+            response = self.client.get(
+                "/portal/szymczyk/review-packet/current",
+                headers={"X-LegalAI-Portal-Secret": "test-portal-review-secret"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertEqual(
+            Client.url, "https://storage.example/portal/szymczyk/review-packet/current"
+        )
+        self.assertEqual(
+            Client.headers, {"Authorization": f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}"}
+        )
+
     def test_portal_q5_feedback_archives_only_matching_packet(self) -> None:
         async def fake_forward(**kwargs: Any) -> dict[str, Any]:
             self.assertEqual(kwargs["binding"].gateway_tool, "storage.archive_feedback")

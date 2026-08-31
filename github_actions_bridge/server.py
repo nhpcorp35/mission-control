@@ -86,6 +86,16 @@ _ATTORNEY_REVIEW_PREFIX = (
 )
 _ATTORNEY_REVIEW_FEEDBACK_FILENAME = "John-Cuomo-Case00-Attorney-Feedback-Email-2026-08-02.md"
 _ATTORNEY_REVIEW_EVALUATION_FILENAME = ATTORNEY_REVIEW_FILENAMES["structured_evaluation"]
+SZYMCZYK_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
+SZYMCZYK_REVIEW_PACKET_PREFIX = (
+    f"cases/{SZYMCZYK_CASE_ID}/derived/attorney-review-candidates/"
+)
+SZYMCZYK_CURRENT_REVIEW_POINTER_KEY = (
+    f"cases/{SZYMCZYK_CASE_ID}/derived/attorney-review-current.json"
+)
+_SZYMCZYK_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SZYMCZYK_PACKET_HEADER = "# Verified-Case Attorney Review Packet"
+_SZYMCZYK_REVIEW_PACKET_MAX_BYTES = 50_000
 
 # Structured Case-00 ref / dispatch failures (safe for Gateway envelopes).
 ERROR_REF_INVALID = "ref_invalid"
@@ -2454,6 +2464,67 @@ async def read_latest_szymczyk_portal_feedback(request: Request) -> JSONResponse
     except (ClientError, UnicodeDecodeError):
         return JSONResponse({"ok": False, "error": "feedback_read_unavailable"}, status_code=502)
     return JSONResponse({"ok": True, "archive_id": latest["Key"].rstrip("/").split("/")[-2], "submitted_at": latest["LastModified"].isoformat(), "feedback_markdown": body})
+
+
+@mcp.custom_route("/portal/szymczyk/review-packet/current", methods=["GET"])
+async def read_current_szymczyk_review_packet(request: Request) -> JSONResponse:
+    """Return the explicitly promoted, immutable B2 review packet only."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        client = _b2_client()
+        pointer_head = client.head_object(
+            Bucket=B2_BUCKET, Key=SZYMCZYK_CURRENT_REVIEW_POINTER_KEY
+        )
+        pointer_raw = client.get_object(
+            Bucket=B2_BUCKET, Key=SZYMCZYK_CURRENT_REVIEW_POINTER_KEY
+        )["Body"].read()
+        if (
+            int(pointer_head.get("ContentLength", -1)) != len(pointer_raw)
+            or hashlib.sha256(pointer_raw).hexdigest()
+            != (pointer_head.get("Metadata") or {}).get("sha256", "").lower()
+        ):
+            raise ValueError("current review pointer verification failed")
+        pointer = json.loads(pointer_raw)
+        if not isinstance(pointer, dict):
+            raise ValueError("invalid current review pointer")
+        if pointer.get("schema_version") != 1:
+            raise ValueError("invalid current review pointer")
+        run_id = str(pointer.get("run_id", ""))
+        digest = str(pointer.get("packet_sha256", "")).lower()
+        object_key = str(pointer.get("object_key", ""))
+        packet_size = pointer.get("size")
+        expected_key = SZYMCZYK_REVIEW_PACKET_PREFIX + run_id + "/review_packet.md"
+        if (
+            not _SZYMCZYK_RUN_ID_RE.fullmatch(run_id)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or object_key != expected_key
+            or not isinstance(packet_size, int)
+            or packet_size < 0
+        ):
+            raise ValueError("invalid current review pointer")
+        head = client.head_object(Bucket=B2_BUCKET, Key=object_key)
+        if (
+            int(head.get("ContentLength", -1)) > _SZYMCZYK_REVIEW_PACKET_MAX_BYTES
+            or int(head.get("ContentLength", -1)) != packet_size
+            or (head.get("Metadata") or {}).get("sha256", "").lower() != digest
+        ):
+            raise ValueError("current review packet verification failed")
+        packet_bytes = client.get_object(Bucket=B2_BUCKET, Key=object_key)["Body"].read()
+        if len(packet_bytes) != packet_size or hashlib.sha256(packet_bytes).hexdigest() != digest:
+            raise ValueError("current review packet verification failed")
+        packet = packet_bytes.decode("utf-8")
+        if not packet.startswith(_SZYMCZYK_PACKET_HEADER):
+            raise ValueError("invalid current review packet")
+    except ClientError as exc:
+        code = str((exc.response or {}).get("Error", {}).get("Code", ""))
+        error = "not_found" if code in {"404", "NoSuchKey", "NotFound"} else "review_packet_read_unavailable"
+        return JSONResponse({"ok": False, "error": error}, status_code=404 if error == "not_found" else 502)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "review_packet_read_unavailable"}, status_code=502)
+    return JSONResponse({"ok": True, "run_id": run_id, "packet_sha256": digest, "review_packet_markdown": packet})
 
 
 def _b2_object_exists(client: Any, object_key: str) -> bool:

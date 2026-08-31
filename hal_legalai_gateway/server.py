@@ -257,6 +257,24 @@ async def _read_latest_szymczyk_feedback(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=response.status_code)
 
 
+async def _read_current_szymczyk_review_packet(request: Request) -> JSONResponse:
+    """Relay the B2-backed current packet through the existing portal secret."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    if not secret or not hmac.compare_digest(request.headers.get("X-LegalAI-Portal-Secret", ""), secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    settings = get_settings(); headers = {}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.get(settings.downstream_by_key("storage").base_url.rstrip("/") + "/portal/szymczyk/review-packet/current", headers=headers)
+            result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "review_packet_read_unavailable"}, status_code=502)
+    return JSONResponse(result if isinstance(result, dict) else {"ok": False, "error": "review_packet_read_unavailable"}, status_code=response.status_code)
+
+
 async def _read_portal_case00_feedback(
     request: Request, *, question_id: str
 ) -> JSONResponse:
@@ -682,6 +700,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/szymczyk/feedback/latest", include_in_schema=False)
     async def read_latest_szymczyk_feedback(request: Request) -> JSONResponse:
         return await _read_latest_szymczyk_feedback(request)
+
+    @application.get("/portal/szymczyk/review-packet/current", include_in_schema=False)
+    async def read_current_szymczyk_review_packet(request: Request) -> JSONResponse:
+        return await _read_current_szymczyk_review_packet(request)
 
     @application.post("/portal/case-00/q5/feedback", include_in_schema=False)
     async def archive_portal_case00_q5_feedback(request: Request) -> JSONResponse:
