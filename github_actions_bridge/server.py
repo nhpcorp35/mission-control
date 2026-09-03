@@ -2419,7 +2419,7 @@ async def list_szymczyk_pleadings_inventory(request: Request) -> JSONResponse:
         documents = [
             {"filename": filename, "first_page": min(numbers), "last_page": max(numbers)}
             for filename, numbers in pages.items()
-            if pleading_re.search(headings.get(filename, ""))
+            if pleading_re.search(filename)
         ]
         return JSONResponse(
             {"ok": True, "case_id": SZYMCZYK_CASE_ID, "documents": sorted(documents, key=lambda item: item["filename"].lower())}
@@ -3661,7 +3661,7 @@ def main() -> None:
             )
             logger.warning(
                 "Szymczyk pleading inventory smoke: %d documents",
-                sum(bool(pleading_re.search(text)) for text in headings.values()),
+                sum(bool(pleading_re.search(filename)) for filename in headings),
             )
         except Exception:
             logger.exception("Szymczyk verified case index failed")
