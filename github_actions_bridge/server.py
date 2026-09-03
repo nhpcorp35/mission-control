@@ -3701,12 +3701,23 @@ def main() -> None:
                 "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_WITH_CROSS_C_81.pdf",
                 "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_REPLY_TO_CROSS_CLAI_21.pdf",
             }
-            issue_re = re.compile(
-                r"\\b(?:CAUSE\\s+OF\\s+ACTION|WHEREFORE|PRAYER\\s+FOR\\s+RELIEF|"
-                r"AS\\s+AND\\s+FOR|COUNTER[- ]CLAIM|CROSS[- ]CLAIM|"
-                r"THIRD[- ]PARTY|CONTRIBUTION|INDEMN(?:ITY|IFICATION)|"
-                r"APPORTIONMENT|NEGLIGENCE|DAMAGES)\\b",
-                re.IGNORECASE,
+            issue_terms = (
+                "CAUSE OF ACTION",
+                "WHEREFORE",
+                "PRAYER FOR RELIEF",
+                "AS AND FOR",
+                "COUNTER-CLAIM",
+                "COUNTERCLAIM",
+                "CROSS-CLAIM",
+                "CROSS CLAIM",
+                "THIRD-PARTY",
+                "THIRD PARTY",
+                "CONTRIBUTION",
+                "INDEMNITY",
+                "INDEMNIFICATION",
+                "APPORTIONMENT",
+                "NEGLIGENCE",
+                "DAMAGES",
             )
             excerpts = []
             for record in records:
@@ -3717,17 +3728,25 @@ def main() -> None:
                 text = str(record.get("text", ""))
                 if not isinstance(page_number, int) or not text:
                     continue
-                match = issue_re.search(text)
-                if match:
-                    start = max(0, match.start() - 320)
-                    end = min(len(text), match.end() + 720)
-                    excerpt = " ".join(text[start:end].split())
+                upper_text = text.upper()
+                match_start = next(
+                    (
+                        upper_text.find(term)
+                        for term in issue_terms
+                        if upper_text.find(term) >= 0
+                    ),
+                    -1,
+                )
+                if page_number == 1 or match_start >= 0:
+                    excerpt_start = 0 if page_number == 1 else max(0, match_start - 320)
+                    excerpt_end = min(len(text), excerpt_start + 1100)
+                    excerpt = " ".join(text[excerpt_start:excerpt_end].split())
                     if excerpt:
                         excerpts.append(
                             {
                                 "filename": filename,
                                 "page": page_number,
-                                "excerpt": excerpt[:1100],
+                                "excerpt": excerpt,
                             }
                         )
             logger.warning(
