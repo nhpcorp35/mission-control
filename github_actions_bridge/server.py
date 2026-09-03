@@ -2413,7 +2413,7 @@ async def list_szymczyk_pleadings_inventory(request: Request) -> JSONResponse:
                 if page_number == 1:
                     headings[filename] = str(record.get("text", ""))
         pleading_re = re.compile(
-            r"\\b(?:SUMMONS|COMPLAINT|ANSWER|THIRD[- ]PARTY|CROSS[- ]CLAIM)\\b",
+            r"\b(?:SUMMONS|COMPLAINT|ANSWER|THIRD[- ]PARTY|CROSS[- ]CLAIM)\b",
             re.IGNORECASE,
         )
         documents = [
