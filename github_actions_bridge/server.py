@@ -2387,6 +2387,47 @@ async def archive_case00_attorney_feedback(
     }
 
 
+@mcp.custom_route("/portal/szymczyk/pleadings-inventory", methods=["GET"])
+async def list_szymczyk_pleadings_inventory(request: Request) -> JSONResponse:
+    """List only likely verified pleading documents and their page ranges."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        prefix, _ = read_verified_manifest(
+            _b2_client(), B2_BUCKET, SZYMCZYK_CASE_ID,
+            "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc",
+        )
+        raw = _b2_client().get_object(
+            Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl"
+        )["Body"].read().decode("utf-8")
+        pages: dict[str, list[int]] = {}
+        headings: dict[str, str] = {}
+        for line in raw.splitlines():
+            record = json.loads(line)
+            filename = str(record.get("filename", ""))
+            page_number = record.get("page_number")
+            if filename and isinstance(page_number, int):
+                pages.setdefault(filename, []).append(page_number)
+                if page_number == 1:
+                    headings[filename] = str(record.get("text", ""))
+        pleading_re = re.compile(
+            r"\\b(?:SUMMONS|COMPLAINT|ANSWER|THIRD[- ]PARTY|CROSS[- ]CLAIM)\\b",
+            re.IGNORECASE,
+        )
+        documents = [
+            {"filename": filename, "first_page": min(numbers), "last_page": max(numbers)}
+            for filename, numbers in pages.items()
+            if pleading_re.search(headings.get(filename, ""))
+        ]
+        return JSONResponse(
+            {"ok": True, "case_id": SZYMCZYK_CASE_ID, "documents": sorted(documents, key=lambda item: item["filename"].lower())}
+        )
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
 @mcp.custom_route("/portal/szymczyk/feedback", methods=["POST"])
 async def archive_szymczyk_portal_feedback(request: Request) -> JSONResponse:
     """Archive one bounded Szymczyk portal decision in its own B2 prefix."""
