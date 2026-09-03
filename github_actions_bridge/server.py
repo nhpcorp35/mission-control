@@ -3650,18 +3650,44 @@ def main() -> None:
             raw = _b2_client().get_object(
                 Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl"
             )["Body"].read().decode("utf-8")
-            headings = {
-                str(record.get("filename", "")): str(record.get("text", ""))
-                for record in (json.loads(line) for line in raw.splitlines())
-                if record.get("page_number") == 1
-            }
-            pleading_re = re.compile(
-                r"\b(?:SUMMONS|COMPLAINT|ANSWER|THIRD[- ]PARTY|CROSS[- ]CLAIM)\b",
+            records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            first_pages: dict[str, dict[str, Any]] = {}
+            page_counts: dict[str, int] = {}
+            for record in records:
+                filename = str(record.get("filename", ""))
+                if not filename:
+                    continue
+                page_number = record.get("page_number")
+                if isinstance(page_number, int):
+                    page_counts[filename] = max(page_counts.get(filename, 0), page_number)
+                if page_number == 1:
+                    first_pages[filename] = record
+
+            court_re = re.compile(
+                r"\bSUPREME\s+COURT\s+OF\s+THE\s+STATE\s+OF\s+NEW\s+YORK\b",
                 re.IGNORECASE,
             )
+            pleading_re = re.compile(
+                r"\b(?:VERIFIED\s+)?(?:SUMMONS(?:\s+WITH\s+NOTICE)?|"
+                r"COMPLAINT|ANSWER|THIRD[- ]PARTY\s+COMPLAINT|"
+                r"THIRD[- ]PARTY\s+ANSWER|CROSS[- ]CLAIM)\b",
+                re.IGNORECASE,
+            )
+            candidates = []
+            for filename, record in sorted(first_pages.items()):
+                opening = str(record.get("text", ""))
+                heading = pleading_re.search(opening)
+                if court_re.search(opening) and heading:
+                    candidates.append(
+                        {
+                            "filename": filename,
+                            "pages": page_counts.get(filename, 1),
+                            "opening_heading": heading.group(0).upper(),
+                        }
+                    )
             logger.warning(
-                "Szymczyk pleading inventory smoke: %d documents",
-                sum(bool(pleading_re.search(filename)) for filename in headings),
+                "Szymczyk opening-page pleading candidates (read-only): %s",
+                candidates[:25],
             )
         except Exception:
             logger.exception("Szymczyk verified case index failed")
