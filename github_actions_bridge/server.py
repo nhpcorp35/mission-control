@@ -3689,6 +3689,51 @@ def main() -> None:
                 "Szymczyk opening-page pleading candidates (read-only): %s",
                 candidates[:25],
             )
+
+            # One-time, bounded source extraction for the original pleadings
+            # only. It neither writes B2 nor changes the review portal/packet.
+            source_filenames = {
+                "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_SUMMONS___COMPLAINT_1.pdf",
+                "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_3.pdf",
+                "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_TO_THIRD_PAR_10.pdf",
+                "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_19.pdf",
+                "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_86.pdf",
+                "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_WITH_CROSS_C_81.pdf",
+                "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_REPLY_TO_CROSS_CLAI_21.pdf",
+            }
+            issue_re = re.compile(
+                r"\\b(?:CAUSE\\s+OF\\s+ACTION|WHEREFORE|PRAYER\\s+FOR\\s+RELIEF|"
+                r"AS\\s+AND\\s+FOR|COUNTER[- ]CLAIM|CROSS[- ]CLAIM|"
+                r"THIRD[- ]PARTY|CONTRIBUTION|INDEMN(?:ITY|IFICATION)|"
+                r"APPORTIONMENT|NEGLIGENCE|DAMAGES)\\b",
+                re.IGNORECASE,
+            )
+            excerpts = []
+            for record in records:
+                filename = str(record.get("filename", ""))
+                if filename not in source_filenames:
+                    continue
+                page_number = record.get("page_number")
+                text = str(record.get("text", ""))
+                if not isinstance(page_number, int) or not text:
+                    continue
+                match = issue_re.search(text)
+                if match:
+                    start = max(0, match.start() - 320)
+                    end = min(len(text), match.end() + 720)
+                    excerpt = " ".join(text[start:end].split())
+                    if excerpt:
+                        excerpts.append(
+                            {
+                                "filename": filename,
+                                "page": page_number,
+                                "excerpt": excerpt[:1100],
+                            }
+                        )
+            logger.warning(
+                "Szymczyk original-pleading source excerpts (read-only): %s",
+                excerpts[:60],
+            )
         except Exception:
             logger.exception("Szymczyk verified case index failed")
     timer = threading.Timer(15.0, build_szymczyk_index_after_startup)
