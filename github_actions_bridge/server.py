@@ -3643,6 +3643,26 @@ def main() -> None:
         try:
             _promote_szymczyk_intake("ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc")
             logger.warning("Szymczyk verified case index result: %s", _build_verified_case_index(SZYMCZYK_CASE_ID, "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc"))
+            prefix, _ = read_verified_manifest(
+                _b2_client(), B2_BUCKET, SZYMCZYK_CASE_ID,
+                "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc",
+            )
+            raw = _b2_client().get_object(
+                Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl"
+            )["Body"].read().decode("utf-8")
+            headings = {
+                str(record.get("filename", "")): str(record.get("text", ""))
+                for record in (json.loads(line) for line in raw.splitlines())
+                if record.get("page_number") == 1
+            }
+            pleading_re = re.compile(
+                r"\b(?:SUMMONS|COMPLAINT|ANSWER|THIRD[- ]PARTY|CROSS[- ]CLAIM)\b",
+                re.IGNORECASE,
+            )
+            logger.warning(
+                "Szymczyk pleading inventory smoke: %d documents",
+                sum(bool(pleading_re.search(text)) for text in headings.values()),
+            )
         except Exception:
             logger.exception("Szymczyk verified case index failed")
     timer = threading.Timer(15.0, build_szymczyk_index_after_startup)
