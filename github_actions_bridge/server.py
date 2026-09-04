@@ -62,7 +62,7 @@ from case_intake import (
     intake_keys,
     verify_object as verify_case_intake_object,
 )
-from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, validate_page_request
+from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, source_set_key, validate_page_request, validate_source_set
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -2278,7 +2278,37 @@ def _complete_generic_direct_intake(
             sort_keys=True,
         ).encode()
         _put_immutable_or_same(client, key=descriptor_key, body=descriptor)
-        _put_immutable_or_same(client, key=identity_key, body=identity)
+        # The original case identity is immutable. Later verified bundles are
+        # supplements recorded through the additive source-set pointer below.
+        try:
+            existing_identity = json.loads(client.get_object(Bucket=B2_BUCKET, Key=identity_key)["Body"].read())
+        except ClientError as exc:
+            if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+            existing_identity = None
+        if existing_identity is None:
+            _put_immutable_or_same(client, key=identity_key, body=identity)
+            sources = [{"source_sha256": source_sha256}]
+        else:
+            if existing_identity.get("case_id") != case_id or not re.fullmatch(r"[0-9a-f]{64}", str(existing_identity.get("source_sha256", ""))):
+                raise ValueError("existing case identity is invalid")
+            pointer_key = source_set_key(case_id)
+            try:
+                source_set = json.loads(client.get_object(Bucket=B2_BUCKET, Key=pointer_key)["Body"].read())
+                sources = [{"source_sha256": digest} for digest in validate_source_set(case_id, source_set)]
+            except ClientError as exc:
+                if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+                    raise
+                sources = [{"source_sha256": str(existing_identity["source_sha256"])}]
+            if source_sha256 not in {item["source_sha256"] for item in sources}:
+                sources.append({"source_sha256": source_sha256})
+        source_set = {"schema_version": "verified-case-source-set.v1", "case_id": case_id, "sources": sources}
+        validate_source_set(case_id, source_set)
+        source_set_body = json.dumps(source_set, sort_keys=True).encode()
+        source_set_digest = hashlib.sha256(source_set_body).hexdigest()
+        _put_immutable_or_same(client, key=f"cases/{case_id}/intake/source-sets/{source_set_digest}.json", body=source_set_body)
+        # This pointer may advance only by adding an already immutable bundle.
+        client.put_object(Bucket=B2_BUCKET, Key=source_set_key(case_id), Body=source_set_body, ContentType="application/json", Metadata={"sha256": source_set_digest})
         index = _build_verified_case_index(case_id, source_sha256)
         return {
             "ok": True,
