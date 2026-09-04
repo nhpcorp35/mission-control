@@ -440,6 +440,38 @@ async def _list_portal_registered_cases(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "registry_unavailable"}, status_code=502)
     return JSONResponse(result, status_code=response.status_code)
 
+
+async def _create_portal_draft_request(request: Request) -> JSONResponse:
+    """Forward an authenticated internal draft question to the private Bridge."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    settings = get_settings()
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.post(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/cases/draft-requests",
+                json=payload,
+                headers=headers,
+            )
+        result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "draft_request_unavailable"}, status_code=502)
+    if not isinstance(result, dict):
+        return JSONResponse({"ok": False, "error": "draft_request_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
+
 def _sign_browser_value(payload: dict[str, Any]) -> str:
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -839,6 +871,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/cases/registered", include_in_schema=False)
     async def list_portal_registered_cases(request: Request) -> JSONResponse:
         return await _list_portal_registered_cases(request)
+
+    @application.post("/portal/cases/draft-request", include_in_schema=False)
+    async def create_portal_draft_request(request: Request) -> JSONResponse:
+        return await _create_portal_draft_request(request)
 
     @application.post("/portal/case-00/{question_id}/packet", include_in_schema=False)
     async def read_portal_case00_packet(question_id: str, request: Request) -> JSONResponse:
