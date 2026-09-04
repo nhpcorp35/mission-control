@@ -1360,6 +1360,66 @@ async def list_registered_cases(request: Request) -> JSONResponse:
         }
     )
 
+@mcp.custom_route("/cases/draft-requests", methods=["POST"])
+async def create_case_draft_request(request: Request) -> JSONResponse:
+    """Create an internal-only question request for a verified indexed matter."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id = str(payload.get("case_id", ""))
+        question = " ".join(str(payload.get("question", "")).split())
+        requested_by = " ".join(str(payload.get("requested_by", "")).split())
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
+    if not question or len(question) > 1000 or len(requested_by) > 320:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    try:
+        client = _b2_client()
+        index = client.list_objects_v2(
+            Bucket=B2_BUCKET,
+            Prefix=f"cases/{case_id}/intake/",
+            MaxKeys=100,
+        )
+        indexed = any(
+            str(item.get("Key", "")).endswith("/page_records.jsonl")
+            for item in index.get("Contents", [])
+        )
+        if not indexed:
+            return JSONResponse({"ok": False, "error": "source_not_indexed"}, status_code=409)
+        request_id = f"draft-{int(time.time())}-{uuid.uuid4().hex[:12]}"
+        key = f"cases/{case_id}/derived/draft-requests/{request_id}.json"
+        body = json.dumps(
+            {
+                "schema_version": "legalai-draft-request.v1",
+                "case_id": case_id,
+                "question": question,
+                "requested_by": requested_by,
+                "status": "DRAFT",
+                "external_communication": False,
+                "created_at": int(time.time()),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        client.put_object(
+            Bucket=B2_BUCKET,
+            Key=key,
+            Body=body,
+            ContentType="application/json",
+            Metadata={"sha256": hashlib.sha256(body).hexdigest()},
+        )
+    except ClientError:
+        return JSONResponse({"ok": False, "error": "draft_request_unavailable"}, status_code=502)
+    return JSONResponse(
+        {"ok": True, "case_id": case_id, "request_id": request_id, "status": "DRAFT"},
+        status_code=201,
+    )
+
+
 @mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
 async def read_case00_portal_packet(request: Request) -> JSONResponse:
     """Return one fixed Case-00 review packet for the protected portal only."""
