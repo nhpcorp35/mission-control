@@ -73,6 +73,33 @@ def canonical_source_prefix(case_id: str, source_sha256: str) -> str:
     return f"cases/{case_id}/intake/source/{source_sha256}/"
 
 
+
+def validate_source_set(case_id: str, payload: dict[str, Any]) -> list[str]:
+    """Validate an additive, immutable list of verified source bundle digests."""
+    if not CASE_ID_RE.fullmatch(case_id):
+        raise ValueError("case_id has an unsupported format")
+    if not isinstance(payload, dict) or payload.get("schema_version") != "verified-case-source-set.v1":
+        raise ValueError("verified source set has an unsupported schema")
+    if payload.get("case_id") != case_id:
+        raise ValueError("verified source set case_id does not match")
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("verified source set must contain sources")
+    digests: list[str] = []
+    for item in sources:
+        digest = item.get("source_sha256") if isinstance(item, dict) else None
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest) or digest in digests:
+            raise ValueError("verified source set contains an invalid or duplicate source")
+        digests.append(digest)
+    return digests
+
+
+def source_set_key(case_id: str) -> str:
+    """Canonical mutable pointer to immutable verified source-set versions."""
+    if not CASE_ID_RE.fullmatch(case_id):
+        raise ValueError("case_id has an unsupported format")
+    return f"cases/{case_id}/intake/source_set.json"
+
 def validate_page_request(document_name: str, pages: list[int]) -> tuple[str, list[int]]:
     if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\.pdf", document_name):
         raise ValueError("document_name must be a safe PDF basename")
