@@ -100,6 +100,40 @@ def source_set_key(case_id: str) -> str:
         raise ValueError("case_id has an unsupported format")
     return f"cases/{case_id}/intake/source_set.json"
 
+
+def read_verified_source_set(client: Any, bucket: str, case_id: str) -> list[str]:
+    """Return every verified bundle for a case, oldest/original first.
+
+    Older promoted cases have only an immutable ``case_identity``.  Once a
+    supplement is verified, the additive source-set pointer becomes the
+    canonical search set.  The original identity must remain in that set.
+    """
+    if not CASE_ID_RE.fullmatch(case_id):
+        raise ValueError("case_id has an unsupported format")
+    import json
+
+    identity = json.loads(
+        client.get_object(
+            Bucket=bucket, Key=f"cases/{case_id}/intake/case_identity.json"
+        )["Body"].read()
+    )
+    original = identity.get("source_sha256") if isinstance(identity, dict) else None
+    if not isinstance(original, str) or not SHA256_RE.fullmatch(original):
+        raise ValueError("case has an invalid original source identity")
+    try:
+        payload = json.loads(
+            client.get_object(Bucket=bucket, Key=source_set_key(case_id))["Body"].read()
+        )
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if str(((response or {}).get("Error") or {}).get("Code", "")) in {"404", "NoSuchKey", "NotFound"}:
+            return [original]
+        raise
+    digests = validate_source_set(case_id, payload)
+    if original not in digests:
+        raise ValueError("verified source set omits the immutable original source")
+    return digests
+
 def validate_page_request(document_name: str, pages: list[int]) -> tuple[str, list[int]]:
     if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\.pdf", document_name):
         raise ValueError("document_name must be a safe PDF basename")
