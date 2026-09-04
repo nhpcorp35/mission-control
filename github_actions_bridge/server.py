@@ -1360,6 +1360,61 @@ async def list_registered_cases(request: Request) -> JSONResponse:
         }
     )
 
+@mcp.custom_route("/cases/source-map", methods=["POST"])
+async def read_case_source_map(request: Request) -> JSONResponse:
+    """Return a bounded document/page map for one verified indexed matter."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id = str(payload.get("case_id", ""))
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
+    try:
+        client = _b2_client()
+        prefix = f"cases/{case_id}/intake/"
+        located = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=100)
+        keys = [
+            str(item.get("Key", ""))
+            for item in located.get("Contents", [])
+            if str(item.get("Key", "")).endswith("/page_records.jsonl")
+        ]
+        if len(keys) != 1:
+            return JSONResponse({"ok": False, "error": "source_not_indexed"}, status_code=409)
+        index_key = keys[0]
+        head = client.head_object(Bucket=B2_BUCKET, Key=index_key)
+        size = int(head.get("ContentLength", 0))
+        if size <= 0 or size > 10_000_000:
+            return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
+        stream = client.get_object(Bucket=B2_BUCKET, Key=index_key)["Body"]
+        try:
+            raw = stream.read(size + 1)
+        finally:
+            stream.close()
+        if len(raw) != size:
+            return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
+        pages: dict[str, int] = {}
+        for line in raw.decode("utf-8").splitlines():
+            row = json.loads(line)
+            filename = str(row.get("filename", ""))
+            page_number = row.get("page_number")
+            if filename and isinstance(page_number, int) and page_number > 0:
+                pages[filename] = max(pages.get(filename, 0), page_number)
+        if not pages or len(pages) > 300:
+            return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
+    documents = [
+        {"filename": filename, "pages": pages[filename]}
+        for filename in sorted(pages, key=str.casefold)
+    ]
+    return JSONResponse({"ok": True, "case_id": case_id, "documents": documents})
+
+
 @mcp.custom_route("/cases/draft-requests", methods=["POST"])
 async def create_case_draft_request(request: Request) -> JSONResponse:
     """Create an internal-only question request for a verified indexed matter."""
