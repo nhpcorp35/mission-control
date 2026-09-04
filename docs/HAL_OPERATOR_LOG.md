@@ -39,9 +39,17 @@ substitute for those tests.
 
 ### Next Objective
 
-Deploy the additive source-set workspace change, verify the protected
-supplement route and a cross-bundle search against a non-production-safe
-verified case, then record the deployed commit and verification result.
+Deployment completed at commit `9507756e0789f64591ab40a47354677c37060879`.
+Railway reported successful deployments for both
+`hal-github-actions-bridge` and `hal-legalai-gateway`. The Bridge `/health`
+endpoint reported that exact deployed commit, and an unauthenticated request to
+`/intake/supplement` returned the expected 303 redirect into the existing
+protected browser-login flow. No ZIP was uploaded and no B2 case data was
+changed during verification.
+
+The remaining live functional verification is a deliberately separate,
+authorized supplement upload against a suitable ongoing case; it must confirm
+that a search result from the supplement carries its distinct `source_sha256`.
 
 ## 2026-08-13 — Phase 2C MCP / Unified notification inspection
 
