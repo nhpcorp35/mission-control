@@ -1,6 +1,6 @@
 import io
 import unittest
-from github_actions_bridge.verified_case_reader import RangeObjectReader, canonical_source_prefix, source_set_key, validate_page_request, validate_source_set
+from github_actions_bridge.verified_case_reader import RangeObjectReader, canonical_source_prefix, read_verified_source_set, source_set_key, validate_page_request, validate_source_set
 
 
 class _Body(io.BytesIO):
@@ -38,6 +38,17 @@ class VerifiedCaseReaderTests(unittest.TestCase):
             validate_source_set(case_id, {"schema_version": "verified-case-source-set.v1", "case_id": case_id, "sources": [{"source_sha256": "a" * 64}, {"source_sha256": "a" * 64}]})
         with self.assertRaises(ValueError):
             validate_source_set(case_id, {"schema_version": "verified-case-source-set.v1", "case_id": "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37", "sources": [{"source_sha256": "a" * 64}]})
+
+    def test_reads_original_only_when_additive_pointer_does_not_exist(self):
+        case_id = "NY-Nassau-613561-2026-Desousa-v-Rennick"
+        class Client:
+            def get_object(self, **kwargs):
+                if kwargs["Key"].endswith("case_identity.json"):
+                    return {"Body": _Body(("{\"case_id\": \"%s\", \"source_sha256\": \"%s\"}" % (case_id, "a" * 64)).encode())}
+                error = RuntimeError("missing")
+                error.response = {"Error": {"Code": "NoSuchKey"}}
+                raise error
+        self.assertEqual(read_verified_source_set(Client(), "bucket", case_id), ["a" * 64])
 
     def test_limits_and_normalizes_page_requests(self):
         self.assertEqual(validate_page_request("Doc 2.pdf", [4, 2, 4]), ("Doc 2.pdf", [2, 4]))

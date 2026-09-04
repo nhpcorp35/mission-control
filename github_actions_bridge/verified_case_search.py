@@ -48,3 +48,21 @@ def search_index_jsonl(raw: bytes, query: str, limit: int = 20) -> list[dict[str
         return search_page_records(records, query, limit)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("verified page index is invalid") from exc
+
+
+def search_source_indexes(
+    indexes: Iterable[tuple[str, bytes]], query: str, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Search immutable per-bundle indexes together with source citations."""
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be between 1 and 50")
+    results: list[dict[str, Any]] = []
+    for source_sha256, raw in indexes:
+        if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            raise ValueError("verified source index has an invalid identity")
+        for result in search_index_jsonl(raw, query, limit=50):
+            results.append({"source_sha256": source_sha256, **result})
+    return sorted(
+        results,
+        key=lambda item: (-item["score"], item["source_sha256"], item["filename"], item["page_number"]),
+    )[:limit]

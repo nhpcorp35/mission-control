@@ -32,7 +32,7 @@ from starlette.responses import JSONResponse, Response
 
 from botocore.exceptions import ClientError
 from pypdf import PdfReader
-from verified_case_search import search_index_jsonl
+from verified_case_search import search_index_jsonl, search_source_indexes
 from verified_case_index import build_page_records
 
 from storage_policy import (
@@ -62,7 +62,7 @@ from case_intake import (
     intake_keys,
     verify_object as verify_case_intake_object,
 )
-from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, source_set_key, validate_page_request, validate_source_set
+from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, read_verified_source_set, source_set_key, validate_page_request, validate_source_set
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -1362,7 +1362,7 @@ async def list_registered_cases(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/cases/indexed/search", methods=["POST"])
 async def search_indexed_case(request: Request) -> JSONResponse:
-    """Search one verified case index using its stored source identity."""
+    """Search all verified source bundles for a case with source citations."""
     expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
     supplied = normalize_bearer_token(request.headers.get("authorization"))
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
@@ -1380,18 +1380,12 @@ async def search_indexed_case(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     try:
         client = _b2_client()
-        identity_key = f"cases/{case_id}/intake/case_identity.json"
-        identity = json.loads(
-            client.get_object(Bucket=B2_BUCKET, Key=identity_key)["Body"].read()
-        )
-        source_sha256 = str(identity.get("source_sha256", ""))
-        if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
-            raise ValueError("invalid source identity")
-        prefix, _ = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
-        raw = client.get_object(
-            Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl"
-        )["Body"].read()
-        results = search_index_jsonl(raw, query, limit)
+        source_sha256s = read_verified_source_set(client, B2_BUCKET, case_id)
+        indexes = []
+        for source_sha256 in source_sha256s:
+            prefix, _ = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
+            indexes.append((source_sha256, client.get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()))
+        results = search_source_indexes(indexes, query, limit)
     except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return JSONResponse({"ok": False, "error": "search_unavailable"}, status_code=502)
     return JSONResponse({"ok": True, "case_id": case_id, "results": results})
@@ -1413,41 +1407,34 @@ async def read_case_source_map(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
     try:
         client = _b2_client()
-        prefix = f"cases/{case_id}/intake/"
-        located = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=100)
-        keys = [
-            str(item.get("Key", ""))
-            for item in located.get("Contents", [])
-            if str(item.get("Key", "")).endswith("/page_records.jsonl")
-        ]
-        if len(keys) != 1:
-            return JSONResponse({"ok": False, "error": "source_not_indexed"}, status_code=409)
-        index_key = keys[0]
-        head = client.head_object(Bucket=B2_BUCKET, Key=index_key)
-        size = int(head.get("ContentLength", 0))
-        if size <= 0 or size > 10_000_000:
-            return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
-        stream = client.get_object(Bucket=B2_BUCKET, Key=index_key)["Body"]
-        try:
-            raw = stream.read(size + 1)
-        finally:
-            stream.close()
-        if len(raw) != size:
-            return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
-        pages: dict[str, int] = {}
-        for line in raw.decode("utf-8").splitlines():
-            row = json.loads(line)
-            filename = str(row.get("filename", ""))
-            page_number = row.get("page_number")
-            if filename and isinstance(page_number, int) and page_number > 0:
-                pages[filename] = max(pages.get(filename, 0), page_number)
+        pages: dict[tuple[str, str], int] = {}
+        for source_sha256 in read_verified_source_set(client, B2_BUCKET, case_id):
+            prefix, _ = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
+            index_key = prefix + "page_records.jsonl"
+            head = client.head_object(Bucket=B2_BUCKET, Key=index_key)
+            size = int(head.get("ContentLength", 0))
+            if size <= 0 or size > 10_000_000:
+                return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
+            stream = client.get_object(Bucket=B2_BUCKET, Key=index_key)["Body"]
+            try:
+                raw = stream.read(size + 1)
+            finally:
+                stream.close()
+            if len(raw) != size:
+                return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
+            for line in raw.decode("utf-8").splitlines():
+                row = json.loads(line)
+                filename = str(row.get("filename", ""))
+                page_number = row.get("page_number")
+                if filename and isinstance(page_number, int) and page_number > 0:
+                    pages[(source_sha256, filename)] = max(pages.get((source_sha256, filename), 0), page_number)
         if not pages or len(pages) > 300:
             return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
     documents = [
-        {"filename": filename, "pages": pages[filename]}
-        for filename in sorted(pages, key=str.casefold)
+        {"source_sha256": source_sha256, "filename": filename, "pages": pages[(source_sha256, filename)]}
+        for source_sha256, filename in sorted(pages, key=lambda item: (item[1].casefold(), item[0]))
     ]
     return JSONResponse({"ok": True, "case_id": case_id, "documents": documents})
 
@@ -2829,7 +2816,7 @@ async def open_verified_case_pdf(request: Request) -> Response:
 
 @mcp.custom_route("/cases/open-pdf", methods=["POST"])
 async def open_indexed_case_pdf(request: Request) -> Response:
-    """Open one verified PDF by case ID only for an authenticated portal caller."""
+    """Open a source-cited verified PDF for an authenticated portal caller."""
     expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
     provided = normalize_bearer_token(request.headers.get("authorization"))
     if not expected or not provided or not hmac.compare_digest(provided, expected):
@@ -2837,16 +2824,13 @@ async def open_indexed_case_pdf(request: Request) -> Response:
     try:
         payload = await request.json()
         case_id = str(payload.get("case_id", ""))
+        source_sha256 = str(payload.get("source_sha256", ""))
         document_name, _ = validate_page_request(str(payload.get("document_name", "")), [1])
         if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
             raise ValueError("invalid case identity")
         client = _b2_client()
-        identity = json.loads(
-            client.get_object(
-                Bucket=B2_BUCKET, Key=f"cases/{case_id}/intake/case_identity.json"
-            )["Body"].read()
-        )
-        source_sha256 = str(identity.get("source_sha256", ""))
+        if source_sha256 not in read_verified_source_set(client, B2_BUCKET, case_id):
+            raise ValueError("source is not in the verified case source set")
         prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
         filenames = {
             str(item.get("filename", "")).rsplit("/", 1)[-1]
@@ -4349,11 +4333,11 @@ def _index_registered_verified_cases() -> None:
                 identity = json.loads(
                     client.get_object(Bucket=B2_BUCKET, Key=identity_key)["Body"].read()
                 )
-                source_sha256 = str(identity.get("source_sha256", ""))
-                if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+                if identity.get("case_id") != case_id:
                     continue
-                result = _build_verified_case_index(case_id, source_sha256)
-                logger.warning("Registered verified-case index result case_id=%s result=%s", case_id, result)
+                for source_sha256 in read_verified_source_set(client, B2_BUCKET, case_id):
+                    result = _build_verified_case_index(case_id, source_sha256)
+                    logger.warning("Registered verified-case index result case_id=%s source_sha256=%s result=%s", case_id, source_sha256, result)
             except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                 logger.warning("Registered case is not ready for automatic indexing case_id=%s", case_id)
     except ClientError:
