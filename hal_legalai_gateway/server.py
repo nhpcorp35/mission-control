@@ -1086,10 +1086,14 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/intake", include_in_schema=False, response_model=None)
     async def generic_intake_page(request: Request) -> HTMLResponse | RedirectResponse:
         """Authenticated entry point for future verified-case ZIP + manifest intake."""
+        requested_case_id = str(request.query_params.get("case_id") or "")
+        if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", requested_case_id):
+            requested_case_id = ""
+        return_to = "/intake" + (f"?case_id={requested_case_id}" if requested_case_id else "")
         if _browser_login(request) is None:
             nonce = secrets.token_urlsafe(24)
             state = _sign_browser_value(
-                {"nonce": nonce, "exp": int(time.time()) + 600, "return_to": "/intake"}
+                {"nonce": nonce, "exp": int(time.time()) + 600, "return_to": return_to}
             )
             settings = get_settings()
             callback = f"{settings.gateway_public_url.rstrip('/')}/auth/callback"
@@ -1120,6 +1124,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         <label>JSON manifest <input id="manifest" type="file" accept=".json,application/json" required></label><br>
         <button id="upload">Upload, verify, and index</button><pre id="status" aria-live="polite"></pre></main>
         <script>
+        document.getElementById('case-id').value = """ + json.dumps(requested_case_id) + """;
         const out=document.getElementById('status');
         const jsonHeaders={'Content-Type':'application/json'};
         async function request(path,payload){const r=await fetch(path,{method:'POST',headers:jsonHeaders,body:JSON.stringify(payload)});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'request failed');return result;}
@@ -1203,7 +1208,7 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         if login != settings.allowed_github_login:
             return RedirectResponse(url="/intake/rennick", status_code=303)
         destination = str(state_payload.get("return_to") or "/intake/rennick")
-        if destination not in {"/intake", "/intake/rennick", "/intake/szymczyk"} and not re.fullmatch(r"/intake/szymczyk/(?:identify|promote|inventory|process)\?sha256=[0-9a-f]{64}", destination):
+        if destination not in {"/intake", "/intake/rennick", "/intake/szymczyk"} and not re.fullmatch(r"/intake\?case_id=NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", destination) and not re.fullmatch(r"/intake/szymczyk/(?:identify|promote|inventory|process)\?sha256=[0-9a-f]{64}", destination):
             destination = "/intake/rennick"
         response = RedirectResponse(url=destination, status_code=303)
         response.set_cookie(_RENNICK_SESSION_COOKIE, _sign_browser_value({"login": login, "exp": int(time.time()) + RENNICK_BROWSER_SESSION_SECONDS}), max_age=RENNICK_BROWSER_SESSION_SECONDS, httponly=True, secure=True, samesite="lax")
