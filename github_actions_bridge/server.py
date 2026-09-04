@@ -2045,6 +2045,256 @@ def _complete_rennick_direct_supplement_upload(upload_id: str) -> dict[str, Any]
     return result
 
 
+GENERIC_DIRECT_UPLOAD_TTL_SECONDS = 15 * 60
+GENERIC_DIRECT_UPLOAD_PREFIX = "pending-intakes/generic/.pending/"
+
+
+def _generic_intake_metadata(
+    case_id: str,
+    source_filename: str,
+    manifest_filename: str,
+) -> tuple[str, str, str, str]:
+    """Validate the public metadata used by the generic browser intake flow."""
+    source_key, manifest_key = intake_keys(case_id, source_filename, manifest_filename)
+    return case_id, source_filename, manifest_filename, source_key
+
+
+def _normalized_generic_contents_manifest(case_id: str, source: bytes, manifest: bytes) -> bytes:
+    """Fail closed unless every ZIP member is a hash-verified manifest PDF."""
+    try:
+        payload = json.loads(manifest)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("intake manifest is not valid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("case_id") != case_id:
+        raise ValueError("intake manifest case_id does not match")
+    documents = payload.get("documents")
+    if not isinstance(documents, list) or not documents:
+        raise ValueError("intake manifest must contain documents")
+
+    expected: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(documents):
+        if not isinstance(item, dict):
+            raise ValueError(f"intake manifest documents[{index}] is invalid")
+        filename = str(item.get("filename") or "")
+        path = pathlib.PurePosixPath(filename)
+        if (
+            not filename
+            or filename != path.name
+            or path.is_absolute()
+            or ".." in path.parts
+            or not filename.lower().endswith(".pdf")
+            or filename in expected
+        ):
+            raise ValueError("intake manifest contains an unsafe or duplicate PDF filename")
+        size = item.get("size_bytes", item.get("size"))
+        digest = str(item.get("sha256") or "").lower()
+        if not isinstance(size, int) or size < 1:
+            raise ValueError("intake manifest PDF size is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("intake manifest PDF SHA-256 is invalid")
+        expected[filename] = {"filename": filename, "size": size, "sha256": digest}
+
+    found: set[str] = set()
+    try:
+        with zipfile.ZipFile(io.BytesIO(source)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                member_path = pathlib.PurePosixPath(info.filename)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError("source ZIP contains an unsafe path")
+                filename = member_path.name
+                if filename not in expected or filename in found:
+                    raise ValueError("source ZIP does not exactly match the manifest")
+                expected_item = expected[filename]
+                if info.file_size != expected_item["size"]:
+                    raise ValueError("source ZIP PDF size does not match the manifest")
+                if hashlib.sha256(archive.read(info)).hexdigest() != expected_item["sha256"]:
+                    raise ValueError("source ZIP PDF hash does not match the manifest")
+                found.add(filename)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("source bundle is not a valid ZIP") from exc
+    if found != set(expected):
+        raise ValueError("source ZIP is missing manifest PDFs")
+    return json.dumps(
+        {
+            "schema_version": "case-contents.v1",
+            "files": [expected[name] for name in sorted(expected)],
+        },
+        sort_keys=True,
+    ).encode()
+
+
+def _copy_immutable_or_same(
+    client: Any,
+    *,
+    destination: str,
+    source: str,
+    content_type: str,
+    sha256: str,
+    size: int,
+) -> None:
+    """Copy a verified pending object once, or accept only identical prior bytes."""
+    try:
+        head = client.head_object(Bucket=B2_BUCKET, Key=destination)
+        if (
+            int(head.get("ContentLength", -1)) == size
+            and str((head.get("Metadata") or {}).get("sha256") or "") == sha256
+        ):
+            return
+        raise ValueError("immutable verified intake object already exists with different bytes")
+    except ClientError as exc:
+        if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    client.copy_object(
+        Bucket=B2_BUCKET,
+        Key=destination,
+        CopySource={"Bucket": B2_BUCKET, "Key": source},
+        MetadataDirective="REPLACE",
+        Metadata={"sha256": sha256},
+        ContentType=content_type,
+    )
+
+
+def _put_immutable_or_same(
+    client: Any,
+    *,
+    key: str,
+    body: bytes,
+    content_type: str = "application/json",
+) -> None:
+    """Write a deterministic immutable metadata object without overwrite drift."""
+    digest = hashlib.sha256(body).hexdigest()
+    try:
+        head = client.head_object(Bucket=B2_BUCKET, Key=key)
+        if (
+            int(head.get("ContentLength", -1)) == len(body)
+            and str((head.get("Metadata") or {}).get("sha256") or "") == digest
+        ):
+            return
+        raise ValueError("immutable verified intake metadata already exists with different bytes")
+    except ClientError as exc:
+        if str(((exc.response or {}).get("Error") or {}).get("Code", "")) not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    client.put_object(
+        Bucket=B2_BUCKET,
+        Key=key,
+        Body=body,
+        ContentType=content_type,
+        Metadata={"sha256": digest},
+    )
+
+
+def _prepare_generic_direct_intake(
+    case_id: str,
+    source_filename: str,
+    manifest_filename: str,
+) -> dict[str, Any]:
+    """Issue two short-lived direct-upload URLs; browser clients never see B2 credentials."""
+    _generic_intake_metadata(case_id, source_filename, manifest_filename)
+    client = _b2_client()
+    _ensure_rennick_direct_upload_cors(client)
+    upload_id = uuid.uuid4().hex
+    prefix = f"{GENERIC_DIRECT_UPLOAD_PREFIX}{upload_id}/"
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "expires_in_seconds": GENERIC_DIRECT_UPLOAD_TTL_SECONDS,
+        "max_source_bytes": MAX_BUNDLE_BYTES,
+        "max_manifest_bytes": MAX_MANIFEST_BYTES,
+        "source": {
+            "content_type": "application/zip",
+            "url": client.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": B2_BUCKET, "Key": prefix + "source.zip", "ContentType": "application/zip"},
+                ExpiresIn=GENERIC_DIRECT_UPLOAD_TTL_SECONDS,
+                HttpMethod="PUT",
+            ),
+        },
+        "manifest": {
+            "content_type": "application/json",
+            "url": client.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": B2_BUCKET, "Key": prefix + "manifest.json", "ContentType": "application/json"},
+                ExpiresIn=GENERIC_DIRECT_UPLOAD_TTL_SECONDS,
+                HttpMethod="PUT",
+            ),
+        },
+    }
+
+
+def _complete_generic_direct_intake(
+    upload_id: str,
+    case_id: str,
+    source_filename: str,
+    manifest_filename: str,
+) -> dict[str, Any]:
+    """Verify a pending ZIP + manifest, then atomically expose only canonical verified metadata."""
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        raise ValueError("invalid direct upload id")
+    _generic_intake_metadata(case_id, source_filename, manifest_filename)
+    prefix = f"{GENERIC_DIRECT_UPLOAD_PREFIX}{upload_id}/"
+    pending_source, pending_manifest = prefix + "source.zip", prefix + "manifest.json"
+    client = _b2_client()
+    try:
+        source_head = client.head_object(Bucket=B2_BUCKET, Key=pending_source)
+        manifest_head = client.head_object(Bucket=B2_BUCKET, Key=pending_manifest)
+        source_size, manifest_size = int(source_head.get("ContentLength", 0)), int(manifest_head.get("ContentLength", 0))
+        if not 1 <= source_size <= MAX_BUNDLE_BYTES or not 1 <= manifest_size <= MAX_MANIFEST_BYTES:
+            raise ValueError("pending intake object size is outside the allowed range")
+        source = client.get_object(Bucket=B2_BUCKET, Key=pending_source)["Body"].read()
+        manifest = client.get_object(Bucket=B2_BUCKET, Key=pending_manifest)["Body"].read()
+        if len(source) != source_size or len(manifest) != manifest_size:
+            raise ValueError("pending intake object read size mismatch")
+        contents = _normalized_generic_contents_manifest(case_id, source, manifest)
+        source_sha256, manifest_sha256 = hashlib.sha256(source).hexdigest(), hashlib.sha256(manifest).hexdigest()
+        canonical_prefix = canonical_source_prefix(case_id, source_sha256)
+        source_key = canonical_prefix + source_filename
+        intake_manifest_key = canonical_prefix + "intake_manifest.json"
+        contents_key = canonical_prefix + "contents_manifest.json"
+        descriptor_key = canonical_prefix + "source_descriptor.json"
+        identity_key = f"cases/{case_id}/intake/case_identity.json"
+        _copy_immutable_or_same(client, destination=source_key, source=pending_source, content_type="application/zip", sha256=source_sha256, size=source_size)
+        _copy_immutable_or_same(client, destination=intake_manifest_key, source=pending_manifest, content_type="application/json", sha256=manifest_sha256, size=manifest_size)
+        _put_immutable_or_same(client, key=contents_key, body=contents)
+        descriptor = json.dumps(
+            {
+                "schema_version": "verified-case-source-descriptor.v1",
+                "case_id": case_id,
+                "source_sha256": source_sha256,
+                "source_object_key": source_key,
+                "contents_manifest_key": contents_key,
+            },
+            sort_keys=True,
+        ).encode()
+        identity = json.dumps(
+            {
+                "schema_version": "case-identity.v1",
+                "case_id": case_id,
+                "source_sha256": source_sha256,
+                "source_filename": source_filename,
+                "manifest_filename": manifest_filename,
+            },
+            sort_keys=True,
+        ).encode()
+        _put_immutable_or_same(client, key=descriptor_key, body=descriptor)
+        _put_immutable_or_same(client, key=identity_key, body=identity)
+        index = _build_verified_case_index(case_id, source_sha256)
+        return {
+            "ok": True,
+            "case_id": case_id,
+            "source_sha256": source_sha256,
+            "verified_documents": len(json.loads(contents)["files"]),
+            "index": index,
+        }
+    finally:
+        for key in (pending_source, pending_manifest):
+            try:
+                client.delete_object(Bucket=B2_BUCKET, Key=key)
+            except Exception:
+                logger.warning("could not clean up pending generic intake object", exc_info=True)
+
+
 def _prepare_szymczyk_direct_intake() -> dict[str, Any]:
     """Issue one short-lived direct B2 URL for the 733 MB provisional intake."""
     client = _b2_client()
@@ -2641,6 +2891,45 @@ def _build_verified_case_index(case_id: str, source_sha256: str) -> dict[str, An
     # the HEAD check above preserves the no-overwrite rule for this startup job.
     client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson")
     return {"ok": True, "created": True, "index_key": index_key, "bytes": len(body)}
+
+
+@mcp.custom_route("/intake/direct/prepare", methods=["POST"])
+async def prepare_generic_direct_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(
+            _prepare_generic_direct_intake(
+                str(payload.get("case_id", "")),
+                str(payload.get("source_filename", "")),
+                str(payload.get("manifest_filename", "")),
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@mcp.custom_route("/intake/direct/complete", methods=["POST"])
+async def complete_generic_direct_intake(request: Request) -> JSONResponse:
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        return JSONResponse(
+            _complete_generic_direct_intake(
+                str(payload.get("upload_id", "")),
+                str(payload.get("case_id", "")),
+                str(payload.get("source_filename", "")),
+                str(payload.get("manifest_filename", "")),
+            )
+        )
+    except (TypeError, ValueError, KeyError, ClientError, zipfile.BadZipFile) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
 
 
 @mcp.custom_route("/intake/szymczyk/direct/prepare", methods=["POST"])
