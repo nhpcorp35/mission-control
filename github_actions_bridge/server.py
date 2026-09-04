@@ -1310,13 +1310,14 @@ async def list_case00_storage(
 
 @mcp.custom_route("/cases/registered/list", methods=["GET"])
 async def list_registered_cases(request: Request) -> JSONResponse:
-    """List registered B2 case identifiers only; never return case content."""
+    """List case IDs and readiness metadata only; never return case content or keys."""
     expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
     supplied = normalize_bearer_token(request.headers.get("authorization"))
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     try:
-        response = _b2_client().list_objects_v2(
+        client = _b2_client()
+        response = client.list_objects_v2(
             Bucket=B2_BUCKET, Prefix="cases/", Delimiter="/", MaxKeys=200
         )
         case_ids = sorted(
@@ -1326,10 +1327,38 @@ async def list_registered_cases(request: Request) -> JSONResponse:
             and item["Prefix"].startswith("cases/")
             and item["Prefix"].endswith("/")
         )
+        cases: list[dict[str, str]] = []
+        for case_id in case_ids:
+            prefix = f"cases/{case_id}/intake/"
+            intake = client.list_objects_v2(
+                Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=100
+            )
+            names = {
+                str(item.get("Key", ""))[len(prefix):]
+                for item in intake.get("Contents", [])
+                if isinstance(item.get("Key"), str) and str(item["Key"]).startswith(prefix)
+            }
+            has_identity = "case_identity.json" in names
+            has_descriptor = any(name.endswith("/source_descriptor.json") for name in names)
+            has_index = any(name.endswith("/page_records.jsonl") for name in names)
+            if has_index:
+                stage = "Verified source indexed"
+            elif has_identity and has_descriptor:
+                stage = "Verified source"
+            elif names:
+                stage = "Intake stored"
+            else:
+                stage = "Registered"
+            cases.append({"case_id": case_id, "stage": stage})
     except ClientError:
         return JSONResponse({"ok": False, "error": "registry_unavailable"}, status_code=502)
-    return JSONResponse({"ok": True, "case_ids": case_ids, "truncated": bool(response.get("IsTruncated"))})
-
+    return JSONResponse(
+        {
+            "ok": True,
+            "cases": cases,
+            "truncated": bool(response.get("IsTruncated")),
+        }
+    )
 
 @mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
 async def read_case00_portal_packet(request: Request) -> JSONResponse:
