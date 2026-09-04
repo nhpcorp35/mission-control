@@ -80,7 +80,7 @@ _RENNICK_SESSION_COOKIE = "rennick_upload_session"
 _PORTAL_REVIEW_DECISIONS = frozenset(
     {"accept", "revise", "reject", "investigate_further"}
 )
-_PORTAL_REVIEW_QUESTIONS = frozenset({"Q4", "Q5"})
+_PORTAL_REVIEW_QUESTIONS = frozenset({"Q1", "Q2", "Q3", "Q4", "Q5"})
 _PORTAL_REVIEWER_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}$")
 _PORTAL_REVIEW_ARCHIVE_ID = re.compile(r"^review-\d{8}-[0-9a-f]{12}$")
 
@@ -379,6 +379,39 @@ async def _read_portal_case00_feedback(
         return JSONResponse({"ok": False, "error": "feedback_read_unavailable"}, status_code=502)
     if not isinstance(result, dict):
         return JSONResponse({"ok": False, "error": "feedback_read_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
+
+
+async def _read_portal_case00_packet(request: Request, *, question_id: str) -> JSONResponse:
+    """Read one fixed Case-00 candidate through the private Bridge route."""
+    if question_id not in _PORTAL_REVIEW_QUESTIONS:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not isinstance(payload, dict) or str(payload.get("question_id", "")).upper() != question_id:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    settings = get_settings()
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.post(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/case-00/portal-packet/read",
+                json={"question_id": question_id}, headers=headers,
+            )
+        result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "packet_unavailable"}, status_code=502)
+    if not isinstance(result, dict):
+        return JSONResponse({"ok": False, "error": "packet_unavailable"}, status_code=502)
     return JSONResponse(result, status_code=response.status_code)
 
 
@@ -777,6 +810,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             url=f"{base}/.well-known/oauth-authorization-server",
             status_code=307,
         )
+
+    @application.post("/portal/case-00/{question_id}/packet", include_in_schema=False)
+    async def read_portal_case00_packet(question_id: str, request: Request) -> JSONResponse:
+        return await _read_portal_case00_packet(request, question_id=question_id.upper())
 
     @application.post("/portal/case-00/q4/feedback", include_in_schema=False)
     async def archive_portal_case00_q4_feedback(request: Request) -> JSONResponse:
