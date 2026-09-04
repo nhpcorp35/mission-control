@@ -554,6 +554,43 @@ async def _list_portal_draft_requests(request: Request, case_id: str) -> JSONRes
         return JSONResponse({"ok": False, "error": "draft_queue_unavailable"}, status_code=502)
     return JSONResponse(result, status_code=response.status_code)
 
+
+async def _open_portal_case_pdf(request: Request, case_id: str) -> Response:
+    """Open one verified case PDF through the internal portal boundary."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    document_name = payload.get("document_name") if isinstance(payload, dict) else None
+    if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\\.pdf", document_name):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    settings = get_settings()
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.post(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/cases/open-pdf",
+                headers=headers,
+                json={"case_id": case_id, "document_name": document_name},
+            )
+            content = response.content
+    except httpx.HTTPError:
+        return JSONResponse({"ok": False, "error": "pdf_unavailable"}, status_code=502)
+    if not response.is_success:
+        return JSONResponse({"ok": False, "error": "pdf_unavailable"}, status_code=502)
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{document_name}"'},
+    )
+
 def _sign_browser_value(payload: dict[str, Any]) -> str:
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -961,6 +998,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/cases/{case_id}/source-map", include_in_schema=False)
     async def read_portal_case_source_map(case_id: str, request: Request) -> JSONResponse:
         return await _read_portal_case_source_map(request, case_id)
+
+    @application.post("/portal/cases/{case_id}/pdf", include_in_schema=False)
+    async def open_portal_case_pdf(case_id: str, request: Request) -> Response:
+        return await _open_portal_case_pdf(request, case_id)
 
     @application.post("/portal/cases/draft-request", include_in_schema=False)
     async def create_portal_draft_request(request: Request) -> JSONResponse:
