@@ -3900,6 +3900,37 @@ def create_http_app(
     )
 
 
+
+def _index_registered_verified_cases() -> None:
+    """Build missing page indexes for registered, already-verified source sets."""
+    try:
+        client = _b2_client()
+        response = client.list_objects_v2(
+            Bucket=B2_BUCKET, Prefix="cases/", Delimiter="/", MaxKeys=200
+        )
+        case_ids = [
+            item["Prefix"][len("cases/"):-1]
+            for item in response.get("CommonPrefixes", [])
+            if isinstance(item.get("Prefix"), str)
+            and item["Prefix"].startswith("cases/")
+            and item["Prefix"].endswith("/")
+        ]
+        for case_id in sorted(case_ids):
+            identity_key = f"cases/{case_id}/intake/case_identity.json"
+            try:
+                identity = json.loads(
+                    client.get_object(Bucket=B2_BUCKET, Key=identity_key)["Body"].read()
+                )
+                source_sha256 = str(identity.get("source_sha256", ""))
+                if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+                    continue
+                result = _build_verified_case_index(case_id, source_sha256)
+                logger.warning("Registered verified-case index result case_id=%s result=%s", case_id, result)
+            except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                logger.warning("Registered case is not ready for automatic indexing case_id=%s", case_id)
+    except ClientError:
+        logger.exception("Registered verified-case index scan failed")
+
 def main() -> None:
     import uvicorn
 
@@ -4041,6 +4072,9 @@ def main() -> None:
     timer = threading.Timer(15.0, build_szymczyk_index_after_startup)
     timer.daemon = True
     timer.start()
+    registered_index_timer = threading.Timer(30.0, _index_registered_verified_cases)
+    registered_index_timer.daemon = True
+    registered_index_timer.start()
     uvicorn.run(
         app,
         host="0.0.0.0",
