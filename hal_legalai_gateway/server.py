@@ -1155,7 +1155,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             if(!put.ok)throw new Error('Manifest upload failed.');
             out.textContent='Verifying every listed PDF and building the search index…';
             const result=await request('/intake/direct/complete',{upload_id:plan.upload_id,case_id:caseId,source_filename:source.name,manifest_filename:manifest.name});
-            out.textContent='Verified and indexed. '+JSON.stringify(result,null,2);
+            out.textContent='Verified and indexed '+result.verified_documents+' document(s). The matter is now available in the attorney workspace; no attorney was contacted and no legal draft was generated.';
           }catch(error){out.textContent='Intake failed: '+error.message;}
         };
         </script>'''.replace("__REQUESTED_CASE_ID__", json.dumps(requested_case_id)))
