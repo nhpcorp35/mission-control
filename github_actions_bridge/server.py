@@ -1512,6 +1512,69 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
     )
 
 
+@mcp.custom_route("/cases/{case_id}/draft-requests", methods=["GET"])
+async def list_case_draft_requests(request: Request) -> JSONResponse:
+    """List internal-only draft requests for one verified indexed matter."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    case_id = str(request.path_params.get("case_id", ""))
+    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
+    try:
+        client = _b2_client()
+        listed = client.list_objects_v2(
+            Bucket=B2_BUCKET,
+            Prefix=f"cases/{case_id}/derived/draft-requests/",
+            MaxKeys=100,
+        )
+        requests: list[dict[str, Any]] = []
+        for item in listed.get("Contents", []):
+            key = str(item.get("Key", ""))
+            if not key.endswith(".json"):
+                continue
+            response = client.get_object(Bucket=B2_BUCKET, Key=key)
+            raw = response["Body"].read()
+            if len(raw) > 8_000:
+                continue
+            entry = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(entry, dict)
+                or entry.get("schema_version") != "legalai-draft-request.v1"
+                or entry.get("case_id") != case_id
+                or entry.get("status") != "DRAFT"
+                or entry.get("external_communication") is not False
+            ):
+                continue
+            request_id = key.rsplit("/", 1)[-1].removesuffix(".json")
+            question = entry.get("question")
+            requested_by = entry.get("requested_by")
+            created_at = entry.get("created_at")
+            if (
+                isinstance(question, str)
+                and isinstance(requested_by, str)
+                and isinstance(created_at, int)
+            ):
+                requests.append(
+                    {
+                        "request_id": request_id,
+                        "question": question,
+                        "requested_by": requested_by,
+                        "status": "DRAFT",
+                        "created_at": created_at,
+                        "external_communication": False,
+                    }
+                )
+        requests.sort(key=lambda item: item["created_at"], reverse=True)
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
+        return JSONResponse({"ok": False, "error": "draft_queue_unavailable"}, status_code=502)
+    return JSONResponse(
+        {"ok": True, "case_id": case_id, "requests": requests},
+        status_code=200,
+    )
+
+
 @mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
 async def read_case00_portal_packet(request: Request) -> JSONResponse:
     """Return one fixed Case-00 review packet for the protected portal only."""
