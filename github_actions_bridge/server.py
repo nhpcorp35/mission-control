@@ -120,6 +120,13 @@ CANONICAL_CASE00_ATTORNEY_PACKET_SIZE = 57278
 CANONICAL_CASE00_ATTORNEY_PACKET_SHA256 = (
     "ce7e3a25b22ec23822aec4dcd317b1df38ce6c85b59f684f45f3bdb811316d86"
 )
+CASE00_PORTAL_PACKET_SOURCES = {
+    "Q1": ("Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/candidate-answers/q1-candidate-20260824T190326Z/case00_attorney_review_packet.md", 34145, "978a296536da23f850f8fe047c6d5524"),
+    "Q2": ("Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/candidate-answers/q2-candidate-20260824T194018Z/case00_attorney_review_packet.md", 14810, "6d3dd6b450ce59b105205775c159b3c5"),
+    "Q3": ("Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/candidate-answers/q3-candidate-20260825T154244Z/case00_attorney_review_packet.md", 18139, "d7bfe8c3202ad53b67c222ffe2575b8c"),
+    "Q4": ("Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/candidate-answers/q4-candidate-20260828T222820Z/case00_attorney_review_packet.md", 17344, "1adcdb3f8321dd33a321f6c00ccb7836"),
+    "Q5": ("Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/candidate-answers/q5-candidate-20260829T182332Z/case00_attorney_review_packet.md", 4455, "4d7ff5ac1cc6faa6b91a8e454a32ff16"),
+}
 MAX_CASE00_QUESTION_SECTION_CHARS = 20_000
 _CASE00_PACKET_QUESTION_SECTION_RE = re.compile(
     r"^## (Q[1-9]\d*)\.\s*(.*?)(?=^## Q[1-9]\d*\.|\Z)",
@@ -1299,6 +1306,40 @@ async def list_case00_storage(
         "count": len(objects),
         "truncated": bool(response.get("IsTruncated")),
     }
+
+
+@mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
+async def read_case00_portal_packet(request: Request) -> JSONResponse:
+    """Return one fixed Case-00 review packet for the protected portal only."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        question_id = str(payload.get("question_id", "")).upper()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    source = CASE00_PORTAL_PACKET_SOURCES.get(question_id)
+    if source is None:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    object_key, expected_size, expected_etag = source
+    try:
+        client = _b2_client()
+        head = client.head_object(Bucket=B2_BUCKET, Key=object_key)
+        if head.get("ContentLength") != expected_size or (head.get("ETag") or "").strip('"') != expected_etag:
+            raise ValueError("Case-00 portal packet integrity mismatch")
+        stream = client.get_object(Bucket=B2_BUCKET, Key=object_key)["Body"]
+        try:
+            body = stream.read(expected_size + 1)
+        finally:
+            stream.close()
+        if len(body) != expected_size:
+            raise ValueError("Case-00 portal packet size mismatch")
+        packet = body.decode("utf-8")
+    except (ClientError, UnicodeDecodeError, ValueError):
+        return JSONResponse({"ok": False, "error": "packet_unavailable"}, status_code=502)
+    return JSONResponse({"ok": True, "question_id": question_id, "packet_markdown": packet, "sha256": hashlib.sha256(body).hexdigest()})
 
 
 @mcp.custom_route("/case-00/attorney-feedback/read", methods=["POST"])
