@@ -2547,6 +2547,52 @@ async def open_verified_case_pdf(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
+@mcp.custom_route("/cases/open-pdf", methods=["POST"])
+async def open_indexed_case_pdf(request: Request) -> Response:
+    """Open one verified PDF by case ID only for an authenticated portal caller."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id = str(payload.get("case_id", ""))
+        document_name, _ = validate_page_request(str(payload.get("document_name", "")), [1])
+        if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+            raise ValueError("invalid case identity")
+        client = _b2_client()
+        identity = json.loads(
+            client.get_object(
+                Bucket=B2_BUCKET, Key=f"cases/{case_id}/intake/case_identity.json"
+            )["Body"].read()
+        )
+        source_sha256 = str(identity.get("source_sha256", ""))
+        prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
+        filenames = {
+            str(item.get("filename", "")).rsplit("/", 1)[-1]
+            for item in manifest["files"]
+            if isinstance(item, dict)
+        }
+        if document_name not in filenames:
+            raise ValueError("document is not in the verified source manifest")
+        descriptor = json.loads(
+            client.get_object(
+                Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json"
+            )["Body"].read()
+        )
+        source_key = str(descriptor.get("source_object_key", ""))
+        if not source_key.startswith(prefix):
+            raise ValueError("verified source descriptor is invalid")
+        pdf = read_pdf_from_object(client, B2_BUCKET, source_key, document_name)
+        return Response(
+            content=pdf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{document_name}"'},
+        )
+    except (TypeError, ValueError, KeyError, ClientError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "pdf_unavailable"}, status_code=400)
+
+
 @mcp.custom_route("/cases/verified/search", methods=["POST"])
 async def search_verified_case(request: Request) -> JSONResponse:
     """Search a prebuilt immutable page index and return exact citations only."""
