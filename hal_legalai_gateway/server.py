@@ -441,6 +441,37 @@ async def _list_portal_registered_cases(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=response.status_code)
 
 
+async def _search_portal_indexed_case(request: Request, case_id: str) -> JSONResponse:
+    """Forward a protected verified-record search to the private Bridge."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        query = " ".join(str(payload.get("query", "")).split())
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    settings = get_settings()
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.post(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/cases/indexed/search",
+                json={"case_id": case_id, "query": query, "limit": 20},
+                headers=headers,
+            )
+        result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "search_unavailable"}, status_code=502)
+    if not isinstance(result, dict):
+        return JSONResponse({"ok": False, "error": "search_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
+
+
 async def _read_portal_case_source_map(request: Request, case_id: str) -> JSONResponse:
     """Forward an authenticated source-map request to the private Bridge."""
     secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
@@ -897,6 +928,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/cases/registered", include_in_schema=False)
     async def list_portal_registered_cases(request: Request) -> JSONResponse:
         return await _list_portal_registered_cases(request)
+
+    @application.post("/portal/cases/{case_id}/search", include_in_schema=False)
+    async def search_portal_indexed_case(case_id: str, request: Request) -> JSONResponse:
+        return await _search_portal_indexed_case(request, case_id)
 
     @application.get("/portal/cases/{case_id}/source-map", include_in_schema=False)
     async def read_portal_case_source_map(case_id: str, request: Request) -> JSONResponse:
