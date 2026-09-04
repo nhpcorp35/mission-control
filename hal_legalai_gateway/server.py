@@ -326,7 +326,7 @@ async def _open_portal_szymczyk_verified_pdf(request: Request) -> Response:
     except (ValueError, json.JSONDecodeError):
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     document_name = payload.get("document_name") if isinstance(payload, dict) else None
-    if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\\.pdf", document_name):
+    if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\.pdf", document_name):
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     return await _forward_verified_case_pdf(
         {
