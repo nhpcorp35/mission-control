@@ -1308,6 +1308,29 @@ async def list_case00_storage(
     }
 
 
+@mcp.custom_route("/cases/registered/list", methods=["GET"])
+async def list_registered_cases(request: Request) -> JSONResponse:
+    """List registered B2 case identifiers only; never return case content."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        response = _b2_client().list_objects_v2(
+            Bucket=B2_BUCKET, Prefix="cases/", Delimiter="/", MaxKeys=200
+        )
+        case_ids = sorted(
+            item["Prefix"][len("cases/"):-1]
+            for item in response.get("CommonPrefixes", [])
+            if isinstance(item.get("Prefix"), str)
+            and item["Prefix"].startswith("cases/")
+            and item["Prefix"].endswith("/")
+        )
+    except ClientError:
+        return JSONResponse({"ok": False, "error": "registry_unavailable"}, status_code=502)
+    return JSONResponse({"ok": True, "case_ids": case_ids, "truncated": bool(response.get("IsTruncated"))})
+
+
 @mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
 async def read_case00_portal_packet(request: Request) -> JSONResponse:
     """Return one fixed Case-00 review packet for the protected portal only."""
