@@ -1360,6 +1360,43 @@ async def list_registered_cases(request: Request) -> JSONResponse:
         }
     )
 
+@mcp.custom_route("/cases/indexed/search", methods=["POST"])
+async def search_indexed_case(request: Request) -> JSONResponse:
+    """Search one verified case index using its stored source identity."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id = str(payload.get("case_id", ""))
+        query = " ".join(str(payload.get("query", "")).split())
+        limit = int(payload.get("limit", 20))
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
+    if not query or len(query) > 500 or limit < 1 or limit > 20:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    try:
+        client = _b2_client()
+        identity_key = f"cases/{case_id}/intake/case_identity.json"
+        identity = json.loads(
+            client.get_object(Bucket=B2_BUCKET, Key=identity_key)["Body"].read()
+        )
+        source_sha256 = str(identity.get("source_sha256", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            raise ValueError("invalid source identity")
+        prefix, _ = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
+        raw = client.get_object(
+            Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl"
+        )["Body"].read()
+        results = search_index_jsonl(raw, query, limit)
+    except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "search_unavailable"}, status_code=502)
+    return JSONResponse({"ok": True, "case_id": case_id, "results": results})
+
+
 @mcp.custom_route("/cases/source-map", methods=["POST"])
 async def read_case_source_map(request: Request) -> JSONResponse:
     """Return a bounded document/page map for one verified indexed matter."""
