@@ -28,7 +28,7 @@ from fastmcp.server.dependencies import get_access_token
 from key_value.aio.stores.redis import RedisStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from botocore.exceptions import ClientError
 from pypdf import PdfReader
@@ -62,7 +62,7 @@ from case_intake import (
     intake_keys,
     verify_object as verify_case_intake_object,
 )
-from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_verified_manifest, validate_page_request
+from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, validate_page_request
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -2197,6 +2197,36 @@ async def read_verified_case_pages(request: Request) -> JSONResponse:
         if not source_key.startswith(prefix):
             raise ValueError("verified source descriptor is invalid")
         return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "document_name": document_name, "pages": extract_pdf_pages_from_object(_b2_client(), B2_BUCKET, source_key, document_name, pages)})
+    except (TypeError, ValueError, KeyError, ClientError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@mcp.custom_route("/cases/verified/open-pdf", methods=["POST"])
+async def open_verified_case_pdf(request: Request) -> Response:
+    """Return one bounded verified source PDF for an authenticated internal caller."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id = str(payload.get("case_id", ""))
+        source_sha256 = str(payload.get("source_sha256", ""))
+        document_name, _ = validate_page_request(str(payload.get("document_name", "")), [1])
+        prefix, manifest = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
+        filenames = {str(item.get("filename", "")) for item in manifest["files"] if isinstance(item, dict)}
+        if document_name not in filenames:
+            raise ValueError("document is not in the verified source manifest")
+        descriptor = json.loads(_b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read())
+        source_key = str(descriptor.get("source_object_key", ""))
+        if not source_key.startswith(prefix):
+            raise ValueError("verified source descriptor is invalid")
+        pdf = read_pdf_from_object(_b2_client(), B2_BUCKET, source_key, document_name)
+        return Response(
+            content=pdf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{document_name}"'},
+        )
     except (TypeError, ValueError, KeyError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 

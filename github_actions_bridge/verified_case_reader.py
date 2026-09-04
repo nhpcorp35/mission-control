@@ -115,6 +115,23 @@ def extract_pdf_pages(archive_bytes: bytes, document_name: str, pages: list[int]
         raise ValueError("verified source is not a readable ZIP archive") from exc
 
 
+def read_pdf_from_object(client: Any, bucket: str, key: str, document_name: str) -> bytes:
+    """Read one bounded verified PDF from its ZIP source using B2 ranges."""
+    document_name, _ = validate_page_request(document_name, [1])
+    size = int(client.head_object(Bucket=bucket, Key=key)["ContentLength"])
+    try:
+        with zipfile.ZipFile(io.BufferedReader(RangeObjectReader(client, bucket, key, size))) as archive:
+            members = {name.rsplit("/", 1)[-1]: info for name, info in ((item.filename, item) for item in archive.infolist())}
+            member = members.get(document_name)
+            if member is None:
+                raise ValueError("document is not in the verified archive")
+            if member.file_size > _MAX_PDF_BYTES:
+                raise ValueError("selected PDF exceeds the bounded reader limit")
+            return archive.read(member)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("verified source is not a readable ZIP archive") from exc
+
+
 def extract_pdf_pages_from_object(client: Any, bucket: str, key: str, document_name: str, pages: list[int]) -> list[dict[str, Any]]:
     """Read one small PDF from a verified ZIP using B2 byte ranges only."""
     document_name, pages = validate_page_request(document_name, pages)

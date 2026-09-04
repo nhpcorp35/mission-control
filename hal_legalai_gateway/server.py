@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
@@ -316,6 +316,27 @@ async def _search_portal_szymczyk_verified_pages(request: Request) -> JSONRespon
     )
 
 
+async def _open_portal_szymczyk_verified_pdf(request: Request) -> Response:
+    """Open one verified Szymczyk source PDF through the portal secret boundary."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    if not secret or not hmac.compare_digest(request.headers.get("X-LegalAI-Portal-Secret", ""), secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    document_name = payload.get("document_name") if isinstance(payload, dict) else None
+    if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\\.pdf", document_name):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    return await _forward_verified_case_pdf(
+        {
+            "case_id": _PORTAL_SZYMCZYK_CASE_ID,
+            "source_sha256": _PORTAL_SZYMCZYK_SOURCE_SHA256,
+            "document_name": document_name,
+        }
+    )
+
+
 async def _read_portal_case00_feedback(
     request: Request, *, question_id: str
 ) -> JSONResponse:
@@ -607,6 +628,37 @@ async def _forward_verified_case_operation(operation: str, payload: dict[str, An
     except ValueError: result = {"ok": False, "error": f"bridge_verified_case_{operation}_response_invalid"}
     return result if response.is_success else {"ok": False, "error": result.get("error", f"bridge_verified_case_{operation}_failed")}
 
+
+
+async def _forward_verified_case_pdf(payload: dict[str, Any]) -> Response:
+    """Forward one bounded verified PDF from Bridge without exposing its credentials."""
+    settings = get_settings()
+    downstream = settings.downstream_by_key("storage")
+    headers = {"Content-Type": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.post(
+                f"{downstream.base_url.rstrip('/')}/cases/verified/open-pdf",
+                headers=headers,
+                json=payload,
+            )
+            content = response.content
+    except httpx.HTTPError:
+        return JSONResponse({"ok": False, "error": "pdf_unavailable"}, status_code=502)
+    if not response.is_success:
+        try:
+            result = response.json()
+        except ValueError:
+            result = {"ok": False, "error": "pdf_unavailable"}
+        return JSONResponse(result if isinstance(result, dict) else {"ok": False, "error": "pdf_unavailable"}, status_code=502)
+    filename = str(payload.get("document_name", "document.pdf"))
+    return Response(content=content, media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{filename}"'})
+
+
+
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
     application.router.routes = [
@@ -741,6 +793,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.post("/portal/szymczyk/verified-search", include_in_schema=False)
     async def search_portal_szymczyk_verified_pages(request: Request) -> JSONResponse:
         return await _search_portal_szymczyk_verified_pages(request)
+
+    @application.post("/portal/szymczyk/verified-pdf", include_in_schema=False)
+    async def open_portal_szymczyk_verified_pdf(request: Request) -> Response:
+        return await _open_portal_szymczyk_verified_pdf(request)
 
     @application.get("/portal/szymczyk/feedback/latest", include_in_schema=False)
     async def read_latest_szymczyk_feedback(request: Request) -> JSONResponse:
