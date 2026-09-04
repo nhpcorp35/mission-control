@@ -275,6 +275,47 @@ async def _read_current_szymczyk_review_packet(request: Request) -> JSONResponse
     return JSONResponse(result if isinstance(result, dict) else {"ok": False, "error": "review_packet_read_unavailable"}, status_code=response.status_code)
 
 
+_PORTAL_SZYMCZYK_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
+_PORTAL_SZYMCZYK_SOURCE_SHA256 = "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc"
+
+
+async def _search_portal_szymczyk_verified_pages(request: Request) -> JSONResponse:
+    """Read-only verified-page search for the single attorney workspace matter.
+
+    The browser supplies only a bounded query. The Gateway supplies the
+    immutable case/source binding and private Bridge authorization, so this
+    surface cannot select another source or obtain credentials.
+    """
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    query = payload.get("query") if isinstance(payload, dict) else None
+    if not isinstance(query, str):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    query = query.strip()
+    if not query or len(query) > 500:
+        return JSONResponse({"ok": False, "error": "invalid_query"}, status_code=400)
+
+    result = await _forward_verified_case_operation(
+        "search",
+        {
+            "case_id": _PORTAL_SZYMCZYK_CASE_ID,
+            "source_sha256": _PORTAL_SZYMCZYK_SOURCE_SHA256,
+            "query": query,
+            "limit": 12,
+        },
+    )
+    return JSONResponse(
+        result if isinstance(result, dict) else {"ok": False, "error": "search_unavailable"},
+        status_code=200 if isinstance(result, dict) and result.get("ok") else 502,
+    )
+
+
 async def _read_portal_case00_feedback(
     request: Request, *, question_id: str
 ) -> JSONResponse:
@@ -696,6 +737,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/szymczyk/feedback/status", include_in_schema=False)
     async def szymczyk_feedback_status(request: Request) -> JSONResponse:
         return await _szymczyk_feedback_status(request)
+
+    @application.post("/portal/szymczyk/verified-search", include_in_schema=False)
+    async def search_portal_szymczyk_verified_pages(request: Request) -> JSONResponse:
+        return await _search_portal_szymczyk_verified_pages(request)
 
     @application.get("/portal/szymczyk/feedback/latest", include_in_schema=False)
     async def read_latest_szymczyk_feedback(request: Request) -> JSONResponse:
