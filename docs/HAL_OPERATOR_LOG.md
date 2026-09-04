@@ -1,5 +1,48 @@
 # HAL Operator Log
 
+## 2026-09-04 — Additive verified source-set workspace support
+
+### Objective
+
+Allow an ongoing verified matter to receive separately verified supplement ZIPs
+without changing its original attorney-supplied ZIP, then search all verified
+bundles together with source-specific citations.
+
+### Change summary
+
+- Added a verified-source-set reader that preserves compatibility for existing
+  single-bundle matters and refuses a source-set pointer that omits the
+  immutable original source.
+- Updated indexed-case search to merge each verified bundle's immutable page
+  index and return `source_sha256` with every filename/page citation.
+- Updated source maps and PDF opening to retain that source binding, including
+  duplicate filenames across different bundles.
+- Startup index maintenance now checks every registered verified source, not
+  only the original bundle.
+- Added the authenticated `/intake/supplement?case_id=…` workspace route. It
+  reuses the existing direct-to-B2 verification flow, adds only a new immutable
+  verified source record, then indexes it; it never overwrites the original ZIP
+  or contacts an attorney.
+
+### Tests executed
+
+```text
+PYTHONPATH=. python -m unittest \
+  github_actions_bridge.test_verified_case_search \
+  github_actions_bridge.test_verified_case_reader -v
+# Ran 11 tests — OK
+```
+
+Gateway integration tests could not run in this checkout because its Python
+environment does not contain `httpx`; no production action was taken as a
+substitute for those tests.
+
+### Next Objective
+
+Deploy the additive source-set workspace change, verify the protected
+supplement route and a cross-bundle search against a non-production-safe
+verified case, then record the deployed commit and verification result.
+
 ## 2026-08-13 — Phase 2C MCP / Unified notification inspection
 
 ### Objective
