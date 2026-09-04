@@ -1124,7 +1124,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         <label>JSON manifest <input id="manifest" type="file" accept=".json,application/json" required></label><br>
         <button id="upload">Upload, verify, and index</button><pre id="status" aria-live="polite"></pre></main>
         <script>
-        document.getElementById('case-id').value = """ + json.dumps(requested_case_id) + """;
+        document.getElementById('case-id').value = __REQUESTED_CASE_ID__;
         const out=document.getElementById('status');
         const jsonHeaders={'Content-Type':'application/json'};
         async function request(path,payload){const r=await fetch(path,{method:'POST',headers:jsonHeaders,body:JSON.stringify(payload)});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'request failed');return result;}
@@ -1148,7 +1148,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             out.textContent='Verified and indexed. '+JSON.stringify(result,null,2);
           }catch(error){out.textContent='Intake failed: '+error.message;}
         };
-        </script>''')
+        </script>'''.replace("__REQUESTED_CASE_ID__", json.dumps(requested_case_id)))
 
     @application.get("/intake/rennick", include_in_schema=False, response_model=None)
     async def rennick_upload_page(request: Request) -> HTMLResponse | RedirectResponse:
