@@ -2189,7 +2189,11 @@ async def read_verified_case_pages(request: Request) -> JSONResponse:
         source_sha256 = str(payload.get("source_sha256", ""))
         document_name, pages = validate_page_request(str(payload.get("document_name", "")), payload.get("pages"))
         prefix, manifest = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
-        filenames = {str(item.get("filename", "")) for item in manifest["files"] if isinstance(item, dict)}
+        filenames = {
+            str(item.get("filename", "")).rsplit("/", 1)[-1]
+            for item in manifest["files"]
+            if isinstance(item, dict)
+        }
         if document_name not in filenames:
             raise ValueError("document is not in the verified source manifest")
         descriptor = json.loads(_b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read())
@@ -2214,7 +2218,11 @@ async def open_verified_case_pdf(request: Request) -> Response:
         source_sha256 = str(payload.get("source_sha256", ""))
         document_name, _ = validate_page_request(str(payload.get("document_name", "")), [1])
         prefix, manifest = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
-        filenames = {str(item.get("filename", "")) for item in manifest["files"] if isinstance(item, dict)}
+        filenames = {
+            str(item.get("filename", "")).rsplit("/", 1)[-1]
+            for item in manifest["files"]
+            if isinstance(item, dict)
+        }
         if document_name not in filenames:
             raise ValueError("document is not in the verified source manifest")
         descriptor = json.loads(_b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read())
