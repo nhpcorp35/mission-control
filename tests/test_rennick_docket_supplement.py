@@ -164,3 +164,62 @@ class RennickDocketSupplementTests(unittest.TestCase):
 
         self.assertTrue(all(prefix + "documents/" + name not in stored for name in server.RENNICK_SUPPLEMENT_FILENAMES))
         self.assertIn(canonical_archive, stored)
+
+
+
+class GenericIntakeManifestTests(unittest.TestCase):
+    def _pair(self, server, *, case_id: str | None = None) -> tuple[bytes, bytes]:
+        case_id = case_id or "NY-Nassau-613561-2026-Desousa-v-Rennick"
+        document = b"%PDF-1.4 generic verified test document"
+        filename = "verified-record.pdf"
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr(filename, document)
+        manifest = json.dumps(
+            {
+                "case_id": case_id,
+                "documents": [
+                    {
+                        "filename": filename,
+                        "size_bytes": len(document),
+                        "sha256": hashlib.sha256(document).hexdigest(),
+                    }
+                ],
+            },
+            sort_keys=True,
+        ).encode()
+        return bundle.getvalue(), manifest
+
+    def test_generic_manifest_normalizes_only_hash_verified_pdfs(self) -> None:
+        server = _bridge_server()
+        bundle, manifest = self._pair(server)
+        normalized = json.loads(
+            server._normalized_generic_contents_manifest(
+                "NY-Nassau-613561-2026-Desousa-v-Rennick", bundle, manifest
+            )
+        )
+        self.assertEqual(normalized["schema_version"], "case-contents.v1")
+        self.assertEqual(normalized["files"][0]["filename"], "verified-record.pdf")
+
+    def test_generic_manifest_rejects_zip_bytes_that_do_not_match_manifest(self) -> None:
+        server = _bridge_server()
+        bundle, manifest = self._pair(server)
+        tampered = io.BytesIO()
+        with zipfile.ZipFile(tampered, "w") as archive:
+            archive.writestr("verified-record.pdf", b"changed bytes")
+        with self.assertRaisesRegex(ValueError, "hash"):
+            server._normalized_generic_contents_manifest(
+                "NY-Nassau-613561-2026-Desousa-v-Rennick",
+                tampered.getvalue(),
+                manifest,
+            )
+
+    def test_generic_manifest_rejects_mismatched_case_identity(self) -> None:
+        server = _bridge_server()
+        bundle, manifest = self._pair(
+            server, case_id="NY-Nassau-613561-2026-Other-v-Matter"
+        )
+        with self.assertRaisesRegex(ValueError, "case_id"):
+            server._normalized_generic_contents_manifest(
+                "NY-Nassau-613561-2026-Desousa-v-Rennick", bundle, manifest
+            )
