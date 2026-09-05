@@ -90,6 +90,7 @@ _ATTORNEY_REVIEW_FEEDBACK_FILENAME = "John-Cuomo-Case00-Attorney-Feedback-Email-
 _ATTORNEY_REVIEW_EVALUATION_FILENAME = ATTORNEY_REVIEW_FILENAMES["structured_evaluation"]
 SZYMCZYK_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
 MAX_SOURCE_MAP_DOCUMENTS = 1_000
+MAX_SOURCE_MAP_INDEX_BYTES = 50_000_000
 SZYMCZYK_REVIEW_PACKET_PREFIX = (
     f"cases/{SZYMCZYK_CASE_ID}/derived/attorney-review-candidates/"
 )
@@ -1470,7 +1471,7 @@ async def read_case_source_map(request: Request) -> JSONResponse:
             index_key = prefix + "page_records.jsonl"
             head = client.head_object(Bucket=B2_BUCKET, Key=index_key)
             size = int(head.get("ContentLength", 0))
-            if size <= 0 or size > 10_000_000:
+            if size <= 0 or size > MAX_SOURCE_MAP_INDEX_BYTES:
                 return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
             stream = client.get_object(Bucket=B2_BUCKET, Key=index_key)["Body"]
             try:
