@@ -1517,3 +1517,10 @@ Control execution-engine facts before returning primary product focus to LegalAI
 ### Next Objective
 
 - Use the terminal Pushover state (including the bounded failure code if any) to complete the Calvagno internal-draft diagnostic.
+
+
+### Completion update — 2026-09-05
+
+- Calvagno diagnostic retry completed successfully in GitHub Actions run `33985783732` after the worker was corrected to read the canonical `intake/source/<sha>/page_records.jsonl` indexes selected by the verified B2 source set.
+- The worker’s deterministic fallback covers valid OCR/terminology gaps without exceeding 30 pages or 50,000 context characters; all generated citations are checked against those retrieved verified pages.
+- No original ZIP, verified source record, attorney packet, OAuth configuration, or ChatGPT app was modified.
