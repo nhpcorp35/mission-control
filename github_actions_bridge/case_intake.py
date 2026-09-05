@@ -5,7 +5,11 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import io
+import json
+import pathlib
 import re
+import zipfile
 from typing import Any
 
 
@@ -14,6 +18,8 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,180}$")
 MAX_BUNDLE_BYTES = 128 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1 * 1024 * 1024
+GENERIC_DIRECT_MAX_BUNDLE_BYTES = 1024 * 1024 * 1024
+GENERIC_SOURCE_EXTENSIONS = frozenset({".pdf", ".jpg", ".jpeg", ".wav"})
 
 
 def intake_keys(case_id: str, source_filename: str, manifest_filename: str) -> tuple[str, str]:
@@ -43,6 +49,74 @@ def decode_base64_upload(value: str, *, label: str, max_size: int) -> bytes:
     if not 1 <= len(payload) <= max_size:
         raise ValueError(f"{label} size is outside the allowed range")
     return payload
+
+
+def normalized_generic_contents_manifest(case_id: str, source: bytes, manifest: bytes) -> bytes:
+    """Return a canonical manifest only for a complete hash-verified source ZIP.
+
+    The full attorney-supplied set may include JPG/JPEG or WAV exhibits.  Those
+    files remain hash-verified and immutable; downstream indexing deliberately
+    indexes PDFs only.
+    """
+    try:
+        payload = json.loads(manifest)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("intake manifest is not valid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("case_id") != case_id:
+        raise ValueError("intake manifest case_id does not match")
+    documents = payload.get("documents")
+    if not isinstance(documents, list) or not documents:
+        raise ValueError("intake manifest must contain documents")
+
+    expected: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(documents):
+        if not isinstance(item, dict):
+            raise ValueError(f"intake manifest documents[{index}] is invalid")
+        filename = str(item.get("filename") or "")
+        path = pathlib.PurePosixPath(filename)
+        if (
+            not filename
+            or filename != path.name
+            or path.is_absolute()
+            or ".." in path.parts
+            or path.suffix.lower() not in GENERIC_SOURCE_EXTENSIONS
+            or filename in expected
+        ):
+            raise ValueError("intake manifest contains an unsafe, unsupported, or duplicate filename")
+        size = item.get("size_bytes", item.get("size"))
+        digest = str(item.get("sha256") or "").lower()
+        if not isinstance(size, int) or size < 1:
+            raise ValueError("intake manifest file size is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("intake manifest file SHA-256 is invalid")
+        expected[filename] = {"filename": filename, "size": size, "sha256": digest}
+
+    found: set[str] = set()
+    try:
+        with zipfile.ZipFile(io.BytesIO(source)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                member_path = pathlib.PurePosixPath(info.filename)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError("source ZIP contains an unsafe path")
+                filename = member_path.name
+                if filename not in expected or filename in found:
+                    raise ValueError("source ZIP does not exactly match the manifest")
+                expected_item = expected[filename]
+                if info.file_size != expected_item["size"]:
+                    raise ValueError("source ZIP file size does not match the manifest")
+                if hashlib.sha256(archive.read(info)).hexdigest() != expected_item["sha256"]:
+                    raise ValueError("source ZIP file hash does not match the manifest")
+                found.add(filename)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("source bundle is not a valid ZIP") from exc
+    if found != set(expected):
+        raise ValueError("source ZIP is missing manifest files")
+    return json.dumps(
+        {"schema_version": "case-contents.v1", "files": [expected[name] for name in sorted(expected)]},
+        sort_keys=True,
+    ).encode()
 
 
 def verify_object(
