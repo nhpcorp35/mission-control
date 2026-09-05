@@ -1,5 +1,43 @@
 # HAL Operator Log
 
+## 2026-09-05 — Complete-source verified intake for Calvagno
+
+### Objective
+
+Prepare the historical attorney-supplied Calvagno source set as an immutable
+verified matter without discarding non-PDF exhibits.
+
+### Change summary
+
+- Generic direct intake now hash-verifies a complete ZIP containing PDFs plus
+  JPG/JPEG and WAV exhibits; only verified PDFs are indexed for text search.
+- Increased the direct-to-B2 generic-source ceiling to 1 GiB and the private
+  completion timeout to 15 minutes, so a large set can be verified and indexed
+  without proxying document bytes through the Gateway.
+- Raised the bounded verified-PDF reader ceiling to 80 MiB for the largest
+  preserved Calvagno exhibit; it remains finite.
+- Prepared but did not upload the original source set for `NY-Suffolk-600371-
+  2021-DeSousa-v-Calvagno-II-Karcher`: 129 files (125 PDFs, 3 JPGs, 1 WAV),
+  404 MiB. The source manifest records its historical `legal-ai` tag and path;
+  every archived member is size- and SHA-256-verified.
+- No attorney was contacted, no attorney packet was changed, and no B2 object
+  was written while preparing the source set.
+
+### Tests executed
+
+```text
+python -m unittest \
+  github_actions_bridge.test_case_intake \
+  github_actions_bridge.test_verified_case_index \
+  github_actions_bridge.test_verified_case_reader \
+  github_actions_bridge.test_verified_case_search -v
+# Ran 16 tests — OK
+```
+
+The broader Bridge test module requires service dependencies (`boto3`,
+`fastmcp`) absent from this local runtime; syntax compilation passed for both
+Bridge and Gateway modules.
+
 ## 2026-09-04 — Additive verified source-set workspace support
 
 ### Objective
