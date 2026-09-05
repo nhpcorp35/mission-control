@@ -1375,6 +1375,24 @@ async def list_registered_cases(request: Request) -> JSONResponse:
             has_index = any(
                 name.endswith("/page_records.jsonl") for name in names
             )
+            # Readiness is canonical: check each immutable source-set member's
+            # exact page-index key. A broad listing is only a fallback signal.
+            if not has_index:
+                try:
+                    has_index = any(
+                        bool(
+                            client.head_object(
+                                Bucket=B2_BUCKET,
+                                Key=canonical_source_prefix(case_id, source_sha256)
+                                + "page_records.jsonl",
+                            )
+                        )
+                        for source_sha256 in read_verified_source_set(
+                            client, B2_BUCKET, case_id
+                        )
+                    )
+                except (ClientError, ValueError, KeyError, TypeError):
+                    has_index = False
             stage = (
                 "Verified source indexed" if has_index
                 else "Verified source" if has_identity and has_descriptor
