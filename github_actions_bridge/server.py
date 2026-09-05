@@ -64,7 +64,7 @@ from case_intake import (
     normalized_generic_contents_manifest,
     verify_object as verify_case_intake_object,
 )
-from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, read_verified_source_set, registered_case_stage, source_set_key, validate_page_request, validate_source_set
+from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, read_verified_source_set, source_set_key, validate_page_request, validate_source_set
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -1359,7 +1359,20 @@ async def list_registered_cases(request: Request) -> JSONResponse:
                 for item in intake.get("Contents", [])
                 if isinstance(item.get("Key"), str) and str(item["Key"]).startswith(prefix)
             }
-            cases.append({"case_id": case_id, "stage": registered_case_stage(names)})
+            has_identity = "case_identity.json" in names
+            has_descriptor = any(
+                name.endswith("/source_descriptor.json") for name in names
+            )
+            has_index = any(
+                name.endswith("/page_records.jsonl") for name in names
+            )
+            stage = (
+                "Verified source indexed" if has_index
+                else "Verified source" if has_identity and has_descriptor
+                else "Intake stored" if names
+                else "Registered"
+            )
+            cases.append({"case_id": case_id, "stage": stage})
     except ClientError:
         return JSONResponse({"ok": False, "error": "registry_unavailable"}, status_code=502)
     return JSONResponse(
