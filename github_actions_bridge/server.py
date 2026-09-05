@@ -1577,6 +1577,7 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
             requested_by = entry.get("requested_by")
             created_at = entry.get("created_at")
             status = "QUEUED"
+            failure_code: str | None = None
             draft: dict[str, Any] | None = None
             try:
                 status_raw = client.get_object(
@@ -1587,6 +1588,9 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                 value = status_entry.get("status") if isinstance(status_entry, dict) else None
                 if value in {"QUEUED", "RUNNING", "READY", "FAILED"}:
                     status = value
+                candidate_code = status_entry.get("failure_code") if isinstance(status_entry, dict) else None
+                if isinstance(candidate_code, str) and re.fullmatch(r"[a-z_]{1,40}", candidate_code):
+                    failure_code = candidate_code
                 if status == "READY":
                     draft_raw = client.get_object(
                         Bucket=B2_BUCKET,
@@ -1616,6 +1620,8 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                 }
                 if draft is not None:
                     row["draft"] = draft
+                if failure_code is not None:
+                    row["failure_code"] = failure_code
                 requests.append(row)
         requests.sort(key=lambda item: item["created_at"], reverse=True)
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
