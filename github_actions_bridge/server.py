@@ -56,10 +56,12 @@ from storage_policy import (
     verify_retrieved_acceptance_contract,
 )
 from case_intake import (
+    GENERIC_DIRECT_MAX_BUNDLE_BYTES,
     MAX_BUNDLE_BYTES,
     MAX_MANIFEST_BYTES,
     decode_base64_upload,
     intake_keys,
+    normalized_generic_contents_manifest,
     verify_object as verify_case_intake_object,
 )
 from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, read_verified_source_set, source_set_key, validate_page_request, validate_source_set
@@ -2034,6 +2036,10 @@ def _complete_rennick_direct_supplement_upload(upload_id: str) -> dict[str, Any]
 
 GENERIC_DIRECT_UPLOAD_TTL_SECONDS = 15 * 60
 GENERIC_DIRECT_UPLOAD_PREFIX = "pending-intakes/generic/.pending/"
+# Generic verified matters may preserve the complete attorney-supplied source
+# set, including exhibits such as photos and audio.  The page index remains
+# PDF-only, but the immutable source ZIP must not be silently reduced to fit
+# the searcher.  Direct B2 uploads avoid proxying this bounded larger payload.
 
 
 def _generic_intake_metadata(
@@ -2047,69 +2053,13 @@ def _generic_intake_metadata(
 
 
 def _normalized_generic_contents_manifest(case_id: str, source: bytes, manifest: bytes) -> bytes:
-    """Fail closed unless every ZIP member is a hash-verified manifest PDF."""
-    try:
-        payload = json.loads(manifest)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("intake manifest is not valid JSON") from exc
-    if not isinstance(payload, dict) or payload.get("case_id") != case_id:
-        raise ValueError("intake manifest case_id does not match")
-    documents = payload.get("documents")
-    if not isinstance(documents, list) or not documents:
-        raise ValueError("intake manifest must contain documents")
+    """Fail closed unless every ZIP member is a hash-verified supported source.
 
-    expected: dict[str, dict[str, Any]] = {}
-    for index, item in enumerate(documents):
-        if not isinstance(item, dict):
-            raise ValueError(f"intake manifest documents[{index}] is invalid")
-        filename = str(item.get("filename") or "")
-        path = pathlib.PurePosixPath(filename)
-        if (
-            not filename
-            or filename != path.name
-            or path.is_absolute()
-            or ".." in path.parts
-            or not filename.lower().endswith(".pdf")
-            or filename in expected
-        ):
-            raise ValueError("intake manifest contains an unsafe or duplicate PDF filename")
-        size = item.get("size_bytes", item.get("size"))
-        digest = str(item.get("sha256") or "").lower()
-        if not isinstance(size, int) or size < 1:
-            raise ValueError("intake manifest PDF size is invalid")
-        if not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise ValueError("intake manifest PDF SHA-256 is invalid")
-        expected[filename] = {"filename": filename, "size": size, "sha256": digest}
-
-    found: set[str] = set()
-    try:
-        with zipfile.ZipFile(io.BytesIO(source)) as archive:
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
-                member_path = pathlib.PurePosixPath(info.filename)
-                if member_path.is_absolute() or ".." in member_path.parts:
-                    raise ValueError("source ZIP contains an unsafe path")
-                filename = member_path.name
-                if filename not in expected or filename in found:
-                    raise ValueError("source ZIP does not exactly match the manifest")
-                expected_item = expected[filename]
-                if info.file_size != expected_item["size"]:
-                    raise ValueError("source ZIP PDF size does not match the manifest")
-                if hashlib.sha256(archive.read(info)).hexdigest() != expected_item["sha256"]:
-                    raise ValueError("source ZIP PDF hash does not match the manifest")
-                found.add(filename)
-    except zipfile.BadZipFile as exc:
-        raise ValueError("source bundle is not a valid ZIP") from exc
-    if found != set(expected):
-        raise ValueError("source ZIP is missing manifest PDFs")
-    return json.dumps(
-        {
-            "schema_version": "case-contents.v1",
-            "files": [expected[name] for name in sorted(expected)],
-        },
-        sort_keys=True,
-    ).encode()
+    PDFs are the only members indexed or made available through the PDF reader;
+    images and audio remain in the immutable original bundle with hashes so the
+    preserved source set is complete without treating them as searchable text.
+    """
+    return normalized_generic_contents_manifest(case_id, source, manifest)
 
 
 def _copy_immutable_or_same(
@@ -2187,7 +2137,7 @@ def _prepare_generic_direct_intake(
         "ok": True,
         "upload_id": upload_id,
         "expires_in_seconds": GENERIC_DIRECT_UPLOAD_TTL_SECONDS,
-        "max_source_bytes": MAX_BUNDLE_BYTES,
+        "max_source_bytes": GENERIC_DIRECT_MAX_BUNDLE_BYTES,
         "max_manifest_bytes": MAX_MANIFEST_BYTES,
         "source": {
             "content_type": "application/zip",
@@ -2227,7 +2177,7 @@ def _complete_generic_direct_intake(
         source_head = client.head_object(Bucket=B2_BUCKET, Key=pending_source)
         manifest_head = client.head_object(Bucket=B2_BUCKET, Key=pending_manifest)
         source_size, manifest_size = int(source_head.get("ContentLength", 0)), int(manifest_head.get("ContentLength", 0))
-        if not 1 <= source_size <= MAX_BUNDLE_BYTES or not 1 <= manifest_size <= MAX_MANIFEST_BYTES:
+        if not 1 <= source_size <= GENERIC_DIRECT_MAX_BUNDLE_BYTES or not 1 <= manifest_size <= MAX_MANIFEST_BYTES:
             raise ValueError("pending intake object size is outside the allowed range")
         source = client.get_object(Bucket=B2_BUCKET, Key=pending_source)["Body"].read()
         manifest = client.get_object(Bucket=B2_BUCKET, Key=pending_manifest)["Body"].read()
@@ -2301,7 +2251,11 @@ def _complete_generic_direct_intake(
             "ok": True,
             "case_id": case_id,
             "source_sha256": source_sha256,
-            "verified_documents": len(json.loads(contents)["files"]),
+            "verified_files": len(json.loads(contents)["files"]),
+            "indexed_documents": sum(
+                1 for item in json.loads(contents)["files"]
+                if str(item.get("filename", "")).lower().endswith(".pdf")
+            ),
             "index": index,
         }
     finally:
