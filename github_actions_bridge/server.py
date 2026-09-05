@@ -528,6 +528,7 @@ WORKFLOW = os.environ.get("GITHUB_WORKFLOW", "hal-bridge-proof.yml")
 WORKFLOW_BRANCH = os.environ.get("GITHUB_WORKFLOW_BRANCH", "agent/hal-bridge-proof-workflow")
 CASE00_WORKFLOW = os.environ.get("GITHUB_CASE00_WORKFLOW", "hal-case00-q1.yml")
 CASE00_WORKFLOW_BRANCH = os.environ.get("GITHUB_CASE00_WORKFLOW_BRANCH", "main")
+VERIFIED_CASE_DRAFT_WORKFLOW = "hal-verified-case-draft.yml"
 B2_BUCKET = os.environ.get("B2_BUCKET", "legalai-corpus")
 B2_PREFIX = os.environ.get("B2_PROOF_PREFIX", "Benchmarks/Bridge-Proof")
 PUBLIC_URL = os.environ.get(
@@ -1038,6 +1039,17 @@ async def _dispatch_case00_generation(
     }
 
 
+async def _dispatch_verified_case_draft(case_id: str, request_id: str) -> None:
+    """Start the generic, source-bounded internal-draft workflow on main."""
+    response, _body, transport_error = await _github_json(
+        "POST",
+        f"/repos/{REPOSITORY}/actions/workflows/{VERIFIED_CASE_DRAFT_WORKFLOW}/dispatches",
+        json={"ref": "main", "inputs": {"case_id": case_id, "request_id": request_id}},
+    )
+    if transport_error is not None or response is None or response.status_code not in {201, 204}:
+        raise RuntimeError("verified_draft_dispatch_failed")
+
+
 def validate_case00_benchmark_question(benchmark_id: str, question_id: str) -> tuple[str, str]:
     """Return normalized IDs or raise a structured unsupported-combination error.
 
@@ -1493,10 +1505,13 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
             ContentType="application/json",
             Metadata={"sha256": hashlib.sha256(body).hexdigest()},
         )
+        await _dispatch_verified_case_draft(case_id, request_id)
     except ClientError:
         return JSONResponse({"ok": False, "error": "draft_request_unavailable"}, status_code=502)
+    except RuntimeError:
+        return JSONResponse({"ok": False, "error": "draft_dispatch_unavailable"}, status_code=502)
     return JSONResponse(
-        {"ok": True, "case_id": case_id, "request_id": request_id, "status": "DRAFT"},
+        {"ok": True, "case_id": case_id, "request_id": request_id, "status": "QUEUED"},
         status_code=201,
     )
 
@@ -1540,21 +1555,37 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
             question = entry.get("question")
             requested_by = entry.get("requested_by")
             created_at = entry.get("created_at")
+            status = "QUEUED"
+            draft: dict[str, Any] | None = None
+            try:
+                status_raw = client.get_object(Bucket=B2_BUCKET, Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json")["Body"].read()
+                status_entry = json.loads(status_raw.decode("utf-8"))
+                value = status_entry.get("status") if isinstance(status_entry, dict) else None
+                if value in {"QUEUED", "RUNNING", "READY", "FAILED"}: status = value
+                if status == "READY":
+                    draft_raw = client.get_object(Bucket=B2_BUCKET, Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/draft.json")["Body"].read()
+                    candidate = json.loads(draft_raw.decode("utf-8"))
+                    if isinstance(candidate, dict) and candidate.get("request_id") == request_id: draft = candidate
+                    else: status = "FAILED"
+            except ClientError:
+                pass
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                status = "FAILED"
             if (
                 isinstance(question, str)
                 and isinstance(requested_by, str)
                 and isinstance(created_at, int)
             ):
-                requests.append(
-                    {
+                row: dict[str, Any] = {
                         "request_id": request_id,
                         "question": question,
                         "requested_by": requested_by,
-                        "status": "DRAFT",
+                        "status": status,
                         "created_at": created_at,
                         "external_communication": False,
-                    }
-                )
+                }
+                if draft is not None: row["draft"] = draft
+                requests.append(row)
         requests.sort(key=lambda item: item["created_at"], reverse=True)
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
         return JSONResponse({"ok": False, "error": "draft_queue_unavailable"}, status_code=502)
@@ -4450,3 +4481,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+￿￿￿
