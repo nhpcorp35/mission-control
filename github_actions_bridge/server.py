@@ -1347,18 +1347,27 @@ async def list_registered_cases(request: Request) -> JSONResponse:
         cases: list[dict[str, str]] = []
         for case_id in case_ids:
             prefix = f"cases/{case_id}/intake/"
-            # A verified source bundle can legitimately include more than one
-            # hundred intake objects. The readiness index must not be missed
-            # merely because it sorts after those objects. B2/S3 caps a single
-            # listing page at 1,000; this remains a bounded metadata-only scan.
-            intake = client.list_objects_v2(
-                Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=1000
-            )
-            names = {
-                str(item.get("Key", ""))[len(prefix):]
-                for item in intake.get("Contents", [])
-                if isinstance(item.get("Key"), str) and str(item["Key"]).startswith(prefix)
-            }
+            # Follow every bounded B2/S3 listing page. Source bundles can
+            # contain many extracted records, so an index may sort after the
+            # first 1,000 intake objects.
+            names: set[str] = set()
+            continuation_token: str | None = None
+            while True:
+                request_args: dict[str, Any] = {
+                    "Bucket": B2_BUCKET, "Prefix": prefix, "MaxKeys": 1000
+                }
+                if continuation_token:
+                    request_args["ContinuationToken"] = continuation_token
+                intake = client.list_objects_v2(**request_args)
+                names.update(
+                    str(item.get("Key", ""))[len(prefix):]
+                    for item in intake.get("Contents", [])
+                    if isinstance(item.get("Key"), str)
+                    and str(item["Key"]).startswith(prefix)
+                )
+                continuation_token = str(intake.get("NextContinuationToken") or "")
+                if not intake.get("IsTruncated") or not continuation_token:
+                    break
             has_identity = "case_identity.json" in names
             has_descriptor = any(
                 name.endswith("/source_descriptor.json") for name in names
