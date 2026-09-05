@@ -1524,3 +1524,20 @@ Control execution-engine facts before returning primary product focus to LegalAI
 - Calvagno diagnostic retry completed successfully in GitHub Actions run `33985783732` after the worker was corrected to read the canonical `intake/source/<sha>/page_records.jsonl` indexes selected by the verified B2 source set.
 - The worker’s deterministic fallback covers valid OCR/terminology gaps without exceeding 30 pages or 50,000 context characters; all generated citations are checked against those retrieved verified pages.
 - No original ZIP, verified source record, attorney packet, OAuth configuration, or ChatGPT app was modified.
+
+
+## 2026-09-05 — Workspace MVP standardization
+
+### Completed
+
+- Unified Szymczyk with generic verified-record actions (Search, Source map, and Prepare) while retaining its existing attorney-review route.
+- Verified the idempotent Rennick promotion and index build against its existing B2 intake; the original source remains immutable.
+- Added read-only Case-00 search and source-map support from its existing protected 98-PDF source corpus and canonical page index. Existing Case-00 attorney packets and question workflow remain unchanged.
+- Kept incomplete/blank intake records unavailable for source search, map, or drafting.
+
+### Verification
+
+- Szymczyk index: present and verified in B2.
+- Rennick promotion: successful; verified page index already present.
+- Case-00 canonical page index and source PDFs: present on the protected LegalAI volume.
+- LegalAI Executor deployment: healthy after the workspace update.
