@@ -1393,6 +1393,12 @@ async def list_registered_cases(request: Request) -> JSONResponse:
                     )
                 except (ClientError, ValueError, KeyError, TypeError):
                     has_index = False
+            if case_id == RENNICK_CASE_ID and not has_index:
+                try:
+                    client.head_object(Bucket=B2_BUCKET, Key=canonical_source_prefix(case_id, "6394faf9d9ccdf258a061e231bf2ce9a7e27599c27e5187c4234613e876caf77") + "page_records.jsonl")
+                    has_index = True
+                except ClientError:
+                    pass
             stage = (
                 "Verified source indexed" if has_index
                 else "Verified source" if has_identity and has_descriptor
