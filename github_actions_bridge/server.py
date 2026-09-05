@@ -89,6 +89,7 @@ _ATTORNEY_REVIEW_PREFIX = (
 _ATTORNEY_REVIEW_FEEDBACK_FILENAME = "John-Cuomo-Case00-Attorney-Feedback-Email-2026-08-02.md"
 _ATTORNEY_REVIEW_EVALUATION_FILENAME = ATTORNEY_REVIEW_FILENAMES["structured_evaluation"]
 SZYMCZYK_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
+MAX_SOURCE_MAP_DOCUMENTS = 1_000
 SZYMCZYK_REVIEW_PACKET_PREFIX = (
     f"cases/{SZYMCZYK_CASE_ID}/derived/attorney-review-candidates/"
 )
@@ -1484,7 +1485,9 @@ async def read_case_source_map(request: Request) -> JSONResponse:
                 page_number = row.get("page_number")
                 if filename and isinstance(page_number, int) and page_number > 0:
                     pages[(source_sha256, filename)] = max(pages.get((source_sha256, filename), 0), page_number)
-        if not pages or len(pages) > 300:
+        # A verified matter may legitimately contain more than 300 PDFs.
+        # Keep the response bounded while allowing the complete Szymczyk map.
+        if not pages or len(pages) > MAX_SOURCE_MAP_DOCUMENTS:
             return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
