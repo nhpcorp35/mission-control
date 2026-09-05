@@ -1498,3 +1498,22 @@ Control execution-engine facts before returning primary product focus to LegalAI
 
 - Execute LegalAI product work; revisit Mission Control only for blocking
   defects or strategic automation that removes the user from text loops.
+
+
+## 2026-09-05 — LegalAI verified-draft diagnostics
+
+### Completed
+
+- Published bounded failure-code propagation from derived internal-draft status records through the protected bridge and workspace monitor.
+- Deployed and verified healthy Railway services after the change.
+- Started the approved Calvagno diagnostic retry. Source ZIPs remain immutable in B2; only derived draft-status records are updated.
+
+### Verification
+
+- Bridge publish: `eca52024ef17d52f5e15e1a5307dac36d6f73f37`.
+- Workspace publish: `8774942888e4498ccc5e3b56630ea4e46639f0f7`.
+- Production services reported `SUCCESS` after deployment.
+
+### Next Objective
+
+- Use the terminal Pushover state (including the bounded failure code if any) to complete the Calvagno internal-draft diagnostic.
