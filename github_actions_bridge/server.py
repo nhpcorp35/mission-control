@@ -1044,7 +1044,10 @@ async def _dispatch_verified_case_draft(case_id: str, request_id: str) -> None:
     response, _body, transport_error = await _github_json(
         "POST",
         f"/repos/{REPOSITORY}/actions/workflows/{VERIFIED_CASE_DRAFT_WORKFLOW}/dispatches",
-        json={"ref": "main", "inputs": {"case_id": case_id, "request_id": request_id}},
+        json={
+            "ref": "main",
+            "inputs": {"case_id": case_id, "request_id": request_id},
+        },
     )
     if transport_error is not None or response is None or response.status_code not in {201, 204}:
         raise RuntimeError("verified_draft_dispatch_failed")
@@ -1505,6 +1508,24 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
             ContentType="application/json",
             Metadata={"sha256": hashlib.sha256(body).hexdigest()},
         )
+        lease_body = json.dumps(
+            {
+                "schema_version": "legalai-internal-draft-status.v1",
+                "case_id": case_id,
+                "request_id": request_id,
+                "status": "QUEUED",
+                "updated_at": int(time.time()),
+                "dispatch_attempts": 1,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        client.put_object(
+            Bucket=B2_BUCKET,
+            Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
+            Body=lease_body,
+            ContentType="application/json",
+            Metadata={"sha256": hashlib.sha256(lease_body).hexdigest()},
+        )
         await _dispatch_verified_case_draft(case_id, request_id)
     except ClientError:
         return JSONResponse({"ok": False, "error": "draft_request_unavailable"}, status_code=502)
@@ -1558,15 +1579,24 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
             status = "QUEUED"
             draft: dict[str, Any] | None = None
             try:
-                status_raw = client.get_object(Bucket=B2_BUCKET, Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json")["Body"].read()
+                status_raw = client.get_object(
+                    Bucket=B2_BUCKET,
+                    Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
+                )["Body"].read()
                 status_entry = json.loads(status_raw.decode("utf-8"))
                 value = status_entry.get("status") if isinstance(status_entry, dict) else None
-                if value in {"QUEUED", "RUNNING", "READY", "FAILED"}: status = value
+                if value in {"QUEUED", "RUNNING", "READY", "FAILED"}:
+                    status = value
                 if status == "READY":
-                    draft_raw = client.get_object(Bucket=B2_BUCKET, Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/draft.json")["Body"].read()
+                    draft_raw = client.get_object(
+                        Bucket=B2_BUCKET,
+                        Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/draft.json",
+                    )["Body"].read()
                     candidate = json.loads(draft_raw.decode("utf-8"))
-                    if isinstance(candidate, dict) and candidate.get("request_id") == request_id: draft = candidate
-                    else: status = "FAILED"
+                    if isinstance(candidate, dict) and candidate.get("request_id") == request_id:
+                        draft = candidate
+                    else:
+                        status = "FAILED"
             except ClientError:
                 pass
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
@@ -1584,7 +1614,8 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                         "created_at": created_at,
                         "external_communication": False,
                 }
-                if draft is not None: row["draft"] = draft
+                if draft is not None:
+                    row["draft"] = draft
                 requests.append(row)
         requests.sort(key=lambda item: item["created_at"], reverse=True)
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
