@@ -4359,6 +4359,38 @@ def _index_registered_verified_cases() -> None:
     except ClientError:
         logger.exception("Registered verified-case index scan failed")
 
+
+def _recover_unleased_verified_drafts() -> None:
+    """Dispatch legacy verified requests created before durable leases existed.
+
+    New requests write ``status.json`` before dispatch, so this one-shot startup
+    repair cannot duplicate a current job. It touches derived records only.
+    """
+    try:
+        client = _b2_client()
+        roots = client.list_objects_v2(Bucket=B2_BUCKET, Prefix="cases/", Delimiter="/", MaxKeys=200)
+        for root in roots.get("CommonPrefixes", []):
+            prefix = str(root.get("Prefix", ""))
+            case_id = prefix[len("cases/"):-1] if prefix.startswith("cases/") and prefix.endswith("/") else ""
+            if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+                continue
+            queued = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=f"cases/{case_id}/derived/draft-requests/", MaxKeys=100)
+            for item in queued.get("Contents", []):
+                request_key = str(item.get("Key", ""))
+                if not request_key.endswith(".json"):
+                    continue
+                request_id = request_key.rsplit("/", 1)[-1].removesuffix(".json")
+                status_key = f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json"
+                try:
+                    client.head_object(Bucket=B2_BUCKET, Key=status_key)
+                    continue
+                except ClientError:
+                    pass
+                asyncio.run(_dispatch_verified_case_draft(case_id, request_id))
+                logger.warning("Recovered unleased verified draft case_id=%s request_id=%s", case_id, request_id)
+    except Exception:
+        logger.exception("Verified draft recovery scan failed")
+
 def main() -> None:
     import uvicorn
 
@@ -4503,6 +4535,9 @@ def main() -> None:
     registered_index_timer = threading.Timer(30.0, _index_registered_verified_cases)
     registered_index_timer.daemon = True
     registered_index_timer.start()
+    draft_recovery_timer = threading.Timer(90.0, _recover_unleased_verified_drafts)
+    draft_recovery_timer.daemon = True
+    draft_recovery_timer.start()
     uvicorn.run(
         app,
         host="0.0.0.0",
