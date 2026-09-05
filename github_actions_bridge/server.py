@@ -1626,6 +1626,28 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
     )
 
 
+@mcp.tool()
+async def get_verified_draft_status(case_id: str) -> dict[str, Any]:
+    """Return safe internal job status only; never source text or questions."""
+    _require_allowed_user()
+    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        raise ValueError("invalid case_id")
+    client = _b2_client()
+    items = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=f"cases/{case_id}/derived/draft-requests/", MaxKeys=100).get("Contents", [])
+    jobs = []
+    for item in items:
+        request_id = str(item.get("Key", "")).rsplit("/", 1)[-1].removesuffix(".json")
+        if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", request_id):
+            continue
+        try:
+            raw = client.get_object(Bucket=B2_BUCKET, Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json")["Body"].read()
+            status = json.loads(raw.decode("utf-8")).get("status")
+        except (ClientError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            status = "QUEUED"
+        jobs.append({"request_id": request_id, "status": status, "draft_available": status == "READY"})
+    return {"ok": True, "case_id": case_id, "jobs": sorted(jobs, key=lambda job: job["request_id"], reverse=True)}
+
+
 @mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
 async def read_case00_portal_packet(request: Request) -> JSONResponse:
     """Return one fixed Case-00 review packet for the protected portal only."""
