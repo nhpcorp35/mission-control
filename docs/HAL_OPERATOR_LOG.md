@@ -38,6 +38,15 @@ The broader Bridge test module requires service dependencies (`boto3`,
 `fastmcp`) absent from this local runtime; syntax compilation passed for both
 Bridge and Gateway modules.
 
+### Live intake verification
+
+The protected intake completed on 2026-09-05 for
+`NY-Suffolk-600371-2021-DeSousa-v-Calvagno-II-Karcher`. B2 accepted the
+immutable original-source ZIP and manifest, verified all 129 source files, and
+created the PDF page index for all 125 PDFs. The ZIP SHA-256 is
+`14a8abebfd7912b2dc81e4cf99652562ba962dddc8efe310e4091383950c9a29`.
+No attorney was contacted and no attorney packet or legal draft was changed.
+
 ## 2026-09-04 — Additive verified source-set workspace support
 
 ### Objective
