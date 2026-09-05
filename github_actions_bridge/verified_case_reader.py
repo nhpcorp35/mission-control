@@ -10,7 +10,9 @@ from typing import Any
 CASE_ID_RE = re.compile(r"^NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RANGE_BLOCK_BYTES = 1_048_576
-_MAX_PDF_BYTES = 32 * 1_048_576
+# Attorney-provided exhibit PDFs may be larger than a routine filing.  Keep a
+# finite cap while allowing the preserved Calvagno source set's 65 MB exhibit.
+_MAX_PDF_BYTES = 80 * 1_048_576
 
 
 class RangeObjectReader(io.RawIOBase):
