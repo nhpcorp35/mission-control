@@ -4535,9 +4535,10 @@ def main() -> None:
     registered_index_timer = threading.Timer(30.0, _index_registered_verified_cases)
     registered_index_timer.daemon = True
     registered_index_timer.start()
-    draft_recovery_timer = threading.Timer(90.0, _recover_unleased_verified_drafts)
-    draft_recovery_timer.daemon = True
-    draft_recovery_timer.start()
+    # Legacy requests created before leases existed must be recovered before
+    # the service is considered ready; a process-local delayed timer can be
+    # lost during a rolling deployment without leaving an audit record.
+    _recover_unleased_verified_drafts()
     uvicorn.run(
         app,
         host="0.0.0.0",
