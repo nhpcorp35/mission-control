@@ -64,7 +64,7 @@ from case_intake import (
     normalized_generic_contents_manifest,
     verify_object as verify_case_intake_object,
 )
-from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, read_verified_source_set, source_set_key, validate_page_request, validate_source_set
+from verified_case_reader import canonical_source_prefix, extract_pdf_pages_from_object, read_pdf_from_object, read_verified_manifest, read_verified_source_set, registered_case_stage, source_set_key, validate_page_request, validate_source_set
 from service_auth import (
     BRIDGE_SERVICE_TOKEN_ENV,
     CANONICAL_GATEWAY_DISPLAY_NAME,
@@ -1347,26 +1347,19 @@ async def list_registered_cases(request: Request) -> JSONResponse:
         cases: list[dict[str, str]] = []
         for case_id in case_ids:
             prefix = f"cases/{case_id}/intake/"
+            # A verified source bundle can legitimately include more than one
+            # hundred intake objects. The readiness index must not be missed
+            # merely because it sorts after those objects. B2/S3 caps a single
+            # listing page at 1,000; this remains a bounded metadata-only scan.
             intake = client.list_objects_v2(
-                Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=100
+                Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=1000
             )
             names = {
                 str(item.get("Key", ""))[len(prefix):]
                 for item in intake.get("Contents", [])
                 if isinstance(item.get("Key"), str) and str(item["Key"]).startswith(prefix)
             }
-            has_identity = "case_identity.json" in names
-            has_descriptor = any(name.endswith("/source_descriptor.json") for name in names)
-            has_index = any(name.endswith("/page_records.jsonl") for name in names)
-            if has_index:
-                stage = "Verified source indexed"
-            elif has_identity and has_descriptor:
-                stage = "Verified source"
-            elif names:
-                stage = "Intake stored"
-            else:
-                stage = "Registered"
-            cases.append({"case_id": case_id, "stage": stage})
+            cases.append({"case_id": case_id, "stage": registered_case_stage(names)})
     except ClientError:
         return JSONResponse({"ok": False, "error": "registry_unavailable"}, status_code=502)
     return JSONResponse(
