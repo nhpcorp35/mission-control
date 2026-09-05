@@ -1,0 +1,33 @@
+name: HAL Rennick Verified Index
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/hal-rennick-verified-index.yml]
+permissions:
+  contents: read
+jobs:
+  promote-and-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET }}
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_REGION: ${{ secrets.B2_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: python -m pip install -r requirements.txt
+      - run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "github_actions_bridge")
+          import server
+          print(server._promote_rennick_intake())
+          print(server._build_verified_case_index(
+              server.RENNICK_CASE_ID,
+              "6394faf9d9ccdf258a061e231bf2ce9a7e27599c27e5187c4234613e876caf77",
+          ))
+          PY
