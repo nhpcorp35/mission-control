@@ -90,7 +90,6 @@ _ATTORNEY_REVIEW_FEEDBACK_FILENAME = "John-Cuomo-Case00-Attorney-Feedback-Email-
 _ATTORNEY_REVIEW_EVALUATION_FILENAME = ATTORNEY_REVIEW_FILENAMES["structured_evaluation"]
 SZYMCZYK_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
 MAX_SOURCE_MAP_DOCUMENTS = 1_000
-MAX_SOURCE_MAP_INDEX_BYTES = 50_000_000
 SZYMCZYK_REVIEW_PACKET_PREFIX = (
     f"cases/{SZYMCZYK_CASE_ID}/derived/attorney-review-candidates/"
 )
@@ -1468,29 +1467,38 @@ async def read_case_source_map(request: Request) -> JSONResponse:
         pages: dict[tuple[str, str], int] = {}
         for source_sha256 in read_verified_source_set(client, B2_BUCKET, case_id):
             prefix, _ = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
-            index_key = prefix + "page_records.jsonl"
-            head = client.head_object(Bucket=B2_BUCKET, Key=index_key)
-            size = int(head.get("ContentLength", 0))
-            if size <= 0 or size > MAX_SOURCE_MAP_INDEX_BYTES:
-                return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
-            stream = client.get_object(Bucket=B2_BUCKET, Key=index_key)["Body"]
+            stream = client.get_object(
+                Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl"
+            )["Body"]
             try:
-                raw = stream.read(size + 1)
+                # Page-record indexes can be large. Read each verified record as
+                # a line instead of materializing the full index in the bridge.
+                for raw_line in stream.iter_lines():
+                    if not raw_line:
+                        continue
+                    line = (
+                        raw_line.decode("utf-8")
+                        if isinstance(raw_line, bytes)
+                        else str(raw_line)
+                    )
+                    row = json.loads(line)
+                    filename = str(row.get("filename", ""))
+                    page_number = row.get("page_number")
+                    if filename and isinstance(page_number, int) and page_number > 0:
+                        key = (source_sha256, filename)
+                        if key not in pages and len(pages) >= MAX_SOURCE_MAP_DOCUMENTS:
+                            return JSONResponse(
+                                {"ok": False, "error": "source_map_unavailable"},
+                                status_code=502,
+                            )
+                        pages[key] = max(pages.get(key, 0), page_number)
             finally:
                 stream.close()
-            if len(raw) != size:
-                return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
-            for line in raw.decode("utf-8").splitlines():
-                row = json.loads(line)
-                filename = str(row.get("filename", ""))
-                page_number = row.get("page_number")
-                if filename and isinstance(page_number, int) and page_number > 0:
-                    pages[(source_sha256, filename)] = max(pages.get((source_sha256, filename), 0), page_number)
         # A verified matter may legitimately contain more than 300 PDFs.
         # Keep the response bounded while allowing the complete Szymczyk map.
         if not pages or len(pages) > MAX_SOURCE_MAP_DOCUMENTS:
             return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
-    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
     documents = [
         {"source_sha256": source_sha256, "filename": filename, "pages": pages[(source_sha256, filename)]}
