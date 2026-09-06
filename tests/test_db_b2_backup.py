@@ -36,6 +36,14 @@ class FakeS3:
 
 
 class TestConsistentBackup(unittest.TestCase):
+    def test_missing_source_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "missing.db"
+            backup = Path(tempdir) / "backup.db"
+            with self.assertRaises(FileNotFoundError):
+                create_consistent_sqlite_backup(source, backup)
+            self.assertFalse(backup.exists())
+
     def test_backup_includes_committed_wal_state(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             source = Path(tempdir) / "source.db"
