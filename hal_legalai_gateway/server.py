@@ -214,7 +214,9 @@ async def _archive_portal_szymczyk_feedback(request: Request) -> JSONResponse:
     if authorization:
         headers["Authorization"] = authorization
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+        # The first Case-00 request may build a bounded cache from its
+        # canonical B2 originals.  Subsequent calls use that cache.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
             response = await client.post(settings.downstream_by_key("storage").base_url.rstrip("/") + "/portal/szymczyk/feedback", headers=headers, json=payload)
             result = response.json()
     except (httpx.HTTPError, ValueError):
@@ -230,7 +232,7 @@ async def _szymczyk_feedback_status(request: Request) -> JSONResponse:
     authorization = service_authorization_header(settings.bridge_authorization)
     if authorization: headers["Authorization"] = authorization
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
             response = await client.get(settings.downstream_by_key("storage").base_url.rstrip("/") + "/portal/szymczyk/feedback/status", headers=headers)
             result = response.json()
     except (httpx.HTTPError, ValueError):
@@ -458,7 +460,7 @@ async def _search_portal_indexed_case(request: Request, case_id: str) -> JSONRes
     if authorization:
         headers["Authorization"] = authorization
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
             response = await client.post(
                 f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/cases/indexed/search",
                 json={"case_id": case_id, "query": query, "limit": 20},
@@ -484,7 +486,7 @@ async def _read_portal_case_source_map(request: Request, case_id: str) -> JSONRe
     if authorization:
         headers["Authorization"] = authorization
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=settings.connect_timeout_seconds)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
             response = await client.post(
                 f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/cases/source-map",
                 json={"case_id": case_id},
