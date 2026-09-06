@@ -1,0 +1,31 @@
+name: Mission Control B2 backup tests
+
+on:
+  pull_request:
+    paths:
+      - "mission_control/db_b2_backup.py"
+      - "tests/test_db_b2_backup.py"
+      - "scripts/railway-start.sh"
+      - ".github/workflows/mission-control-b2-backup-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test-b2-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project
+        run: python -m pip install -e .
+
+      - name: Run B2 backup unit tests
+        run: python -m unittest tests.test_db_b2_backup
