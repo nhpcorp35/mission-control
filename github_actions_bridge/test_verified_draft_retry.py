@@ -12,6 +12,7 @@ os.environ.setdefault("STORAGE_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY
 
 from server import (  # noqa: E402
     VERIFIED_DRAFT_RETRY_AFTER_SECONDS,
+    _collapse_duplicate_draft_requests,
     _is_discardable_temporary_draft_request,
     _queued_draft_needs_retry,
 )
@@ -58,6 +59,19 @@ class VerifiedDraftRetryTests(unittest.TestCase):
         self.assertNotEqual(
             f"cases/case/derived/internal-drafts/{first}/discarded.json",
             f"cases/case/derived/internal-drafts/{second}/discarded.json",
+        )
+
+    def test_duplicate_question_prefers_ready_draft_without_hiding_other_questions(self):
+        requests = [
+            {"request_id": "draft-1-aaaaaaaaaaaa", "question": "What relief is requested?", "requested_by": "allen@example.com", "status": "READY", "created_at": 10},
+            {"request_id": "draft-2-bbbbbbbbbbbb", "question": " What  relief is requested? ", "requested_by": "Allen@example.com", "status": "QUEUED", "created_at": 20},
+            {"request_id": "draft-3-cccccccccccc", "question": "What evidence supports it?", "requested_by": "allen@example.com", "status": "QUEUED", "created_at": 30},
+            {"request_id": "draft-4-dddddddddddd", "question": "What relief is requested?", "requested_by": "other@example.com", "status": "QUEUED", "created_at": 40},
+        ]
+        visible = _collapse_duplicate_draft_requests(requests)
+        self.assertEqual(
+            [item["request_id"] for item in visible],
+            ["draft-4-dddddddddddd", "draft-3-cccccccccccc", "draft-1-aaaaaaaaaaaa"],
         )
 
 

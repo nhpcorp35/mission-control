@@ -1540,6 +1540,66 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
         )
         if not indexed:
             return JSONResponse({"ok": False, "error": "source_not_indexed"}, status_code=409)
+        # A browser refresh must not create a second internal request for the
+        # same attorney and question.  Reuse a recent active or completed
+        # request; deliberate later reconsideration can be expressed as a new
+        # question, while the original B2 request remains immutable.
+        existing = client.list_objects_v2(
+            Bucket=B2_BUCKET,
+            Prefix=f"cases/{case_id}/derived/draft-requests/",
+            MaxKeys=100,
+        )
+        now = int(time.time())
+        duplicate: tuple[int, str, str] | None = None
+        for item in existing.get("Contents", []):
+            existing_key = str(item.get("Key", ""))
+            if not existing_key.endswith(".json"):
+                continue
+            raw = client.get_object(Bucket=B2_BUCKET, Key=existing_key)["Body"].read()
+            if len(raw) > 8_000:
+                continue
+            entry = json.loads(raw.decode("utf-8"))
+            if not isinstance(entry, dict):
+                continue
+            created_at = entry.get("created_at")
+            if (
+                entry.get("schema_version") != "legalai-draft-request.v1"
+                or entry.get("case_id") != case_id
+                or entry.get("status") != "DRAFT"
+                or entry.get("external_communication") is not False
+                or not isinstance(created_at, int)
+                or now - created_at > 600
+                or " ".join(str(entry.get("question", "")).split()) != question
+                or " ".join(str(entry.get("requested_by", "")).split()) != requested_by
+            ):
+                continue
+            existing_id = existing_key.rsplit("/", 1)[-1].removesuffix(".json")
+            status = "QUEUED"
+            try:
+                status_raw = client.get_object(
+                    Bucket=B2_BUCKET,
+                    Key=f"cases/{case_id}/derived/internal-drafts/{existing_id}/status.json",
+                )["Body"].read()
+                status_entry = json.loads(status_raw.decode("utf-8"))
+                if isinstance(status_entry, dict) and status_entry.get("status") in {"QUEUED", "RUNNING", "READY"}:
+                    status = status_entry["status"]
+                else:
+                    continue
+            except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+            if duplicate is None or created_at > duplicate[0]:
+                duplicate = (created_at, existing_id, status)
+        if duplicate is not None:
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "case_id": case_id,
+                    "request_id": duplicate[1],
+                    "status": duplicate[2],
+                    "reused": True,
+                },
+                status_code=200,
+            )
         request_id = f"draft-{int(time.time())}-{uuid.uuid4().hex[:12]}"
         key = f"cases/{case_id}/derived/draft-requests/{request_id}.json"
         body = json.dumps(
@@ -1625,6 +1685,36 @@ def _is_discardable_temporary_draft_request(entry: dict[str, Any] | None) -> boo
         and " ".join(str(entry.get("question", "")).casefold().split())
         == "is this a test?"
     )
+
+
+def _draft_request_identity(entry: dict[str, Any]) -> tuple[str, str]:
+    """Return the normalized identity used only to suppress accidental repeats."""
+    return (
+        " ".join(str(entry["question"]).casefold().split()),
+        " ".join(str(entry["requested_by"]).casefold().split()),
+    )
+
+
+def _collapse_duplicate_draft_requests(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Present one best result for an accidentally repeated attorney question.
+
+    This affects the workspace response only.  It never deletes, rewrites, or
+    marks B2 request, status, draft, source, or attorney-packet records.
+    """
+    status_rank = {"READY": 0, "RUNNING": 1, "QUEUED": 2, "FAILED": 3}
+    preferred = sorted(
+        requests,
+        key=lambda item: (status_rank.get(item["status"], 9), -item["created_at"]),
+    )
+    retained: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    for item in preferred:
+        identity = _draft_request_identity(item)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        retained.append(item)
+    return sorted(retained, key=lambda item: item["created_at"], reverse=True)
 
 
 def _draft_discard_marker_key(case_id: str, request_id: str) -> str:
@@ -1748,7 +1838,7 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                 if failure_code is not None:
                     row["failure_code"] = failure_code
                 requests.append(row)
-        requests.sort(key=lambda item: item["created_at"], reverse=True)
+        requests = _collapse_duplicate_draft_requests(requests)
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
         return JSONResponse({"ok": False, "error": "draft_queue_unavailable"}, status_code=502)
     return JSONResponse(
