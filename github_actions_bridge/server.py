@@ -1609,6 +1609,28 @@ def _queued_draft_needs_retry(
     )
 
 
+def _is_discardable_temporary_draft_request(entry: dict[str, Any] | None) -> bool:
+    """Allow a workspace-only discard marker for the explicit test question.
+
+    The underlying request, draft, and audit objects remain preserved in B2.
+    This is deliberately narrow: it cannot hide an attorney's substantive
+    question or change a verified source record.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return (
+        entry.get("schema_version") == "legalai-draft-request.v1"
+        and entry.get("status") == "DRAFT"
+        and entry.get("external_communication") is False
+        and " ".join(str(entry.get("question", "")).casefold().split())
+        == "is this a test?"
+    )
+
+
+def _draft_discard_marker_key(case_id: str, request_id: str) -> str:
+    return f"cases/{case_id}/derived/internal-drafts/{request_id}/discarded.json"
+
+
 @mcp.custom_route("/cases/{case_id}/draft-requests", methods=["GET"])
 async def list_case_draft_requests(request: Request) -> JSONResponse:
     """List internal-only draft requests for one verified indexed matter."""
@@ -1648,6 +1670,16 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
             question = entry.get("question")
             requested_by = entry.get("requested_by")
             created_at = entry.get("created_at")
+            try:
+                client.head_object(
+                    Bucket=B2_BUCKET,
+                    Key=_draft_discard_marker_key(case_id, request_id),
+                )
+                continue
+            except ClientError as exc:
+                code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
+                if code not in {"404", "NoSuchKey", "NotFound"}:
+                    raise
             status = "QUEUED"
             failure_code: str | None = None
             draft: dict[str, Any] | None = None
@@ -1723,6 +1755,45 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
         {"ok": True, "case_id": case_id, "requests": requests},
         status_code=200,
     )
+
+
+@mcp.custom_route("/cases/{case_id}/draft-requests/{request_id}/discard-test", methods=["POST"])
+async def discard_temporary_case_draft_request(request: Request) -> JSONResponse:
+    """Hide the exact temporary test request without deleting B2 evidence."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    case_id = str(request.path_params.get("case_id", ""))
+    request_id = str(request.path_params.get("request_id", ""))
+    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
+    if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", request_id):
+        return JSONResponse({"ok": False, "error": "invalid_request_id"}, status_code=400)
+    request_key = f"cases/{case_id}/derived/draft-requests/{request_id}.json"
+    try:
+        client = _b2_client()
+        raw = client.get_object(Bucket=B2_BUCKET, Key=request_key)["Body"].read()
+        entry = json.loads(raw.decode("utf-8"))
+        if not _is_discardable_temporary_draft_request(entry):
+            return JSONResponse({"ok": False, "error": "not_temporary_test"}, status_code=409)
+        marker = {
+            "schema_version": "legalai-draft-discard.v1",
+            "case_id": case_id,
+            "request_id": request_id,
+            "reason": "temporary_test",
+            "external_communication": False,
+            "discarded_at": int(time.time()),
+        }
+        marker_raw = json.dumps(marker, sort_keys=True).encode("utf-8")
+        _put_immutable_or_same(
+            client,
+            key=_draft_discard_marker_key(case_id, request_id),
+            body=marker_raw,
+        )
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return JSONResponse({"ok": False, "error": "draft_discard_unavailable"}, status_code=502)
+    return JSONResponse({"ok": True, "case_id": case_id, "request_id": request_id, "discarded": True})
 
 
 @mcp.tool()
