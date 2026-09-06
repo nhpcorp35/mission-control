@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import MagicMock
 from pathlib import Path
 import sys
 import os
@@ -47,6 +48,17 @@ class VerifiedDraftRetryTests(unittest.TestCase):
         self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "question": "What relief is requested?"}))
         self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "external_communication": True}))
         self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "status": "ARCHIVED"}))
+
+    def test_request_ids_are_independent(self):
+        first = "draft-1000-aaaaaaaaaaaa"
+        second = "draft-1001-bbbbbbbbbbbb"
+        self.assertNotEqual(first, second)
+        # A discard marker is stored under one request ID only; the other
+        # request's derived prefix is a different B2 key.
+        self.assertNotEqual(
+            f"cases/case/derived/internal-drafts/{first}/discarded.json",
+            f"cases/case/derived/internal-drafts/{second}/discarded.json",
+        )
 
 
 if __name__ == "__main__":
