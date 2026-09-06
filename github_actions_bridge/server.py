@@ -530,6 +530,7 @@ WORKFLOW_BRANCH = os.environ.get("GITHUB_WORKFLOW_BRANCH", "agent/hal-bridge-pro
 CASE00_WORKFLOW = os.environ.get("GITHUB_CASE00_WORKFLOW", "hal-case00-q1.yml")
 CASE00_WORKFLOW_BRANCH = os.environ.get("GITHUB_CASE00_WORKFLOW_BRANCH", "main")
 VERIFIED_CASE_DRAFT_WORKFLOW = "hal-verified-case-draft.yml"
+CASE00_INTERNAL_DRAFT_WORKFLOW = "hal-case00-internal-draft.yml"
 VERIFIED_DRAFT_RETRY_AFTER_SECONDS = 120
 VERIFIED_DRAFT_MAX_DISPATCH_ATTEMPTS = 2
 B2_BUCKET = os.environ.get("B2_BUCKET", "legalai-corpus")
@@ -1044,12 +1045,17 @@ async def _dispatch_case00_generation(
 
 async def _dispatch_verified_case_draft(case_id: str, request_id: str) -> None:
     """Start the generic, source-bounded internal-draft workflow on main."""
+    workflow = (
+        CASE00_INTERNAL_DRAFT_WORKFLOW
+        if case_id == CASE00_BENCHMARK_ID
+        else VERIFIED_CASE_DRAFT_WORKFLOW
+    )
     response, _body, transport_error = await _github_json(
         "POST",
-        f"/repos/{REPOSITORY}/actions/workflows/{VERIFIED_CASE_DRAFT_WORKFLOW}/dispatches",
+        f"/repos/{REPOSITORY}/actions/workflows/{workflow}/dispatches",
         json={
             "ref": "main",
-            "inputs": {"case_id": case_id, "request_id": request_id},
+            "inputs": ({"request_id": request_id} if case_id == CASE00_BENCHMARK_ID else {"case_id": case_id, "request_id": request_id}),
         },
     )
     if transport_error is not None or response is None or response.status_code not in {201, 204}:
@@ -1523,19 +1529,15 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
         requested_by = " ".join(str(payload.get("requested_by", "")).split())
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
-    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+    if case_id != CASE00_BENCHMARK_ID and not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
         return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
     if not question or len(question) > 1000 or len(requested_by) > 320:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     try:
         client = _b2_client()
-        index = client.list_objects_v2(
-            Bucket=B2_BUCKET,
-            Prefix=f"cases/{case_id}/intake/",
-            MaxKeys=100,
-        )
+        index = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=("Benchmarks/Case-00-Triborough/original/Tribrough Full Docket/" if case_id == CASE00_BENCHMARK_ID else f"cases/{case_id}/intake/"), MaxKeys=100)
         indexed = any(
-            str(item.get("Key", "")).endswith("/page_records.jsonl")
+            (str(item.get("Key", "")).lower().endswith(".pdf") if case_id == CASE00_BENCHMARK_ID else str(item.get("Key", "")).endswith("/page_records.jsonl"))
             for item in index.get("Contents", [])
         )
         if not indexed:
@@ -1729,7 +1731,7 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     case_id = str(request.path_params.get("case_id", ""))
-    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+    if case_id != CASE00_BENCHMARK_ID and not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
         return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
     try:
         client = _b2_client()
