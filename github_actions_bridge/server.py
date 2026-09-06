@@ -111,6 +111,12 @@ ERROR_UNSUPPORTED_BENCHMARK_QUESTION = "unsupported_benchmark_question"
 CASE00_BENCHMARK_ID = "Case-00-Triborough"
 _CASE00_QUESTION_ID_RE = re.compile(r"^Q[1-9]\d*$")
 _CASE00_QUESTION_TOKEN_RE = re.compile(r"^q[1-9]\d*$")
+CASE00_SOURCE_PREFIX = "Benchmarks/Case-00-Triborough/original/Tribrough Full Docket/"
+CASE00_SOURCE_CACHE_SECONDS = 15 * 60
+CASE00_SOURCE_MAX_DOCUMENTS = 110
+CASE00_SOURCE_MAX_BYTES = 32 * 1024 * 1024
+_case00_source_cache: tuple[float, list[dict[str, Any]]] | None = None
+_case00_source_cache_lock = threading.Lock()
 
 # Canonical Case-00 benchmark source document (single verified attorney packet).
 # Retrieval is intentionally bounded to this key and verified before parsing.
@@ -1216,6 +1222,95 @@ def _b2_client():
     )
 
 
+def _load_case00_source_records() -> list[dict[str, Any]]:
+    """Build a bounded, read-only page index from Case-00's canonical B2 PDFs.
+
+    The web app must not receive B2 credentials or a copied corpus.  This
+    internal cache is rebuilt only from the fixed original-source prefix and
+    contains the minimum metadata/text needed for the protected search and map.
+    """
+    global _case00_source_cache
+    now = time.monotonic()
+    with _case00_source_cache_lock:
+        if _case00_source_cache and now - _case00_source_cache[0] < CASE00_SOURCE_CACHE_SECONDS:
+            return _case00_source_cache[1]
+        client = _b2_client()
+        objects: list[dict[str, Any]] = []
+        token: str | None = None
+        while True:
+            request_args: dict[str, Any] = {
+                "Bucket": B2_BUCKET,
+                "Prefix": CASE00_SOURCE_PREFIX,
+                "MaxKeys": 1_000,
+            }
+            if token:
+                request_args["ContinuationToken"] = token
+            response = client.list_objects_v2(**request_args)
+            objects.extend(
+                item for item in response.get("Contents", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("Key"), str)
+                and item["Key"].startswith(CASE00_SOURCE_PREFIX)
+                and item["Key"].lower().endswith(".pdf")
+            )
+            if not response.get("IsTruncated"):
+                break
+            token = response.get("NextContinuationToken")
+            if not isinstance(token, str) or not token:
+                raise ValueError("Case-00 source listing was truncated")
+        if not 1 <= len(objects) <= CASE00_SOURCE_MAX_DOCUMENTS:
+            raise ValueError("unexpected Case-00 source count")
+        records: list[dict[str, Any]] = []
+        for item in sorted(objects, key=lambda value: str(value["Key"]).casefold()):
+            key = str(item["Key"])
+            filename = key.rsplit("/", 1)[-1]
+            # The original bucket retains duplicate download artifacts such as
+            # "(1).pdf".  They are not canonical record documents.
+            if filename.casefold().endswith("(1).pdf"):
+                continue
+            size = int(item.get("Size") or 0)
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\.pdf", filename) or not 1 <= size <= CASE00_SOURCE_MAX_BYTES:
+                raise ValueError("invalid Case-00 source object")
+            stream = client.get_object(Bucket=B2_BUCKET, Key=key)["Body"]
+            try:
+                raw = stream.read(CASE00_SOURCE_MAX_BYTES + 1)
+            finally:
+                stream.close()
+            if len(raw) != size:
+                raise ValueError("Case-00 source object size mismatch")
+            digest = hashlib.sha256(raw).hexdigest()
+            reader = PdfReader(io.BytesIO(raw))
+            for page_number, page in enumerate(reader.pages, start=1):
+                text = (page.extract_text() or "").strip()
+                records.append({
+                    "source_sha256": digest,
+                    "filename": filename,
+                    "page_number": page_number,
+                    "text": text,
+                })
+        if not records:
+            raise ValueError("Case-00 record extraction returned no pages")
+        _case00_source_cache = (now, records)
+        return records
+
+
+def _search_case00_source_records(query: str, limit: int) -> list[dict[str, Any]]:
+    terms = {term for term in re.findall(r"[a-z0-9]{3,}", query.casefold())}
+    if not terms:
+        return []
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for record in _load_case00_source_records():
+        score = sum(record["text"].casefold().count(term) for term in terms)
+        if score:
+            ranked.append((score, record))
+    return [
+        record for _, record in sorted(
+            ranked,
+            key=lambda value: (-value[0], value[1]["filename"].casefold(), value[1]["page_number"]),
+        )[:limit]
+    ]
+
+
 def _parse_case00_question_sections(packet: str) -> dict[str, str]:
     """Extract ``## QN.`` sections from the canonical Case-00 source document."""
     sections: dict[str, str] = {}
@@ -1439,11 +1534,15 @@ async def search_indexed_case(request: Request) -> JSONResponse:
         limit = int(payload.get("limit", 20))
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
-    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+    if case_id != CASE00_BENCHMARK_ID and not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
         return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
     if not query or len(query) > 500 or limit < 1 or limit > 20:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     try:
+        if case_id == CASE00_BENCHMARK_ID:
+            return JSONResponse(
+                {"ok": True, "case_id": case_id, "results": _search_case00_source_records(query, limit)}
+            )
         client = _b2_client()
         source_sha256s = read_verified_source_set(client, B2_BUCKET, case_id)
         indexes = []
@@ -1451,7 +1550,7 @@ async def search_indexed_case(request: Request) -> JSONResponse:
             prefix, _ = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
             indexes.append((source_sha256, client.get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()))
         results = search_source_indexes(indexes, query, limit)
-    except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError, OSError):
         return JSONResponse({"ok": False, "error": "search_unavailable"}, status_code=502)
     return JSONResponse({"ok": True, "case_id": case_id, "results": results})
 
@@ -1468,9 +1567,19 @@ async def read_case_source_map(request: Request) -> JSONResponse:
         case_id = str(payload.get("case_id", ""))
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
-    if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+    if case_id != CASE00_BENCHMARK_ID and not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
         return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
     try:
+        if case_id == CASE00_BENCHMARK_ID:
+            pages: dict[tuple[str, str], int] = {}
+            for record in _load_case00_source_records():
+                key = (record["source_sha256"], record["filename"])
+                pages[key] = max(pages.get(key, 0), record["page_number"])
+            documents = [
+                {"source_sha256": source_sha256, "filename": filename, "pages": pages[(source_sha256, filename)]}
+                for source_sha256, filename in sorted(pages, key=lambda item: (item[1].casefold(), item[0]))
+            ]
+            return JSONResponse({"ok": True, "case_id": case_id, "documents": documents})
         client = _b2_client()
         pages: dict[tuple[str, str], int] = {}
         for source_sha256 in read_verified_source_set(client, B2_BUCKET, case_id):
@@ -1506,7 +1615,7 @@ async def read_case_source_map(request: Request) -> JSONResponse:
         # Keep the response bounded while allowing the complete Szymczyk map.
         if not pages or len(pages) > MAX_SOURCE_MAP_DOCUMENTS:
             return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
-    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, OSError):
         return JSONResponse({"ok": False, "error": "source_map_unavailable"}, status_code=502)
     documents = [
         {"source_sha256": source_sha256, "filename": filename, "pages": pages[(source_sha256, filename)]}
@@ -3126,9 +3235,33 @@ async def open_indexed_case_pdf(request: Request) -> Response:
         case_id = str(payload.get("case_id", ""))
         source_sha256 = str(payload.get("source_sha256", ""))
         document_name, _ = validate_page_request(str(payload.get("document_name", "")), [1])
-        if not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        if case_id != CASE00_BENCHMARK_ID and not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
             raise ValueError("invalid case identity")
         client = _b2_client()
+        if case_id == CASE00_BENCHMARK_ID:
+            records = _load_case00_source_records()
+            if not any(
+                record["source_sha256"] == source_sha256 and record["filename"] == document_name
+                for record in records
+            ):
+                raise ValueError("source is not in the canonical Case-00 record")
+            stream = client.get_object(
+                Bucket=B2_BUCKET, Key=CASE00_SOURCE_PREFIX + document_name
+            )["Body"]
+            try:
+                pdf = stream.read(CASE00_SOURCE_MAX_BYTES + 1)
+            finally:
+                stream.close()
+            if (
+                len(pdf) > CASE00_SOURCE_MAX_BYTES
+                or hashlib.sha256(pdf).hexdigest() != source_sha256
+            ):
+                raise ValueError("Case-00 source integrity check failed")
+            return Response(
+                content=pdf,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'inline; filename="{document_name}"'},
+            )
         if source_sha256 not in read_verified_source_set(client, B2_BUCKET, case_id):
             raise ValueError("source is not in the verified case source set")
         prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
