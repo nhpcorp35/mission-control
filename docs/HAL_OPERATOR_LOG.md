@@ -1,5 +1,33 @@
 # HAL Operator Log
 
+## 2026-09-06 — LegalAI Case-00 workspace production verification
+
+### Completed
+
+- Verified the protected Case-00 attorney workspace end to end in production:
+  compact answered-question history, new-review-question entry, verified-record
+  search, source map, and protected source-PDF opening.
+- Confirmed the duplicate-submission guard keeps completed answers intact while
+  allowing a distinct new request to queue.
+- Updated the answered-question history to show the fixed Q1–Q5 question
+  labels alongside their identifiers. No packet, candidate answer, original
+  source document, or B2 object changed.
+
+### Verification
+
+- LegalAI publish: `a1e65abf6f42353bea8be23e2209cf1d91bb798e`.
+- Railway deployment: `7b308c34-2b44-43d1-8a2d-624bbe97ca4a` — `SUCCESS`.
+- Production browser verification confirmed the protected PDF relay opens a
+  mapped source document and the answered-question page renders all five
+  existing entries with their question labels.
+
+### Boundaries preserved
+
+- No credentials, access configuration, B2 original sources, attorney
+  communications, or ChatGPT app/OAuth settings changed.
+
+---
+
 ## 2026-09-06 — Temporary verified-draft cleanup
 
 ### Completed
