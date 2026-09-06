@@ -11,6 +11,7 @@ os.environ.setdefault("STORAGE_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY
 
 from server import (  # noqa: E402
     VERIFIED_DRAFT_RETRY_AFTER_SECONDS,
+    _is_discardable_temporary_draft_request,
     _queued_draft_needs_retry,
 )
 
@@ -34,6 +35,18 @@ class VerifiedDraftRetryTests(unittest.TestCase):
         self.assertFalse(_queued_draft_needs_retry({"status": "READY", "dispatch_attempts": 1}, created_at, now))
         self.assertFalse(_queued_draft_needs_retry({"status": "QUEUED", "dispatch_attempts": 2}, created_at, now))
         self.assertFalse(_queued_draft_needs_retry({"status": "QUEUED", "dispatch_attempts": 1}, "bad", now))
+
+    def test_only_exact_internal_test_question_can_be_discarded(self):
+        allowed = {
+            "schema_version": "legalai-draft-request.v1",
+            "status": "DRAFT",
+            "external_communication": False,
+            "question": " Is this a test? ",
+        }
+        self.assertTrue(_is_discardable_temporary_draft_request(allowed))
+        self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "question": "What relief is requested?"}))
+        self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "external_communication": True}))
+        self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "status": "ARCHIVED"}))
 
 
 if __name__ == "__main__":
