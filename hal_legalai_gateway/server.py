@@ -1,5 +1,3 @@
-"""HAL LegalAI Gateway HTTP + authenticated MCP service (Phase 2)."""
-
 from __future__ import annotations
 
 import base64
@@ -596,7 +594,7 @@ async def _open_portal_case_pdf(request: Request, case_id: str) -> Response:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     document_name = payload.get("document_name") if isinstance(payload, dict) else None
     source_sha256 = payload.get("source_sha256") if isinstance(payload, dict) else None
-    if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\\.pdf", document_name):
+    if not isinstance(document_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\.pdf", document_name):
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
