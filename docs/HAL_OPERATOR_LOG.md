@@ -15,7 +15,8 @@
 
 ### Verification
 
-- Focused Bridge checks passed: 10 tests.
+- Focused Bridge checks passed: 11 tests, including a per-request isolation
+  regression: discarding one test request cannot target another request ID.
 - The LegalAI workspace, private gateway, and GitHub Actions bridge each
   deployed successfully and passed their Railway health checks.
 
