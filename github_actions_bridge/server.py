@@ -530,6 +530,8 @@ WORKFLOW_BRANCH = os.environ.get("GITHUB_WORKFLOW_BRANCH", "agent/hal-bridge-pro
 CASE00_WORKFLOW = os.environ.get("GITHUB_CASE00_WORKFLOW", "hal-case00-q1.yml")
 CASE00_WORKFLOW_BRANCH = os.environ.get("GITHUB_CASE00_WORKFLOW_BRANCH", "main")
 VERIFIED_CASE_DRAFT_WORKFLOW = "hal-verified-case-draft.yml"
+VERIFIED_DRAFT_RETRY_AFTER_SECONDS = 120
+VERIFIED_DRAFT_MAX_DISPATCH_ATTEMPTS = 2
 B2_BUCKET = os.environ.get("B2_BUCKET", "legalai-corpus")
 B2_PREFIX = os.environ.get("B2_PROOF_PREFIX", "Benchmarks/Bridge-Proof")
 PUBLIC_URL = os.environ.get(
@@ -1588,6 +1590,25 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
     )
 
 
+def _queued_draft_needs_retry(
+    status_entry: dict[str, Any] | None,
+    created_at: Any,
+    now: int,
+) -> bool:
+    """Return whether one stalled draft can receive its sole recovery dispatch."""
+    if not isinstance(status_entry, dict) or not isinstance(created_at, int):
+        return False
+    if status_entry.get("status") != "QUEUED":
+        return False
+    attempts = status_entry.get("dispatch_attempts")
+    if not isinstance(attempts, int) or attempts < 1:
+        return False
+    return (
+        attempts < VERIFIED_DRAFT_MAX_DISPATCH_ATTEMPTS
+        and now - created_at >= VERIFIED_DRAFT_RETRY_AFTER_SECONDS
+    )
+
+
 @mcp.custom_route("/cases/{case_id}/draft-requests", methods=["GET"])
 async def list_case_draft_requests(request: Request) -> JSONResponse:
     """List internal-only draft requests for one verified indexed matter."""
@@ -1630,12 +1651,14 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
             status = "QUEUED"
             failure_code: str | None = None
             draft: dict[str, Any] | None = None
+            status_entry: dict[str, Any] | None = None
             try:
                 status_raw = client.get_object(
                     Bucket=B2_BUCKET,
                     Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
                 )["Body"].read()
-                status_entry = json.loads(status_raw.decode("utf-8"))
+                candidate_status = json.loads(status_raw.decode("utf-8"))
+                status_entry = candidate_status if isinstance(candidate_status, dict) else None
                 value = status_entry.get("status") if isinstance(status_entry, dict) else None
                 if value in {"QUEUED", "RUNNING", "READY", "FAILED"}:
                     status = value
@@ -1656,6 +1679,25 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                 pass
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 status = "FAILED"
+            if _queued_draft_needs_retry(status_entry, created_at, int(time.time())):
+                assert status_entry is not None
+                retry_status = {
+                    "schema_version": "legalai-internal-draft-status.v1",
+                    "case_id": case_id,
+                    "request_id": request_id,
+                    "status": "QUEUED",
+                    "updated_at": int(time.time()),
+                    "dispatch_attempts": status_entry["dispatch_attempts"] + 1,
+                }
+                retry_raw = json.dumps(retry_status, sort_keys=True).encode("utf-8")
+                client.put_object(
+                    Bucket=B2_BUCKET,
+                    Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
+                    Body=retry_raw,
+                    ContentType="application/json",
+                    Metadata={"sha256": hashlib.sha256(retry_raw).hexdigest()},
+                )
+                await _dispatch_verified_case_draft(case_id, request_id)
             if (
                 isinstance(question, str)
                 and isinstance(requested_by, str)
