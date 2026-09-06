@@ -37,6 +37,10 @@ case "${SERVICE_MODE:-api}" in
     exec python -m mcp_connector.server
     ;;
   api)
+    if [[ "${MISSION_CONTROL_B2_BACKUP_ENABLED:-}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+      echo "Starting Mission Control B2 backup daemon"
+      python -m mission_control.db_b2_backup daemon &
+    fi
     echo "Starting API server"
     exec uvicorn app.api:app \
       --host 0.0.0.0 \
