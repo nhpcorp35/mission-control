@@ -3,15 +3,17 @@
 The live database is opened read-only and copied with SQLite's online backup API,
 so committed WAL state is included without stopping or checkpointing the service.
 Temporary backup files are created outside the persistent volume and removed after
-B2 verification.
+B2 verification. A small receipt is written only after the remote backup has been
+verified by size and SHA-256.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "/data/mission-control.db"
 DEFAULT_PREFIX = "disaster-recovery/mission-control"
+DEFAULT_RECEIPT_PATH = "/data/mission-control-b2-backup-last.json"
 DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_INITIAL_DELAY_SECONDS = 30
 
@@ -37,6 +40,7 @@ class BackupResult:
     size_bytes: int
     sha256: str
     created_at: str
+    verified: bool = True
 
 
 def _sha256_file(path: Path) -> str:
@@ -52,6 +56,27 @@ def _sha256_stream(body: BinaryIO) -> str:
     for chunk in iter(lambda: body.read(1024 * 1024), b""):
         digest.update(chunk)
     return digest.hexdigest()
+
+
+def _write_verified_receipt(path: Path, result: BackupResult) -> None:
+    """Atomically persist a non-secret receipt for the last verified backup."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(asdict(result), sort_keys=True, indent=2) + "\n"
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def create_consistent_sqlite_backup(source_path: Path, destination_path: Path) -> None:
@@ -83,16 +108,20 @@ def backup_database_to_b2(
     *,
     source_path: Optional[Path] = None,
     prefix: Optional[str] = None,
+    receipt_path: Optional[Path] = None,
     client=None,
     config: Optional[B2Config] = None,
     now: Optional[datetime] = None,
 ) -> BackupResult:
-    """Create, upload, download-verify, and clean up one SQLite backup."""
+    """Create, upload, download-verify, receipt, and clean up one SQLite backup."""
     db_path = source_path or Path(
         os.environ.get("MISSION_CONTROL_DB_PATH", DEFAULT_DB_PATH)
     )
     backup_prefix = prefix or os.environ.get(
         "MISSION_CONTROL_B2_BACKUP_PREFIX", DEFAULT_PREFIX
+    )
+    receipt = receipt_path or Path(
+        os.environ.get("MISSION_CONTROL_B2_BACKUP_RECEIPT_PATH", DEFAULT_RECEIPT_PATH)
     )
     created = now or datetime.now(timezone.utc)
     if created.tzinfo is None:
@@ -144,12 +173,14 @@ def backup_database_to_b2(
         if remote_sha256 != sha256:
             raise RuntimeError("B2 backup downloaded SHA-256 verification failed")
 
-        return BackupResult(
+        result = BackupResult(
             key=key,
             size_bytes=size_bytes,
             sha256=sha256,
             created_at=created.isoformat(),
         )
+        _write_verified_receipt(receipt, result)
+        return result
     finally:
         if temp_path is not None:
             try:
