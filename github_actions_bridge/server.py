@@ -1636,12 +1636,17 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
         case_id = str(payload.get("case_id", ""))
         question = " ".join(str(payload.get("question", "")).split())
         requested_by = " ".join(str(payload.get("requested_by", "")).split())
+        regenerate_from_request_id = str(payload.get("regenerate_from_request_id", "")).strip()
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
     if case_id != CASE00_BENCHMARK_ID and not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
         return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
     if not question or len(question) > 1000 or len(requested_by) > 320:
         return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if regenerate_from_request_id and not re.fullmatch(
+        r"draft-[0-9]+-[0-9a-f]{12}", regenerate_from_request_id
+    ):
+        return JSONResponse({"ok": False, "error": "invalid_regeneration_request"}, status_code=400)
     try:
         client = _b2_client()
         index = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=("Benchmarks/Case-00-Triborough/original/Tribrough Full Docket/" if case_id == CASE00_BENCHMARK_ID else f"cases/{case_id}/intake/"), MaxKeys=100)
@@ -1651,10 +1656,34 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
         )
         if not indexed:
             return JSONResponse({"ok": False, "error": "source_not_indexed"}, status_code=409)
+        # Regeneration is explicit, authenticated, and limited to the same
+        # attorney's completed identical request. The prior B2 request remains
+        # immutable and is linked from the fresh request for auditability.
+        if regenerate_from_request_id:
+            source_key = f"cases/{case_id}/derived/draft-requests/{regenerate_from_request_id}.json"
+            source_raw = client.get_object(Bucket=B2_BUCKET, Key=source_key)["Body"].read()
+            source_entry = json.loads(source_raw.decode("utf-8"))
+            if (
+                not isinstance(source_entry, dict)
+                or source_entry.get("schema_version") != "legalai-draft-request.v1"
+                or source_entry.get("case_id") != case_id
+                or source_entry.get("status") != "DRAFT"
+                or source_entry.get("external_communication") is not False
+                or " ".join(str(source_entry.get("question", "")).split()) != question
+                or " ".join(str(source_entry.get("requested_by", "")).split()) != requested_by
+            ):
+                return JSONResponse({"ok": False, "error": "regeneration_not_allowed"}, status_code=409)
+            source_status_raw = client.get_object(
+                Bucket=B2_BUCKET,
+                Key=f"cases/{case_id}/derived/internal-drafts/{regenerate_from_request_id}/status.json",
+            )["Body"].read()
+            source_status = json.loads(source_status_raw.decode("utf-8"))
+            if not isinstance(source_status, dict) or source_status.get("status") != "READY":
+                return JSONResponse({"ok": False, "error": "regeneration_not_allowed"}, status_code=409)
         # A browser refresh must not create a second internal request for the
         # same attorney and question.  Reuse a recent active or completed
-        # request; deliberate later reconsideration can be expressed as a new
-        # question, while the original B2 request remains immutable.
+        # request; an explicit completed-draft regeneration is the sole
+        # exception and remains linked in B2.
         existing = client.list_objects_v2(
             Bucket=B2_BUCKET,
             Prefix=f"cases/{case_id}/derived/draft-requests/",
@@ -1722,6 +1751,8 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
                 "status": "DRAFT",
                 "external_communication": False,
                 "created_at": int(time.time()),
+                **({"regenerated_from_request_id": regenerate_from_request_id}
+                   if regenerate_from_request_id else {}),
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -1815,7 +1846,11 @@ def _collapse_duplicate_draft_requests(requests: list[dict[str, Any]]) -> list[d
     status_rank = {"READY": 0, "RUNNING": 1, "QUEUED": 2, "FAILED": 3}
     preferred = sorted(
         requests,
-        key=lambda item: (status_rank.get(item["status"], 9), -item["created_at"]),
+        key=lambda item: (
+            0 if item.get("regenerated_from_request_id") else 1,
+            status_rank.get(item["status"], 9),
+            -item["created_at"],
+        ),
     )
     retained: list[dict[str, Any]] = []
     identities: set[tuple[str, str]] = set()
@@ -1946,6 +1981,11 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                 }
                 if draft is not None:
                     row["draft"] = draft
+                regenerated_from = entry.get("regenerated_from_request_id")
+                if isinstance(regenerated_from, str) and re.fullmatch(
+                    r"draft-[0-9]+-[0-9a-f]{12}", regenerated_from
+                ):
+                    row["regenerated_from_request_id"] = regenerated_from
                 if failure_code is not None:
                     row["failure_code"] = failure_code
                 requests.append(row)
