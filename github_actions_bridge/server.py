@@ -1998,6 +1998,45 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
     )
 
 
+@mcp.custom_route("/cases/{case_id}/draft-requests/{request_id}/input-audit", methods=["GET"])
+async def read_case_draft_input_audit(request: Request) -> JSONResponse:
+    """Return only verified retrieval citations for one internal draft."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    case_id = str(request.path_params.get("case_id", ""))
+    request_id = str(request.path_params.get("request_id", ""))
+    if case_id != CASE00_BENCHMARK_ID and not re.fullmatch(r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id):
+        return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
+    if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", request_id):
+        return JSONResponse({"ok": False, "error": "invalid_request_id"}, status_code=400)
+    try:
+        raw = _b2_client().get_object(
+            Bucket=B2_BUCKET,
+            Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/input_audit.json",
+        )["Body"].read()
+        audit = json.loads(raw.decode("utf-8"))
+        citations = audit.get("retrieval_citations") if isinstance(audit, dict) else None
+        if not isinstance(citations, list) or len(citations) > 45:
+            raise ValueError("invalid audit")
+        safe = []
+        for citation in citations:
+            if not isinstance(citation, dict):
+                raise ValueError("invalid citation")
+            source = citation.get("source_sha256"); filename = citation.get("filename"); page = citation.get("page_number")
+            if (
+                not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{64}", source)
+                or not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\.pdf", filename)
+                or not isinstance(page, int) or page < 1 or page > 5000
+            ):
+                raise ValueError("invalid citation")
+            safe.append({"source_sha256": source, "filename": filename, "page_number": page})
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "draft_audit_unavailable"}, status_code=404)
+    return JSONResponse({"ok": True, "case_id": case_id, "request_id": request_id, "retrieval_citations": safe})
+
+
 @mcp.custom_route("/cases/{case_id}/draft-requests/{request_id}/discard-test", methods=["POST"])
 async def discard_temporary_case_draft_request(request: Request) -> JSONResponse:
     """Hide the exact temporary test request without deleting B2 evidence."""
