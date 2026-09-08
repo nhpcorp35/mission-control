@@ -2012,7 +2012,16 @@ async def read_case_draft_input_audit(request: Request) -> JSONResponse:
     if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", request_id):
         return JSONResponse({"ok": False, "error": "invalid_request_id"}, status_code=400)
     try:
-        raw = _b2_client().get_object(
+        client = _b2_client()
+        request_raw = client.get_object(
+            Bucket=B2_BUCKET,
+            Key=f"cases/{case_id}/derived/draft-requests/{request_id}.json",
+        )["Body"].read()
+        request_entry = json.loads(request_raw.decode("utf-8"))
+        requested_by = request_entry.get("requested_by") if isinstance(request_entry, dict) else None
+        if not isinstance(requested_by, str) or not re.fullmatch(r"[^\\s@]{1,64}@[A-Za-z0-9.-]{1,190}", requested_by):
+            raise ValueError("invalid requester")
+        raw = client.get_object(
             Bucket=B2_BUCKET,
             Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/input_audit.json",
         )["Body"].read()
@@ -2034,7 +2043,7 @@ async def read_case_draft_input_audit(request: Request) -> JSONResponse:
             safe.append({"source_sha256": source, "filename": filename, "page_number": page})
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return JSONResponse({"ok": False, "error": "draft_audit_unavailable"}, status_code=404)
-    return JSONResponse({"ok": True, "case_id": case_id, "request_id": request_id, "retrieval_citations": safe})
+    return JSONResponse({"ok": True, "case_id": case_id, "request_id": request_id, "requested_by": requested_by, "retrieval_citations": safe})
 
 
 @mcp.custom_route("/cases/{case_id}/draft-requests/{request_id}/discard-test", methods=["POST"])
