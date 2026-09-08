@@ -75,5 +75,14 @@ class VerifiedDraftRetryTests(unittest.TestCase):
         )
 
 
+    def test_explicit_regeneration_is_visible_over_older_ready_duplicate(self):
+        requests = [
+            {"request_id": "draft-1-aaaaaaaaaaaa", "question": "What relief is requested?", "requested_by": "allen@example.com", "status": "READY", "created_at": 10},
+            {"request_id": "draft-2-bbbbbbbbbbbb", "question": "What relief is requested?", "requested_by": "allen@example.com", "status": "QUEUED", "created_at": 20, "regenerated_from_request_id": "draft-1-aaaaaaaaaaaa"},
+        ]
+        visible = _collapse_duplicate_draft_requests(requests)
+        self.assertEqual([item["request_id"] for item in visible], ["draft-2-bbbbbbbbbbbb"])
+
+
 if __name__ == "__main__":
     unittest.main()
