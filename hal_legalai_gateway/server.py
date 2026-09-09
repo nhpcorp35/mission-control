@@ -626,7 +626,7 @@ async def _diagnose_portal_case_page(request: Request, case_id: str) -> JSONResp
     page_number = payload.get("page_number")
     if (
         not isinstance(document_name, str)
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\\.pdf", document_name)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\.pdf", document_name)
         or not isinstance(source_sha256, str)
         or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
         or isinstance(page_number, bool)
