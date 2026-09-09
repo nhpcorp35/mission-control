@@ -609,6 +609,67 @@ async def _discard_portal_test_draft_request(
     return JSONResponse(result, status_code=response.status_code)
 
 
+async def _diagnose_portal_case_page(request: Request, case_id: str) -> JSONResponse:
+    """Compare one verified page with its immutable B2 index without exposing text."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    document_name = payload.get("document_name")
+    source_sha256 = payload.get("source_sha256")
+    page_number = payload.get("page_number")
+    if (
+        not isinstance(document_name, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,180}\\.pdf", document_name)
+        or not isinstance(source_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+        or isinstance(page_number, bool)
+        or not isinstance(page_number, int)
+        or not 1 <= page_number <= 5000
+    ):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    result = await _forward_verified_case_operation(
+        "page-diagnostic",
+        {
+            "case_id": case_id,
+            "source_sha256": source_sha256,
+            "document_name": document_name,
+            "page_number": page_number,
+        },
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        return JSONResponse({"ok": False, "error": "page_diagnostic_unavailable"}, status_code=502)
+    if (
+        result.get("case_id") != case_id
+        or result.get("source_sha256") != source_sha256
+        or result.get("document_name") != document_name
+        or result.get("page_number") != page_number
+    ):
+        return JSONResponse({"ok": False, "error": "page_diagnostic_unavailable"}, status_code=502)
+    safe = {
+        key: result.get(key)
+        for key in (
+            "ok",
+            "case_id",
+            "source_sha256",
+            "document_name",
+            "page_number",
+            "direct_text_present",
+            "indexed_record_present",
+            "matches",
+        )
+    }
+    if not all(isinstance(safe[key], bool) for key in ("direct_text_present", "indexed_record_present", "matches")):
+        return JSONResponse({"ok": False, "error": "page_diagnostic_unavailable"}, status_code=502)
+    return JSONResponse(safe)
+
+
 async def _open_portal_case_pdf(request: Request, case_id: str) -> Response:
     """Open one verified case PDF through the internal portal boundary."""
     secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
@@ -1086,6 +1147,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/cases/{case_id}/source-map", include_in_schema=False)
     async def read_portal_case_source_map(case_id: str, request: Request) -> JSONResponse:
         return await _read_portal_case_source_map(request, case_id)
+
+    @application.post("/portal/cases/{case_id}/page-diagnostic", include_in_schema=False)
+    async def diagnose_portal_case_page(case_id: str, request: Request) -> JSONResponse:
+        return await _diagnose_portal_case_page(request, case_id)
 
     @application.post("/portal/cases/{case_id}/pdf", include_in_schema=False)
     async def open_portal_case_pdf(case_id: str, request: Request) -> Response:
