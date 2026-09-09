@@ -1027,6 +1027,40 @@ def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
         application.router.routes.append(route)
 
 
+_SZYMCZYK_PAGE17_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
+_SZYMCZYK_PAGE17_SOURCE_SHA256 = "ff8a0773d740358d56e43055f518e42b6124a4bc4fb00a39abaf85c5393568dc"
+_SZYMCZYK_PAGE17_DOCUMENT = "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_TO_THIRD_PAR_10.pdf"
+
+
+async def _run_szymczyk_page17_startup_verification() -> None:
+    """One-time deployment verification; logs booleans only and never writes B2."""
+    try:
+        result = await _forward_verified_case_operation(
+            "page-diagnostic",
+            {
+                "case_id": _SZYMCZYK_PAGE17_CASE_ID,
+                "source_sha256": _SZYMCZYK_PAGE17_SOURCE_SHA256,
+                "document_name": _SZYMCZYK_PAGE17_DOCUMENT,
+                "page_number": 17,
+            },
+        )
+    except Exception:
+        logger.exception("page17_server_verification unavailable")
+        return
+    if not isinstance(result, dict) or not result.get("ok"):
+        logger.error("page17_server_verification unavailable")
+        return
+    if not all(isinstance(result.get(key), bool) for key in ("direct_text_present", "indexed_record_present", "matches")):
+        logger.error("page17_server_verification invalid_response")
+        return
+    logger.info(
+        "page17_server_verification direct_text_present=%s indexed_record_present=%s matches=%s",
+        result["direct_text_present"],
+        result["indexed_record_present"],
+        result["matches"],
+    )
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global _settings, _registered_tools, _mcp_http_app, _mcp
@@ -1049,7 +1083,7 @@ async def lifespan(application: FastAPI):
         _settings.connect_timeout_seconds,
         _settings.read_timeout_seconds,
     )
-    async with _mcp_http_app.lifespan(application):
+    await _run_szymczyk_page17_startup_verification()
         yield
     logger.info("HAL LegalAI Gateway shutting down")
     _settings = None
