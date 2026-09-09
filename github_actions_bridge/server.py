@@ -5136,7 +5136,7 @@ def main() -> None:
             and item.get("page_number") == 17
             for item in audit_citations
         )
-        logger.info("Szymczyk draft audit verification (read-only): citations=%d page17_present=%s", len(audit_citations), page17_present)
+        logger.warning("Szymczyk draft audit verification (read-only): citations=%d page17_present=%s", len(audit_citations), page17_present)
     except Exception:
         logger.exception("Szymczyk draft audit verification unavailable")
 
