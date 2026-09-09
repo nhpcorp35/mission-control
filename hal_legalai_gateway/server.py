@@ -648,7 +648,7 @@ async def _diagnose_portal_case_page(request: Request, case_id: str) -> JSONResp
     if (
         result.get("case_id") != case_id
         or result.get("source_sha256") != source_sha256
-        or result.get("document_name") != document_name
+        or result.get("filename") != document_name
         or result.get("page_number") != page_number
     ):
         return JSONResponse({"ok": False, "error": "page_diagnostic_unavailable"}, status_code=502)
@@ -658,7 +658,7 @@ async def _diagnose_portal_case_page(request: Request, case_id: str) -> JSONResp
             "ok",
             "case_id",
             "source_sha256",
-            "document_name",
+            "filename",
             "page_number",
             "direct_text_present",
             "indexed_record_present",
