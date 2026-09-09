@@ -33,7 +33,7 @@ from starlette.responses import JSONResponse, Response
 from botocore.exceptions import ClientError
 from pypdf import PdfReader
 from verified_case_search import search_index_jsonl, search_source_indexes
-from verified_case_index import build_page_records
+from verified_case_index import build_page_records, diagnose_page_record
 
 from storage_policy import (
     ALLOWED_QUESTION_IDS,
@@ -3394,6 +3394,83 @@ async def search_verified_case(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "results": search_index_jsonl(raw, query, limit)})
     except (TypeError, ValueError, KeyError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@mcp.custom_route("/cases/verified/page-diagnostic", methods=["POST"])
+async def diagnose_verified_case_page(request: Request) -> JSONResponse:
+    """Compare one original verified PDF page to its derived index record.
+
+    Service-authenticated and read-only: the response includes only lengths,
+    hashes, and match status, never source text or any B2 write.
+    """
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    provided = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        case_id = str(payload.get("case_id", ""))
+        source_sha256 = str(payload.get("source_sha256", ""))
+        document_name, pages = validate_page_request(
+            str(payload.get("document_name", "")),
+            [payload.get("page_number")],
+        )
+        page_number = pages[0]
+        client = _b2_client()
+        if source_sha256 not in read_verified_source_set(client, B2_BUCKET, case_id):
+            raise ValueError("source is not in the verified case source set")
+        prefix, manifest = read_verified_manifest(
+            client, B2_BUCKET, case_id, source_sha256
+        )
+        allowed = {
+            str(item.get("filename", "")).rsplit("/", 1)[-1]
+            for item in manifest.get("files", [])
+            if isinstance(item, dict)
+        }
+        if document_name not in allowed:
+            raise ValueError("document is not in the verified source manifest")
+        descriptor = json.loads(
+            client.get_object(
+                Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json"
+            )["Body"].read()
+        )
+        source_key = str(descriptor.get("source_object_key", ""))
+        if not source_key.startswith(prefix):
+            raise ValueError("verified source descriptor is invalid")
+        direct_pages = extract_pdf_pages_from_object(
+            client, B2_BUCKET, source_key, document_name, [page_number]
+        )
+        direct_text = str(direct_pages[0].get("text", ""))
+        index_raw = client.get_object(
+            Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl"
+        )["Body"].read()
+        diagnostic = diagnose_page_record(
+            index_raw,
+            filename=document_name,
+            page_number=page_number,
+            extracted_text=direct_text,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "case_id": case_id,
+                "source_sha256": source_sha256,
+                **diagnostic,
+            }
+        )
+    except (
+        ClientError,
+        TypeError,
+        ValueError,
+        KeyError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return JSONResponse(
+            {"ok": False, "error": "page_diagnostic_unavailable"},
+            status_code=400,
+        )
 
 
 @mcp.custom_route("/cases/verified/build-index", methods=["POST"])
