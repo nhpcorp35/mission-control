@@ -648,22 +648,19 @@ async def _diagnose_portal_case_page(request: Request, case_id: str) -> JSONResp
     if (
         result.get("case_id") != case_id
         or result.get("source_sha256") != source_sha256
-        or result.get("document_name") != document_name
+        or result.get("filename") != document_name
         or result.get("page_number") != page_number
     ):
         return JSONResponse({"ok": False, "error": "page_diagnostic_unavailable"}, status_code=502)
     safe = {
-        key: result.get(key)
-        for key in (
-            "ok",
-            "case_id",
-            "source_sha256",
-            "document_name",
-            "page_number",
-            "direct_text_present",
-            "indexed_record_present",
-            "matches",
-        )
+        "ok": True,
+        "case_id": case_id,
+        "source_sha256": source_sha256,
+        "document_name": document_name,
+        "page_number": page_number,
+        "direct_text_present": result.get("direct_text_present"),
+        "indexed_record_present": result.get("indexed_record_present"),
+        "matches": result.get("matches"),
     }
     if not all(isinstance(safe[key], bool) for key in ("direct_text_present", "indexed_record_present", "matches")):
         return JSONResponse({"ok": False, "error": "page_diagnostic_unavailable"}, status_code=502)
