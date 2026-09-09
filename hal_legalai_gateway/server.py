@@ -1084,6 +1084,7 @@ async def lifespan(application: FastAPI):
         _settings.read_timeout_seconds,
     )
     await _run_szymczyk_page17_startup_verification()
+    async with _mcp_http_app.lifespan(application):
         yield
     logger.info("HAL LegalAI Gateway shutting down")
     _settings = None
