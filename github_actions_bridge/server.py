@@ -5121,25 +5121,6 @@ def main() -> None:
     # the service is considered ready; a process-local delayed timer can be
     # lost during a rolling deployment without leaving an audit record.
     _recover_unleased_verified_drafts()
-    # Temporary read-only audit verification for the completed Szymczyk draft.
-    # Logs only a boolean and citation count; it never exposes text or writes B2.
-    try:
-        audit_raw = _b2_client().get_object(
-            Bucket=B2_BUCKET,
-            Key="cases/NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37/derived/internal-drafts/draft-1788976161-8b4e612cb251/input_audit.json",
-        )["Body"].read()
-        audit_data = json.loads(audit_raw.decode("utf-8"))
-        audit_citations = audit_data.get("retrieval_citations", []) if isinstance(audit_data, dict) else []
-        page17_present = any(
-            isinstance(item, dict)
-            and item.get("filename") == "158068_2018_ANDRZEJ_SZYMCZYK_v_HUDSON_36_LLC_et_al_ANSWER_TO_THIRD_PAR_10.pdf"
-            and item.get("page_number") == 17
-            for item in audit_citations
-        )
-        logger.warning("Szymczyk draft audit verification (read-only): citations=%d page17_present=%s", len(audit_citations), page17_present)
-    except Exception:
-        logger.exception("Szymczyk draft audit verification unavailable")
-
     uvicorn.run(
         app,
         host="0.0.0.0",
