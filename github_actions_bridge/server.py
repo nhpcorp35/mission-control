@@ -1723,6 +1723,11 @@ async def create_case_draft_request(request: Request) -> JSONResponse:
             ):
                 continue
             existing_id = existing_key.rsplit("/", 1)[-1].removesuffix(".json")
+            # An explicit regeneration deliberately reuses the question text.
+            # Do not let its completed source request suppress the fresh,
+            # auditable replacement request it explicitly authorized.
+            if existing_id == regenerate_from_request_id:
+                continue
             status = "QUEUED"
             try:
                 status_raw = client.get_object(
