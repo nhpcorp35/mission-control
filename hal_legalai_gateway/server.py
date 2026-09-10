@@ -530,6 +530,31 @@ async def _create_portal_draft_request(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=response.status_code)
 
 
+async def _read_portal_draft_worker_status(request: Request) -> JSONResponse:
+    """Relay a non-sensitive worker heartbeat through the existing portal secret."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    settings = get_settings()
+    headers = {"Accept": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.get(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/operations/internal-draft-worker/status",
+                headers=headers,
+            )
+        result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "worker_status_unavailable"}, status_code=502)
+    if not isinstance(result, dict):
+        return JSONResponse({"ok": False, "error": "worker_status_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
+
+
 async def _list_portal_draft_requests(request: Request, case_id: str) -> JSONResponse:
     """Read the internal-only draft queue through the private Bridge."""
     secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
@@ -1133,6 +1158,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             url=f"{base}/.well-known/oauth-authorization-server",
             status_code=307,
         )
+
+    @application.get("/portal/operations/internal-draft-worker/status", include_in_schema=False)
+    async def read_portal_draft_worker_status(request: Request) -> JSONResponse:
+        return await _read_portal_draft_worker_status(request)
 
     @application.get("/portal/cases/registered", include_in_schema=False)
     async def list_portal_registered_cases(request: Request) -> JSONResponse:
