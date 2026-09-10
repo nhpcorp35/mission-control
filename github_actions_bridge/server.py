@@ -1876,6 +1876,31 @@ def _draft_discard_marker_key(case_id: str, request_id: str) -> str:
     return f"cases/{case_id}/derived/internal-drafts/{request_id}/discarded.json"
 
 
+@mcp.custom_route("/operations/internal-draft-worker/status", methods=["GET"])
+async def read_internal_draft_worker_status(request: Request) -> JSONResponse:
+    """Return the non-sensitive verified-draft worker heartbeat."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        raw = _b2_client().get_object(
+            Bucket=B2_BUCKET, Key="operations/internal-draft-worker/status.json"
+        )["Body"].read()
+        worker = json.loads(raw.decode("utf-8"))
+    except (ClientError, UnicodeDecodeError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "worker_status_unavailable"}, status_code=502)
+    if (
+        not isinstance(worker, dict)
+        or worker.get("schema_version") != "legalai-internal-draft-worker-status.v1"
+        or worker.get("status") not in {"RUNNING", "IDLE", "FAILED"}
+        or not isinstance(worker.get("updated_at"), str)
+    ):
+        return JSONResponse({"ok": False, "error": "worker_status_unavailable"}, status_code=502)
+    safe = {key: worker[key] for key in ("status", "updated_at", "mode", "outcome", "case_id", "request_id") if key in worker}
+    return JSONResponse({"ok": True, "worker": safe}, status_code=200)
+
+
 @mcp.custom_route("/cases/{case_id}/draft-requests", methods=["GET"])
 async def list_case_draft_requests(request: Request) -> JSONResponse:
     """List internal-only draft requests for one verified indexed matter."""
