@@ -222,6 +222,15 @@ def get_deployed_commit_sha() -> str:
     return value if value else UNKNOWN_DEPLOYED_COMMIT_SHA
 
 
+def b2_configuration_fingerprint() -> str:
+    """Return a non-secret fingerprint of the configured B2 storage location."""
+    fields = ("B2_BUCKET", "B2_ENDPOINT", "B2_REGION")
+    material = "\x1f".join(
+        f"{field}={(os.environ.get(field) or '').strip()}" for field in fields
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
 def missing_required_production_tools(registered: Iterable[str]) -> list[str]:
     """Return sorted required tool names absent from the registered set."""
     return sorted(REQUIRED_PRODUCTION_TOOLS - set(registered))
@@ -4869,6 +4878,7 @@ async def health(_request: Request) -> JSONResponse:
             "catalog_identity": CANONICAL_GATEWAY_DISPLAY_NAME,
             "plugin_refresh_mcp_url": plugin_refresh_mcp_url(PUBLIC_URL),
             "deployed_commit_sha": get_deployed_commit_sha(),
+            "b2_configuration_fingerprint": b2_configuration_fingerprint(),
             "registered_tools": await list_registered_tool_names(),
             "time": int(time.time()),
         }
@@ -4977,6 +4987,7 @@ def main() -> None:
     import uvicorn
 
     asyncio.run(validate_required_production_tools())
+    logger.warning("B2 configuration fingerprint=%s", b2_configuration_fingerprint())
     # One-time migration for the already verified Rennick intake. The operation
     # is create-only and idempotent, so later restarts only compare immutable
     # records; it never accepts a browser upload or overwrites B2 objects.
