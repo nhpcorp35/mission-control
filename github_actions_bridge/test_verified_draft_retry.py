@@ -14,6 +14,7 @@ from server import (  # noqa: E402
     VERIFIED_DRAFT_RETRY_AFTER_SECONDS,
     _collapse_duplicate_draft_requests,
     _is_discardable_temporary_draft_request,
+    _newest_draft_request_items,
     _queued_draft_needs_retry,
 )
 
@@ -49,6 +50,18 @@ class VerifiedDraftRetryTests(unittest.TestCase):
         self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "question": "What relief is requested?"}))
         self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "external_communication": True}))
         self.assertFalse(_is_discardable_temporary_draft_request({**allowed, "status": "ARCHIVED"}))
+
+    def test_newest_request_is_not_omitted_after_the_first_hundred(self):
+        listed = {
+            "Contents": [
+                {"Key": f"cases/case/derived/draft-requests/draft-{index:04d}-aaaaaaaaaaaa.json"}
+                for index in range(101)
+            ]
+        }
+        ordered = _newest_draft_request_items(listed)
+        self.assertEqual(len(ordered), 101)
+        self.assertTrue(ordered[0]["Key"].endswith("draft-0100-aaaaaaaaaaaa.json"))
+        self.assertTrue(ordered[-1]["Key"].endswith("draft-0000-aaaaaaaaaaaa.json"))
 
     def test_request_ids_are_independent(self):
         first = "draft-1000-aaaaaaaaaaaa"
