@@ -580,6 +580,33 @@ async def _list_portal_draft_requests(request: Request, case_id: str) -> JSONRes
     return JSONResponse(result, status_code=response.status_code)
 
 
+async def _read_portal_draft_request_status(
+    request: Request, case_id: str, request_id: str
+) -> JSONResponse:
+    """Relay one exact draft state without scanning the case queue."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    settings = get_settings()
+    headers = {"Accept": "application/json"}
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.get(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/cases/{case_id}/draft-requests/{request_id}/status",
+                headers=headers,
+            )
+        result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "draft_status_unavailable"}, status_code=502)
+    if not isinstance(result, dict):
+        return JSONResponse({"ok": False, "error": "draft_status_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
+
+
 async def _read_portal_draft_input_audit(
     request: Request, case_id: str, request_id: str
 ) -> JSONResponse:
@@ -1190,6 +1217,11 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/cases/{case_id}/draft-requests", include_in_schema=False)
     async def list_portal_draft_requests(case_id: str, request: Request) -> JSONResponse:
         return await _list_portal_draft_requests(request, case_id)
+
+    @application.get("/portal/cases/{case_id}/draft-requests/{request_id}/status", include_in_schema=False)
+    async def read_portal_draft_request_status(case_id: str, request_id: str, request: Request) -> JSONResponse:
+        return await _read_portal_draft_request_status(request, case_id, request_id)
+
 
     @application.get("/portal/cases/{case_id}/draft-requests/{request_id}/input-audit", include_in_schema=False)
     async def read_portal_draft_input_audit(case_id: str, request_id: str, request: Request) -> JSONResponse:
