@@ -2045,6 +2045,63 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
     )
 
 
+@mcp.custom_route("/cases/{case_id}/draft-requests/{request_id}/status", methods=["GET"])
+async def read_case_draft_request_status(request: Request) -> JSONResponse:
+    """Read one durable draft state without scanning the case queue."""
+    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
+    supplied = normalize_bearer_token(request.headers.get("authorization"))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    case_id = str(request.path_params.get("case_id", ""))
+    request_id = str(request.path_params.get("request_id", ""))
+    if (
+        (case_id != CASE00_BENCHMARK_ID and not re.fullmatch(
+            r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", case_id
+        ))
+        or not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", request_id)
+    ):
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    try:
+        client = _b2_client()
+        raw = client.get_object(
+            Bucket=B2_BUCKET,
+            Key=f"cases/{case_id}/derived/draft-requests/{request_id}.json",
+        )["Body"].read()
+        entry = json.loads(raw.decode("utf-8"))
+        if (
+            not isinstance(entry, dict)
+            or entry.get("schema_version") != "legalai-draft-request.v1"
+            or entry.get("case_id") != case_id
+            or entry.get("status") != "DRAFT"
+            or entry.get("external_communication") is not False
+        ):
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+        status_raw = client.get_object(
+            Bucket=B2_BUCKET,
+            Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
+        )["Body"].read()
+        status_entry = json.loads(status_raw.decode("utf-8"))
+        status = status_entry.get("status") if isinstance(status_entry, dict) else None
+        if status not in {"QUEUED", "RUNNING", "READY", "FAILED"}:
+            return JSONResponse({"ok": False, "error": "status_unavailable"}, status_code=502)
+        payload: dict[str, Any] = {"ok": True, "request_id": request_id, "status": status}
+        if status == "READY":
+            draft_raw = client.get_object(
+                Bucket=B2_BUCKET,
+                Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/draft.json",
+            )["Body"].read()
+            draft = json.loads(draft_raw.decode("utf-8"))
+            if not isinstance(draft, dict) or draft.get("request_id") != request_id:
+                return JSONResponse({"ok": False, "error": "status_unavailable"}, status_code=502)
+            payload["draft"] = draft
+        return JSONResponse(payload, status_code=200)
+    except ClientError as exc:
+        code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
+        return JSONResponse({"ok": False, "error": "not_found" if code in {"404", "NoSuchKey", "NotFound"} else "status_unavailable"}, status_code=404 if code in {"404", "NoSuchKey", "NotFound"} else 502)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return JSONResponse({"ok": False, "error": "status_unavailable"}, status_code=502)
+
+
 @mcp.custom_route("/cases/{case_id}/draft-requests/{request_id}/input-audit", methods=["GET"])
 async def read_case_draft_input_audit(request: Request) -> JSONResponse:
     """Return only verified retrieval citations for one internal draft."""
