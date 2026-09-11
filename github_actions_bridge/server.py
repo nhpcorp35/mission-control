@@ -1918,13 +1918,21 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "invalid_case_id"}, status_code=400)
     try:
         client = _b2_client()
+        # B2 returns keys in ascending order. Request IDs are timestamp-prefixed,
+        # so a 100-key first page can omit the newest request and leave its
+        # browser status permanently "queued". Fetch the complete bounded
+        # workspace queue page, then inspect newest entries first.
         listed = client.list_objects_v2(
             Bucket=B2_BUCKET,
             Prefix=f"cases/{case_id}/derived/draft-requests/",
-            MaxKeys=100,
+            MaxKeys=1000,
         )
         requests: list[dict[str, Any]] = []
-        for item in listed.get("Contents", []):
+        for item in sorted(
+            listed.get("Contents", []),
+            key=lambda candidate: str(candidate.get("Key", "")),
+            reverse=True,
+        ):
             key = str(item.get("Key", ""))
             if not key.endswith(".json"):
                 continue
