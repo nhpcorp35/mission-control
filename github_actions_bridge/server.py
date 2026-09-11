@@ -1843,6 +1843,18 @@ def _is_discardable_temporary_draft_request(entry: dict[str, Any] | None) -> boo
     )
 
 
+def _newest_draft_request_items(listed: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return B2 draft-request entries newest-first from one bounded page."""
+    contents = listed.get("Contents", [])
+    if not isinstance(contents, list):
+        return []
+    return sorted(
+        (item for item in contents if isinstance(item, dict)),
+        key=lambda candidate: str(candidate.get("Key", "")),
+        reverse=True,
+    )
+
+
 def _draft_request_identity(entry: dict[str, Any]) -> tuple[str, str]:
     """Return the normalized identity used only to suppress accidental repeats."""
     return (
@@ -1928,11 +1940,7 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
             MaxKeys=1000,
         )
         requests: list[dict[str, Any]] = []
-        for item in sorted(
-            listed.get("Contents", []),
-            key=lambda candidate: str(candidate.get("Key", "")),
-            reverse=True,
-        ):
+        for item in _newest_draft_request_items(listed):
             key = str(item.get("Key", ""))
             if not key.endswith(".json"):
                 continue
