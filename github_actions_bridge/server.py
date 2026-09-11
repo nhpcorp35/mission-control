@@ -2084,7 +2084,13 @@ async def read_case_draft_request_status(request: Request) -> JSONResponse:
         status = status_entry.get("status") if isinstance(status_entry, dict) else None
         if status not in {"QUEUED", "RUNNING", "READY", "FAILED"}:
             return JSONResponse({"ok": False, "error": "status_unavailable"}, status_code=502)
-        payload: dict[str, Any] = {"ok": True, "request_id": request_id, "status": status}
+        payload: dict[str, Any] = {
+            "ok": True,
+            "request_id": request_id,
+            "status": status,
+            "question": entry.get("question"),
+            "requested_by": entry.get("requested_by"),
+        }
         if status == "READY":
             draft_raw = client.get_object(
                 Bucket=B2_BUCKET,
