@@ -173,6 +173,31 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="Publish proof JSON to B2, verify it, and return the object key.",
     ),
     ToolBinding(
+        gateway_tool="draft.create", namespace="draft", downstream_service="bridge",
+        downstream_tool="draft.create",
+        description="Create one internal-only attorney-review draft from a verified case record.",
+    ),
+    ToolBinding(
+        gateway_tool="draft.regenerate", namespace="draft", downstream_service="bridge",
+        downstream_tool="draft.regenerate",
+        description="Regenerate only the caller's completed draft as an immutable linked replacement.",
+    ),
+    ToolBinding(
+        gateway_tool="draft.status", namespace="draft", downstream_service="bridge",
+        downstream_tool="draft.status",
+        description="Read the exact status of one caller-owned attorney-review draft.",
+    ),
+    ToolBinding(
+        gateway_tool="draft.list", namespace="draft", downstream_service="bridge",
+        downstream_tool="draft.list",
+        description="List the caller's recent attorney-review drafts for one verified case.",
+    ),
+    ToolBinding(
+        gateway_tool="draft.cancel", namespace="draft", downstream_service="bridge",
+        downstream_tool="draft.cancel",
+        description="Cancel one caller-owned queued or running draft while preserving its audit trail.",
+    ),
+    ToolBinding(
         gateway_tool="storage.list_inventory",
         namespace="storage",
         downstream_service="storage",
@@ -895,6 +920,27 @@ def register_forwarding_tools(
     @mcp.tool(name="case.get_artifacts", description=by_name["case.get_artifacts"].description)
     async def case_get_artifacts(mission_id: str) -> dict[str, Any]:
         return await _forward("case.get_artifacts", {"mission_id": mission_id})
+
+    # --- verified attorney-review drafts ---
+    @mcp.tool(name="draft.create", description=by_name["draft.create"].description)
+    async def draft_create(case_id: str, question: str) -> dict[str, Any]:
+        return await _forward("draft.create", {"case_id": case_id, "question": question})
+
+    @mcp.tool(name="draft.regenerate", description=by_name["draft.regenerate"].description)
+    async def draft_regenerate(case_id: str, request_id: str) -> dict[str, Any]:
+        return await _forward("draft.regenerate", {"case_id": case_id, "request_id": request_id})
+
+    @mcp.tool(name="draft.status", description=by_name["draft.status"].description)
+    async def draft_status(case_id: str, request_id: str) -> dict[str, Any]:
+        return await _forward("draft.status", {"case_id": case_id, "request_id": request_id})
+
+    @mcp.tool(name="draft.list", description=by_name["draft.list"].description)
+    async def draft_list(case_id: str, limit: int = 20) -> dict[str, Any]:
+        return await _forward("draft.list", {"case_id": case_id, "limit": limit})
+
+    @mcp.tool(name="draft.cancel", description=by_name["draft.cancel"].description)
+    async def draft_cancel(case_id: str, request_id: str) -> dict[str, Any]:
+        return await _forward("draft.cancel", {"case_id": case_id, "request_id": request_id})
 
     # --- storage ---
     @mcp.tool(
