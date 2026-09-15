@@ -173,6 +173,11 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "get_acceptance_contract",
         "get_case00_question",
         "verify_case_intake",
+        "draft.create",
+        "draft.regenerate",
+        "draft.status",
+        "draft.list",
+        "draft.cancel",
     }
 )
 
@@ -557,6 +562,7 @@ PUBLIC_URL = os.environ.get(
 # Exact origin+path the existing unnumbered ChatGPT plugin recaches on Refresh.
 PLUGIN_REFRESH_MCP_URL = plugin_refresh_mcp_url(PUBLIC_URL)
 ALLOWED_GITHUB_LOGIN = os.environ.get("ALLOWED_GITHUB_LOGIN", "nhpcorp35")
+LEGALAI_MCP_REVIEWER_EMAIL_ENV = "LEGALAI_MCP_REVIEWER_EMAIL"
 GITHUB_API = "https://api.github.com"
 CASE_ARTIFACT_PREFIX = (
     "Benchmarks/Case-00-Triborough/derived/"
@@ -1983,7 +1989,7 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                 candidate_status = json.loads(status_raw.decode("utf-8"))
                 status_entry = candidate_status if isinstance(candidate_status, dict) else None
                 value = status_entry.get("status") if isinstance(status_entry, dict) else None
-                if value in {"QUEUED", "RUNNING", "READY", "FAILED"}:
+                if value in {"QUEUED", "RUNNING", "READY", "FAILED", "CANCELLED"}:
                     status = value
                 candidate_code = status_entry.get("failure_code") if isinstance(status_entry, dict) else None
                 if isinstance(candidate_code, str) and re.fullmatch(r"[a-z_]{1,40}", candidate_code):
@@ -2090,7 +2096,7 @@ async def read_case_draft_request_status(request: Request) -> JSONResponse:
         )["Body"].read()
         status_entry = json.loads(status_raw.decode("utf-8"))
         status = status_entry.get("status") if isinstance(status_entry, dict) else None
-        if status not in {"QUEUED", "RUNNING", "READY", "FAILED"}:
+        if status not in {"QUEUED", "RUNNING", "READY", "FAILED", "CANCELLED"}:
             return JSONResponse({"ok": False, "error": "status_unavailable"}, status_code=502)
         payload: dict[str, Any] = {
             "ok": True,
@@ -2223,6 +2229,193 @@ async def get_verified_draft_status(case_id: str) -> dict[str, Any]:
             status = "QUEUED"
         jobs.append({"request_id": request_id, "status": status, "draft_available": status == "READY"})
     return {"ok": True, "case_id": case_id, "jobs": sorted(jobs, key=lambda job: job["request_id"], reverse=True)}
+
+
+def _mcp_draft_reviewer() -> str:
+    """Return the explicitly configured reviewer for protected draft actions.
+
+    GitHub OAuth proves the operator, while this deployment setting binds that
+    operator to the durable LegalAI requester identity.  Do not accept a
+    caller-supplied email: that would permit cross-reviewer access.
+    """
+    _require_allowed_user()
+    reviewer = " ".join((os.environ.get(LEGALAI_MCP_REVIEWER_EMAIL_ENV) or "").split())
+    if not _PORTAL_REVIEWER_EMAIL.fullmatch(reviewer):
+        raise PermissionError("LegalAI draft actions are not configured for a reviewer")
+    return reviewer
+
+
+def _validate_draft_case_id(case_id: str) -> str:
+    value = (case_id or "").strip()
+    if value != CASE00_BENCHMARK_ID and not re.fullmatch(
+        r"NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}", value
+    ):
+        raise ValueError("invalid case_id")
+    return value
+
+
+def _validate_draft_request_id(request_id: str) -> str:
+    value = (request_id or "").strip()
+    if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", value):
+        raise ValueError("invalid request_id")
+    return value
+
+
+def _draft_request_entry(client: Any, case_id: str, request_id: str) -> dict[str, Any]:
+    raw = client.get_object(
+        Bucket=B2_BUCKET,
+        Key=f"cases/{case_id}/derived/draft-requests/{request_id}.json",
+    )["Body"].read()
+    entry = json.loads(raw.decode("utf-8"))
+    if (
+        not isinstance(entry, dict)
+        or entry.get("schema_version") != "legalai-draft-request.v1"
+        or entry.get("case_id") != case_id
+        or entry.get("status") != "DRAFT"
+        or entry.get("external_communication") is not False
+    ):
+        raise ValueError("draft request is unavailable")
+    return entry
+
+
+def _draft_status_entry(client: Any, case_id: str, request_id: str) -> dict[str, Any]:
+    raw = client.get_object(
+        Bucket=B2_BUCKET,
+        Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
+    )["Body"].read()
+    entry = json.loads(raw.decode("utf-8"))
+    if not isinstance(entry, dict) or entry.get("status") not in {"QUEUED", "RUNNING", "READY", "FAILED", "CANCELLED"}:
+        raise ValueError("draft status is unavailable")
+    return entry
+
+
+def _assert_owned_draft(entry: dict[str, Any], reviewer: str) -> None:
+    if " ".join(str(entry.get("requested_by", "")).split()).casefold() != reviewer.casefold():
+        raise PermissionError("draft request belongs to a different reviewer")
+
+
+def _write_draft_status(client: Any, case_id: str, request_id: str, value: dict[str, Any]) -> None:
+    raw = json.dumps(value, sort_keys=True).encode("utf-8")
+    client.put_object(
+        Bucket=B2_BUCKET,
+        Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
+        Body=raw,
+        ContentType="application/json",
+        Metadata={"sha256": hashlib.sha256(raw).hexdigest()},
+    )
+
+
+async def _create_mcp_draft(case_id: str, question: str, reviewer: str, regenerate_from: str = "") -> dict[str, Any]:
+    """Create one immutable request, preserving the portal's duplicate guard."""
+    question = " ".join((question or "").split())
+    if not question or len(question) > 1000:
+        raise ValueError("question must contain 1 to 1000 characters")
+    client = _b2_client()
+    index = client.list_objects_v2(
+        Bucket=B2_BUCKET,
+        Prefix=("Benchmarks/Case-00-Triborough/original/Tribrough Full Docket/" if case_id == CASE00_BENCHMARK_ID else f"cases/{case_id}/intake/"),
+        MaxKeys=100,
+    )
+    indexed = any(
+        str(item.get("Key", "")).lower().endswith(".pdf") if case_id == CASE00_BENCHMARK_ID else str(item.get("Key", "")).endswith("/page_records.jsonl")
+        for item in index.get("Contents", [])
+    )
+    if not indexed:
+        raise ValueError("source is not indexed")
+    if regenerate_from:
+        previous = _draft_request_entry(client, case_id, regenerate_from)
+        _assert_owned_draft(previous, reviewer)
+        if " ".join(str(previous.get("question", "")).split()) != question or _draft_status_entry(client, case_id, regenerate_from).get("status") != "READY":
+            raise PermissionError("only your completed identical draft can be regenerated")
+    existing = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=f"cases/{case_id}/derived/draft-requests/", MaxKeys=1000)
+    now = int(time.time())
+    for item in _newest_draft_request_items(existing):
+        candidate_id = str(item.get("Key", "")).rsplit("/", 1)[-1].removesuffix(".json")
+        if candidate_id == regenerate_from or not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", candidate_id):
+            continue
+        try:
+            candidate = _draft_request_entry(client, case_id, candidate_id)
+            _assert_owned_draft(candidate, reviewer)
+            created = candidate.get("created_at")
+            status = _draft_status_entry(client, case_id, candidate_id).get("status")
+        except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError, PermissionError):
+            continue
+        if (
+            isinstance(created, int) and now - created <= 600
+            and " ".join(str(candidate.get("question", "")).split()) == question
+            and status in {"QUEUED", "RUNNING", "READY"}
+        ):
+            return {"ok": True, "case_id": case_id, "request_id": candidate_id, "status": status, "reused": True}
+    request_id = f"draft-{now}-{uuid.uuid4().hex[:12]}"
+    body = {
+        "schema_version": "legalai-draft-request.v1", "case_id": case_id,
+        "question": question, "requested_by": reviewer, "status": "DRAFT",
+        "external_communication": False, "created_at": now,
+        **({"regenerated_from_request_id": regenerate_from} if regenerate_from else {}),
+    }
+    raw = json.dumps(body, sort_keys=True).encode("utf-8")
+    client.put_object(Bucket=B2_BUCKET, Key=f"cases/{case_id}/derived/draft-requests/{request_id}.json", Body=raw, ContentType="application/json", Metadata={"sha256": hashlib.sha256(raw).hexdigest()})
+    _write_draft_status(client, case_id, request_id, {
+        "schema_version": "legalai-internal-draft-status.v1", "case_id": case_id,
+        "request_id": request_id, "status": "QUEUED", "updated_at": now,
+        "dispatch_attempts": 1,
+    })
+    await _dispatch_verified_case_draft(case_id, request_id)
+    return {"ok": True, "case_id": case_id, "request_id": request_id, "status": "QUEUED", "reused": False}
+
+
+@mcp.tool(name="draft.create", description="Create one internal-only LegalAI review draft from a verified case record.")
+async def mcp_draft_create(case_id: str, question: str) -> dict[str, Any]:
+    return await _create_mcp_draft(_validate_draft_case_id(case_id), question, _mcp_draft_reviewer())
+
+
+@mcp.tool(name="draft.regenerate", description="Regenerate only your completed LegalAI draft; creates an immutable linked replacement.")
+async def mcp_draft_regenerate(case_id: str, request_id: str) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
+    reviewer = _mcp_draft_reviewer(); entry = _draft_request_entry(_b2_client(), case_id, request_id)
+    _assert_owned_draft(entry, reviewer)
+    return await _create_mcp_draft(case_id, str(entry.get("question", "")), reviewer, request_id)
+
+
+@mcp.tool(name="draft.status", description="Return the exact current status of one of your LegalAI review draft requests.")
+async def mcp_draft_status(case_id: str, request_id: str) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
+    entry = _draft_request_entry(_b2_client(), case_id, request_id); _assert_owned_draft(entry, _mcp_draft_reviewer())
+    status = _draft_status_entry(_b2_client(), case_id, request_id)
+    return {"ok": True, "case_id": case_id, "request_id": request_id, "status": status["status"], "updated_at": status.get("updated_at"), "draft_available": status["status"] == "READY"}
+
+
+@mcp.tool(name="draft.list", description="List up to 20 of your most recent LegalAI review draft requests for one case.")
+async def mcp_draft_list(case_id: str, limit: int = 20) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); reviewer = _mcp_draft_reviewer()
+    if not isinstance(limit, int) or limit < 1 or limit > 20: raise ValueError("limit must be between 1 and 20")
+    client = _b2_client(); listed = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=f"cases/{case_id}/derived/draft-requests/", MaxKeys=1000)
+    rows = []
+    for item in _newest_draft_request_items(listed):
+        request_id = str(item.get("Key", "")).rsplit("/", 1)[-1].removesuffix(".json")
+        if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", request_id): continue
+        try:
+            entry = _draft_request_entry(client, case_id, request_id); _assert_owned_draft(entry, reviewer)
+            status = _draft_status_entry(client, case_id, request_id)
+        except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError, PermissionError): continue
+        rows.append({"request_id": request_id, "question": entry.get("question"), "status": status.get("status"), "created_at": entry.get("created_at"), "updated_at": status.get("updated_at")})
+        if len(rows) >= limit: break
+    return {"ok": True, "case_id": case_id, "requests": rows}
+
+
+@mcp.tool(name="draft.cancel", description="Cancel one of your queued or running LegalAI draft requests. The immutable request and audit remain preserved.")
+async def mcp_draft_cancel(case_id: str, request_id: str) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
+    client = _b2_client(); entry = _draft_request_entry(client, case_id, request_id); _assert_owned_draft(entry, _mcp_draft_reviewer())
+    status = _draft_status_entry(client, case_id, request_id)
+    if status["status"] == "CANCELLED": return {"ok": True, "case_id": case_id, "request_id": request_id, "status": "CANCELLED", "already_cancelled": True}
+    if status["status"] not in {"QUEUED", "RUNNING"}: raise ValueError("only queued or running drafts can be cancelled")
+    _write_draft_status(client, case_id, request_id, {
+        "schema_version": "legalai-internal-draft-status.v1", "case_id": case_id, "request_id": request_id,
+        "status": "CANCELLED", "updated_at": int(time.time()), "cancelled_by": _mcp_draft_reviewer(),
+        "previous_status": status["status"],
+    })
+    return {"ok": True, "case_id": case_id, "request_id": request_id, "status": "CANCELLED", "already_cancelled": False}
 
 
 @mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
