@@ -94,6 +94,17 @@
         "workflow.status",
         "workflow.cancel"
       ]
+    },
+    "draft": {
+      "description": "Protected internal attorney-review draft actions for verified matters.",
+      "downstream_service": "bridge",
+      "tools": [
+        "draft.create",
+        "draft.regenerate",
+        "draft.status",
+        "draft.list",
+        "draft.cancel"
+      ]
     }
   },
   "tool_routes": [
@@ -349,6 +360,41 @@
       "downstream_service": "mission_control",
       "downstream_tool": "cancel_workflow",
       "description": "Cancel a durable Mission Control workflow (downstream cancel_workflow). Returns the sanitized durable status envelope. Secrets, child mission YAML, and agent stdout/stderr are never included. Orchestration remains fail-closed while MISSION_CONTROL_WORKFLOW_ORCHESTRATION is disabled. Thin forwarder: no polling, history, or workflow parsing in the gateway."
+    },
+    {
+      "tool": "draft.create",
+      "namespace": "draft",
+      "downstream_service": "bridge",
+      "downstream_tool": "draft.create",
+      "description": "Create an internal-only attorney-review draft from one verified case record."
+    },
+    {
+      "tool": "draft.regenerate",
+      "namespace": "draft",
+      "downstream_service": "bridge",
+      "downstream_tool": "draft.regenerate",
+      "description": "Regenerate only the authenticated reviewer's completed draft as an immutable linked replacement."
+    },
+    {
+      "tool": "draft.status",
+      "namespace": "draft",
+      "downstream_service": "bridge",
+      "downstream_tool": "draft.status",
+      "description": "Read the exact status of one authenticated reviewer's draft request."
+    },
+    {
+      "tool": "draft.list",
+      "namespace": "draft",
+      "downstream_service": "bridge",
+      "downstream_tool": "draft.list",
+      "description": "List up to 20 recent drafts belonging to the authenticated reviewer for one case."
+    },
+    {
+      "tool": "draft.cancel",
+      "namespace": "draft",
+      "downstream_service": "bridge",
+      "downstream_tool": "draft.cancel",
+      "description": "Cancel an authenticated reviewer's queued or running draft while retaining request and audit records."
     }
   ]
 }
