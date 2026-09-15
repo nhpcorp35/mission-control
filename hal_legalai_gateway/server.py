@@ -51,6 +51,11 @@ REQUIRED_PUBLIC_TOOL_NAMES = frozenset(
         "case.status",
         "case.cancel",
         "case.list_artifacts",
+        "draft.create",
+        "draft.regenerate",
+        "draft.status",
+        "draft.list",
+        "draft.cancel",
     }
 )
 
