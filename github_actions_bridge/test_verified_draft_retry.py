@@ -1,8 +1,10 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 import sys
 import os
+import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("GITHUB_OAUTH_CLIENT_ID", "test-client")
@@ -16,6 +18,7 @@ from server import (  # noqa: E402
     _is_discardable_temporary_draft_request,
     _newest_draft_request_items,
     _queued_draft_needs_retry,
+    _read_case_draft_request_snapshots,
 )
 
 
@@ -62,6 +65,29 @@ class VerifiedDraftRetryTests(unittest.TestCase):
         self.assertEqual(len(ordered), 101)
         self.assertTrue(ordered[0]["Key"].endswith("draft-0100-aaaaaaaaaaaa.json"))
         self.assertTrue(ordered[-1]["Key"].endswith("draft-0000-aaaaaaaaaaaa.json"))
+
+    def test_request_snapshots_are_read_with_bounded_parallelism(self):
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def read_snapshot(client, case_id, item):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+            return None
+
+        items = [{"Key": f"draft-{index}.json"} for index in range(12)]
+        with patch("server._read_case_draft_request_snapshot", side_effect=read_snapshot):
+            snapshots = _read_case_draft_request_snapshots(object(), "case", items)
+
+        self.assertEqual(snapshots, [None] * 12)
+        self.assertGreater(peak, 1)
+        self.assertLessEqual(peak, 8)
 
     def test_request_ids_are_independent(self):
         first = "draft-1000-aaaaaaaaaaaa"
