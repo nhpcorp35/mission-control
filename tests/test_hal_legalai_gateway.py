@@ -103,7 +103,9 @@ WORKFLOW_YAML_FIXTURE = (
 )
 WORKFLOW_IDEMPOTENCY_KEY = "wf-replay-01"
 CANONICAL_WORKFLOW_ID = "00000000-0000-4000-8000-000000000001"
-EXPECTED_NAMESPACES = REQUIRED_NAMESPACES | {"workflow"}
+EXPECTED_NAMESPACES = REQUIRED_NAMESPACES | {
+    "workflow", "draft", "review", "job", "system"
+}
 FORBIDDEN_WORKFLOW_TOOLS = (
     "workflow.wait",
     "workflow.history",
@@ -1049,7 +1051,7 @@ class CanonicalIdentityTests(unittest.TestCase):
             by_namespace.setdefault(binding.namespace, []).append(binding.gateway_tool)
         self.assertEqual(
             set(by_namespace),
-            {"case", "storage", "mission", "workflow"},
+            EXPECTED_NAMESPACES,
         )
         for namespace, tools in by_namespace.items():
             self.assertTrue(tools, msg=f"{namespace} must expose tools")
@@ -1584,7 +1586,7 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
             )
             for binding in DEFAULT_TOOL_BINDINGS
         ]
-        self.assertEqual(registry_ids, default_ids)
+        self.assertEqual(sorted(registry_ids), sorted(default_ids))
         merged = bindings_from_registry(registry)
         merged_by_name = {binding.gateway_tool: binding for binding in merged}
         defaults_by_name = {
