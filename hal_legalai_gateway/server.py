@@ -56,6 +56,12 @@ REQUIRED_PUBLIC_TOOL_NAMES = frozenset(
         "draft.status",
         "draft.list",
         "draft.cancel",
+        "draft.get",
+        "draft.get_audit",
+        "review.get",
+        "review.list",
+        "job.error",
+        "system.capabilities",
     }
 )
 
