@@ -198,6 +198,36 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="Cancel one caller-owned queued or running draft while preserving its audit trail.",
     ),
     ToolBinding(
+        gateway_tool="draft.get", namespace="draft", downstream_service="bridge",
+        downstream_tool="draft.get",
+        description="Read one completed caller-owned draft, including its source-supported answer.",
+    ),
+    ToolBinding(
+        gateway_tool="draft.get_audit", namespace="draft", downstream_service="bridge",
+        downstream_tool="draft.get_audit",
+        description="Read the bounded verified-page retrieval audit for one caller-owned draft.",
+    ),
+    ToolBinding(
+        gateway_tool="review.get", namespace="review", downstream_service="bridge",
+        downstream_tool="review.get",
+        description="Read the newest archived attorney review for one exact draft.",
+    ),
+    ToolBinding(
+        gateway_tool="review.list", namespace="review", downstream_service="bridge",
+        downstream_tool="review.list",
+        description="List the newest archived attorney reviews for one verified case.",
+    ),
+    ToolBinding(
+        gateway_tool="job.error", namespace="job", downstream_service="bridge",
+        downstream_tool="job.error",
+        description="Read sanitized failure details for one caller-owned draft job.",
+    ),
+    ToolBinding(
+        gateway_tool="system.capabilities", namespace="system", downstream_service="bridge",
+        downstream_tool="system.capabilities",
+        description="List the exact deployed Bridge tool catalog and deployment provenance.",
+    ),
+    ToolBinding(
         gateway_tool="storage.list_inventory",
         namespace="storage",
         downstream_service="storage",
@@ -941,6 +971,30 @@ def register_forwarding_tools(
     @mcp.tool(name="draft.cancel", description=by_name["draft.cancel"].description)
     async def draft_cancel(case_id: str, request_id: str) -> dict[str, Any]:
         return await _forward("draft.cancel", {"case_id": case_id, "request_id": request_id})
+
+    @mcp.tool(name="draft.get", description=by_name["draft.get"].description)
+    async def draft_get(case_id: str, request_id: str) -> dict[str, Any]:
+        return await _forward("draft.get", {"case_id": case_id, "request_id": request_id})
+
+    @mcp.tool(name="draft.get_audit", description=by_name["draft.get_audit"].description)
+    async def draft_get_audit(case_id: str, request_id: str) -> dict[str, Any]:
+        return await _forward("draft.get_audit", {"case_id": case_id, "request_id": request_id})
+
+    @mcp.tool(name="review.get", description=by_name["review.get"].description)
+    async def review_get(case_id: str, request_id: str) -> dict[str, Any]:
+        return await _forward("review.get", {"case_id": case_id, "request_id": request_id})
+
+    @mcp.tool(name="review.list", description=by_name["review.list"].description)
+    async def review_list(case_id: str, limit: int = 20) -> dict[str, Any]:
+        return await _forward("review.list", {"case_id": case_id, "limit": limit})
+
+    @mcp.tool(name="job.error", description=by_name["job.error"].description)
+    async def job_error(case_id: str, request_id: str) -> dict[str, Any]:
+        return await _forward("job.error", {"case_id": case_id, "request_id": request_id})
+
+    @mcp.tool(name="system.capabilities", description=by_name["system.capabilities"].description)
+    async def system_capabilities() -> dict[str, Any]:
+        return await _forward("system.capabilities", {})
 
     # --- storage ---
     @mcp.tool(
