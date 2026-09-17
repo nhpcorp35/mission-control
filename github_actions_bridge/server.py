@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, Literal, NoReturn
 from urllib.parse import urlparse
 
@@ -1899,6 +1900,109 @@ def _draft_discard_marker_key(case_id: str, request_id: str) -> str:
     return f"cases/{case_id}/derived/internal-drafts/{request_id}/discarded.json"
 
 
+def _read_case_draft_request_snapshot(
+    client: Any, case_id: str, item: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    """Hydrate one workspace row; safe to run concurrently for read latency."""
+    key = str(item.get("Key", ""))
+    if not key.endswith(".json"):
+        return None
+    raw = client.get_object(Bucket=B2_BUCKET, Key=key)["Body"].read()
+    if len(raw) > 8_000:
+        return None
+    entry = json.loads(raw.decode("utf-8"))
+    if (
+        not isinstance(entry, dict)
+        or entry.get("schema_version") != "legalai-draft-request.v1"
+        or entry.get("case_id") != case_id
+        or entry.get("status") != "DRAFT"
+        or entry.get("external_communication") is not False
+    ):
+        return None
+    request_id = key.rsplit("/", 1)[-1].removesuffix(".json")
+    try:
+        client.head_object(
+            Bucket=B2_BUCKET,
+            Key=_draft_discard_marker_key(case_id, request_id),
+        )
+        return None
+    except ClientError as exc:
+        code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
+        if code not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    status = "QUEUED"
+    failure_code: str | None = None
+    draft: dict[str, Any] | None = None
+    status_entry: dict[str, Any] | None = None
+    try:
+        status_raw = client.get_object(
+            Bucket=B2_BUCKET,
+            Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
+        )["Body"].read()
+        candidate_status = json.loads(status_raw.decode("utf-8"))
+        status_entry = candidate_status if isinstance(candidate_status, dict) else None
+        value = status_entry.get("status") if isinstance(status_entry, dict) else None
+        if value in {"QUEUED", "RUNNING", "READY", "FAILED", "CANCELLED"}:
+            status = value
+        candidate_code = status_entry.get("failure_code") if isinstance(status_entry, dict) else None
+        if isinstance(candidate_code, str) and re.fullmatch(r"[a-z_]{1,40}", candidate_code):
+            failure_code = candidate_code
+        if status == "READY":
+            draft_raw = client.get_object(
+                Bucket=B2_BUCKET,
+                Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/draft.json",
+            )["Body"].read()
+            candidate = json.loads(draft_raw.decode("utf-8"))
+            if isinstance(candidate, dict) and candidate.get("request_id") == request_id:
+                draft = candidate
+            else:
+                status = "FAILED"
+    except ClientError:
+        pass
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        status = "FAILED"
+    question = entry.get("question")
+    requested_by = entry.get("requested_by")
+    created_at = entry.get("created_at")
+    if not (
+        isinstance(question, str)
+        and isinstance(requested_by, str)
+        and isinstance(created_at, int)
+    ):
+        return None
+    row: dict[str, Any] = {
+        "request_id": request_id,
+        "question": question,
+        "requested_by": requested_by,
+        "status": status,
+        "created_at": created_at,
+        "external_communication": False,
+    }
+    if draft is not None:
+        row["draft"] = draft
+    regenerated_from = entry.get("regenerated_from_request_id")
+    if isinstance(regenerated_from, str) and re.fullmatch(
+        r"draft-[0-9]+-[0-9a-f]{12}", regenerated_from
+    ):
+        row["regenerated_from_request_id"] = regenerated_from
+    if failure_code is not None:
+        row["failure_code"] = failure_code
+    return row, status_entry
+
+
+def _read_case_draft_request_snapshots(
+    client: Any, case_id: str, items: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], dict[str, Any] | None] | None]:
+    """Bound B2 fan-out while avoiding one serial round trip per object."""
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(items)))) as executor:
+        return list(
+            executor.map(
+                lambda item: _read_case_draft_request_snapshot(client, case_id, item),
+                items,
+            )
+        )
+
+
 @mcp.custom_route("/operations/internal-draft-worker/status", methods=["GET"])
 async def read_internal_draft_worker_status(request: Request) -> JSONResponse:
     """Return the non-sensitive verified-draft worker heartbeat."""
@@ -1946,69 +2050,20 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
             MaxKeys=1000,
         )
         requests: list[dict[str, Any]] = []
-        for item in _newest_draft_request_items(listed):
-            key = str(item.get("Key", ""))
-            if not key.endswith(".json"):
+        snapshots = await asyncio.to_thread(
+            _read_case_draft_request_snapshots,
+            client,
+            case_id,
+            _newest_draft_request_items(listed),
+        )
+        now = int(time.time())
+        for snapshot in snapshots:
+            if snapshot is None:
                 continue
-            response = client.get_object(Bucket=B2_BUCKET, Key=key)
-            raw = response["Body"].read()
-            if len(raw) > 8_000:
-                continue
-            entry = json.loads(raw.decode("utf-8"))
-            if (
-                not isinstance(entry, dict)
-                or entry.get("schema_version") != "legalai-draft-request.v1"
-                or entry.get("case_id") != case_id
-                or entry.get("status") != "DRAFT"
-                or entry.get("external_communication") is not False
-            ):
-                continue
-            request_id = key.rsplit("/", 1)[-1].removesuffix(".json")
-            question = entry.get("question")
-            requested_by = entry.get("requested_by")
-            created_at = entry.get("created_at")
-            try:
-                client.head_object(
-                    Bucket=B2_BUCKET,
-                    Key=_draft_discard_marker_key(case_id, request_id),
-                )
-                continue
-            except ClientError as exc:
-                code = str(((exc.response or {}).get("Error") or {}).get("Code", ""))
-                if code not in {"404", "NoSuchKey", "NotFound"}:
-                    raise
-            status = "QUEUED"
-            failure_code: str | None = None
-            draft: dict[str, Any] | None = None
-            status_entry: dict[str, Any] | None = None
-            try:
-                status_raw = client.get_object(
-                    Bucket=B2_BUCKET,
-                    Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/status.json",
-                )["Body"].read()
-                candidate_status = json.loads(status_raw.decode("utf-8"))
-                status_entry = candidate_status if isinstance(candidate_status, dict) else None
-                value = status_entry.get("status") if isinstance(status_entry, dict) else None
-                if value in {"QUEUED", "RUNNING", "READY", "FAILED", "CANCELLED"}:
-                    status = value
-                candidate_code = status_entry.get("failure_code") if isinstance(status_entry, dict) else None
-                if isinstance(candidate_code, str) and re.fullmatch(r"[a-z_]{1,40}", candidate_code):
-                    failure_code = candidate_code
-                if status == "READY":
-                    draft_raw = client.get_object(
-                        Bucket=B2_BUCKET,
-                        Key=f"cases/{case_id}/derived/internal-drafts/{request_id}/draft.json",
-                    )["Body"].read()
-                    candidate = json.loads(draft_raw.decode("utf-8"))
-                    if isinstance(candidate, dict) and candidate.get("request_id") == request_id:
-                        draft = candidate
-                    else:
-                        status = "FAILED"
-            except ClientError:
-                pass
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                status = "FAILED"
-            if _queued_draft_needs_retry(status_entry, created_at, int(time.time())):
+            row, status_entry = snapshot
+            request_id = row["request_id"]
+            created_at = row["created_at"]
+            if _queued_draft_needs_retry(status_entry, created_at, now):
                 assert status_entry is not None
                 retry_status = {
                     "schema_version": "legalai-internal-draft-status.v1",
@@ -2027,29 +2082,9 @@ async def list_case_draft_requests(request: Request) -> JSONResponse:
                     Metadata={"sha256": hashlib.sha256(retry_raw).hexdigest()},
                 )
                 await _dispatch_verified_case_draft(case_id, request_id)
-            if (
-                isinstance(question, str)
-                and isinstance(requested_by, str)
-                and isinstance(created_at, int)
-            ):
-                row: dict[str, Any] = {
-                        "request_id": request_id,
-                        "question": question,
-                        "requested_by": requested_by,
-                        "status": status,
-                        "created_at": created_at,
-                        "external_communication": False,
-                }
-                if draft is not None:
-                    row["draft"] = draft
-                regenerated_from = entry.get("regenerated_from_request_id")
-                if isinstance(regenerated_from, str) and re.fullmatch(
-                    r"draft-[0-9]+-[0-9a-f]{12}", regenerated_from
-                ):
-                    row["regenerated_from_request_id"] = regenerated_from
-                if failure_code is not None:
-                    row["failure_code"] = failure_code
-                requests.append(row)
+                row["status"] = "QUEUED"
+                row.pop("failure_code", None)
+            requests.append(row)
         requests = _collapse_duplicate_draft_requests(requests)
     except (ClientError, UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
         return JSONResponse({"ok": False, "error": "draft_queue_unavailable"}, status_code=502)
