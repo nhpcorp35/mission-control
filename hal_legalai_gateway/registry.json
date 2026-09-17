@@ -103,8 +103,25 @@
         "draft.regenerate",
         "draft.status",
         "draft.list",
-        "draft.cancel"
+        "draft.cancel",
+        "draft.get",
+        "draft.get_audit"
       ]
+    },
+    "review": {
+      "description": "Read-only archived attorney-review access for verified matters.",
+      "downstream_service": "bridge",
+      "tools": ["review.get", "review.list"]
+    },
+    "job": {
+      "description": "Read-only sanitized job diagnostics.",
+      "downstream_service": "bridge",
+      "tools": ["job.error"]
+    },
+    "system": {
+      "description": "Read-only deployed capability and provenance discovery.",
+      "downstream_service": "bridge",
+      "tools": ["system.capabilities"]
     }
   },
   "tool_routes": [
@@ -395,6 +412,48 @@
       "downstream_service": "bridge",
       "downstream_tool": "draft.cancel",
       "description": "Cancel an authenticated reviewer's queued or running draft while retaining request and audit records."
+    },
+    {
+      "tool": "draft.get",
+      "namespace": "draft",
+      "downstream_service": "bridge",
+      "downstream_tool": "draft.get",
+      "description": "Read one completed authenticated-reviewer draft, including its source-supported answer."
+    },
+    {
+      "tool": "draft.get_audit",
+      "namespace": "draft",
+      "downstream_service": "bridge",
+      "downstream_tool": "draft.get_audit",
+      "description": "Read the bounded verified-page retrieval audit for one authenticated-reviewer draft."
+    },
+    {
+      "tool": "review.get",
+      "namespace": "review",
+      "downstream_service": "bridge",
+      "downstream_tool": "review.get",
+      "description": "Read the newest archived attorney review for one exact draft."
+    },
+    {
+      "tool": "review.list",
+      "namespace": "review",
+      "downstream_service": "bridge",
+      "downstream_tool": "review.list",
+      "description": "List up to 50 newest archived attorney reviews for one verified case."
+    },
+    {
+      "tool": "job.error",
+      "namespace": "job",
+      "downstream_service": "bridge",
+      "downstream_tool": "job.error",
+      "description": "Read sanitized failure details for one authenticated-reviewer draft job."
+    },
+    {
+      "tool": "system.capabilities",
+      "namespace": "system",
+      "downstream_service": "bridge",
+      "downstream_tool": "system.capabilities",
+      "description": "List the exact deployed Bridge tool catalog and immutable deployment provenance."
     }
   ]
 }

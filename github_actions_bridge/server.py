@@ -179,6 +179,12 @@ REQUIRED_PRODUCTION_TOOLS = frozenset(
         "draft.status",
         "draft.list",
         "draft.cancel",
+        "draft.get",
+        "draft.get_audit",
+        "review.get",
+        "review.list",
+        "job.error",
+        "system.capabilities",
     }
 )
 
@@ -2340,6 +2346,52 @@ def _write_draft_status(client: Any, case_id: str, request_id: str, value: dict[
     )
 
 
+def _read_bounded_json_object(client: Any, key: str, max_bytes: int) -> dict[str, Any]:
+    """Read one canonical JSON object without allowing unbounded responses."""
+    stream = client.get_object(Bucket=B2_BUCKET, Key=key)["Body"]
+    try:
+        raw = stream.read(max_bytes + 1)
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+    if len(raw) > max_bytes:
+        raise ValueError("stored record exceeds the supported size")
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("stored record is unavailable")
+    return value
+
+
+def _validate_review_record(value: dict[str, Any], case_id: str, request_id: str) -> dict[str, Any]:
+    """Return the allowlisted structured-review fields after strict validation."""
+    if (
+        value.get("schema_version") != 1
+        or value.get("case_id") != case_id
+        or value.get("request_id") != request_id
+        or value.get("decision") not in {"approve", "needs_revision"}
+        or not isinstance(value.get("reviewer"), str)
+        or not _PORTAL_REVIEWER_EMAIL.fullmatch(value["reviewer"])
+        or not isinstance(value.get("submitted_at"), int)
+        or value.get("accuracy_rating") not in range(1, 6)
+        or value.get("usefulness_rating") not in range(1, 6)
+    ):
+        raise ValueError("attorney review is unavailable")
+    result = {
+        key: value[key]
+        for key in (
+            "submitted_at", "reviewer", "case_id", "request_id", "decision",
+            "accuracy_rating", "usefulness_rating",
+        )
+    }
+    for key in ("missing_or_overstated", "citation_problems", "comments"):
+        text = value.get(key, "")
+        if not isinstance(text, str) or len(text) > 4_000:
+            raise ValueError("attorney review is unavailable")
+        result[key] = text
+    return result
+
+
 async def _create_mcp_draft(case_id: str, question: str, reviewer: str, regenerate_from: str = "") -> dict[str, Any]:
     """Create one immutable request, preserving the portal's duplicate guard."""
     question = " ".join((question or "").split())
@@ -2451,6 +2503,104 @@ async def mcp_draft_cancel(case_id: str, request_id: str) -> dict[str, Any]:
         "previous_status": status["status"],
     })
     return {"ok": True, "case_id": case_id, "request_id": request_id, "status": "CANCELLED", "already_cancelled": False}
+
+
+@mcp.tool(name="draft.get", description="Read one completed caller-owned LegalAI draft, including its source-supported answer.")
+async def mcp_draft_get(case_id: str, request_id: str) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
+    client = _b2_client(); request_entry = _draft_request_entry(client, case_id, request_id)
+    _assert_owned_draft(request_entry, _mcp_draft_reviewer())
+    status = _draft_status_entry(client, case_id, request_id)
+    if status["status"] != "READY":
+        return {"ok": True, "case_id": case_id, "request_id": request_id, "status": status["status"], "draft_available": False}
+    draft = _read_bounded_json_object(
+        client,
+        f"cases/{case_id}/derived/internal-drafts/{request_id}/draft.json",
+        2_000_000,
+    )
+    if draft.get("request_id") != request_id or draft.get("case_id") not in {None, case_id}:
+        raise ValueError("draft is unavailable")
+    return {
+        "ok": True, "case_id": case_id, "request_id": request_id, "status": "READY",
+        "question": request_entry.get("question"), "draft_available": True, "draft": draft,
+    }
+
+
+@mcp.tool(name="draft.get_audit", description="Read the bounded verified-page retrieval audit for one caller-owned LegalAI draft.")
+async def mcp_draft_get_audit(case_id: str, request_id: str) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
+    client = _b2_client(); request_entry = _draft_request_entry(client, case_id, request_id)
+    _assert_owned_draft(request_entry, _mcp_draft_reviewer())
+    audit = _read_bounded_json_object(
+        client,
+        f"cases/{case_id}/derived/internal-drafts/{request_id}/input_audit.json",
+        2_000_000,
+    )
+    citations = audit.get("retrieval_citations")
+    if not isinstance(citations, list) or len(citations) > 45:
+        raise ValueError("draft audit is unavailable")
+    return {"ok": True, "case_id": case_id, "request_id": request_id, "audit": audit}
+
+
+@mcp.tool(name="review.get", description="Read the newest archived attorney review for one exact LegalAI draft.")
+async def mcp_review_get(case_id: str, request_id: str) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
+    _require_allowed_user(); client = _b2_client()
+    prefix = f"cases/{case_id}/derived/attorney-feedback/{request_id}/"
+    listed = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=100)
+    items = sorted(listed.get("Contents", []), key=lambda item: item.get("LastModified", ""), reverse=True)
+    for item in items:
+        key = str(item.get("Key", ""))
+        if not key.endswith(".json"):
+            continue
+        try:
+            review = _validate_review_record(_read_bounded_json_object(client, key, 20_000), case_id, request_id)
+        except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
+        return {"ok": True, "case_id": case_id, "request_id": request_id, "review": review}
+    raise ValueError("no archived attorney review found for this draft")
+
+
+@mcp.tool(name="review.list", description="List up to 50 newest archived attorney reviews for one verified case.")
+async def mcp_review_list(case_id: str, limit: int = 20) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); _require_allowed_user()
+    if not isinstance(limit, int) or limit < 1 or limit > 50:
+        raise ValueError("limit must be between 1 and 50")
+    client = _b2_client(); prefix = f"cases/{case_id}/derived/attorney-feedback/"
+    listed = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=prefix, MaxKeys=1000)
+    items = sorted(listed.get("Contents", []), key=lambda item: item.get("LastModified", ""), reverse=True)
+    reviews: list[dict[str, Any]] = []
+    for item in items:
+        key = str(item.get("Key", "")); parts = key.removeprefix(prefix).split("/", 1)
+        if len(parts) != 2 or not key.endswith(".json") or not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", parts[0]):
+            continue
+        try:
+            reviews.append(_validate_review_record(_read_bounded_json_object(client, key, 20_000), case_id, parts[0]))
+        except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
+        if len(reviews) >= limit:
+            break
+    return {"ok": True, "case_id": case_id, "reviews": reviews}
+
+
+@mcp.tool(name="job.error", description="Read the sanitized failure details for one caller-owned LegalAI draft job.")
+async def mcp_job_error(case_id: str, request_id: str) -> dict[str, Any]:
+    case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
+    client = _b2_client(); request_entry = _draft_request_entry(client, case_id, request_id)
+    _assert_owned_draft(request_entry, _mcp_draft_reviewer())
+    status = _draft_status_entry(client, case_id, request_id)
+    safe = {key: status[key] for key in ("status", "updated_at", "failure_code", "failure_stage", "error") if key in status}
+    return {"ok": True, "case_id": case_id, "request_id": request_id, "job": safe}
+
+
+@mcp.tool(name="system.capabilities", description="List the exact deployed Bridge tool catalog and immutable deployment provenance.")
+async def mcp_system_capabilities() -> dict[str, Any]:
+    _require_allowed_user()
+    return {
+        "ok": True,
+        "deployed_commit_sha": get_deployed_commit_sha(),
+        "tools": await list_registered_tool_names(),
+    }
 
 
 @mcp.custom_route("/case-00/portal-packet/read", methods=["POST"])
