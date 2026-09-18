@@ -46,6 +46,31 @@ class VerifiedDraftRetryTests(unittest.TestCase):
         self.assertEqual(result["job"]["gate_reason"], "ambiguous_third_party_answer")
         self.assertNotIn("private_detail", result["job"])
 
+    def test_job_error_returns_persisted_safe_validation_reason(self):
+        status = {
+            "status": "FAILED",
+            "updated_at": "2026-09-18T20:41:52Z",
+            "failure_code": "model_output_validation",
+            "failure_stage": "model_validation",
+            "validation_reason": "verified_pleading_called_missing",
+            "private_detail": "must not be returned",
+        }
+        with patch("server._validate_draft_case_id", return_value="case"), \
+             patch("server._validate_draft_request_id", return_value="draft-1-aaaaaaaaaaaa"), \
+             patch("server._b2_client", return_value=object()), \
+             patch("server._draft_request_entry", return_value={}), \
+             patch("server._assert_owned_draft"), \
+             patch("server._mcp_draft_reviewer", return_value="reviewer@example.com"), \
+             patch("server._draft_status_entry", return_value=status):
+            result = __import__("asyncio").run(
+                mcp_job_error("case", "draft-1-aaaaaaaaaaaa")
+            )
+        self.assertEqual(
+            result["job"]["validation_reason"],
+            "verified_pleading_called_missing",
+        )
+        self.assertNotIn("private_detail", result["job"])
+
     def test_retries_only_a_stalled_first_dispatch(self):
         created_at = 1_000
         self.assertTrue(
