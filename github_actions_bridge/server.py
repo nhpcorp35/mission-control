@@ -2593,7 +2593,7 @@ async def mcp_job_error(case_id: str, request_id: str) -> dict[str, Any]:
         key: status[key]
         for key in (
             "status", "updated_at", "failure_code", "failure_stage",
-            "gate_reason", "error",
+            "gate_reason", "validation_reason", "error",
         )
         if key in status
     }
