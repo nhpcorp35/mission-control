@@ -2589,7 +2589,14 @@ async def mcp_job_error(case_id: str, request_id: str) -> dict[str, Any]:
     client = _b2_client(); request_entry = _draft_request_entry(client, case_id, request_id)
     _assert_owned_draft(request_entry, _mcp_draft_reviewer())
     status = _draft_status_entry(client, case_id, request_id)
-    safe = {key: status[key] for key in ("status", "updated_at", "failure_code", "failure_stage", "error") if key in status}
+    safe = {
+        key: status[key]
+        for key in (
+            "status", "updated_at", "failure_code", "failure_stage",
+            "gate_reason", "error",
+        )
+        if key in status
+    }
     return {"ok": True, "case_id": case_id, "request_id": request_id, "job": safe}
 
 
