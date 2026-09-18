@@ -36,8 +36,14 @@ ALLOWED_EXECUTABLE = "python3"
 ALLOWED_SCRIPT = "scripts/generate_attorney_feedback_candidate.py"
 ALLOWED_REBUILD_SCRIPT = "scripts/rebuild_case00_derived.py"
 ALLOWED_CASE00_B2_Q1_SCRIPT = "scripts/run_case00_b2_q1.py"
+ALLOWED_VERIFIED_DRAFT_SCRIPT = "scripts/run_verified_case_draft.py"
 ALLOWED_SCRIPTS = frozenset(
-    {ALLOWED_SCRIPT, ALLOWED_REBUILD_SCRIPT, ALLOWED_CASE00_B2_Q1_SCRIPT}
+    {
+        ALLOWED_SCRIPT,
+        ALLOWED_REBUILD_SCRIPT,
+        ALLOWED_CASE00_B2_Q1_SCRIPT,
+        ALLOWED_VERIFIED_DRAFT_SCRIPT,
+    }
 )
 
 ALLOWED_REPOSITORY_ALIASES: dict[str, str] = {
@@ -78,6 +84,10 @@ _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 
 # Git SHA or ref-safe tokens (no traversal / shell / weird punctuation).
 _GIT_REF_SAFE_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
+_VERIFIED_CASE_ID_RE = re.compile(
+    r"^NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}$"
+)
+_DRAFT_REQUEST_ID_RE = re.compile(r"^draft-[0-9]+-[0-9a-f]{12}$")
 
 # Env names that must never be forwarded into the command process.
 _BLOCKED_ENV_NAMES = frozenset(
@@ -249,10 +259,28 @@ _CASE00_B2_Q1_POLICY = _ScriptPolicy(
     object_prefix_flags=frozenset({CANDIDATE_B2_PREFIX_FLAG}),
 )
 
+_VERIFIED_DRAFT_DIAGNOSTIC_POLICY = _ScriptPolicy(
+    script=ALLOWED_VERIFIED_DRAFT_SCRIPT,
+    flags_with_value=frozenset({"--case-id", "--request-id"}),
+    flags_no_value=frozenset({"--diagnose-retrieval"}),
+    path_flags=frozenset(),
+    sensitive_flags=frozenset(),
+    env_allowlist=_BASE_ENV_ALLOWLIST | _REBUILD_ENV_ALLOWLIST,
+    workspace_local_paths_only=True,
+    required_flags=frozenset(
+        {"--diagnose-retrieval", "--case-id", "--request-id"}
+    ),
+    flag_value_patterns=(
+        ("--case-id", _VERIFIED_CASE_ID_RE),
+        ("--request-id", _DRAFT_REQUEST_ID_RE),
+    ),
+)
+
 _SCRIPT_POLICIES: dict[str, _ScriptPolicy] = {
     ALLOWED_SCRIPT: _GENERATION_POLICY,
     ALLOWED_REBUILD_SCRIPT: _REBUILD_POLICY,
     ALLOWED_CASE00_B2_Q1_SCRIPT: _CASE00_B2_Q1_POLICY,
+    ALLOWED_VERIFIED_DRAFT_SCRIPT: _VERIFIED_DRAFT_DIAGNOSTIC_POLICY,
 }
 
 _SENSITIVE_FLAGS = frozenset().union(
