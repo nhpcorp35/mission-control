@@ -85,7 +85,7 @@ _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 # Git SHA or ref-safe tokens (no traversal / shell / weird punctuation).
 _GIT_REF_SAFE_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 _VERIFIED_CASE_ID_RE = re.compile(
-    r"^NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}$"
+    r"^(?:Case-00-Triborough|NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80})$"
 )
 _DRAFT_REQUEST_ID_RE = re.compile(r"^draft-[0-9]+-[0-9a-f]{12}$")
 _RETRIEVAL_PROFILE_RE = re.compile(
