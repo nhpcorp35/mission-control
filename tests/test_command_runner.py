@@ -428,6 +428,47 @@ class TestCommandRunner(unittest.TestCase):
         self.assertEqual(Path(resolved[1]).name, "run_verified_case_draft.py")
         self.assertEqual(resolved[2:], argv[2:])
 
+    def test_verified_draft_validation_profile_is_exactly_allowlisted(self) -> None:
+        script = self.fixture.source_repo / "scripts" / "run_verified_case_draft.py"
+        script.write_text("print('validation')\n")
+        argv = [
+            "python3",
+            "scripts/run_verified_case_draft.py",
+            "--validate-retrieval",
+            "--case-id",
+            "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37",
+            "--profile",
+            "consolidated",
+        ]
+        resolved, _cwd, _out = validate_and_build_argv(
+            argv,
+            workspace=self.fixture.source_repo,
+            working_directory=".",
+            mounted=[self.fixture.mount_root],
+        )
+        self.assertEqual(Path(resolved[1]).name, "run_verified_case_draft.py")
+        self.assertEqual(resolved[2:], argv[2:])
+
+    def test_verified_draft_validation_rejects_unknown_profile(self) -> None:
+        script = self.fixture.source_repo / "scripts" / "run_verified_case_draft.py"
+        script.write_text("print('validation')\n")
+        with self.assertRaises(CommandRunnerError) as ctx:
+            validate_and_build_argv(
+                [
+                    "python3",
+                    "scripts/run_verified_case_draft.py",
+                    "--validate-retrieval",
+                    "--case-id",
+                    "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37",
+                    "--profile",
+                    "case-specific",
+                ],
+                workspace=self.fixture.source_repo,
+                working_directory=".",
+                mounted=[self.fixture.mount_root],
+            )
+        self.assertEqual(ctx.exception.code, "INVALID_ARGV")
+
     def test_verified_draft_script_rejects_generation_mode(self) -> None:
         script = self.fixture.source_repo / "scripts" / "run_verified_case_draft.py"
         script.write_text("print('diagnostic')\n")
