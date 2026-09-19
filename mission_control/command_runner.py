@@ -88,6 +88,9 @@ _VERIFIED_CASE_ID_RE = re.compile(
     r"^NY-[A-Za-z]+-[0-9]{6}-[0-9]{4}-[A-Za-z0-9-]{2,80}$"
 )
 _DRAFT_REQUEST_ID_RE = re.compile(r"^draft-[0-9]+-[0-9a-f]{12}$")
+_RETRIEVAL_PROFILE_RE = re.compile(
+    r"^(?:main-action|counter-cross|third-party|consolidated)$"
+)
 
 # Env names that must never be forwarded into the command process.
 _BLOCKED_ENV_NAMES = frozenset(
@@ -182,6 +185,7 @@ class _ScriptPolicy:
     workspace_local_paths_only: bool = False
     mutually_exclusive_flag_groups: tuple[frozenset[str], ...] = ()
     required_flags: frozenset[str] = frozenset()
+    conditional_required_flags: tuple[tuple[str, frozenset[str]], ...] = ()
     exact_flag_values: frozenset[tuple[str, str]] = frozenset()
     flag_value_patterns: tuple[tuple[str, re.Pattern[str]], ...] = ()
     # Non-path B2 object-prefix flags (validated separately from path_flags).
@@ -261,18 +265,24 @@ _CASE00_B2_Q1_POLICY = _ScriptPolicy(
 
 _VERIFIED_DRAFT_DIAGNOSTIC_POLICY = _ScriptPolicy(
     script=ALLOWED_VERIFIED_DRAFT_SCRIPT,
-    flags_with_value=frozenset({"--case-id", "--request-id"}),
-    flags_no_value=frozenset({"--diagnose-retrieval"}),
+    flags_with_value=frozenset({"--case-id", "--request-id", "--profile"}),
+    flags_no_value=frozenset({"--diagnose-retrieval", "--validate-retrieval"}),
     path_flags=frozenset(),
     sensitive_flags=frozenset(),
     env_allowlist=_BASE_ENV_ALLOWLIST | _REBUILD_ENV_ALLOWLIST,
     workspace_local_paths_only=True,
-    required_flags=frozenset(
-        {"--diagnose-retrieval", "--case-id", "--request-id"}
+    mutually_exclusive_flag_groups=(
+        frozenset({"--diagnose-retrieval", "--validate-retrieval"}),
+    ),
+    required_flags=frozenset({"--case-id"}),
+    conditional_required_flags=(
+        ("--diagnose-retrieval", frozenset({"--request-id"})),
+        ("--validate-retrieval", frozenset({"--profile"})),
     ),
     flag_value_patterns=(
         ("--case-id", _VERIFIED_CASE_ID_RE),
         ("--request-id", _DRAFT_REQUEST_ID_RE),
+        ("--profile", _RETRIEVAL_PROFILE_RE),
     ),
 )
 
@@ -804,6 +814,29 @@ def validate_and_build_argv(
             names = ", ".join(sorted(present))
             raise CommandRunnerError(
                 f"Mutually exclusive flags combined: {names}",
+                code="INVALID_ARGV",
+            )
+
+    active_modes = {
+        trigger for trigger, _required in policy.conditional_required_flags
+        if trigger in seen_flags
+    }
+    if policy.conditional_required_flags and not active_modes:
+        names = ", ".join(
+            sorted(trigger for trigger, _required in policy.conditional_required_flags)
+        )
+        raise CommandRunnerError(
+            f"One mode flag is required: {names}",
+            code="INVALID_ARGV",
+        )
+    for trigger, required in policy.conditional_required_flags:
+        if trigger not in seen_flags:
+            continue
+        conditional_missing = required - seen_flags
+        if conditional_missing:
+            names = ", ".join(sorted(conditional_missing))
+            raise CommandRunnerError(
+                f"Required flag(s) missing for {trigger}: {names}",
                 code="INVALID_ARGV",
             )
 
