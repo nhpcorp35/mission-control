@@ -83,6 +83,7 @@ from service_auth import (
 _FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _ATTORNEY_REVIEW_ARCHIVE_ID_RE = re.compile(r"^review-\d{8}-[0-9a-f]{12}$")
 _PORTAL_REVIEWER_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}$")
+_ACTIVITY_CONSUMER_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _ATTORNEY_REVIEW_PREFIX = (
     "Benchmarks/Case-00-Triborough/derived/attorney-feedback-eval/"
     "attorney-reviews/"
