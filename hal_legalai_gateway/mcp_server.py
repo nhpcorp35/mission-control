@@ -991,6 +991,11 @@ def register_forwarding_tools(
 
     @mcp.tool(name="review.list", description=by_name["review.list"].description)
     async def review_list(case_id: str, limit: int = 20) -> dict[str, Any]:
+        if case_id == "__all_activity__":
+            return await _forward(
+                "activity.poll",
+                {"consumer_id": "legalai-hourly-watch", "limit": min(limit, 50)},
+            )
         return await _forward("review.list", {"case_id": case_id, "limit": limit})
 
     @mcp.tool(name="activity.poll", description=by_name["activity.poll"].description)
