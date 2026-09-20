@@ -218,6 +218,11 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="List the newest archived attorney reviews for one verified case.",
     ),
     ToolBinding(
+        gateway_tool="activity.poll", namespace="activity", downstream_service="bridge",
+        downstream_tool="activity.poll",
+        description="Return each new LegalAI draft-status or attorney-review event once across all verified cases.",
+    ),
+    ToolBinding(
         gateway_tool="job.error", namespace="job", downstream_service="bridge",
         downstream_tool="job.error",
         description="Read sanitized failure details for one caller-owned draft job.",
@@ -987,6 +992,10 @@ def register_forwarding_tools(
     @mcp.tool(name="review.list", description=by_name["review.list"].description)
     async def review_list(case_id: str, limit: int = 20) -> dict[str, Any]:
         return await _forward("review.list", {"case_id": case_id, "limit": limit})
+
+    @mcp.tool(name="activity.poll", description=by_name["activity.poll"].description)
+    async def activity_poll(consumer_id: str = "legalai-hourly-watch", limit: int = 50) -> dict[str, Any]:
+        return await _forward("activity.poll", {"consumer_id": consumer_id, "limit": limit})
 
     @mcp.tool(name="job.error", description=by_name["job.error"].description)
     async def job_error(case_id: str, request_id: str) -> dict[str, Any]:

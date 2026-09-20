@@ -111,17 +111,31 @@
     "review": {
       "description": "Read-only archived attorney-review access for verified matters.",
       "downstream_service": "bridge",
-      "tools": ["review.get", "review.list"]
+      "tools": [
+        "review.get",
+        "review.list"
+      ]
     },
     "job": {
       "description": "Read-only sanitized job diagnostics.",
       "downstream_service": "bridge",
-      "tools": ["job.error"]
+      "tools": [
+        "job.error"
+      ]
     },
     "system": {
       "description": "Read-only deployed capability and provenance discovery.",
       "downstream_service": "bridge",
-      "tools": ["system.capabilities"]
+      "tools": [
+        "system.capabilities"
+      ]
+    },
+    "activity": {
+      "description": "Cursor-backed activity monitoring across all verified matters.",
+      "downstream_service": "bridge",
+      "tools": [
+        "activity.poll"
+      ]
     }
   },
   "tool_routes": [
@@ -440,6 +454,13 @@
       "downstream_service": "bridge",
       "downstream_tool": "review.list",
       "description": "List up to 50 newest archived attorney reviews for one verified case."
+    },
+    {
+      "tool": "activity.poll",
+      "namespace": "activity",
+      "downstream_service": "bridge",
+      "downstream_tool": "activity.poll",
+      "description": "Return each new LegalAI draft-status or attorney-review event once across all verified cases using a durable consumer cursor."
     },
     {
       "tool": "job.error",

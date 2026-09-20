@@ -2650,6 +2650,78 @@ async def mcp_review_list(case_id: str, limit: int = 20) -> dict[str, Any]:
     return {"ok": True, "case_id": case_id, "reviews": reviews}
 
 
+def _activity_events(client: Any) -> list[dict[str, Any]]:
+    """Build a bounded, sanitized activity stream across every verified case."""
+    roots = client.list_objects_v2(Bucket=B2_BUCKET, Prefix="cases/", Delimiter="/", MaxKeys=200)
+    events: list[dict[str, Any]] = []
+    for common in roots.get("CommonPrefixes", [])[:100]:
+        prefix = str(common.get("Prefix", ""))
+        case_id = prefix.removeprefix("cases/").removesuffix("/")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}", case_id):
+            continue
+        drafts = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=f"cases/{case_id}/derived/draft-status/", MaxKeys=1000)
+        for item in drafts.get("Contents", []):
+            request_id = str(item.get("Key", "")).rsplit("/", 1)[-1].removesuffix(".json")
+            if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", request_id):
+                continue
+            try:
+                status = _draft_status_entry(client, case_id, request_id)
+            except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+            occurred_at = status.get("updated_at"); state = status.get("status")
+            if isinstance(occurred_at, int) and state in {"QUEUED", "RUNNING", "READY", "FAILED", "CANCELLED"}:
+                events.append({"event_id": f"draft:{case_id}:{request_id}:{state}:{occurred_at}", "event_type": "draft_status", "occurred_at": occurred_at, "case_id": case_id, "request_id": request_id, "status": state})
+        feedback_prefix = f"cases/{case_id}/derived/attorney-feedback/"
+        feedback = client.list_objects_v2(Bucket=B2_BUCKET, Prefix=feedback_prefix, MaxKeys=1000)
+        for item in feedback.get("Contents", []):
+            key = str(item.get("Key", "")); parts = key.removeprefix(feedback_prefix).split("/", 1)
+            if len(parts) != 2 or not key.endswith(".json") or not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", parts[0]):
+                continue
+            try:
+                review = _validate_review_record(_read_bounded_json_object(client, key, 20_000), case_id, parts[0])
+            except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+            occurred_at = review["submitted_at"]
+            events.append({"event_id": f"review:{case_id}:{parts[0]}:{occurred_at}", "event_type": "attorney_review", "occurred_at": occurred_at, "case_id": case_id, "request_id": parts[0], "decision": review["decision"], "accuracy_rating": review["accuracy_rating"], "usefulness_rating": review["usefulness_rating"]})
+    events.sort(key=lambda row: (row["occurred_at"], row["event_id"]))
+    return events[-2000:]
+
+
+async def _activity_poll(consumer_id: str = "legalai-hourly-watch", limit: int = 50) -> dict[str, Any]:
+    """Durably advance one bounded consumer cursor after returning unseen events."""
+    _require_allowed_user()
+    consumer_id = " ".join((consumer_id or "").split()).lower()
+    if not _ACTIVITY_CONSUMER_ID.fullmatch(consumer_id):
+        raise ValueError("consumer_id is invalid")
+    if not isinstance(limit, int) or limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100")
+    client = _b2_client(); events = _activity_events(client)
+    reviewer_hash = hashlib.sha256(_mcp_draft_reviewer().casefold().encode()).hexdigest()[:24]
+    cursor_key = f"system/activity-cursors/{reviewer_hash}/{consumer_id}.json"
+    cursor: tuple[int, str] | None = None
+    try:
+        saved = _read_bounded_json_object(client, cursor_key, 10_000)
+        if saved.get("schema_version") == "legalai-activity-cursor.v1" and isinstance(saved.get("occurred_at"), int) and isinstance(saved.get("event_id"), str):
+            cursor = (saved["occurred_at"], saved["event_id"])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {"NoSuchKey", "404", "NotFound"}:
+            raise
+    if cursor is None:
+        selected: list[dict[str, Any]] = []; initialized = True
+        next_cursor = (events[-1]["occurred_at"], events[-1]["event_id"]) if events else (0, "")
+    else:
+        selected = [row for row in events if (row["occurred_at"], row["event_id"]) > cursor][:limit]; initialized = False
+        next_cursor = (selected[-1]["occurred_at"], selected[-1]["event_id"]) if selected else cursor
+    cursor_body = json.dumps({"schema_version": "legalai-activity-cursor.v1", "consumer_id": consumer_id, "occurred_at": next_cursor[0], "event_id": next_cursor[1], "updated_at": int(time.time())}, sort_keys=True).encode()
+    client.put_object(Bucket=B2_BUCKET, Key=cursor_key, Body=cursor_body, ContentType="application/json")
+    return {"ok": True, "consumer_id": consumer_id, "initialized": initialized, "events": selected, "has_more": len(selected) == limit}
+
+
+@mcp.tool(name="activity.poll", description="Return each new LegalAI draft-status or attorney-review event once across all verified cases.")
+async def mcp_activity_poll(consumer_id: str = "legalai-hourly-watch", limit: int = 50) -> dict[str, Any]:
+    return await _activity_poll(consumer_id, limit)
+
+
 @mcp.tool(name="job.error", description="Read the sanitized failure details for one caller-owned LegalAI draft job.")
 async def mcp_job_error(case_id: str, request_id: str) -> dict[str, Any]:
     case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)

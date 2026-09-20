@@ -104,7 +104,7 @@ WORKFLOW_YAML_FIXTURE = (
 WORKFLOW_IDEMPOTENCY_KEY = "wf-replay-01"
 CANONICAL_WORKFLOW_ID = "00000000-0000-4000-8000-000000000001"
 EXPECTED_NAMESPACES = REQUIRED_NAMESPACES | {
-    "workflow", "draft", "review", "job", "system"
+    "workflow", "draft", "review", "activity", "job", "system"
 }
 FORBIDDEN_WORKFLOW_TOOLS = (
     "workflow.wait",
