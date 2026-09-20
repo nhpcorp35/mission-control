@@ -2392,7 +2392,13 @@ def _validate_review_record(value: dict[str, Any], case_id: str, request_id: str
     return result
 
 
-async def _create_mcp_draft(case_id: str, question: str, reviewer: str, regenerate_from: str = "") -> dict[str, Any]:
+async def _create_mcp_draft(
+    case_id: str,
+    question: str,
+    reviewer: str,
+    regenerate_from: str = "",
+    regeneration_operator: str = "",
+) -> dict[str, Any]:
     """Create one immutable request, preserving the portal's duplicate guard."""
     question = " ".join((question or "").split())
     if not question or len(question) > 1000:
@@ -2439,6 +2445,7 @@ async def _create_mcp_draft(case_id: str, question: str, reviewer: str, regenera
         "question": question, "requested_by": reviewer, "status": "DRAFT",
         "external_communication": False, "created_at": now,
         **({"regenerated_from_request_id": regenerate_from} if regenerate_from else {}),
+        **({"regeneration_requested_by": regeneration_operator} if regeneration_operator else {}),
     }
     raw = json.dumps(body, sort_keys=True).encode("utf-8")
     client.put_object(Bucket=B2_BUCKET, Key=f"cases/{case_id}/derived/draft-requests/{request_id}.json", Body=raw, ContentType="application/json", Metadata={"sha256": hashlib.sha256(raw).hexdigest()})
@@ -2456,12 +2463,72 @@ async def mcp_draft_create(case_id: str, question: str) -> dict[str, Any]:
     return await _create_mcp_draft(_validate_draft_case_id(case_id), question, _mcp_draft_reviewer())
 
 
-@mcp.tool(name="draft.regenerate", description="Regenerate only your completed LegalAI draft; creates an immutable linked replacement.")
-async def mcp_draft_regenerate(case_id: str, request_id: str) -> dict[str, Any]:
+def _existing_regenerated_successor(
+    client: Any, case_id: str, source_request_id: str, reviewer: str
+) -> dict[str, Any] | None:
+    """Return an existing immutable replacement for idempotent operator retries."""
+    listed = client.list_objects_v2(
+        Bucket=B2_BUCKET,
+        Prefix=f"cases/{case_id}/derived/draft-requests/",
+        MaxKeys=1000,
+    )
+    for item in _newest_draft_request_items(listed):
+        candidate_id = str(item.get("Key", "")).rsplit("/", 1)[-1].removesuffix(".json")
+        if not re.fullmatch(r"draft-[0-9]+-[0-9a-f]{12}", candidate_id):
+            continue
+        try:
+            candidate = _draft_request_entry(client, case_id, candidate_id)
+        except (ClientError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
+        if (
+            candidate.get("regenerated_from_request_id") == source_request_id
+            and " ".join(str(candidate.get("requested_by", "")).split()).casefold()
+            == reviewer.casefold()
+        ):
+            status = _draft_status_entry(client, case_id, candidate_id).get("status")
+            return {
+                "ok": True,
+                "case_id": case_id,
+                "request_id": candidate_id,
+                "status": status,
+                "reused": True,
+                "reviewer": reviewer,
+                "regenerated_from_request_id": source_request_id,
+            }
+    return None
+
+
+async def _operator_regenerate_draft(case_id: str, request_id: str) -> dict[str, Any]:
+    """Operator regeneration implementation, independent of MCP decoration."""
     case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
-    reviewer = _mcp_draft_reviewer(); entry = _draft_request_entry(_b2_client(), case_id, request_id)
-    _assert_owned_draft(entry, reviewer)
-    return await _create_mcp_draft(case_id, str(entry.get("question", "")), reviewer, request_id)
+    operator = _mcp_draft_reviewer()
+    client = _b2_client()
+    entry = _draft_request_entry(client, case_id, request_id)
+    reviewer = " ".join(str(entry.get("requested_by", "")).split()).lower()
+    if not _PORTAL_REVIEWER_EMAIL.fullmatch(reviewer):
+        raise PermissionError("draft reviewer identity is unavailable")
+    if _draft_status_entry(client, case_id, request_id).get("status") != "READY":
+        raise PermissionError("only a completed draft can be regenerated")
+    existing = _existing_regenerated_successor(client, case_id, request_id, reviewer)
+    if existing is not None:
+        return existing
+    result = await _create_mcp_draft(
+        case_id,
+        str(entry.get("question", "")),
+        reviewer,
+        request_id,
+        regeneration_operator=operator,
+    )
+    return {
+        **result,
+        "reviewer": reviewer,
+        "regenerated_from_request_id": request_id,
+    }
+
+
+@mcp.tool(name="draft.regenerate", description="Operator-regenerate any completed LegalAI draft while preserving its reviewer owner and immutable linkage.")
+async def mcp_draft_regenerate(case_id: str, request_id: str) -> dict[str, Any]:
+    return await _operator_regenerate_draft(case_id, request_id)
 
 
 @mcp.tool(name="draft.status", description="Return the exact current status of one of your LegalAI review draft requests.")

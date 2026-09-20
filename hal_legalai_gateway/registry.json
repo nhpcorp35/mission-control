@@ -390,7 +390,7 @@
       "namespace": "draft",
       "downstream_service": "bridge",
       "downstream_tool": "draft.regenerate",
-      "description": "Regenerate only the authenticated reviewer's completed draft as an immutable linked replacement."
+      "description": "Operator-regenerate any completed draft as an immutable linked replacement while preserving its original reviewer owner."
     },
     {
       "tool": "draft.status",
