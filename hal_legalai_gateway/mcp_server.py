@@ -84,6 +84,7 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
             "search route; it never forwards the inbound OAuth bearer."
         ),
     ),
+    ToolBinding(gateway_tool="case.framework_evidence_check", namespace="case", downstream_service="bridge", downstream_tool="/cases/verified/framework-evidence", description="Read-only framework evidence check returning expert, DEC, drawing/space, and cited-authority categories with model_called false.", notes="No draft or model request."),
     ToolBinding(
         gateway_tool="case.submit",
         namespace="case",
@@ -868,6 +869,24 @@ def register_forwarding_tools(
         if not response.is_success:
             return {"ok": False, "error": str(body.get("error", "verified-page search failed")) if isinstance(body, dict) else "verified-page search failed"}
         return body if isinstance(body, dict) else {"ok": False, "error": "invalid verified-page search response"}
+
+    @mcp.tool(name="case.framework_evidence_check", description=by_name["case.framework_evidence_check"].description)
+    async def case_framework_evidence_check(case_id: str, source_sha256: str) -> dict[str, Any]:
+        if _require_gateway_principal(settings) is None:
+            return {"ok": False, "error": "unauthorized"}
+        if not all(isinstance(value, str) and value.strip() for value in (case_id, source_sha256)):
+            return {"ok": False, "error": "case_id and source_sha256 are required"}
+        downstream = settings.downstream_by_key("bridge")
+        authorization = resolve_authorization_for_service(downstream_service="bridge", bridge_authorization=settings.bridge_authorization)
+        if not authorization:
+            return {"ok": False, "error": "bridge service authorization is unavailable"}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
+                response = await client.post(f"{downstream.base_url.rstrip('/')}/cases/verified/framework-evidence", headers={"Authorization": authorization}, json={"case_id": case_id.strip(), "source_sha256": source_sha256.strip()})
+            body = response.json()
+        except (httpx.HTTPError, ValueError):
+            return {"ok": False, "error": "framework evidence check unavailable"}
+        return body if response.is_success and isinstance(body, dict) else {"ok": False, "error": str(body.get("error", "framework evidence check failed")) if isinstance(body, dict) else "framework evidence check failed"}
 
     @mcp.tool(name="case.submit", description=by_name["case.submit"].description)
     async def case_submit(
