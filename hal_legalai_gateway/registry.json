@@ -171,6 +171,14 @@
       "notes": "Gateway-native authenticated HTTP call to the Bridge verified-page search route; it never forwards the inbound OAuth bearer."
     },
     {
+      "tool": "case.framework_evidence_check",
+      "namespace": "case",
+      "downstream_service": "bridge",
+      "downstream_tool": "/cases/verified/framework-evidence",
+      "description": "Read-only framework evidence check returning expert, DEC/regulatory, drawing/space, and cited-authority categories with model_called false.",
+      "notes": "Gateway-native authenticated HTTP call; no draft or model request."
+    },
+    {
       "tool": "case.submit",
       "namespace": "case",
       "downstream_service": "bridge",

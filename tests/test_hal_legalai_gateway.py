@@ -1645,6 +1645,7 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
             [
                 "case.resolve_commit",
                 "case.search_verified_pages",
+                "case.framework_evidence_check",
                 "case.submit",
                 "case.status",
                 "case.cancel",
