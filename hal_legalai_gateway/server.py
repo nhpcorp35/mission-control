@@ -509,6 +509,37 @@ async def _read_portal_case_source_map(request: Request, case_id: str) -> JSONRe
     return JSONResponse(result, status_code=response.status_code)
 
 
+_RENNICK_FRAMEWORK_CASE_ID = "NY-Nassau-613561-2026-Desousa-v-Rennick"
+_RENNICK_FRAMEWORK_SOURCE_SHA256 = "6394faf9d9ccdf258a061e231bf2ce9a7e27599c27e5187c4234613e876caf77"
+
+
+async def _run_portal_framework_evidence(request: Request, case_id: str) -> JSONResponse:
+    """Run the bounded, no-model Rennick framework-evidence check."""
+    secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
+    supplied = request.headers.get("X-LegalAI-Portal-Secret", "")
+    if not secret or not hmac.compare_digest(supplied, secret):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if case_id != _RENNICK_FRAMEWORK_CASE_ID:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    settings = get_settings()
+    authorization = service_authorization_header(settings.bridge_authorization)
+    if not authorization:
+        return JSONResponse({"ok": False, "error": "framework_evidence_unavailable"}, status_code=502)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=settings.connect_timeout_seconds)) as client:
+            response = await client.post(
+                f"{settings.downstream_by_key('storage').base_url.rstrip('/')}/cases/verified/framework-evidence",
+                json={"case_id": case_id, "source_sha256": _RENNICK_FRAMEWORK_SOURCE_SHA256},
+                headers={"Authorization": authorization, "Content-Type": "application/json"},
+            )
+        result = response.json()
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"ok": False, "error": "framework_evidence_unavailable"}, status_code=502)
+    if not isinstance(result, dict):
+        return JSONResponse({"ok": False, "error": "framework_evidence_unavailable"}, status_code=502)
+    return JSONResponse(result, status_code=response.status_code)
+
+
 async def _create_portal_draft_request(request: Request) -> JSONResponse:
     """Forward an authenticated internal draft question to the private Bridge."""
     secret = os.environ.get("PORTAL_REVIEW_GATEWAY_SECRET", "")
@@ -1212,6 +1243,10 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
     @application.get("/portal/cases/{case_id}/source-map", include_in_schema=False)
     async def read_portal_case_source_map(case_id: str, request: Request) -> JSONResponse:
         return await _read_portal_case_source_map(request, case_id)
+
+    @application.post("/portal/cases/{case_id}/framework-evidence", include_in_schema=False)
+    async def run_portal_framework_evidence(case_id: str, request: Request) -> JSONResponse:
+        return await _run_portal_framework_evidence(request, case_id)
 
     @application.post("/portal/cases/{case_id}/page-diagnostic", include_in_schema=False)
     async def diagnose_portal_case_page(case_id: str, request: Request) -> JSONResponse:

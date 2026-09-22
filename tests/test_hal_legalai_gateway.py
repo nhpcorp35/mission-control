@@ -1285,6 +1285,40 @@ class ApiTests(unittest.TestCase):
         response = self.client.get("/portal/szymczyk/review-packet/current")
         self.assertEqual(response.status_code, 401)
 
+    def test_rennick_framework_evidence_is_portal_protected_and_no_model(self) -> None:
+        response = self.client.post(
+            "/portal/cases/NY-Nassau-613561-2026-Desousa-v-Rennick/framework-evidence"
+        )
+        self.assertEqual(response.status_code, 401)
+
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return {"ok": True, "model_called": False, "categories": {}}
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, *, json, headers):
+                Client.url, Client.body, Client.headers = url, json, headers
+                return Response()
+
+        with mock.patch("hal_legalai_gateway.server.httpx.AsyncClient", lambda **kwargs: Client()):
+            response = self.client.post(
+                "/portal/cases/NY-Nassau-613561-2026-Desousa-v-Rennick/framework-evidence",
+                headers={"X-LegalAI-Portal-Secret": "test-portal-review-secret"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["model_called"])
+        self.assertEqual(Client.url, "https://storage.example/cases/verified/framework-evidence")
+        self.assertEqual(Client.body["source_sha256"], "6394faf9d9ccdf258a061e231bf2ce9a7e27599c27e5187c4234613e876caf77")
+        self.assertEqual(Client.headers["Authorization"], f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}")
+
     def test_szymczyk_current_packet_relays_service_authenticated_read(self) -> None:
         class Response:
             status_code = 200
