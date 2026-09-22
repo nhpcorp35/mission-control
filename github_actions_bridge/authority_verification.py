@@ -29,6 +29,12 @@ _OFFICIAL_PRIMARY_IDENTITIES = {
         "source_url": "https://www.nycourts.gov/reporter/files/bv/137AD3d.pdf",
         "reporter_page": 838,
     },
+    "162 a.d.3d 634": {
+        "title": "Ciringione v Ryan",
+        "issuing_body": "Appellate Division, Second Department",
+        "source_url": "https://www.nycourts.gov/reporter/files/bv/162AD3d.pdf",
+        "reporter_page": 634,
+    },
     "193 a.d.3d 710": {
         "title": "Kuzmicki v Bentley Yacht Club",
         "issuing_body": "Appellate Division, Second Department",

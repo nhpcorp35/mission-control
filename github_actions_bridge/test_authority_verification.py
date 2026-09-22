@@ -31,6 +31,14 @@ class AuthorityVerificationTests(unittest.TestCase):
         self.assertEqual(result["verified_primary_authorities"], [])
         self.assertIn("specific proposition remains unverified", candidate["verification_requirement"])
 
+    def test_additional_official_identity_match_is_available_without_a_holding(self):
+        raw = (b'{"filename":"Affirmation.pdf","page_number":7,"text":"See 162 A.D.3d 634."}\n')
+        result = authority_verification_check(raw)
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["primary_source"]["title"], "Ciringione v Ryan")
+        self.assertEqual(candidate["primary_source"]["reporter_page"], 634)
+        self.assertEqual(result["verified_primary_authorities"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
