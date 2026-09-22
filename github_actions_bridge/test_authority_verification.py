@@ -1,5 +1,5 @@
 import unittest
-from github_actions_bridge.authority_verification import authority_verification_check
+from github_actions_bridge.authority_verification import authority_verification_check, verified_authority_review_record
 
 
 class AuthorityVerificationTests(unittest.TestCase):
@@ -38,6 +38,21 @@ class AuthorityVerificationTests(unittest.TestCase):
         self.assertEqual(candidate["primary_source"]["title"], "Ciringione v Ryan")
         self.assertEqual(candidate["primary_source"]["reporter_page"], 634)
         self.assertEqual(result["verified_primary_authorities"], [])
+
+    def test_review_record_requires_holding_and_filing_proposition(self):
+        primary = result = authority_verification_check(
+            b'{"filename":"Affirmation.pdf","page_number":7,"text":"See 162 A.D.3d 634."}\n'
+        )["candidates"][0]["primary_source"]
+        record = verified_authority_review_record(
+            citation="162 A.D.3d 634", primary_source=primary,
+            holding="A prescriptive easement requires the stated elements.",
+            filing_proposition="Plaintiffs cite the decision for an asserted access right.",
+            record_citations=[{"filename": "Affirmation.pdf", "page_number": 7}],
+        )
+        self.assertEqual(len(record["sha256"]), 64)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            verified_authority_review_record(citation="162 A.D.3d 634", primary_source=primary,
+                holding="", filing_proposition="position", record_citations=[{"filename": "A.pdf", "page_number": 1}])
 
 
 if __name__ == "__main__":

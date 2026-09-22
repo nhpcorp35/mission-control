@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from collections import defaultdict
 from typing import Any
 
@@ -48,6 +49,37 @@ _OFFICIAL_PRIMARY_IDENTITIES = {
         "reporter_page": 764,
     },
 }
+
+
+def verified_authority_review_record(*, citation: str, primary_source: dict[str, Any],
+                                     holding: str, filing_proposition: str,
+                                     record_citations: list[dict[str, Any]]) -> dict[str, Any]:
+    """Create the only authority payload eligible for a downstream draft.
+
+    Identity alone is deliberately insufficient: the reviewed holding must be
+    tied to the proposition asserted in a verified filing and to its pages.
+    """
+    required_source = {"title", "issuing_body", "source_url", "reporter_page"}
+    if (not isinstance(citation, str) or not citation.strip()
+            or not isinstance(primary_source, dict)
+            or not required_source.issubset(primary_source)
+            or not all(isinstance(primary_source[key], (str, int)) and str(primary_source[key]).strip()
+                       for key in required_source)
+            or not isinstance(holding, str) or not holding.strip()
+            or not isinstance(filing_proposition, str) or not filing_proposition.strip()
+            or not isinstance(record_citations, list) or not record_citations):
+        raise ValueError("incomplete verified authority review")
+    if any(not isinstance(item, dict) or not isinstance(item.get("filename"), str)
+           or not isinstance(item.get("page_number"), int) or item["page_number"] < 1
+           for item in record_citations):
+        raise ValueError("invalid verified authority record citations")
+    record = {"citation": citation.strip(), "primary_source": primary_source,
+              "holding": holding.strip(), "filing_proposition": filing_proposition.strip(),
+              "record_citations": record_citations}
+    record["sha256"] = hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return record
 
 
 def _normalized_citation(value: str) -> str:
