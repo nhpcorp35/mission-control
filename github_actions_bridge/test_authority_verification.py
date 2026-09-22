@@ -21,6 +21,16 @@ class AuthorityVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "limit"):
             authority_verification_check(b"", limit=0)
 
+    def test_curated_official_identity_is_not_promoted_to_a_verified_holding(self):
+        raw = (b'{"filename":"Affirmation.pdf","page_number":7,"text":"See 193 A.D.3d 710."}\n')
+        result = authority_verification_check(raw)
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["status"], "official_primary_source_identified")
+        self.assertEqual(candidate["primary_source"]["title"], "Kuzmicki v Bentley Yacht Club")
+        self.assertIn("nycourts.gov", candidate["primary_source"]["source_url"])
+        self.assertEqual(result["verified_primary_authorities"], [])
+        self.assertIn("specific proposition remains unverified", candidate["verification_requirement"])
+
 
 if __name__ == "__main__":
     unittest.main()

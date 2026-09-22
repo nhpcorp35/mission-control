@@ -18,6 +18,31 @@ _PATTERNS = (
     re.compile(r"\bC\.?P\.?L\.?R\.?\s*§?\s*\d+[\w().-]*\b", re.IGNORECASE),
 )
 
+# Curated identity matches from the New York State Law Reporting Bureau's
+# Official Reports.  These entries deliberately stop short of describing a
+# rule or holding: a party's use of a citation must still be checked against
+# the precise proposition asserted in the verified filing.
+_OFFICIAL_PRIMARY_IDENTITIES = {
+    "137 a.d.3d 838": {
+        "title": "Colin Realty Co., LLC v Manhasset Pizza, LLC",
+        "issuing_body": "Appellate Division, Second Department",
+        "source_url": "https://www.nycourts.gov/reporter/files/bv/137AD3d.pdf",
+        "reporter_page": 838,
+    },
+    "193 a.d.3d 710": {
+        "title": "Kuzmicki v Bentley Yacht Club",
+        "issuing_body": "Appellate Division, Second Department",
+        "source_url": "https://www.nycourts.gov/reporter/files/bv/193AD3d.pdf",
+        "reporter_page": 710,
+    },
+    "264 a.d.2d 764": {
+        "title": "Monahan v Hampton Point Assn.",
+        "issuing_body": "Appellate Division, Second Department",
+        "source_url": "https://www.nycourts.gov/reporter/files/bv/264AD2d.pdf",
+        "reporter_page": 764,
+    },
+}
+
 
 def _normalized_citation(value: str) -> str:
     return " ".join(value.casefold().replace("§", " section ").split())
@@ -46,6 +71,16 @@ def extract_party_cited_authorities(raw: bytes, limit: int = 50) -> list[dict[st
                 location = {"filename": filename, "page_number": page_number}
                 if location not in pages[key]:
                     pages[key].append(location)
+    for key, candidate in matches.items():
+        primary = _OFFICIAL_PRIMARY_IDENTITIES.get(key)
+        if primary:
+            candidate["status"] = "official_primary_source_identified"
+            candidate["primary_source"] = primary
+            candidate["verification_requirement"] = (
+                "The official reporter identifies this decision, but the party's "
+                "specific proposition remains unverified until separately reviewed "
+                "against the official decision text."
+            )
     candidates = sorted(matches.values(), key=lambda item: (item["citation"].casefold(), item["record_citations"][0]["filename"], item["record_citations"][0]["page_number"]))
     return candidates[:limit]
 
