@@ -43,6 +43,7 @@ def validate_reviewed_authority_record(value: dict[str, Any], *, case_id: str, s
             "https://www.nycourts.gov/",
             "https://www.nysenate.gov/",
             "https://oysterbaytown.com/",
+            "https://ecode360.com/",
         )):
             raise ValueError("reviewed authority requires official primary source")
         if not re.search(r"\bp\.\s*[1-9][0-9]*\b", item["filing_record_citation"], re.I):

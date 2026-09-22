@@ -48,10 +48,10 @@ class ReviewedAuthorityStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete"):
             create_reviewed_authority_record(case_id=CASE, source_sha256=SOURCE, records=[{"authority_id": "bad"}])
 
-    def test_official_town_code_source_persists(self):
+    def test_designated_town_code_publisher_source_persists(self):
         town_code = record()
         town_code["records"][0]["official_primary_source"] = (
-            "https://oysterbaytown.com/wp-content/uploads/Local-Law-Ch.-241-waterways-10.01.24.pdf"
+            "https://ecode360.com/print/OY1221?guid=26878708"
         )
         town_code["sha256"] = ""
         town_code = create_reviewed_authority_record(
