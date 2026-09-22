@@ -10,6 +10,7 @@ COPY verified_case_index.py .
 COPY framework_evidence.py .
 COPY framework_conflicts.py .
 COPY authority_verification.py .
+COPY reviewed_authority_store.py .
 COPY case_intake.py .
 COPY storage_policy.py .
 COPY service_auth.py .

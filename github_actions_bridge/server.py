@@ -36,6 +36,11 @@ from pypdf import PdfReader
 from framework_conflicts import framework_conflict_map
 from framework_evidence import framework_evidence_check as build_framework_evidence_check
 from authority_verification import authority_verification_check
+from reviewed_authority_store import (
+    create_reviewed_authority_record,
+    get_reviewed_authority_record,
+    put_reviewed_authority_record,
+)
 from verified_case_search import search_index_jsonl, search_source_indexes
 from verified_case_index import build_page_records, diagnose_page_record
 
@@ -1245,6 +1250,27 @@ def _b2_client():
         region_name=os.environ.get("B2_REGION", "us-west-004"),
         aws_access_key_id=os.environ["B2_KEY_ID"],
         aws_secret_access_key=os.environ["B2_APPLICATION_KEY"],
+    )
+
+
+@mcp.tool(name="authority.reviewed.put", description="Persist one immutable, case-scoped reviewed authority record in canonical B2. Requires official primary source, exact holding, filing proposition, filing page citation, and content hash.")
+async def mcp_put_reviewed_authority(
+    case_id: str, source_sha256: str, records: list[dict[str, str]]
+) -> dict[str, Any]:
+    _require_allowed_user()
+    value = create_reviewed_authority_record(
+        case_id=case_id, source_sha256=source_sha256, records=records
+    )
+    persisted = put_reviewed_authority_record(_b2_client(), B2_BUCKET, value)
+    return {"ok": True, "case_id": case_id, "source_sha256": source_sha256,
+            "record_count": len(persisted["records"]), "sha256": persisted["sha256"]}
+
+
+@mcp.tool(name="authority.reviewed.get", description="Read one hash-verified, case-scoped reviewed authority record from canonical B2. Fails closed on missing, incomplete, or changed records.")
+async def mcp_get_reviewed_authority(case_id: str, source_sha256: str) -> dict[str, Any]:
+    _require_allowed_user()
+    return get_reviewed_authority_record(
+        _b2_client(), B2_BUCKET, case_id=case_id, source_sha256=source_sha256
     )
 
 
