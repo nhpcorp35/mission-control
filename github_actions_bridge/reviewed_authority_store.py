@@ -39,7 +39,11 @@ def validate_reviewed_authority_record(value: dict[str, Any], *, case_id: str, s
         if item["authority_id"] in seen:
             raise ValueError("duplicate reviewed authority")
         seen.add(item["authority_id"])
-        if not item["official_primary_source"].startswith(("https://www.nycourts.gov/", "https://www.nysenate.gov/")):
+        if not item["official_primary_source"].startswith((
+            "https://www.nycourts.gov/",
+            "https://www.nysenate.gov/",
+            "https://oysterbaytown.com/",
+        )):
             raise ValueError("reviewed authority requires official primary source")
         if not re.search(r"\bp\.\s*[1-9][0-9]*\b", item["filing_record_citation"], re.I):
             raise ValueError("reviewed authority requires filing page citation")
