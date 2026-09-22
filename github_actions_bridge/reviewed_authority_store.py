@@ -64,9 +64,13 @@ def put_reviewed_authority_record(client: Any, bucket: str, value: dict[str, Any
         existing = None
     if existing is not None:
         validate_reviewed_authority_record(existing, case_id=value["case_id"], source_sha256=value["source_sha256"])
-        if existing != value:
-            raise ValueError("reviewed-authority record already exists with different content")
-        return existing
+        if existing == value:
+            return existing
+        old = {item["authority_id"]: item for item in existing["records"]}
+        new = {item["authority_id"]: item for item in value["records"]}
+        if (not set(old).issubset(new)
+                or any(new[key] != old[key] for key in old)):
+            raise ValueError("reviewed-authority record may only add new entries")
     client.put_object(Bucket=bucket, Key=key, Body=raw, ContentType="application/json", Metadata={"sha256": value["sha256"]})
     return value
 
