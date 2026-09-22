@@ -35,6 +35,7 @@ from botocore.exceptions import ClientError
 from pypdf import PdfReader
 from framework_conflicts import framework_conflict_map
 from framework_evidence import framework_evidence_check as build_framework_evidence_check
+from authority_verification import authority_verification_check
 from verified_case_search import search_index_jsonl, search_source_indexes
 from verified_case_index import build_page_records, diagnose_page_record
 
@@ -4055,6 +4056,7 @@ async def framework_evidence_check(request: Request) -> JSONResponse:
         raw = _b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()
         result = build_framework_evidence_check(raw, limit=20)
         result["conflict_map"] = framework_conflict_map(raw, limit=20)
+        result["authority_verification"] = authority_verification_check(raw, limit=50)
         return JSONResponse({**result, "case_id": case_id, "source_sha256": source_sha256})
     except (TypeError, ValueError, KeyError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)

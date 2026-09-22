@@ -49,7 +49,7 @@ class BridgeDockerPackagingTests(unittest.TestCase):
 
     def test_framework_helpers_are_packaged_regression_anchor(self) -> None:
         copied = _copied_modules()
-        self.assertTrue({"framework_evidence", "framework_conflicts"} <= copied)
+        self.assertTrue({"framework_evidence", "framework_conflicts", "authority_verification"} <= copied)
 
 
 if __name__ == "__main__":
