@@ -4053,24 +4053,6 @@ async def framework_evidence_check(request: Request) -> JSONResponse:
         case_id, source_sha256 = str(payload.get("case_id", "")), str(payload.get("source_sha256", ""))
         prefix, _ = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
         raw = _b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()
-        queries = {"expert_opinion": "expert preliminary one-quarter riparian rule", "regulatory_record": "DEC permit inspection approval certificate occupancy", "drawings_and_space": "survey drawing site plan measurement maneuvering space", "cited_authority": "N.Y. A.D. CPLR ECL riparian navigation"}
-        return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "model_called": False, "categories": {name: search_index_jsonl(raw, query, 20) for name, query in queries.items()}})
-    except (TypeError, ValueError, KeyError, ClientError) as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-
-
-@mcp.custom_route("/cases/verified/framework-evidence", methods=["POST"])
-async def framework_evidence_check(request: Request) -> JSONResponse:
-    """Read-only evidence-category check for attorney framework validation."""
-    expected = normalize_bearer_token(os.environ.get(BRIDGE_SERVICE_TOKEN_ENV))
-    provided = normalize_bearer_token(request.headers.get("authorization"))
-    if not expected or not provided or not hmac.compare_digest(provided, expected):
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-    try:
-        payload = await request.json()
-        case_id, source_sha256 = str(payload.get("case_id", "")), str(payload.get("source_sha256", ""))
-        prefix, _ = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
-        raw = _b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()
         result = build_framework_evidence_check(raw, limit=20)
         result["conflict_map"] = framework_conflict_map(raw, limit=20)
         return JSONResponse({**result, "case_id": case_id, "source_sha256": source_sha256})
