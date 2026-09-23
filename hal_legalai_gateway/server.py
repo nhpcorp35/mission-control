@@ -1379,6 +1379,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         const out=document.getElementById('status');
         const jsonHeaders={'Content-Type':'application/json'};
         async function request(path,payload){const r=await fetch(path,{method:'POST',headers:jsonHeaders,body:JSON.stringify(payload)});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'request failed');return result;}
+        async function uploadThroughGateway(caseId,source,manifest){const body=await new Blob([source,manifest]).arrayBuffer();const r=await fetch('/intake/direct/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Intake-Case-Id':caseId,'X-Intake-Source-Filename':source.name,'X-Intake-Manifest-Filename':manifest.name,'X-Intake-Source-Size':String(source.size)},body});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'private upload failed');return result;}
         document.getElementById('upload').onclick=async()=>{
           try{
             const caseId=document.getElementById('case-id').value.trim();
@@ -1397,7 +1398,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
             out.textContent='Verifying every listed file and building the PDF search index…';
             const result=await request('/intake/direct/complete',{upload_id:plan.upload_id,case_id:caseId,source_filename:source.name,manifest_filename:manifest.name});
             out.textContent='Verified '+result.verified_files+' source file(s) and indexed '+result.indexed_documents+' PDF(s). The matter is now available in the attorney workspace; no attorney was contacted and no legal draft was generated.';
-          }catch(error){out.textContent='Intake failed: '+error.message;}
+          }catch(error){try{out.textContent='Direct storage upload unavailable; using the private verified-upload fallback…';const result=await uploadThroughGateway(caseId,source,manifest);out.textContent='Verified '+result.verified_files+' source file(s) and indexed '+result.indexed_documents+' PDF(s). The matter is now available in the attorney workspace; no attorney was contacted and no legal draft was generated.';}catch(fallbackError){out.textContent='Intake failed: '+fallbackError.message;}}
         };
         </script>'''
         if supplement_mode:
@@ -1517,6 +1518,46 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         except (ValueError, TypeError):
             return JSONResponse({"ok": False, "error": "invalid request"}, status_code=400)
         return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+    @application.post("/intake/direct/upload", include_in_schema=False)
+    async def upload_generic_intake(request: Request) -> JSONResponse:
+        """Same-origin fallback when B2 rejects browser cross-origin PUTs."""
+        if _browser_login(request) is None:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            case_id = str(request.headers.get("X-Intake-Case-Id", ""))
+            source_filename = str(request.headers.get("X-Intake-Source-Filename", ""))
+            manifest_filename = str(request.headers.get("X-Intake-Manifest-Filename", ""))
+            source_size = int(request.headers.get("X-Intake-Source-Size", "0"))
+            body = await request.body()
+            if source_size < 1 or source_size >= len(body):
+                raise ValueError("invalid_source_size")
+            source, manifest = body[:source_size], body[source_size:]
+            plan = await _forward_generic_direct_intake("prepare", {
+                "case_id": case_id,
+                "source_filename": source_filename,
+                "manifest_filename": manifest_filename,
+            })
+            if not plan.get("ok"):
+                return JSONResponse(plan, status_code=502)
+            if len(source) > int(plan["max_source_bytes"]) or len(manifest) > int(plan["max_manifest_bytes"]):
+                raise ValueError("verified_intake_size_limit_exceeded")
+            timeout = httpx.Timeout(900.0, connect=get_settings().connect_timeout_seconds)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                source_response = await client.put(str(plan["source"]["url"]), headers={"Content-Type": str(plan["source"]["content_type"])}, content=source)
+                manifest_response = await client.put(str(plan["manifest"]["url"]), headers={"Content-Type": str(plan["manifest"]["content_type"])}, content=manifest)
+            if not source_response.is_success or not manifest_response.is_success:
+                return JSONResponse({"ok": False, "error": "private_storage_upload_failed"}, status_code=502)
+            result = await _forward_generic_direct_intake("complete", {
+                "upload_id": str(plan["upload_id"]),
+                "case_id": case_id,
+                "source_filename": source_filename,
+                "manifest_filename": manifest_filename,
+            })
+            return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+        except (TypeError, ValueError, KeyError, httpx.HTTPError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc) or "private_upload_failed"}, status_code=400)
 
 
     @application.post("/intake/rennick/upload", include_in_schema=False)
