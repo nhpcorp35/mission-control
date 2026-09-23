@@ -1379,7 +1379,7 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         const out=document.getElementById('status');
         const jsonHeaders={'Content-Type':'application/json'};
         async function request(path,payload){const r=await fetch(path,{method:'POST',headers:jsonHeaders,body:JSON.stringify(payload)});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'request failed');return result;}
-        async function uploadThroughGateway(caseId,source,manifest){const body=await new Blob([source,manifest]).arrayBuffer();const r=await fetch('/intake/direct/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Intake-Case-Id':caseId,'X-Intake-Source-Filename':source.name,'X-Intake-Manifest-Filename':manifest.name,'X-Intake-Source-Size':String(source.size)},body});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'private upload failed');return result;}
+        async function uploadThroughGateway(caseId,source,manifest){const body=await new Blob([source,manifest]).arrayBuffer();const q=new URLSearchParams({case_id:caseId,source_filename:source.name,manifest_filename:manifest.name,source_size:String(source.size)});const r=await fetch('/intake/direct/upload?'+q,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'private upload failed');return result;}
         document.getElementById('upload').onclick=async()=>{
           let caseId,source,manifest;
           try{
@@ -1527,10 +1527,10 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
         if _browser_login(request) is None:
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         try:
-            case_id = str(request.headers.get("X-Intake-Case-Id", ""))
-            source_filename = str(request.headers.get("X-Intake-Source-Filename", ""))
-            manifest_filename = str(request.headers.get("X-Intake-Manifest-Filename", ""))
-            source_size = int(request.headers.get("X-Intake-Source-Size", "0"))
+            case_id = str(request.query_params.get("case_id") or request.headers.get("X-Intake-Case-Id", ""))
+            source_filename = str(request.query_params.get("source_filename") or request.headers.get("X-Intake-Source-Filename", ""))
+            manifest_filename = str(request.query_params.get("manifest_filename") or request.headers.get("X-Intake-Manifest-Filename", ""))
+            source_size = int(request.query_params.get("source_size") or request.headers.get("X-Intake-Source-Size", "0"))
             body = await request.body()
             if source_size < 1 or source_size >= len(body):
                 raise ValueError("invalid_source_size")
