@@ -2566,7 +2566,18 @@ async def mcp_draft_status(case_id: str, request_id: str) -> dict[str, Any]:
     case_id = _validate_draft_case_id(case_id); request_id = _validate_draft_request_id(request_id)
     entry = _draft_request_entry(_b2_client(), case_id, request_id); _assert_owned_draft(entry, _mcp_draft_reviewer())
     status = _draft_status_entry(_b2_client(), case_id, request_id)
-    return {"ok": True, "case_id": case_id, "request_id": request_id, "status": status["status"], "updated_at": status.get("updated_at"), "draft_available": status["status"] == "READY"}
+    result = {"ok": True, "case_id": case_id, "request_id": request_id, "status": status["status"], "updated_at": status.get("updated_at"), "draft_available": status["status"] == "READY"}
+    if status["status"] == "FAILED":
+        result["failure"] = {
+            key: status[key]
+            for key in (
+                "failure_code", "failure_stage", "exception_type", "http_status",
+                "reason_type", "gate_reason", "gate_detail", "gate_metrics",
+                "validation_reason",
+            )
+            if key in status
+        }
+    return result
 
 
 @mcp.tool(name="draft.list", description="List up to 20 of your most recent LegalAI review draft requests for one case.")
