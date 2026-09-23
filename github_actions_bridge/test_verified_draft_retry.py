@@ -19,11 +19,39 @@ from server import (  # noqa: E402
     _newest_draft_request_items,
     _queued_draft_needs_retry,
     _read_case_draft_request_snapshots,
+    mcp_draft_status,
     mcp_job_error,
 )
 
 
 class VerifiedDraftRetryTests(unittest.TestCase):
+    def test_draft_status_returns_only_safe_failure_details(self):
+        status = {
+            "status": "FAILED",
+            "updated_at": "2026-09-23T16:50:20Z",
+            "failure_code": "model_output_validation",
+            "failure_stage": "model_validation",
+            "exception_type": "valueerror",
+            "validation_reason": "incomplete_output_missing_information_invalid_terminal",
+            "private_detail": "must not be returned",
+        }
+        with patch("server._validate_draft_case_id", return_value="case"), \
+             patch("server._validate_draft_request_id", return_value="draft-1-aaaaaaaaaaaa"), \
+             patch("server._b2_client", return_value=object()), \
+             patch("server._draft_request_entry", return_value={}), \
+             patch("server._assert_owned_draft"), \
+             patch("server._mcp_draft_reviewer", return_value="reviewer@example.com"), \
+             patch("server._draft_status_entry", return_value=status):
+            result = __import__("asyncio").run(
+                mcp_draft_status.fn("case", "draft-1-aaaaaaaaaaaa")
+            )
+        self.assertEqual(result["failure"]["failure_code"], "model_output_validation")
+        self.assertEqual(
+            result["failure"]["validation_reason"],
+            "incomplete_output_missing_information_invalid_terminal",
+        )
+        self.assertNotIn("private_detail", result["failure"])
+
     def test_job_error_returns_persisted_safe_gate_reason(self):
         status = {
             "status": "FAILED",
