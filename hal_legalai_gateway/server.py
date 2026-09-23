@@ -1381,10 +1381,11 @@ def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
         async function request(path,payload){const r=await fetch(path,{method:'POST',headers:jsonHeaders,body:JSON.stringify(payload)});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'request failed');return result;}
         async function uploadThroughGateway(caseId,source,manifest){const body=await new Blob([source,manifest]).arrayBuffer();const r=await fetch('/intake/direct/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Intake-Case-Id':caseId,'X-Intake-Source-Filename':source.name,'X-Intake-Manifest-Filename':manifest.name,'X-Intake-Source-Size':String(source.size)},body});const result=await r.json().catch(()=>({ok:false,error:'invalid response'}));if(!r.ok||!result.ok)throw new Error(result.error||'private upload failed');return result;}
         document.getElementById('upload').onclick=async()=>{
+          let caseId,source,manifest;
           try{
-            const caseId=document.getElementById('case-id').value.trim();
-            const source=document.getElementById('source').files[0];
-            const manifest=document.getElementById('manifest').files[0];
+            caseId=document.getElementById('case-id').value.trim();
+            source=document.getElementById('source').files[0];
+            manifest=document.getElementById('manifest').files[0];
             if(!caseId||!source||!manifest)throw new Error('Enter the case ID and select both files.');
             out.textContent='Preparing private upload…';
             const plan=await request('/intake/direct/prepare',{case_id:caseId,source_filename:source.name,manifest_filename:manifest.name});
