@@ -4,10 +4,14 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
+import tempfile
 import zipfile
 from typing import Any
 
 from pypdf import PdfReader
+from PIL import Image
+import pytesseract
 
 try:  # Package import for tests; flat import for the Bridge container.
     from .verified_case_reader import RangeObjectReader
@@ -31,6 +35,48 @@ def build_page_records(client: Any, bucket: str, source_key: str, manifest: dict
                 text = (page.extract_text() or "").strip()
                 if text:
                     lines.append(json.dumps({"filename": document_name, "page_number": number, "text": text}, separators=(",", ":")))
+    return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+
+
+def build_ocr_page_records(client: Any, bucket: str, source_key: str, manifest: dict[str, Any]) -> bytes:
+    """Create a separate OCR index for sparse-text scanned verified PDFs.
+
+    The source PDF stays immutable.  OCR is attempted only where embedded text
+    is too sparse to support retrieval, and every result retains its exact
+    source filename and page number.
+    """
+    size = int(client.head_object(Bucket=bucket, Key=source_key)["ContentLength"])
+    lines: list[str] = []
+    with zipfile.ZipFile(io.BufferedReader(RangeObjectReader(client, bucket, source_key, size))) as archive:
+        members = {item.filename.rsplit("/", 1)[-1]: item for item in archive.infolist()}
+        for item in manifest.get("files", []):
+            filename = str(item.get("filename", "")) if isinstance(item, dict) else ""
+            document_name = filename.rsplit("/", 1)[-1]
+            if not filename.lower().endswith(".pdf") or document_name not in members:
+                continue
+            data = archive.read(members[document_name])
+            pages = PdfReader(io.BytesIO(data)).pages
+            with tempfile.TemporaryDirectory() as temporary:
+                pdf_path = f"{temporary}/source.pdf"
+                with open(pdf_path, "wb") as output:
+                    output.write(data)
+                for number, page in enumerate(pages, start=1):
+                    text = (page.extract_text() or "").strip()
+                    if len(text) < 180:
+                        image_prefix = f"{temporary}/page-{number}"
+                        subprocess.run(
+                            ["pdftoppm", "-f", str(number), "-l", str(number), "-r", "220", "-png", "-singlefile", pdf_path, image_prefix],
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=60,
+                        )
+                        with Image.open(image_prefix + ".png") as image:
+                            ocr_text = pytesseract.image_to_string(image).strip()
+                        if ocr_text:
+                            text = "\n".join(part for part in (text, ocr_text) if part).strip()
+                    if text:
+                        lines.append(json.dumps({"filename": document_name, "page_number": number, "text": text}, separators=(",", ":")))
     return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 
 
