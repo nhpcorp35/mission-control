@@ -42,7 +42,7 @@ from reviewed_authority_store import (
     put_reviewed_authority_record,
 )
 from verified_case_search import search_index_jsonl, search_source_indexes
-from verified_case_index import build_page_records, diagnose_page_record
+from verified_case_index import build_ocr_page_records, build_page_records, diagnose_page_record
 
 from storage_policy import (
     ALLOWED_QUESTION_IDS,
@@ -102,6 +102,9 @@ SZYMCZYK_CASE_ID = "NY-NewYork-158068-2018-Szymczyk-v-Hudson-36-37"
 MAX_SOURCE_MAP_DOCUMENTS = 1_000
 SZYMCZYK_REVIEW_PACKET_PREFIX = (
     f"cases/{SZYMCZYK_CASE_ID}/derived/attorney-review-candidates/"
+)
+OCR_INDEX_SOURCE_SHA256S = frozenset(
+    {"c3ebfd9a47a673932b40f470ff02072e4902acbda49412a938596b110f29a1fc"}
 )
 SZYMCZYK_CURRENT_REVIEW_POINTER_KEY = (
     f"cases/{SZYMCZYK_CASE_ID}/derived/attorney-review-current.json"
@@ -1600,7 +1603,7 @@ async def search_indexed_case(request: Request) -> JSONResponse:
         indexes = []
         for source_sha256 in source_sha256s:
             prefix, _ = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
-            indexes.append((source_sha256, client.get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()))
+            indexes.append((source_sha256, _read_preferred_verified_case_index(client, prefix)))
         results = search_source_indexes(indexes, query, limit)
     except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError, OSError):
         return JSONResponse({"ok": False, "error": "search_unavailable"}, status_code=502)
@@ -4073,7 +4076,7 @@ async def search_verified_case(request: Request) -> JSONResponse:
         case_id, source_sha256 = str(payload.get("case_id", "")), str(payload.get("source_sha256", ""))
         query, limit = str(payload.get("query", "")), int(payload.get("limit", 20))
         prefix, _ = read_verified_manifest(_b2_client(), B2_BUCKET, case_id, source_sha256)
-        raw = _b2_client().get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()
+        raw = _read_preferred_verified_case_index(_b2_client(), prefix)
         return JSONResponse({"ok": True, "case_id": case_id, "source_sha256": source_sha256, "results": search_index_jsonl(raw, query, limit)})
     except (TypeError, ValueError, KeyError, ClientError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -4206,6 +4209,38 @@ def _build_verified_case_index(case_id: str, source_sha256: str) -> dict[str, An
     # the HEAD check above preserves the no-overwrite rule for this startup job.
     client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson")
     return {"ok": True, "created": True, "index_key": index_key, "bytes": len(body)}
+
+
+def _build_verified_case_ocr_index(case_id: str, source_sha256: str) -> dict[str, Any]:
+    """Create a versioned, additive OCR index without changing original text."""
+    client = _b2_client()
+    prefix, manifest = read_verified_manifest(client, B2_BUCKET, case_id, source_sha256)
+    index_key = prefix + "page_records.ocr-v1.jsonl"
+    try:
+        existing = client.head_object(Bucket=B2_BUCKET, Key=index_key)
+        if int(existing.get("ContentLength", 0)) > 0:
+            return {"ok": True, "already_present": True, "index_key": index_key}
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    descriptor = json.loads(client.get_object(Bucket=B2_BUCKET, Key=prefix + "source_descriptor.json")["Body"].read())
+    source_key = str(descriptor.get("source_object_key", ""))
+    if not source_key.startswith(prefix):
+        raise ValueError("verified source descriptor is invalid")
+    body = build_ocr_page_records(client, B2_BUCKET, source_key, manifest)
+    client.put_object(Bucket=B2_BUCKET, Key=index_key, Body=body, ContentType="application/x-ndjson")
+    return {"ok": True, "created": True, "index_key": index_key, "bytes": len(body)}
+
+
+def _read_preferred_verified_case_index(client: Any, prefix: str) -> bytes:
+    """Prefer the versioned OCR index when present; otherwise use base text."""
+    ocr_key = prefix + "page_records.ocr-v1.jsonl"
+    try:
+        return client.get_object(Bucket=B2_BUCKET, Key=ocr_key)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}:
+            raise
+    return client.get_object(Bucket=B2_BUCKET, Key=prefix + "page_records.jsonl")["Body"].read()
 
 
 @mcp.custom_route("/intake/direct/prepare", methods=["POST"])
@@ -5640,6 +5675,9 @@ def _index_registered_verified_cases() -> None:
                 for source_sha256 in read_verified_source_set(client, B2_BUCKET, case_id):
                     result = _build_verified_case_index(case_id, source_sha256)
                     logger.warning("Registered verified-case index result case_id=%s source_sha256=%s result=%s", case_id, source_sha256, result)
+                    if source_sha256 in OCR_INDEX_SOURCE_SHA256S:
+                        ocr_result = _build_verified_case_ocr_index(case_id, source_sha256)
+                        logger.warning("Registered verified-case OCR index result case_id=%s source_sha256=%s result=%s", case_id, source_sha256, ocr_result)
             except (ClientError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                 logger.warning("Registered case is not ready for automatic indexing case_id=%s", case_id)
     except ClientError:
