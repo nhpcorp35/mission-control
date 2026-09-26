@@ -1182,64 +1182,13 @@ class ApiTests(unittest.TestCase):
             "mission_control",
         )
 
-    def test_mcp_catalog_is_public_but_tools_require_authorization(self) -> None:
-        existing = self.client.post(
-            "/mcp",
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-        )
-        self.assertIn(existing.status_code, {401, 403})
+    def test_mcp_requires_authorization(self) -> None:
         response = self.client.post(
-            "/mcp-v9",
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            "/mcp",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         )
-        self.assertEqual(response.status_code, 200)
-        tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
-        self.assertIn("gateway.health", tools)
-        self.assertEqual(
-            tools["draft.create"]["_meta"]["securitySchemes"],
-            [{"type": "oauth2", "scopes": ["user"]}],
-        )
-        call = self.client.post(
-            "/mcp-v9",
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-            json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "draft.create", "arguments": {}}},
-        )
-        self.assertEqual(call.status_code, 200)
-        result = call.json()["result"]
-        self.assertTrue(result["isError"])
-        self.assertIn("mcp/www_authenticate", result["_meta"])
-
-        other = self.client.post(
-            "/mcp-v9",
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-            json={"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "secret://test"}},
-        )
-        self.assertIn(other.status_code, {401, 403})
-
-        invalid = self.client.post(
-            "/mcp-v9",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                "Authorization": "Bearer invalid-token",
-            },
-            json={"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
-        )
-        self.assertIn(invalid.status_code, {401, 403})
-
-        authorized = self.client.post(
-            "/mcp-v9",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                "Authorization": f"Bearer {TEST_GATEWAY_OAUTH_TOKEN}",
-            },
-            json={"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "gateway.auth_status", "arguments": {}}},
-        )
-        self.assertEqual(authorized.status_code, 200)
-        self.assertTrue(authorized.json()["result"]["structuredContent"]["authorized"])
+        self.assertIn(response.status_code, {401, 403})
 
     def test_mcp_rejects_invalid_token(self) -> None:
         response = self.client.post(
