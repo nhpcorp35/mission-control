@@ -1218,6 +1218,29 @@ class ApiTests(unittest.TestCase):
         )
         self.assertIn(other.status_code, {401, 403})
 
+        invalid = self.client.post(
+            "/mcp-v9",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": "Bearer invalid-token",
+            },
+            json={"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
+        )
+        self.assertIn(invalid.status_code, {401, 403})
+
+        authorized = self.client.post(
+            "/mcp-v9",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {TEST_GATEWAY_OAUTH_TOKEN}",
+            },
+            json={"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "gateway.auth_status", "arguments": {}}},
+        )
+        self.assertEqual(authorized.status_code, 200)
+        self.assertTrue(authorized.json()["result"]["structuredContent"]["authorized"])
+
     def test_mcp_rejects_invalid_token(self) -> None:
         response = self.client.post(
             "/mcp",

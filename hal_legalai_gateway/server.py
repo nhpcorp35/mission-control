@@ -1122,7 +1122,7 @@ class _CatalogBeforeAuth:
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if isinstance(scope.get("user"), AuthenticatedUser) or any(
-            key == b"authorization" for key, _ in scope.get("headers", [])
+            key.lower() == b"authorization" for key, _ in scope.get("headers", [])
         ):
             await self.protected(scope, receive, send)
             return
@@ -1130,10 +1130,15 @@ class _CatalogBeforeAuth:
             await self.protected(scope, receive, send)
             return
         request = Request(scope, receive)
-        body = await request.body()
-        if len(body) > 64 * 1024:
-            await self.protected(scope, receive, send)
-            return
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 64 * 1024:
+                await Response(status_code=413)(scope, receive, send)
+                return
+            chunks.append(chunk)
+        body = b"".join(chunks)
         try:
             message = json.loads(body)
         except (ValueError, UnicodeDecodeError):
