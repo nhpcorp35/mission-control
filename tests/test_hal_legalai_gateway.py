@@ -104,7 +104,7 @@ WORKFLOW_YAML_FIXTURE = (
 WORKFLOW_IDEMPOTENCY_KEY = "wf-replay-01"
 CANONICAL_WORKFLOW_ID = "00000000-0000-4000-8000-000000000001"
 EXPECTED_NAMESPACES = REQUIRED_NAMESPACES | {
-    "workflow", "draft", "review", "activity", "job", "system"
+    "workflow", "draft", "review", "authority", "activity", "job", "system"
 }
 FORBIDDEN_WORKFLOW_TOOLS = (
     "workflow.wait",
@@ -1671,6 +1671,45 @@ class WorkflowGatewaySliceDTests(unittest.TestCase):
         self.assertEqual(preserved_namespaces, EXPECTED_NAMESPACES)
         for required in REQUIRED_GATEWAY_TOOLS:
             self.assertIn(required, defaults_by_name)
+
+    def test_reviewed_authority_tools_are_explicit_and_scoped(self) -> None:
+        registry = load_registry(REGISTRY_PATH)
+        self.assertEqual(
+            registry.namespaces["authority"].tools,
+            ("authority.reviewed.get", "authority.reviewed.put"),
+        )
+        tools = self._collect_tools("authority.reviewed.get", "authority.reviewed.put")
+        case_id, source_sha256 = "NY-Nassau-613561-2026-Desousa-v-Rennick", "a" * 64
+        records = [{"authority_id": "reviewed-example"}]
+        with mock.patch(
+            "hal_legalai_gateway.mcp_server._require_gateway_principal",
+            return_value="nhpcorp35",
+        ), mock.patch(
+            "hal_legalai_gateway.mcp_server.forward_mcp_tool",
+            new_callable=mock.AsyncMock,
+            return_value={"ok": True, "result": {"sha256": "b" * 64}},
+        ) as forward_mock:
+            result = asyncio.run(tools["authority.reviewed.get"](case_id, source_sha256))
+            self.assertTrue(result["ok"])
+            kwargs = forward_mock.await_args.kwargs
+            self.assertEqual(kwargs["binding"].downstream_tool, "authority.reviewed.get")
+            self.assertEqual(kwargs["arguments"], {"case_id": case_id, "source_sha256": source_sha256})
+            self.assertEqual(kwargs["authorization"], f"Bearer {TEST_BRIDGE_SERVICE_TOKEN}")
+
+            forward_mock.reset_mock()
+            denied = asyncio.run(tools["authority.reviewed.put"](case_id, source_sha256, records, False))
+            self.assertFalse(denied["ok"])
+            self.assertEqual(denied["failure_stage"], "authorization")
+            forward_mock.assert_not_awaited()
+
+            result = asyncio.run(tools["authority.reviewed.put"](case_id, source_sha256, records, True))
+            self.assertTrue(result["ok"])
+            kwargs = forward_mock.await_args.kwargs
+            self.assertEqual(kwargs["binding"].downstream_tool, "authority.reviewed.put")
+            self.assertEqual(kwargs["arguments"], {
+                "case_id": case_id, "source_sha256": source_sha256, "records": records,
+            })
+            self.assertNotIn("authorization_confirmed", kwargs["arguments"])
 
     def test_existing_namespaces_are_unchanged(self) -> None:
         registry = load_registry(REGISTRY_PATH)
