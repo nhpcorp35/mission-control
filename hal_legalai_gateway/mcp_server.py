@@ -219,6 +219,20 @@ DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
         description="List the newest archived attorney reviews for one verified case.",
     ),
     ToolBinding(
+        gateway_tool="authority.reviewed.get", namespace="authority", downstream_service="bridge",
+        downstream_tool="authority.reviewed.get",
+        description="Read one hash-verified, case-scoped reviewed authority record from canonical B2.",
+    ),
+    ToolBinding(
+        gateway_tool="authority.reviewed.put", namespace="authority", downstream_service="bridge",
+        downstream_tool="authority.reviewed.put",
+        description=(
+            "Persist one immutable reviewed-authority record in canonical B2. "
+            "Requires explicit authorization and the Bridge's verified source, "
+            "holding, proposition, filing-page, and hash contract."
+        ),
+    ),
+    ToolBinding(
         gateway_tool="activity.poll", namespace="activity", downstream_service="bridge",
         downstream_tool="activity.poll",
         description="Return each new LegalAI draft-status or attorney-review event once across all verified cases.",
@@ -1016,6 +1030,32 @@ def register_forwarding_tools(
                 {"consumer_id": "legalai-hourly-watch", "limit": min(limit, 50)},
             )
         return await _forward("review.list", {"case_id": case_id, "limit": limit})
+
+    @mcp.tool(name="authority.reviewed.get", description=by_name["authority.reviewed.get"].description)
+    async def authority_reviewed_get(case_id: str, source_sha256: str) -> dict[str, Any]:
+        return await _forward(
+            "authority.reviewed.get",
+            {"case_id": case_id, "source_sha256": source_sha256},
+        )
+
+    @mcp.tool(name="authority.reviewed.put", description=by_name["authority.reviewed.put"].description)
+    async def authority_reviewed_put(
+        case_id: str,
+        source_sha256: str,
+        records: list[dict[str, str]],
+        authorization_confirmed: bool,
+    ) -> dict[str, Any]:
+        if not authorization_confirmed:
+            return {
+                "ok": False,
+                "gateway_tool": "authority.reviewed.put",
+                "failure_stage": "authorization",
+                "error": {"message": "explicit authorization required", "stage": "authorization"},
+            }
+        return await _forward(
+            "authority.reviewed.put",
+            {"case_id": case_id, "source_sha256": source_sha256, "records": records},
+        )
 
     @mcp.tool(name="activity.poll", description=by_name["activity.poll"].description)
     async def activity_poll(consumer_id: str = "legalai-hourly-watch", limit: int = 50) -> dict[str, Any]:
