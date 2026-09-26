@@ -23,6 +23,9 @@ from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
 from starlette.authentication import AuthenticationBackend
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import HTTPConnection
+from starlette.routing import Route
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from fastmcp.server.auth.middleware import RequireAuthMiddleware
 
 from hal_legalai_gateway.config import GatewaySettings, load_settings
 from hal_legalai_gateway.health import aggregate_health
@@ -80,6 +83,7 @@ _settings: GatewaySettings | None = None
 _mcp: FastMCP | None = None
 _registered_tools: list[str] = []
 _mcp_http_app: Any = None
+_mcp_v9_http_app: Any = None
 _auth_override: AuthProvider | None = None
 RENNICK_SOURCE_BYTES_MAX = 50 * 1024 * 1024
 RENNICK_MANIFEST_BYTES_MAX = 128 * 1024
@@ -125,11 +129,12 @@ def get_mcp() -> FastMCP | None:
 
 def reset_settings_for_tests() -> None:
     """Clear cached settings / MCP state (test helper)."""
-    global _settings, _mcp, _registered_tools, _mcp_http_app, _auth_override
+    global _settings, _mcp, _registered_tools, _mcp_http_app, _mcp_v9_http_app, _auth_override
     _settings = None
     _mcp = None
     _registered_tools = []
     _mcp_http_app = None
+    _mcp_v9_http_app = None
     _auth_override = None
 
 
@@ -1108,23 +1113,96 @@ async def _forward_verified_case_pdf(payload: dict[str, Any]) -> Response:
 
 
 
-def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
+class _CatalogBeforeAuth:
+    """Allow anonymous MCP discovery, but never execute a tool without OAuth."""
+
+    def __init__(self, protected: RequireAuthMiddleware, resource_metadata_url: str):
+        self.protected = protected
+        self.resource_metadata_url = resource_metadata_url
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if isinstance(scope.get("user"), AuthenticatedUser) or any(
+            key.lower() == b"authorization" for key, _ in scope.get("headers", [])
+        ):
+            await self.protected(scope, receive, send)
+            return
+        if scope["method"] != "POST":
+            await self.protected(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 64 * 1024:
+                await Response(status_code=413)(scope, receive, send)
+                return
+            chunks.append(chunk)
+        body = b"".join(chunks)
+        try:
+            message = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            message = None
+        method = message.get("method") if isinstance(message, dict) else None
+        if method == "tools/call" and "id" in message:
+            challenge = (
+                f'Bearer resource_metadata="{self.resource_metadata_url}", '
+                'error="insufficient_scope", error_description="Sign in to use LegalAI tools"'
+            )
+            response = JSONResponse({
+                "jsonrpc": "2.0", "id": message["id"],
+                "result": {
+                    "content": [{"type": "text", "text": "Authentication required."}],
+                    "isError": True, "_meta": {"mcp/www_authenticate": [challenge]},
+                },
+            })
+            await response(scope, receive, send)
+            return
+        if method not in {"initialize", "notifications/initialized", "tools/list"}:
+            await self.protected(scope, receive, send)
+            return
+        first = True
+
+        async def replay() -> Any:
+            nonlocal first
+            if first:
+                first = False
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.protected.app(scope, replay, send)
+
+
+def _attach_mcp_routes(application: FastAPI, mcp_app: Any, *, v9_only: bool = False) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
+    routes = (
+        [route for route in mcp_app.routes if getattr(route, "path", None) in {
+            "/mcp-v9", "/.well-known/oauth-protected-resource/mcp-v9"
+        }]
+        if v9_only else mcp_app.routes
+    )
     application.router.routes = [
         route
         for route in application.router.routes
         if getattr(route, "path", None) not in {
-            getattr(mcp_route, "path", None) for mcp_route in mcp_app.routes
+            getattr(mcp_route, "path", None) for mcp_route in routes
         }
     ]
-    for route in mcp_app.routes:
+    for route in routes:
+        if v9_only and getattr(route, "path", None) == "/mcp-v9" and isinstance(route, Route) and isinstance(route.endpoint, RequireAuthMiddleware):
+            route = Route(
+                route.path,
+                endpoint=_CatalogBeforeAuth(route.endpoint, str(route.endpoint.resource_metadata_url)),
+                methods=route.methods,
+                name=route.name,
+            )
         application.router.routes.append(route)
 
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global _settings, _registered_tools, _mcp_http_app, _mcp
+    global _settings, _registered_tools, _mcp_http_app, _mcp_v9_http_app, _mcp
     configure_logging()
     # Fail closed on missing GitHub OAuth config / GATEWAY_BRIDGE_AUTHORIZATION.
     _settings = load_settings()
@@ -1132,6 +1210,9 @@ async def lifespan(application: FastAPI):
     _mcp = create_mcp_server(_settings, auth=auth)
     _mcp_http_app = _mcp.http_app(path="/mcp", transport="http")
     _attach_mcp_routes(application, _mcp_http_app)
+    v9 = create_mcp_server(_settings, auth=_mcp.auth, catalog_oauth_metadata=True)
+    _mcp_v9_http_app = v9.http_app(path="/mcp-v9", transport="http")
+    _attach_mcp_routes(application, _mcp_v9_http_app, v9_only=True)
     _registered_tools = await list_registered_tool_names(_mcp)
     logger.info(
         "HAL LegalAI Gateway starting phase=2 deployed_commit_sha=%s "
@@ -1144,13 +1225,14 @@ async def lifespan(application: FastAPI):
         _settings.connect_timeout_seconds,
         _settings.read_timeout_seconds,
     )
-    async with _mcp_http_app.lifespan(application):
+    async with _mcp_http_app.lifespan(application), _mcp_v9_http_app.lifespan(application):
         yield
     logger.info("HAL LegalAI Gateway shutting down")
     _settings = None
     _mcp = None
     _registered_tools = []
     _mcp_http_app = None
+    _mcp_v9_http_app = None
 
 
 def create_app(*, auth_override: AuthProvider | None = None) -> FastAPI:
