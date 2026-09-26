@@ -1376,6 +1376,13 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(status_result["run_id"], run_payload["id"])
         self.assertEqual(status_result["status"], "completed")
 
+        # A missing run may have aged out of the bounded GitHub search. It
+        # cannot be reported as an active dispatch.
+        self.assertEqual(
+            self.server._run_result("mission-aged-out", None),
+            {"ok": False, "mission_id": "mission-aged-out", "error": "run_not_found"},
+        )
+
         cancel_result = asyncio.run(run_cancel())
         self.assertEqual(cancel_result["ok"], True)
         self.assertEqual(cancel_result["mission_id"], "mission-cancel-1")
