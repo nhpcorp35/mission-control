@@ -962,7 +962,7 @@ async def _resolve_case00_run(
 
 def _run_result(mission_id: str, run: dict[str, Any] | None) -> dict[str, Any]:
     if run is None:
-        return {"ok": True, "mission_id": mission_id, "status": "dispatching"}
+        return {"ok": False, "mission_id": mission_id, "error": "run_not_found"}
     return {
         "ok": True,
         "mission_id": mission_id,
