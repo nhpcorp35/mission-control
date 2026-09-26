@@ -1385,6 +1385,29 @@ class Case00GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(artifacts_result["ok"], True)
         self.assertEqual(artifacts_result["mission_id"], "mission-artifacts-1")
 
+    def test_historical_case_run_not_found_is_not_reported_as_dispatching(self) -> None:
+        status = self._tool("get_case00_run")
+
+        async def run(mission_id: str):
+            with mock.patch.object(
+                self.server, "_require_allowed_user", return_value="nhpcorp35"
+            ), mock.patch.object(
+                self.server, "_resolve_case00_run", return_value=None
+            ):
+                return await status(mission_id=mission_id)
+
+        for question_id in ("Q2", "Q5"):
+            mission_id = f"historical-case00-{question_id.lower()}"
+            with self.subTest(question_id=question_id):
+                self.assertEqual(
+                    asyncio.run(run(mission_id)),
+                    {
+                        "ok": False,
+                        "mission_id": mission_id,
+                        "error": "run_not_found",
+                    },
+                )
+
     def test_unified_gateway_registry_routes_generic_case_tools(self) -> None:
         registry_path = (
             Path(__file__).resolve().parent.parent
