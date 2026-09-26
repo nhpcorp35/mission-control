@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 _CASE00_QUESTION_CONTRACT = load_case00_question_contract()
 
-_CANONICAL_ACCEPTANCE_CONTRACT_VERSION = re.compile(r"[0-9]+\\.[0-9]+\\.[0-9]+")
+_CANONICAL_ACCEPTANCE_CONTRACT_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 
 # Settled gateway surface (Phase 2). Downstream tool names stay on the services.
 DEFAULT_TOOL_BINDINGS: tuple[ToolBinding, ...] = (
@@ -698,6 +698,7 @@ def create_mcp_server(
     settings: GatewaySettings,
     *,
     auth: AuthProvider | None = None,
+    catalog_oauth_metadata: bool = False,
 ) -> FastMCP:
     """Build the gateway MCP server with thin forwarders.
 
@@ -719,10 +720,11 @@ def create_mcp_server(
     )
     bindings = bindings_from_registry(settings.registry)
     register_forwarding_tools(mcp, settings, bindings)
-    # ChatGPT needs the catalog before linking the account.  FastMCP 2.x
-    # serializes tool metadata through _meta, including this compatibility key.
-    for tool in mcp._tool_manager._tools.values():
-        tool.meta = {**(tool.meta or {}), "securitySchemes": [{"type": "oauth2", "scopes": ["user"]}]}
+    if catalog_oauth_metadata:
+        # FastMCP 2.x serializes tool metadata through _meta.  Keep the
+        # established /mcp catalog intact while the v9 route is evaluated.
+        for tool in mcp._tool_manager._tools.values():
+            tool.meta = {**(tool.meta or {}), "securitySchemes": [{"type": "oauth2", "scopes": ["user"]}]}
     return mcp
 
 

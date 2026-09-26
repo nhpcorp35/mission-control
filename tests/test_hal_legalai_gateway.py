@@ -1183,8 +1183,14 @@ class ApiTests(unittest.TestCase):
         )
 
     def test_mcp_catalog_is_public_but_tools_require_authorization(self) -> None:
-        response = self.client.post(
+        existing = self.client.post(
             "/mcp",
+            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+        self.assertIn(existing.status_code, {401, 403})
+        response = self.client.post(
+            "/mcp-v9",
             headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         )
@@ -1196,7 +1202,7 @@ class ApiTests(unittest.TestCase):
             [{"type": "oauth2", "scopes": ["user"]}],
         )
         call = self.client.post(
-            "/mcp",
+            "/mcp-v9",
             headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
             json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "draft.create", "arguments": {}}},
         )
@@ -1206,7 +1212,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn("mcp/www_authenticate", result["_meta"])
 
         other = self.client.post(
-            "/mcp",
+            "/mcp-v9",
             headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
             json={"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "secret://test"}},
         )
