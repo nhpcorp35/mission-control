@@ -117,6 +117,14 @@
         "review.list"
       ]
     },
+    "authority": {
+      "description": "Case-scoped, hash-verified reviewed authority records in canonical B2.",
+      "downstream_service": "bridge",
+      "tools": [
+        "authority.reviewed.get",
+        "authority.reviewed.put"
+      ]
+    },
     "job": {
       "description": "Read-only sanitized job diagnostics.",
       "downstream_service": "bridge",
@@ -463,6 +471,20 @@
       "downstream_service": "bridge",
       "downstream_tool": "review.list",
       "description": "List up to 50 newest archived attorney reviews for one verified case."
+    },
+    {
+      "tool": "authority.reviewed.get",
+      "namespace": "authority",
+      "downstream_service": "bridge",
+      "downstream_tool": "authority.reviewed.get",
+      "description": "Read one hash-verified, case-scoped reviewed authority record from canonical B2."
+    },
+    {
+      "tool": "authority.reviewed.put",
+      "namespace": "authority",
+      "downstream_service": "bridge",
+      "downstream_tool": "authority.reviewed.put",
+      "description": "Persist one immutable reviewed-authority record in canonical B2. Requires explicit authorization and the Bridge's verified source, holding, proposition, filing-page, and hash contract."
     },
     {
       "tool": "activity.poll",
