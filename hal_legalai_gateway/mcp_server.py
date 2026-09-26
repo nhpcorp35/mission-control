@@ -719,6 +719,10 @@ def create_mcp_server(
     )
     bindings = bindings_from_registry(settings.registry)
     register_forwarding_tools(mcp, settings, bindings)
+    # ChatGPT needs the catalog before linking the account.  FastMCP 2.x
+    # serializes tool metadata through _meta, including this compatibility key.
+    for tool in mcp._tool_manager._tools.values():
+        tool.meta = {**(tool.meta or {}), "securitySchemes": [{"type": "oauth2", "scopes": ["user"]}]}
     return mcp
 
 

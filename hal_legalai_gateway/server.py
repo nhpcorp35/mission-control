@@ -23,6 +23,9 @@ from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
 from starlette.authentication import AuthenticationBackend
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import HTTPConnection
+from starlette.routing import Route
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from fastmcp.server.auth.middleware import RequireAuthMiddleware
 
 from hal_legalai_gateway.config import GatewaySettings, load_settings
 from hal_legalai_gateway.health import aggregate_health
@@ -1108,6 +1111,61 @@ async def _forward_verified_case_pdf(payload: dict[str, Any]) -> Response:
 
 
 
+class _CatalogBeforeAuth:
+    """Allow anonymous MCP discovery, but never execute a tool without OAuth."""
+
+    def __init__(self, protected: RequireAuthMiddleware, resource_metadata_url: str):
+        self.protected = protected
+        self.resource_metadata_url = resource_metadata_url
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if isinstance(scope.get("user"), AuthenticatedUser) or any(
+            key == b"authorization" for key, _ in scope.get("headers", [])
+        ):
+            await self.protected(scope, receive, send)
+            return
+        if scope["method"] != "POST":
+            await self.protected(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        body = await request.body()
+        if len(body) > 64 * 1024:
+            await self.protected(scope, receive, send)
+            return
+        try:
+            message = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            message = None
+        method = message.get("method") if isinstance(message, dict) else None
+        if method == "tools/call" and "id" in message:
+            challenge = (
+                f'Bearer resource_metadata="{self.resource_metadata_url}", '
+                'error="insufficient_scope", error_description="Sign in to use LegalAI tools"'
+            )
+            response = JSONResponse({
+                "jsonrpc": "2.0", "id": message["id"],
+                "result": {
+                    "content": [{"type": "text", "text": "Authentication required."}],
+                    "isError": True, "_meta": {"mcp/www_authenticate": [challenge]},
+                },
+            })
+            await response(scope, receive, send)
+            return
+        if method not in {"initialize", "notifications/initialized", "tools/list"}:
+            await self.protected(scope, receive, send)
+            return
+        first = True
+
+        async def replay() -> Any:
+            nonlocal first
+            if first:
+                first = False
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.protected.app(scope, replay, send)
+
+
 def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
     """Install (or replace) FastMCP routes so lifespan-bound session managers match."""
     application.router.routes = [
@@ -1118,6 +1176,13 @@ def _attach_mcp_routes(application: FastAPI, mcp_app: Any) -> None:
         }
     ]
     for route in mcp_app.routes:
+        if getattr(route, "path", None) == "/mcp" and isinstance(route, Route) and isinstance(route.endpoint, RequireAuthMiddleware):
+            route = Route(
+                route.path,
+                endpoint=_CatalogBeforeAuth(route.endpoint, str(route.endpoint.resource_metadata_url)),
+                methods=route.methods,
+                name=route.name,
+            )
         application.router.routes.append(route)
 
 
