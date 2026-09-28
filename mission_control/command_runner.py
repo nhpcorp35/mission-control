@@ -89,7 +89,8 @@ _VERIFIED_CASE_ID_RE = re.compile(
 )
 _DRAFT_REQUEST_ID_RE = re.compile(r"^draft-[0-9]+-[0-9a-f]{12}$")
 _RETRIEVAL_PROFILE_RE = re.compile(
-    r"^(?:main-action|counter-cross|third-party|consolidated)$"
+    r"^(?:main-action|counter-cross|third-party|consolidated|"
+    r"motion-recommendation|motion-response)$"
 )
 
 # Env names that must never be forwarded into the command process.
