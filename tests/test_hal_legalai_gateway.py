@@ -1129,6 +1129,45 @@ class ApiTests(unittest.TestCase):
         self._env_patch.stop()
         reset_settings_for_tests()
 
+    def test_kuzmicki_scoped_intake_rejects_missing_token_and_wrong_bundle(self) -> None:
+        path = "/intake/kuzmicki-research/upload"
+        with mock.patch.dict(os.environ, {"KUZMICKI_RESEARCH_INTAKE_TOKEN": "local-test-token"}):
+            self.assertEqual(self.client.post(path, content=b"abc", headers={"X-Kuzmicki-Source-Size": "1"}).status_code, 401)
+            with mock.patch("hal_legalai_gateway.server._forward_generic_direct_intake") as forward:
+                response = self.client.post(path, content=b"abc", headers={
+                    "X-Kuzmicki-Intake-Token": "local-test-token", "X-Kuzmicki-Source-Size": "1",
+                })
+                self.assertEqual(response.status_code, 400)
+                forward.assert_not_called()
+
+    def test_kuzmicki_scoped_intake_forwards_only_verified_pair(self) -> None:
+        import hashlib
+        source, manifest = b"source-test", b"manifest-test"
+        plan = {"ok": True, "upload_id": "a" * 32,
+                "source": {"url": "https://b2.example/source", "content_type": "application/zip"},
+                "manifest": {"url": "https://b2.example/manifest", "content_type": "application/json"}}
+        result = {"ok": True, "source_sha256": hashlib.sha256(source).hexdigest(),
+                  "verified_files": 6, "indexed_documents": 6}
+        class FakeResponse:
+            is_success = True
+        class FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): pass
+            async def put(self, url, *, headers, content): return FakeResponse()
+        async def forward(action, payload):
+            self.assertEqual(payload["case_id"], "NY-Richmond-151944-2017-Kuzmicki-v-Bentley-Yacht-Club")
+            return plan if action == "prepare" else result
+        with mock.patch.dict(os.environ, {"KUZMICKI_RESEARCH_INTAKE_TOKEN": "local-test-token"}), \
+             mock.patch("hal_legalai_gateway.server.KUZMICKI_RESEARCH_SOURCE_SHA256", hashlib.sha256(source).hexdigest()), \
+             mock.patch("hal_legalai_gateway.server.KUZMICKI_RESEARCH_MANIFEST_SHA256", hashlib.sha256(manifest).hexdigest()), \
+             mock.patch("hal_legalai_gateway.server._forward_generic_direct_intake", side_effect=forward) as forwarded, \
+             mock.patch("hal_legalai_gateway.server.httpx.AsyncClient", return_value=FakeClient()):
+            response = self.client.post("/intake/kuzmicki-research/upload", content=source + manifest,
+                headers={"X-Kuzmicki-Intake-Token": "local-test-token", "X-Kuzmicki-Source-Size": str(len(source))})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(forwarded.call_count, 2)
+        self.assertEqual(response.json()["verified_files"], 6)
+
     def test_health_reports_commit_sha_tools_and_downstream_map(self) -> None:
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
