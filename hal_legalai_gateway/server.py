@@ -83,6 +83,12 @@ _mcp_http_app: Any = None
 _auth_override: AuthProvider | None = None
 RENNICK_SOURCE_BYTES_MAX = 50 * 1024 * 1024
 RENNICK_MANIFEST_BYTES_MAX = 128 * 1024
+KUZMICKI_RESEARCH_CASE_ID = "NY-Richmond-151944-2017-Kuzmicki-v-Bentley-Yacht-Club"
+KUZMICKI_RESEARCH_SOURCE_SHA256 = "8ec1f4970135c895028b25d6f2356d69548c3cb74f2794de33a06be46e41ff55"
+KUZMICKI_RESEARCH_MANIFEST_SHA256 = "c994f1a56a627d5c1b37e59341c653dbf3408018dfaa1e6d689a8532df20de10"
+KUZMICKI_RESEARCH_SOURCE_NAME = "Kuzmicki_motion001_source.zip"
+KUZMICKI_RESEARCH_MANIFEST_NAME = "Kuzmicki_motion001_manifest.json"
+KUZMICKI_RESEARCH_MAX_BYTES = 12 * 1024 * 1024
 RENNICK_BROWSER_SESSION_SECONDS = 15 * 60
 _RENNICK_STATE_COOKIE = "rennick_oauth_state"
 _RENNICK_SESSION_COOKIE = "rennick_upload_session"
@@ -1559,6 +1565,50 @@ document.getElementById('upload-supplement').onclick=async()=>{{try{{const files
             return JSONResponse(result, status_code=200 if result.get("ok") else 409)
         except (TypeError, ValueError, KeyError, httpx.HTTPError) as exc:
             return JSONResponse({"ok": False, "error": str(exc) or "private_upload_failed"}, status_code=400)
+
+    @application.post("/intake/kuzmicki-research/upload", include_in_schema=False)
+    async def upload_kuzmicki_research(request: Request) -> JSONResponse:
+        """One scoped intake without a browser session or an exposed B2 credential."""
+        expected_token = os.environ.get("KUZMICKI_RESEARCH_INTAKE_TOKEN", "")
+        supplied_token = request.headers.get("X-Kuzmicki-Intake-Token", "")
+        if not expected_token or not hmac.compare_digest(supplied_token, expected_token):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            source_size = int(request.headers.get("X-Kuzmicki-Source-Size", "0"))
+            if not 0 < source_size < KUZMICKI_RESEARCH_MAX_BYTES:
+                raise ValueError("invalid_source_size")
+            body = await request.body()
+            if len(body) > KUZMICKI_RESEARCH_MAX_BYTES or source_size >= len(body):
+                raise ValueError("invalid_upload_size")
+            source, manifest = body[:source_size], body[source_size:]
+            if (hashlib.sha256(source).hexdigest() != KUZMICKI_RESEARCH_SOURCE_SHA256
+                    or hashlib.sha256(manifest).hexdigest() != KUZMICKI_RESEARCH_MANIFEST_SHA256):
+                raise ValueError("intake_sha256_mismatch")
+            plan = await _forward_generic_direct_intake("prepare", {
+                "case_id": KUZMICKI_RESEARCH_CASE_ID,
+                "source_filename": KUZMICKI_RESEARCH_SOURCE_NAME,
+                "manifest_filename": KUZMICKI_RESEARCH_MANIFEST_NAME,
+            })
+            if not plan.get("ok"):
+                return JSONResponse({"ok": False, "error": "intake_prepare_failed"}, status_code=502)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, connect=get_settings().connect_timeout_seconds)) as client:
+                for name, payload in (("source", source), ("manifest", manifest)):
+                    part = plan[name]
+                    response = await client.put(str(part["url"]), headers={"Content-Type": str(part["content_type"])}, content=payload)
+                    if not response.is_success:
+                        return JSONResponse({"ok": False, "error": "private_storage_upload_failed"}, status_code=502)
+            result = await _forward_generic_direct_intake("complete", {
+                "upload_id": str(plan["upload_id"]),
+                "case_id": KUZMICKI_RESEARCH_CASE_ID,
+                "source_filename": KUZMICKI_RESEARCH_SOURCE_NAME,
+                "manifest_filename": KUZMICKI_RESEARCH_MANIFEST_NAME,
+            })
+            if result.get("ok") and (result.get("source_sha256") != KUZMICKI_RESEARCH_SOURCE_SHA256
+                                     or result.get("verified_files") != 6 or result.get("indexed_documents") != 6):
+                return JSONResponse({"ok": False, "error": "intake_verification_mismatch"}, status_code=502)
+            return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+        except (TypeError, ValueError, KeyError, httpx.HTTPError):
+            return JSONResponse({"ok": False, "error": "invalid_or_unavailable_intake"}, status_code=400)
 
 
     @application.post("/intake/rennick/upload", include_in_schema=False)
