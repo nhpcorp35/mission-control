@@ -449,6 +449,22 @@ class TestCommandRunner(unittest.TestCase):
         self.assertEqual(Path(resolved[1]).name, "run_verified_case_draft.py")
         self.assertEqual(resolved[2:], argv[2:])
 
+    def test_verified_draft_motion_profiles_are_read_only_allowlisted(self) -> None:
+        script = self.fixture.source_repo / "scripts" / "run_verified_case_draft.py"
+        script.write_text("print('validation')\n")
+        for profile in ("motion-recommendation", "motion-response"):
+            argv = [
+                "python3", "scripts/run_verified_case_draft.py",
+                "--validate-retrieval", "--case-id",
+                "NY-Nassau-613561-2026-Desousa-v-Rennick",
+                "--profile", profile,
+            ]
+            resolved, _cwd, _out = validate_and_build_argv(
+                argv, workspace=self.fixture.source_repo,
+                working_directory=".", mounted=[self.fixture.mount_root],
+            )
+            self.assertEqual(resolved[2:], argv[2:])
+
     def test_verified_draft_validation_allows_case00_benchmark(self) -> None:
         script = self.fixture.source_repo / "scripts" / "run_verified_case_draft.py"
         script.write_text("print('validation')\n")
