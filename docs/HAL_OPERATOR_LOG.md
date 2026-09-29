@@ -1,5 +1,20 @@
 # HAL Operator Log
 
+## 2026-09-26 — Case-00 historical status verification
+
+### DONE
+
+- PR #134 (merge `32add65383d59e26a67796b45e38d7cdedeabae2`) changed a missing GitHub Actions run from fabricated `status: dispatching` to `error: run_not_found`. The resolver searches only the newest 50 workflow-dispatch runs.
+- Live Gateway `case.status` returned `completed` / `success` for Q2 mission `case00-q2-verification-20260824-01` (run `32769355935`) and Q5 mission `cef9263a-16e3-47ae-a761-a186142f7291` (run `33268096991`).
+- A synthetic missing mission returned `run_not_found` through the deployed Gateway. These results verify the named missions and the fallback, but do not identify the exact mission IDs behind Registry v53's old labels.
+
+### BLOCKED
+
+- Exact Registry v53 label reconciliation requires the report's source or stored snapshot. Neither the report artifact nor its mission-ID mapping was located in `mission-control` or `legal-ai`. Do not infer that the historical displayed labels changed.
+- No paid draft, B2 source-record mutation, or attorney communication occurred in this verification.
+
+---
+
 ## 2026-09-06 — LegalAI Case-00 workspace production verification
 
 ### Completed
